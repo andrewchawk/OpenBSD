@@ -27,12 +27,12 @@
 .Op Fl s Ar socket
 .Sh DESCRIPTION
 .Nm
-is a dynamic host configuration protocol (DHCP) daemon for clients.
-It requests IP configuration information from for example those offered by
+is a Dynamic Host Configuration Protocol (DHCP) daemon for clients.
+It requests IP configuration information from DHCP servers, e.g.,
 .Xr dhcpd 8 ,
-on interfaces with the
+and uses any such information to configure interfaces on which the
 .Sy AUTOCONF4
-flag set.
+flag is set.
 See
 .Xr hostname.if 5
 and
