@@ -34,9 +34,6 @@ my %internal = (
         EVP_MD_CTRL_ALG_CTRL
         EVP_MD_CTX_FLAG_CLEANED EVP_MD_CTX_FLAG_REUSE
     )],
-    objects => [qw(
-	OBJ_bsearch_ OBJ_bsearch_ex_
-    )],
     x509_vfy => [qw(
 	X509_VERIFY_PARAM_ID
     )]
@@ -223,6 +220,7 @@ try_again:
 	    /^#define HEADER_\w+_H$/ ||
 	    /^#endif$/ ||
 	    /^#else$/ ||
+	    /^#error/ ||
 	    /^extern\s+const\s+ASN1_ITEM\s+\w+_it;$/ ||
 	    /^#\s*include\s/ ||
 	    /^#ifn?def\s/ ||

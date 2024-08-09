@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sysctl.c,v 1.434 2024/08/06 12:36:54 mvs Exp $	*/
+/*	$OpenBSD: kern_sysctl.c,v 1.436 2024/08/08 15:02:36 bluhm Exp $	*/
 /*	$NetBSD: kern_sysctl.c,v 1.17 1996/05/20 17:49:05 mrg Exp $	*/
 
 /*-
@@ -533,6 +533,18 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdstruct(oldp, oldlenp, newp,
 		    &mbs, sizeof(mbs)));
 	}
+	case KERN_MSGBUFSIZE:
+	case KERN_CONSBUFSIZE: {
+		struct msgbuf *mp;
+		mp = (name[0] == KERN_MSGBUFSIZE) ? msgbufp : consbufp;
+		/*
+		 * deal with cases where the message buffer has
+		 * become corrupted.
+		 */
+		if (!mp || mp->msg_magic != MSG_MAGIC)
+			return (ENXIO);
+		return (sysctl_rdint(oldp, oldlenp, newp, mp->msg_bufs));
+	}
 	case KERN_OSREV:
 	case KERN_NFILES:
 	case KERN_TTYCOUNT:
@@ -616,18 +628,6 @@ kern_sysctl_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		error =  sysctl_int(oldp, oldlenp, newp, newlen, &inthostid);
 		hostid = inthostid;
 		return (error);
-	case KERN_MSGBUFSIZE:
-	case KERN_CONSBUFSIZE: {
-		struct msgbuf *mp;
-		mp = (name[0] == KERN_MSGBUFSIZE) ? msgbufp : consbufp;
-		/*
-		 * deal with cases where the message buffer has
-		 * become corrupted.
-		 */
-		if (!mp || mp->msg_magic != MSG_MAGIC)
-			return (ENXIO);
-		return (sysctl_rdint(oldp, oldlenp, newp, mp->msg_bufs));
-	}
 	case KERN_CONSBUF:
 		if ((error = suser(p)))
 			return (error);
@@ -635,7 +635,10 @@ kern_sysctl_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	case KERN_MSGBUF: {
 		struct msgbuf *mp;
 		mp = (name[0] == KERN_MSGBUF) ? msgbufp : consbufp;
-		/* see note above */
+		/*
+		 * deal with cases where the message buffer has
+		 * become corrupted.
+		 */
 		if (!mp || mp->msg_magic != MSG_MAGIC)
 			return (ENXIO);
 		return (sysctl_rdstruct(oldp, oldlenp, newp, mp,
@@ -1679,7 +1682,7 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 			 */
 			if (pr->ps_flags & (PS_SYSTEM | PS_EMBRYO | PS_EXITING))
 				continue;
-			if (arg > 0 && pr->ps_pid != (pid_t)arg) {
+			if (arg >= 0 && pr->ps_pid != (pid_t)arg) {
 				/* not the pid we are looking for */
 				continue;
 			}
@@ -1699,6 +1702,9 @@ sysctl_file(int *name, u_int namelen, char *where, size_t *sizep,
 				FILLIT(fp, fdp, i, NULL, pr);
 				FRELE(fp, p);
 			}
+			/* pid is unique, stop searching */
+			if (arg >= 0)
+				break;
 		}
 		if (!matched)
 			error = ESRCH;
