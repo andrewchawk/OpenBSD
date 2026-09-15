@@ -1,4 +1,4 @@
-/*	$OpenBSD: conf.h,v 1.9 2022/06/28 14:43:50 visa Exp $	*/
+/*	$OpenBSD: conf.h,v 1.12 2025/11/12 11:34:36 hshoexer Exp $	*/
 /*	$NetBSD: conf.h,v 1.2 1996/05/05 19:28:34 christos Exp $	*/
 
 /*
@@ -54,3 +54,15 @@ cdev_decl(pctr);
 
 #include "vmm.h"
 cdev_decl(vmm);
+
+#include "psp.h"
+cdev_decl(psp);
+
+#include "kexec.h"
+#define cdev_kexec_init(c,n) { \
+	dev_init(c,n,open), dev_init(c,n,close), (dev_type_read((*))) enodev, \
+	(dev_type_write((*))) enodev, dev_init(c,n,ioctl), \
+	(dev_type_stop((*))) nullop, 0, \
+	(dev_type_mmap((*))) enodev }
+
+cdev_decl(kexec);

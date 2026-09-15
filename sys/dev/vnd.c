@@ -1,4 +1,4 @@
-/*	$OpenBSD: vnd.c,v 1.181 2023/05/14 18:34:02 krw Exp $	*/
+/*	$OpenBSD: vnd.c,v 1.183 2025/11/17 14:27:43 jsg Exp $	*/
 /*	$NetBSD: vnd.c,v 1.26 1996/03/30 23:06:11 christos Exp $	*/
 
 /*
@@ -399,7 +399,8 @@ vndioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
 	struct vnd_ioctl *vio;
 	struct vnd_user *vnu;
 	struct vattr vattr;
-	int error, part, pmask;
+	uint64_t pmask;
+	int error, part;
 
 	DNPRINTF(VDB_FOLLOW, "vndioctl(%x, %lx, %p, %x, %p): unit %d\n",
 	    dev, cmd, addr, flag, p, unit);
@@ -554,7 +555,7 @@ fail:
 		 * partition are open.
 		 */
 		part = DISKPART(dev);
-		pmask = (1 << part);
+		pmask = (1ULL << part);
 		if ((sc->sc_dk.dk_openmask & ~pmask) ||
 		    ((sc->sc_dk.dk_bopenmask & pmask) &&
 		    (sc->sc_dk.dk_copenmask & pmask))) {

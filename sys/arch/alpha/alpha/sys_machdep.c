@@ -1,4 +1,4 @@
-/*	$OpenBSD: sys_machdep.c,v 1.8 2022/10/31 03:20:41 guenther Exp $	*/
+/*	$OpenBSD: sys_machdep.c,v 1.11 2025/11/01 17:05:19 miod Exp $	*/
 /*	$NetBSD: sys_machdep.c,v 1.14 2002/01/14 00:53:16 thorpej Exp $	*/
 
 /*-
@@ -61,17 +61,16 @@
 #include <sys/systm.h>
 #ifndef NO_IEEE
 #include <sys/device.h>
-#include <sys/proc.h>
 #endif
+#include <sys/proc.h>
 
 #include <sys/mount.h>
 #include <sys/syscallargs.h>
+#include <sys/pledge.h>
 
 #ifndef NO_IEEE
 #include <machine/fpu.h>
 #include <machine/sysarch.h>
-
-#include <dev/pci/pcivar.h>
 
 int
 sys_sysarch(struct proc *p, void *v, register_t *retval)
@@ -81,6 +80,9 @@ sys_sysarch(struct proc *p, void *v, register_t *retval)
 		syscallarg(void *) parms;
 	} */ *uap = v;
 	int error = 0;
+
+	if ((p->p_p->ps_flags & PS_PLEDGE))
+		return pledge_fail(p, EINVAL, 0);
 
 	switch(SCARG(uap, op)) {
 	case ALPHA_FPGETMASK:
@@ -146,6 +148,9 @@ sys_sysarch(struct proc *p, void *v, register_t *retval)
 int
 sys_sysarch(struct proc *p, void *v, register_t *retval)
 {
+	if ((p->p_p->ps_flags & PS_PLEDGE))
+		return pledge_fail(p, EINVAL, 0);
+
 	return (ENOSYS);
 }
 #endif

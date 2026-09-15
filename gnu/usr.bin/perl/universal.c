@@ -123,20 +123,33 @@ S_sv_derived_from_svpvn(pTHX_ SV *sv, SV *namesv, const char * name, const STRLE
 /*
 =for apidoc_section $SV
 
-=for apidoc sv_derived_from_pvn
+=for apidoc      sv_derived_from
+=for apidoc_item sv_derived_from_hv
+=for apidoc_item sv_derived_from_pv
+=for apidoc_item sv_derived_from_pvn
+=for apidoc_item sv_derived_from_sv
 
-Returns a boolean indicating whether the SV is derived from the specified class
-I<at the C level>.  To check derivation at the Perl level, call C<isa()> as a
-normal Perl method.
+These each return a boolean indicating whether C<sv> is derived from the
+specified class I<at the C level>.  To check derivation at the Perl level, call
+C<isa()> as a normal Perl method.
 
-Currently, the only significant value for C<flags> is SVf_UTF8.
+In C<sv_derived_from_hv>, the class name is C<HvNAME(hv)> (which would
+presumably represent a stash).  Its UTF8ness is C<HvNAMEUTF8(hv)>.
 
-=cut
+In C<sv_derived_from> and C<sv_derived_from_pv>, the class name is given by
+C<name>, which is a NUL-terminated C string.  In C<sv_derived_from>, the name
+is never considered to be encoded as UTF-8.
 
-=for apidoc sv_derived_from_sv
+The remaining forms differ only in how the class name is specified;
+they all have a C<flags> parameter. Currently, the only significant value for
+which is C<SVf_UTF8> to indicate that the class name is encoded as such.
 
-Exactly like L</sv_derived_from_pvn>, but takes the name string in the form
-of an SV instead of a string/length pair. This is the advised form.
+In C<sv_derived_from_sv>, the class name is extracted from C<namesv>.
+This is the preferred form.  The class name is considered to be in UTF-8 if
+C<namesv> is marked as such.
+
+In C<sv_derived_from_pvn>, C<len> gives the length of C<name>, so the latter
+may contain embedded NUL characters.
 
 =cut
 
@@ -149,29 +162,12 @@ Perl_sv_derived_from_sv(pTHX_ SV *sv, SV *namesv, U32 flags)
     return sv_derived_from_svpvn(sv, namesv, NULL, 0, flags);
 }
 
-/*
-=for apidoc sv_derived_from
-
-Exactly like L</sv_derived_from_pv>, but doesn't take a C<flags> parameter.
-
-=cut
-*/
-
 bool
 Perl_sv_derived_from(pTHX_ SV *sv, const char *const name)
 {
     PERL_ARGS_ASSERT_SV_DERIVED_FROM;
     return sv_derived_from_svpvn(sv, NULL, name, strlen(name), 0);
 }
-
-/*
-=for apidoc sv_derived_from_pv
-
-Exactly like L</sv_derived_from_pvn>, but takes a nul-terminated string 
-instead of a string/length pair.
-
-=cut
-*/
 
 
 bool
@@ -187,15 +183,6 @@ Perl_sv_derived_from_pvn(pTHX_ SV *sv, const char *const name, const STRLEN len,
     PERL_ARGS_ASSERT_SV_DERIVED_FROM_PVN;
     return sv_derived_from_svpvn(sv, NULL, name, len, flags);
 }
-
-/*
-=for apidoc sv_derived_from_hv
-
-Exactly like L</sv_derived_from_pvn>, but takes the name string as the
-C<HvNAME> of the given HV (which would presumably represent a stash).
-
-=cut
-*/
 
 bool
 Perl_sv_derived_from_hv(pTHX_ SV *sv, HV *hv)
@@ -397,7 +384,8 @@ A specialised variant of C<croak()> for emitting the usage message for xsubs
 works out the package name and subroutine name from C<cv>, and then calls
 C<croak()>.  Hence if C<cv> is C<&ouch::awk>, it would call C<croak> as:
 
- Perl_croak(aTHX_ "Usage: %" SVf "::%" SVf "(%s)", "ouch" "awk",
+ diag_listed_as: SKIPME
+ croak("Usage: %" SVf "::%" SVf "(%s)", "ouch" "awk",
                                                      "eee_yow");
 
 =cut
@@ -430,7 +418,7 @@ Perl_croak_xs_usage(const CV *const cv, const char *const params)
 
         /* Pants. I don't think that it should be possible to get here. */
         /* diag_listed_as: SKIPME */
-        Perl_croak(aTHX_ "Usage: CODE(0x%" UVxf ")(%s)", PTR2UV(cv), params);
+        Perl_croak_nocontext("Usage: CODE(0x%" UVxf ")(%s)", PTR2UV(cv), params);
     }
 }
 
@@ -453,6 +441,33 @@ XS(XS_UNIVERSAL_isa)
         XSRETURN(1);
     }
 }
+
+XS(XS_UNIVERSAL_import_unimport); /* prototype to pass -Wmissing-prototypes */
+XS(XS_UNIVERSAL_import_unimport)
+{
+    dXSARGS;
+    dXSI32;
+
+    if (items > 1) {
+        char *class_pv= SvPV_nolen(ST(0));
+        if (strEQ(class_pv,"UNIVERSAL"))
+            croak("UNIVERSAL does not export anything");
+        /* _charnames is special - ignore it for now as the code that
+         * depends on it has its own "no import" logic that produces better
+         * warnings than this does. */
+        if (strNE(class_pv,"_charnames"))
+            ck_warner_d(packWARN(WARN_DEPRECATED__MISSING_IMPORT_CALLED_WITH_ARGS),
+                        "Attempt to call undefined %s method with arguments "
+                        "(%" SVf_QUOTEDPREFIX "%s) via package "
+                        "%" SVf_QUOTEDPREFIX " (Perhaps you forgot to load the package?)",
+                        ix ? "unimport" : "import",
+                        SVfARG(ST(1)),
+                        (items > 2 ? " ..." : ""),
+                        SVfARG(ST(0)));
+    }
+    XSRETURN_EMPTY;
+}
+
 
 XS(XS_UNIVERSAL_can); /* prototype to pass -Wmissing-prototypes */
 XS(XS_UNIVERSAL_can)
@@ -512,7 +527,7 @@ XS(XS_UNIVERSAL_DOES)
     PERL_UNUSED_ARG(cv);
 
     if (items != 2)
-        Perl_croak(aTHX_ "Usage: invocant->DOES(kind)");
+        croak("Usage: invocant->DOES(kind)");
     else {
         SV * const sv = ST(0);
         if (sv_does_sv( sv, ST(1), 0 ))
@@ -747,10 +762,24 @@ XS(XS_Internals_hv_clear_placehold)
     if (items != 1 || !SvROK(ST(0)))
         croak_xs_usage(cv, "hv");
     else {
-        HV * const hv = MUTABLE_HV(SvRV(ST(0)));
+        HV * const hv = HV_FROM_REF(ST(0));
         hv_clear_placeholders(hv);
         XSRETURN(0);
     }
+}
+
+XS(XS_Internals_stack_refcounted); /* prototype to pass -Wmissing-prototypes */
+XS(XS_Internals_stack_refcounted)
+{
+    dXSARGS;
+    UV val = 0;
+
+    if (items != 0)
+        croak_xs_usage(cv, "");
+#ifdef PERL_RC_STACK
+    val |= 1;
+#endif
+    XSRETURN_UV(val);
 }
 
 XS(XS_PerlIO_get_layers); /* prototype to pass -Wmissing-prototypes */
@@ -796,7 +825,7 @@ XS(XS_PerlIO_get_layers)
                        goto fail;
                   default:
                   fail:
-                       Perl_croak(aTHX_
+                       croak(
                                   "get_layers: unknown argument '%s'",
                                   key);
                   }
@@ -985,7 +1014,7 @@ XS(XS_re_regnames)
     if (!ret)
         XSRETURN_UNDEF;
 
-    av = MUTABLE_AV(SvRV(ret));
+    av = AV_FROM_REF(ret);
     length = av_count(av);
 
     EXTEND(SP, length); /* better extend stack just once */
@@ -993,7 +1022,8 @@ XS(XS_re_regnames)
         entry = av_fetch(av, i, FALSE);
         
         if (!entry)
-            Perl_croak(aTHX_ "NULL array element in re::regnames()");
+            /* diag_listed_as: SKIPME */
+            croak("NULL array element in re::regnames()");
 
         mPUSHs(SvREFCNT_inc_simple_NN(*entry));
     }
@@ -1073,7 +1103,7 @@ XS(XS_re_regexp_pattern)
         } else {
             /* Scalar, so use the string that Perl would return */
             /* return the pattern in (?msixn:..) format */
-            pattern = sv_2mortal(newSVsv(MUTABLE_SV(re)));
+            pattern = sv_mortalcopy_flags(MUTABLE_SV(re), SV_GMAGIC|SV_NOSTEAL);
             PUSHs(pattern);
             XSRETURN(1);
         }
@@ -1199,7 +1229,7 @@ XS(XS_NamedCapture_FETCH)
 
         if (!rx || !SvROK(ST(0))) {
             if (ix & UNDEF_FATAL)
-                Perl_croak_no_modify();
+                croak_no_modify();
             else
                 XSRETURN_UNDEF;
         }
@@ -1287,6 +1317,8 @@ static const struct xsub_details these_details[] = {
     {"UNIVERSAL::isa", XS_UNIVERSAL_isa, NULL, 0 },
     {"UNIVERSAL::can", XS_UNIVERSAL_can, NULL, 0 },
     {"UNIVERSAL::DOES", XS_UNIVERSAL_DOES, NULL, 0 },
+    {"UNIVERSAL::import", XS_UNIVERSAL_import_unimport, NULL, 0},
+    {"UNIVERSAL::unimport", XS_UNIVERSAL_import_unimport, NULL, 1},
 #define VXS_XSUB_DETAILS
 #include "vxs.inc"
 #undef VXS_XSUB_DETAILS
@@ -1301,6 +1333,7 @@ static const struct xsub_details these_details[] = {
     {"Internals::SvREADONLY", XS_Internals_SvREADONLY, "\\[$%@];$", 0 },
     {"Internals::SvREFCNT", XS_Internals_SvREFCNT, "\\[$%@];$", 0 },
     {"Internals::hv_clear_placeholders", XS_Internals_hv_clear_placehold, "\\%", 0 },
+    {"Internals::stack_refcounted", XS_Internals_stack_refcounted, NULL, 0 },
     {"constant::_make_const", XS_constant__make_const, "\\[$@]", 0 },
     {"PerlIO::get_layers", XS_PerlIO_get_layers, "*;@", 0 },
     {"re::is_regexp", XS_re_is_regexp, "$", 0 },

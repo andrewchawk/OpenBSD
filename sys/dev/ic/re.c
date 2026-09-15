@@ -1,4 +1,4 @@
-/*	$OpenBSD: re.c,v 1.217 2024/01/19 03:46:14 dlg Exp $	*/
+/*	$OpenBSD: re.c,v 1.224 2026/08/05 08:05:43 bluhm Exp $	*/
 /*	$FreeBSD: if_re.c,v 1.31 2004/09/04 07:54:05 ru Exp $	*/
 /*
  * Copyright (c) 1997, 1998-2003
@@ -205,7 +205,7 @@ void	re_kstat_detach(struct rl_softc *);
 void	in_delayed_cksum(struct mbuf *);
 
 struct cfdriver re_cd = {
-	0, "re", DV_IFNET
+	NULL, "re", DV_IFNET
 };
 
 #define EE_SET(x)					\
@@ -667,6 +667,8 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	int		error = 0, i;
 	const struct re_revision *rr;
 	const char	*re_name = NULL;
+	int		bus_dma64 = (sc->rl_flags & RL_FLAG_PCIE) ?
+			    BUS_DMA_64BIT : 0;
 
 	sc->sc_hwrev = CSR_READ_4(sc, RL_TXCFG) & RL_TXCFG_HWREV;
 
@@ -913,7 +915,7 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	if ((error = bus_dmamem_alloc(sc->sc_dmat, RL_TX_LIST_SZ(sc),
 		    RL_RING_ALIGN, 0, &sc->rl_ldata.rl_tx_listseg, 1,
 		    &sc->rl_ldata.rl_tx_listnseg, BUS_DMA_NOWAIT |
-		    BUS_DMA_ZERO)) != 0) {
+		    BUS_DMA_ZERO | bus_dma64)) != 0) {
 		printf("%s: can't allocate tx listseg, error = %d\n",
 		    sc->sc_dev.dv_xname, error);
 		goto fail_0;
@@ -930,7 +932,7 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	}
 
 	if ((error = bus_dmamap_create(sc->sc_dmat, RL_TX_LIST_SZ(sc), 1,
-		    RL_TX_LIST_SZ(sc), 0, 0,
+		    RL_TX_LIST_SZ(sc), 0, bus_dma64,
 		    &sc->rl_ldata.rl_tx_list_map)) != 0) {
 		printf("%s: can't create tx list map, error = %d\n",
 		    sc->sc_dev.dv_xname, error);
@@ -949,7 +951,7 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	for (i = 0; i < sc->rl_ldata.rl_tx_desc_cnt; i++) {
 		error = bus_dmamap_create(sc->sc_dmat,
 		    RL_JUMBO_FRAMELEN, sc->rl_ldata.rl_tx_ndescs,
-		    RL_JUMBO_FRAMELEN, 0, 0,
+		    RL_JUMBO_FRAMELEN, 0, bus_dma64,
 		    &sc->rl_ldata.rl_txq[i].txq_dmamap);
 		if (error) {
 			printf("%s: can't create DMA map for TX\n",
@@ -962,7 +964,7 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	if ((error = bus_dmamem_alloc(sc->sc_dmat, RL_RX_DMAMEM_SZ(sc),
 		    RL_RING_ALIGN, 0, &sc->rl_ldata.rl_rx_listseg, 1,
 		    &sc->rl_ldata.rl_rx_listnseg, BUS_DMA_NOWAIT |
-		    BUS_DMA_ZERO)) != 0) {
+		    BUS_DMA_ZERO | bus_dma64)) != 0) {
 		printf("%s: can't allocate rx listnseg, error = %d\n",
 		    sc->sc_dev.dv_xname, error);
 		goto fail_4;
@@ -980,7 +982,7 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	}
 
 	if ((error = bus_dmamap_create(sc->sc_dmat, RL_RX_DMAMEM_SZ(sc), 1,
-		    RL_RX_DMAMEM_SZ(sc), 0, 0,
+		    RL_RX_DMAMEM_SZ(sc), 0, bus_dma64,
 		    &sc->rl_ldata.rl_rx_list_map)) != 0) {
 		printf("%s: can't create rx list map, error = %d\n",
 		    sc->sc_dev.dv_xname, error);
@@ -999,7 +1001,7 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	for (i = 0; i < sc->rl_ldata.rl_rx_desc_cnt; i++) {
 		error = bus_dmamap_create(sc->sc_dmat,
 		    RL_FRAMELEN(sc->rl_max_mtu), 1,
-		    RL_FRAMELEN(sc->rl_max_mtu), 0, 0,
+		    RL_FRAMELEN(sc->rl_max_mtu), 0, bus_dma64,
 		    &sc->rl_ldata.rl_rxsoft[i].rxs_dmamap);
 		if (error) {
 			printf("%s: can't create DMA map for RX\n",
@@ -1013,6 +1015,8 @@ re_attach(struct rl_softc *sc, const char *intrstr)
 	strlcpy(ifp->if_xname, sc->sc_dev.dv_xname, IFNAMSIZ);
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	ifp->if_xflags = IFXF_MPSAFE;
+	if (bus_dma64)
+		ifp->if_xflags |= IFXF_MBUF_64BIT;
 	ifp->if_ioctl = re_ioctl;
 	ifp->if_qstart = re_start;
 	ifp->if_watchdog = re_watchdog;
@@ -1834,7 +1838,7 @@ re_start(struct ifqueue *ifq)
 	free -= idx;
 
 	for (;;) {
-		if (sc->rl_ldata.rl_tx_ndescs >= free + 2) {
+		if (free < sc->rl_ldata.rl_tx_ndescs + 2) {
 			ifq_set_oactive(ifq);
 			break;
 		}
@@ -2480,7 +2484,7 @@ re_kstat_read(struct kstat *ks)
 	struct rl_softc *sc = ks->ks_softc;
 	struct re_kstat_softc *re_ks_sc = ks->ks_ptr;
 	bus_dmamap_t map;
-	uint64_t cmd;
+	bus_addr_t addr;
 	uint32_t reg;
 	uint8_t command;
 	int tmo;
@@ -2490,15 +2494,19 @@ re_kstat_read(struct kstat *ks)
 		return (ENETDOWN);
 
 	map = re_ks_sc->re_ks_sc_map;
-	cmd = map->dm_segs[0].ds_addr | RE_DTCCR_CMD;
+	addr = map->dm_segs[0].ds_addr;
 
 	bus_dmamap_sync(sc->sc_dmat, map, 0, map->dm_mapsize,
 	    BUS_DMASYNC_PREREAD);
 
-	CSR_WRITE_4(sc, RE_DTCCR_HI, cmd >> 32);
-	bus_space_barrier(sc->rl_btag, sc->rl_bhandle, RE_DTCCR_HI, 8,
+	CSR_WRITE_4(sc, RE_DTCCR_HI, RL_ADDR_HI(addr));
+	bus_space_barrier(sc->rl_btag, sc->rl_bhandle, RE_DTCCR_HI, 4,
 	    BUS_SPACE_BARRIER_WRITE);
-	CSR_WRITE_4(sc, RE_DTCCR_LO, cmd);
+	CSR_READ_1(sc, RL_COMMAND);
+	CSR_WRITE_4(sc, RE_DTCCR_LO, RL_ADDR_LO(addr));
+	bus_space_barrier(sc->rl_btag, sc->rl_bhandle, RE_DTCCR_LO, 4,
+	    BUS_SPACE_BARRIER_WRITE);
+	CSR_WRITE_4(sc, RE_DTCCR_LO, RL_ADDR_LO(addr) | RE_DTCCR_CMD);
 	bus_space_barrier(sc->rl_btag, sc->rl_bhandle, RE_DTCCR_LO, 4,
 	    BUS_SPACE_BARRIER_READ|BUS_SPACE_BARRIER_WRITE);
 
@@ -2554,6 +2562,7 @@ re_kstat_attach(struct rl_softc *sc)
 {
 	struct re_kstat_softc *re_ks_sc;
 	struct kstat *ks;
+	int bus_dma64 = (sc->rl_flags & RL_FLAG_PCIE) ? BUS_DMA_64BIT : 0;
 
 	re_ks_sc = malloc(sizeof(*re_ks_sc), M_DEVBUF, M_NOWAIT);
 	if (re_ks_sc == NULL) {
@@ -2564,7 +2573,7 @@ re_kstat_attach(struct rl_softc *sc)
 
 	if (bus_dmamap_create(sc->sc_dmat,
 	    sizeof(struct re_stats), 1, sizeof(struct re_stats), 0,
-	    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
+	    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | bus_dma64,
 	    &re_ks_sc->re_ks_sc_map) != 0) {
 		printf("%s: cannot create counter dma memory map\n",
 		    sc->sc_dev.dv_xname);
@@ -2574,7 +2583,7 @@ re_kstat_attach(struct rl_softc *sc)
 	if (bus_dmamem_alloc(sc->sc_dmat,
 	    sizeof(struct re_stats), RE_STATS_ALIGNMENT, 0,
 	    &re_ks_sc->re_ks_sc_seg, 1, &re_ks_sc->re_ks_sc_nsegs,
-	    BUS_DMA_NOWAIT | BUS_DMA_ZERO) != 0) {
+	    BUS_DMA_NOWAIT | BUS_DMA_ZERO | bus_dma64) != 0) {
 		printf("%s: cannot allocate counter dma memory\n",
 		    sc->sc_dev.dv_xname);
 		goto destroy;

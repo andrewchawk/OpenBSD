@@ -1,4 +1,4 @@
-/*	$OpenBSD: ometric.c,v 1.2 2023/01/06 13:22:00 deraadt Exp $ */
+/*	$OpenBSD: ometric.c,v 1.4 2026/07/09 09:32:32 claudio Exp $ */
 
 /*
  * Copyright (c) 2022 Claudio Jeker <claudio@openbsd.org>
@@ -288,6 +288,34 @@ ometric_type(enum ometric_type type)
 }
 
 static int
+ometric_escape_string(FILE *out, const char *s)
+{
+	unsigned char c;
+
+	while ((c = *s++) != '\0') {
+		switch (c) {
+		case '"':
+			if (fprintf(out, "\\\"") < 0)
+				return -1;
+			break;
+		case '\\':
+			if (fprintf(out, "\\\\") < 0)
+				return -1;
+			break;
+		case '\n':
+			if (fprintf(out, "\\n") < 0)
+				return -1;
+			break;
+		default:
+			if (putc(c, out) == EOF)
+				return -1;
+			break;
+		}
+	}
+	return 0;
+}
+
+static int
 ometric_output_labels(FILE *out, const struct olabels *ol)
 {
 	struct olabel *l;
@@ -301,8 +329,11 @@ ometric_output_labels(FILE *out, const struct olabels *ol)
 
 	while (ol != NULL) {
 		STAILQ_FOREACH(l, &ol->labels, entry) {
-			if (fprintf(out, "%s%s=\"%s\"", comma, l->key,
-			    l->value) < 0)
+			if (fprintf(out, "%s%s=\"", comma, l->key) < 0)
+				return -1;
+			if (ometric_escape_string(out, l->value) < 0)
+				return -1;
+			if (fprintf(out, "\"") < 0)
 				return -1;
 			comma = ",";
 		}
@@ -356,10 +387,14 @@ ometric_output_all(FILE *out)
 	struct ovalue *ov;
 
 	STAILQ_FOREACH(om, &ometrics, entry) {
-		if (om->help)
-			if (fprintf(out, "# HELP %s %s\n", om->name,
-			    om->help) < 0)
+		if (om->help) {
+			if (fprintf(out, "# HELP %s ", om->name) < 0)
 				return -1;
+			if (ometric_escape_string(out, om->help) < 0)
+				return -1;
+			if (fprintf(out, "\n") < 0)
+				return -1;
+		}
 
 		if (fprintf(out, "# TYPE %s %s\n", om->name,
 		    ometric_type(om->type)) < 0)
@@ -512,6 +547,17 @@ ometric_set_int_with_labels(struct ometric *om, uint64_t val,
 
 	extra = olabels_add_extras(ol, keys, values);
 	ometric_set_int(om, val, extra);
+	olabels_free(extra);
+}
+
+void
+ometric_set_float_with_labels(struct ometric *om, double val,
+    const char **keys, const char **values, struct olabels *ol)
+{
+	struct olabels *extra;
+
+	extra = olabels_add_extras(ol, keys, values);
+	ometric_set_float(om, val, extra);
 	olabels_free(extra);
 }
 

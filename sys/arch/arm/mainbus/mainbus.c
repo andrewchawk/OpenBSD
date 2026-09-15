@@ -1,4 +1,4 @@
-/* $OpenBSD: mainbus.c,v 1.24 2022/03/12 14:40:41 mpi Exp $ */
+/* $OpenBSD: mainbus.c,v 1.27 2026/01/05 20:06:15 patrick Exp $ */
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
@@ -51,8 +51,7 @@ struct mainbus_softc {
 };
 
 const struct cfattach mainbus_ca = {
-	sizeof(struct mainbus_softc), mainbus_match, mainbus_attach, NULL,
-	config_activate_children
+	sizeof(struct mainbus_softc), mainbus_match, mainbus_attach
 };
 
 struct cfdriver mainbus_cd = {
@@ -71,6 +70,7 @@ struct arm32_bus_dma_tag mainbus_dma_tag = {
 	_bus_dmamap_unload,
 	_bus_dmamap_sync,
 	_bus_dmamem_alloc,
+	_bus_dmamem_alloc_range,
 	_bus_dmamem_free,
 	_bus_dmamem_map,
 	_bus_dmamem_unmap,
@@ -221,10 +221,8 @@ mainbus_match_status(struct device *parent, void *match, void *aux)
 	struct mainbus_softc *sc = (struct mainbus_softc *)parent;
 	struct fdt_attach_args *fa = aux;
 	struct cfdata *cf = match;
-	char buf[32];
 
-	if (OF_getprop(fa->fa_node, "status", buf, sizeof(buf)) > 0 &&
-	    strcmp(buf, "disabled") == 0)
+	if (!OF_is_enabled(fa->fa_node))
 		return 0;
 
 	if (cf->cf_loc[0] == sc->sc_early)

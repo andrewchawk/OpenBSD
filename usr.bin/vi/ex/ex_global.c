@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_global.c,v 1.17 2016/05/27 09:18:12 martijn Exp $	*/
+/*	$OpenBSD: ex_global.c,v 1.20 2026/04/22 16:01:08 millert Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -67,7 +67,6 @@ ex_g_setup(SCR *sp, EXCMD *cmdp, enum which cmd)
 	RANGE *rp;
 	busy_t btype;
 	recno_t start, end;
-	regex_t *re;
 	regmatch_t match[1];
 	size_t len;
 	int cnt, delim, eval;
@@ -146,7 +145,6 @@ usage:		ex_emsg(sp, cmdp->cmd->usage, EXM_USAGE);
 		 */
 		sp->searchdir = FORWARD;
 	}
-	re = &sp->re_c;
 
 	/* The global commands always set the previous context mark. */
 	abs_mark.lno = sp->lno;
@@ -269,12 +267,12 @@ ex_g_insdel(SCR *sp, lnop_t op, recno_t lno)
 			/* If range less than the line, ignore it. */
 			if (rp->stop < lno)
 				continue;
-			
+
 			/*
-			 * If range greater than the line, decrement or
-			 * increment the range.
+			 * If range is greater than or equal to the line,
+			 * decrement or increment the range.
 			 */
-			if (rp->start > lno) {
+			if (rp->start >= lno) {
 				if (op == LINE_DELETE) {
 					--rp->start;
 					--rp->stop;

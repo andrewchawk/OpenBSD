@@ -1,4 +1,4 @@
-/*	$OpenBSD: octciu.c,v 1.19 2022/12/11 05:31:05 visa Exp $	*/
+/*	$OpenBSD: octciu.c,v 1.21 2026/04/16 15:50:58 kirill Exp $	*/
 
 /*
  * Copyright (c) 2000-2004 Opsycon AB  (www.opsycon.se)
@@ -250,10 +250,12 @@ octciu_intr_establish(int irq, int level, int (*ih_fun)(void *),
 		panic("%s: illegal irq %d", __func__, irq);
 #endif
 
+#if 0
 #ifdef MULTIPROCESSOR
 	/* Span work queue interrupts across CPUs. */
 	if (IS_WORKQ_IRQ(irq))
 		cpuid = irq % ncpus;
+#endif
 #endif
 
 	flags = (level & IPL_MPSAFE) ? CIH_MPSAFE : 0;
@@ -363,7 +365,7 @@ octciu_intr_barrier(void *_ih)
 	struct octciu_intrhand *ih = _ih;
 
 	if (IS_WORKQ_IRQ(ih->ih_irq))
-		ci = get_cpu_info(ih->ih_irq % ncpus);
+		ci = get_cpu_info(ih->ih_cpuid);
 #endif
 
 	sched_barrier(ci);
@@ -450,7 +452,7 @@ octciu_next_irq(uint64_t *isr)
 	: "=r" (tmp) : "0" (tmp));
 
 	irq = 63u - tmp;
-	*isr &= ~(1u << irq);
+	*isr &= ~(1ULL << irq);
 	return irq;
 }
 

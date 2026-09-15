@@ -1,4 +1,4 @@
-/*	$OpenBSD: wd.c,v 1.132 2024/07/22 14:03:22 jsg Exp $ */
+/*	$OpenBSD: wd.c,v 1.136 2026/06/24 17:03:05 krw Exp $ */
 /*	$NetBSD: wd.c,v 1.193 1999/02/28 17:15:27 explorer Exp $ */
 
 /*
@@ -852,8 +852,9 @@ wdsize(dev_t dev)
 {
 	struct wd_softc *wd;
 	struct disklabel *lp;
-	int part, omask;
+	int part;
 	daddr_t size;
+	uint64_t omask;
 
 	WDCDEBUG_PRINT(("wdsize\n"), DEBUG_FUNCS);
 
@@ -862,7 +863,7 @@ wdsize(dev_t dev)
 		return (-1);
 
 	part = DISKPART(dev);
-	omask = wd->sc_dk.dk_openmask & (1 << part);
+	omask = wd->sc_dk.dk_openmask & (1ULL << part);
 
 	if (omask == 0 && wdopen(dev, 0, S_IFBLK, NULL) != 0) {
 		size = -1;

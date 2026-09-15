@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.c,v 1.223 2024/04/03 18:43:32 miod Exp $	*/
+/*	$OpenBSD: pmap.c,v 1.234 2026/03/09 13:24:14 deraadt Exp $	*/
 /*	$NetBSD: pmap.c,v 1.91 2000/06/02 17:46:37 thorpej Exp $	*/
 
 /*
@@ -885,6 +885,25 @@ pmap_kremove(vaddr_t sva, vsize_t len)
 }
 
 /*
+ * Allocate a new PD for Intel's U-K.
+ */
+void
+pmap_alloc_pdir_intel_x86(struct pmap *pmap)
+{
+	vaddr_t va;
+
+	KASSERT(pmap->pm_pdir_intel == 0);
+
+	va = (vaddr_t)km_alloc(NBPG, &kv_any, &kp_zero, &kd_waitok);
+	if (va == 0)
+		panic("kernel_map out of virtual space");
+	pmap->pm_pdir_intel = va;
+	if (!pmap_extract(pmap_kernel(), (vaddr_t)pmap->pm_pdir_intel,
+	    &pmap->pm_pdirpa_intel))
+		panic("can't locate PD page");
+}
+
+/*
  * p m a p   i n i t   f u n c t i o n s
  *
  * pmap_bootstrap and pmap_init are called during system startup
@@ -1350,6 +1369,8 @@ pmap_create(void)
 	pmap->pm_ptphint = NULL;
 	pmap->pm_hiexec = 0;
 	pmap->pm_flags = 0;
+	pmap->pm_pdir_intel = 0;
+	pmap->pm_pdirpa_intel = 0;
 
 	initcodesegment(&pmap->pm_codeseg);
 
@@ -1363,7 +1384,7 @@ pmap_pinit_pd_86(struct pmap *pmap)
 	/* allocate PDP */
 	pmap->pm_pdir = (vaddr_t)km_alloc(NBPG, &kv_any, &kp_dirty, &kd_waitok);
 	if (pmap->pm_pdir == 0)
-		panic("pmap_pinit_pd_86: kernel_map out of virtual space!");
+		panic("kernel_map out of virtual space");
 	pmap_extract(pmap_kernel(), (vaddr_t)pmap->pm_pdir,
 			    &pmap->pm_pdirpa);
 	pmap->pm_pdirsize = NBPG;
@@ -1393,15 +1414,7 @@ pmap_pinit_pd_86(struct pmap *pmap)
 	 * execution, one that lacks all kernel mappings.
 	 */
 	if (cpu_meltdown) {
-		pmap->pm_pdir_intel = (vaddr_t)km_alloc(NBPG, &kv_any, &kp_zero,
-		    &kd_waitok);
-		if (pmap->pm_pdir_intel == 0)
-			panic("%s: kernel_map out of virtual space!", __func__);
-
-		if (!pmap_extract(pmap_kernel(), (vaddr_t)pmap->pm_pdir_intel,
-		    &pmap->pm_pdirpa_intel))
-			panic("%s: unknown PA mapping for meltdown PD",
-			    __func__);
+		pmap_alloc_pdir_intel_x86(pmap);
 
 		/* Copy PDEs from pmap_kernel's U-K view */
 		bcopy((void *)pmap_kernel()->pm_pdir_intel,
@@ -1411,9 +1424,6 @@ pmap_pinit_pd_86(struct pmap *pmap)
 		    "pdir_intel 0x%lx pdirpa_intel 0x%lx\n",
 		    __func__, pmap, pmap->pm_pdir, pmap->pm_pdirpa,
 		    pmap->pm_pdir_intel, pmap->pm_pdirpa_intel);
-	} else {
-		pmap->pm_pdir_intel = 0;
-		pmap->pm_pdirpa_intel = 0;
 	}
 
 	mtx_enter(&pmaps_lock);
@@ -1500,8 +1510,6 @@ pmap_switch(struct proc *o, struct proc *p)
 	if (opmap == pmap) {
 		if (pmap != pmap_kernel())
 			nlazy_cr3_hit++;
-	} else if (o != NULL && pmap == pmap_kernel()) {
-		nlazy_cr3++;
 	} else {
 		self->ci_curpmap = pmap;
 		lcr3(pmap->pm_pdirpa);
@@ -1599,32 +1607,6 @@ pmap_zero_phys_86(paddr_t pa)
 	pmap_update_pg((vaddr_t)zerova);	/* flush TLB */
 	pagezero(zerova, PAGE_SIZE);		/* zero */
 	*zpte = 0;
-}
-
-/*
- * pmap_zero_page_uncached: the same, except uncached.
- */
-
-int
-pmap_zero_page_uncached_86(paddr_t pa)
-{
-#ifdef MULTIPROCESSOR
-	int id = cpu_number();
-#endif
-	pt_entry_t *zpte = PTESLEW(zero_pte, id);
-	caddr_t zerova = VASLEW(pmap_zerop, id);
-
-#ifdef DIAGNOSTIC
-	if (*zpte)
-		panic("pmap_zero_page_uncached_86: lock botch");
-#endif
-
-	*zpte = (pa & PG_FRAME) | PG_V | PG_RW | PG_N;	/* map in */
-	pmap_update_pg((vaddr_t)zerova);		/* flush TLB */
-	pagezero(zerova, PAGE_SIZE);		/* zero */
-	*zpte = 0;
-
-	return 1;
 }
 
 /*
@@ -1973,7 +1955,7 @@ pmap_page_remove_86(struct vm_page *pg)
 				PG_FRAME), VM_PAGE_TO_PHYS(pve->pv_ptp));
 			panic("pmap_page_remove_86: mapped managed page has "
 				"invalid pv_ptp field");
-}
+		}
 #endif
 		opte = i386_atomic_testset_ul(&ptes[atop(pve->pv_va)], 0);
 
@@ -2129,24 +2111,21 @@ pmap_write_protect_86(struct pmap *pmap, vaddr_t sva, vaddr_t eva,
     vm_prot_t prot)
 {
 	pt_entry_t *ptes, *spte, *epte, npte, opte;
-	vaddr_t blockend;
+	vaddr_t blkendva;
 	u_int32_t md_prot;
 	vaddr_t va;
 	int shootall = 0;
 
 	ptes = pmap_map_ptes_86(pmap);		/* locks pmap */
 
-	/* should be ok, but just in case ... */
-	sva &= PG_FRAME;
-	eva &= PG_FRAME;
-
 	if ((eva - sva > 32 * PAGE_SIZE) && pmap != pmap_kernel())
 		shootall = 1;
 
-	for (va = sva; va < eva; va = blockend) {
-		blockend = (va & PD_MASK) + NBPD;
-		if (blockend > eva)
-			blockend = eva;
+	for (va = sva; va < eva; va = blkendva) {
+		/* determine range of block */
+		blkendva = i386_round_pdr(va + 1);
+		if (blkendva > eva)
+			blkendva = eva;
 
 		/*
 		 * XXXCDC: our PTE mappings should never be write-protected!
@@ -2173,7 +2152,7 @@ pmap_write_protect_86(struct pmap *pmap, vaddr_t sva, vaddr_t eva,
 			md_prot |= PG_RW;
 
 		spte = &ptes[atop(va)];
-		epte = &ptes[atop(blockend)];
+		epte = &ptes[atop(blkendva)];
 
 		for (/*null */; spte < epte ; spte++, va += PAGE_SIZE) {
 
@@ -2241,25 +2220,6 @@ pmap_unwire_86(struct pmap *pmap, vaddr_t va)
 		panic("pmap_unwire_86: invalid PDE");
 	}
 #endif
-}
-
-/*
- * pmap_collect: free resources held by a pmap
- *
- * => optional function.
- * => called when a process is swapped out to free memory.
- */
-
-void
-pmap_collect(struct pmap *pmap)
-{
-	/*
-	 * free all of the pt pages by removing the physical mappings
-	 * for its entire address space.
-	 */
-
-	pmap_do_remove(pmap, VM_MIN_ADDRESS, VM_MAX_ADDRESS,
-	    PMAP_REMOVE_SKIPWIRED);
 }
 
 /*
@@ -2509,18 +2469,10 @@ pmap_enter_special_86(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int32_t flags)
 
 	/* Must be kernel VA */
 	if (va < VM_MIN_KERNEL_ADDRESS)
-		panic("%s: invalid special mapping va 0x%lx requested",
-		    __func__, va);
+		panic("invalid special mapping va 0x%lx requested", va);
 
-	if (!pmap->pm_pdir_intel) {
-		pmap->pm_pdir_intel = (vaddr_t)km_alloc(NBPG, &kv_any, &kp_zero,
-		    &kd_waitok);
-		if (pmap->pm_pdir_intel == 0)
-			panic("%s: kernel_map out of virtual space!", __func__);
-		if (!pmap_extract(pmap, pmap->pm_pdir_intel,
-		    &pmap->pm_pdirpa_intel))
-			panic("%s: can't locate PD page", __func__);
-	}
+	if (!pmap->pm_pdir_intel)
+		pmap_alloc_pdir_intel_x86(pmap);
 
 	DPRINTF("%s: pm_pdir_intel 0x%x pm_pdirpa_intel 0x%x\n", __func__,
 	    (uint32_t)pmap->pm_pdir_intel, (uint32_t)pmap->pm_pdirpa_intel);
@@ -2666,11 +2618,12 @@ out:
 /*
  * Locking for tlb shootdown.
  *
- * We lock by setting tlb_shoot_wait to the number of cpus that will
- * receive our tlb shootdown. After sending the IPIs, we don't need to
- * worry about locking order or interrupts spinning for the lock because
- * the call that grabs the "lock" isn't the one that releases it. And
- * there is nothing that can block the IPI that releases the lock.
+ * We lock by grabbing tlb_shoot_lock.lock, then setting per-cpu
+ * tlb_shoot_counts[] to the number of cpus that will receive our tlb
+ * shootdown. After sending the IPIs, we don't need to worry about
+ * locking order or interrupts spinning for the lock because the call
+ * that grabs the "lock" isn't the one that releases it. And there is
+ * nothing that can block the IPI that releases the lock.
  *
  * The functions are organized so that we first count the number of
  * cpus we need to send the IPI to, then we grab the counter, then
@@ -2685,17 +2638,81 @@ out:
  * release the lock if we get an interrupt in a bad moment.
  */
 
-volatile int tlb_shoot_wait __attribute__((section(".kudata")));
+struct {
+	volatile int lock __attribute__((aligned(64)));
+} tlb_shoot_lock __attribute__((section(".kudata")));
+struct {
+        volatile int cpu __attribute__((aligned(64)));
+} tlb_shoot_cpu __attribute__((section(".kudata")));
+
+volatile u_int tlb_shoot_counts[MAXCPUS] __attribute__((section(".kudata")));
 
 volatile vaddr_t tlb_shoot_addr1 __attribute__((section(".kudata")));
 volatile vaddr_t tlb_shoot_addr2 __attribute__((section(".kudata")));
 
+/* Obtain the "lock" for TLB shooting */
+static inline void
+pmap_start_tlb_shoot(u_int targets, const char *func)
+{
+	u_int cpuid = curcpu()->ci_cpuid;
+
+	while (atomic_cas_uint(&tlb_shoot_lock.lock, 0, 1) != 0) {
+#ifdef MP_LOCKDEBUG
+		long nticks = __mp_lock_spinout;
+#endif
+		while (tlb_shoot_lock.lock != 0) {
+			CPU_BUSY_CYCLE();
+#ifdef MP_LOCKDEBUG
+			if (--nticks <= 0) {
+				db_printf("%s: spun out", func);
+				db_enter();
+				nticks = __mp_lock_spinout;
+			}
+#endif
+		}
+	}
+
+	tlb_shoot_cpu.cpu = cpuid;
+	atomic_swap_uint(&tlb_shoot_counts[cpuid], targets);
+}
+
+void
+pmap_tlb_shootwait(void)
+{
+	u_int cpuid = curcpu()->ci_cpuid;
+
+#ifdef MP_LOCKDEBUG
+	long nticks = __mp_lock_spinout;
+#endif
+	while (tlb_shoot_counts[cpuid] > 0) {
+		CPU_BUSY_CYCLE();
+#ifdef MP_LOCKDEBUG
+		if (--nticks <= 0) {
+			db_printf("%s: spun out", __func__);
+			db_enter();
+			nticks = __mp_lock_spinout;
+		}
+#endif
+	}
+}
+
+static inline void
+pmap_tlb_shootfail()
+{
+	u_int cpuid = curcpu()->ci_cpuid;
+
+	if (atomic_dec_int_nv(&tlb_shoot_counts[cpuid]) == 0)
+		tlb_shoot_lock.lock = 0;
+}
+#endif /* MULTIPROCESSOR */
+
 void
 pmap_tlb_shootpage(struct pmap *pm, vaddr_t va)
 {
+#ifdef MULTIPROCESSOR
 	struct cpu_info *ci, *self = curcpu();
 	CPU_INFO_ITERATOR cii;
-	int wait = 0;
+	int targets = 0;
 	u_int64_t mask = 0;
 
 	CPU_INFO_FOREACH(cii, ci) {
@@ -2703,25 +2720,23 @@ pmap_tlb_shootpage(struct pmap *pm, vaddr_t va)
 		    !(ci->ci_flags & CPUF_RUNNING))
 			continue;
 		mask |= (1ULL << ci->ci_cpuid);
-		wait++;
+		targets++;
 	}
 
-	if (wait > 0) {
+	if (targets) {
 		int s = splvm();
 
-		while (atomic_cas_uint(&tlb_shoot_wait, 0, wait) != 0) {
-			while (tlb_shoot_wait != 0)
-				CPU_BUSY_CYCLE();
-		}
+		pmap_start_tlb_shoot(targets, __func__);
 		tlb_shoot_addr1 = va;
 		CPU_INFO_FOREACH(cii, ci) {
 			if ((mask & (1ULL << ci->ci_cpuid)) == 0)
 				continue;
 			if (i386_fast_ipi(ci, LAPIC_IPI_INVLPG) != 0)
-				panic("pmap_tlb_shootpage: ipi failed");
+				pmap_tlb_shootfail();
 		}
 		splx(s);
 	}
+#endif /* MULTIPROCESSOR */
 
 	if (pmap_is_curpmap(pm))
 		pmap_update_pg(va);
@@ -2730,37 +2745,36 @@ pmap_tlb_shootpage(struct pmap *pm, vaddr_t va)
 void
 pmap_tlb_shootrange(struct pmap *pm, vaddr_t sva, vaddr_t eva)
 {
+	vaddr_t va;
+#ifdef MULTIPROCESSOR
 	struct cpu_info *ci, *self = curcpu();
 	CPU_INFO_ITERATOR cii;
-	int wait = 0;
+	int targets = 0;
 	u_int64_t mask = 0;
-	vaddr_t va;
 
 	CPU_INFO_FOREACH(cii, ci) {
 		if (ci == self || !pmap_is_active(pm, ci) ||
 		    !(ci->ci_flags & CPUF_RUNNING))
 			continue;
 		mask |= (1ULL << ci->ci_cpuid);
-		wait++;
+		targets++;
 	}
 
-	if (wait > 0) {
+	if (targets) {
 		int s = splvm();
 
-		while (atomic_cas_uint(&tlb_shoot_wait, 0, wait) != 0) {
-			while (tlb_shoot_wait != 0)
-				CPU_BUSY_CYCLE();
-		}
+		pmap_start_tlb_shoot(targets, __func__);
 		tlb_shoot_addr1 = sva;
 		tlb_shoot_addr2 = eva;
 		CPU_INFO_FOREACH(cii, ci) {
 			if ((mask & (1ULL << ci->ci_cpuid)) == 0)
 				continue;
 			if (i386_fast_ipi(ci, LAPIC_IPI_INVLRANGE) != 0)
-				panic("pmap_tlb_shootrange: ipi failed");
+				pmap_tlb_shootfail();
 		}
 		splx(s);
 	}
+#endif /* MULTIPROCESSOR */
 
 	if (pmap_is_curpmap(pm))
 		for (va = sva; va < eva; va += PAGE_SIZE)
@@ -2770,34 +2784,32 @@ pmap_tlb_shootrange(struct pmap *pm, vaddr_t sva, vaddr_t eva)
 void
 pmap_tlb_shoottlb(void)
 {
+#ifdef MULTIPROCESSOR
 	struct cpu_info *ci, *self = curcpu();
 	CPU_INFO_ITERATOR cii;
-	int wait = 0;
+	int targets = 0;
 	u_int64_t mask = 0;
 
 	CPU_INFO_FOREACH(cii, ci) {
 		if (ci == self || !(ci->ci_flags & CPUF_RUNNING))
 			continue;
 		mask |= (1ULL << ci->ci_cpuid);
-		wait++;
+		targets++;
 	}
 
-	if (wait) {
+	if (targets) {
 		int s = splvm();
 
-		while (atomic_cas_uint(&tlb_shoot_wait, 0, wait) != 0) {
-			while (tlb_shoot_wait != 0)
-				CPU_BUSY_CYCLE();
-		}
-
+		pmap_start_tlb_shoot(targets, __func__);
 		CPU_INFO_FOREACH(cii, ci) {
 			if ((mask & (1ULL << ci->ci_cpuid)) == 0)
 				continue;
 			if (i386_fast_ipi(ci, LAPIC_IPI_INVLTLB) != 0)
-				panic("pmap_tlb_shoottlb: ipi failed");
+				pmap_tlb_shootfail();
 		}
 		splx(s);
 	}
+#endif /* MULTIPROCESSOR */
 
 	tlbflush();
 }
@@ -2805,9 +2817,11 @@ pmap_tlb_shoottlb(void)
 void
 pmap_tlb_droppmap(struct pmap *pm)
 {
-	struct cpu_info *ci, *self = curcpu();
+	struct cpu_info *self = curcpu();
+#ifdef MULTIPROCESSOR
+	struct cpu_info *ci;
 	CPU_INFO_ITERATOR cii;
-	int wait = 0;
+	int targets = 0;
 	u_int64_t mask = 0;
 
 	CPU_INFO_FOREACH(cii, ci) {
@@ -2815,64 +2829,28 @@ pmap_tlb_droppmap(struct pmap *pm)
 		    ci->ci_curpmap != pm)
 			continue;
 		mask |= (1ULL << ci->ci_cpuid);
-		wait++;
+		targets++;
 	}
 
-	if (wait) {
+	if (targets) {
 		int s = splvm();
 
-		while (atomic_cas_uint(&tlb_shoot_wait, 0, wait) != 0) {
-			while (tlb_shoot_wait != 0)
-				CPU_BUSY_CYCLE();
-		}
-
+		pmap_start_tlb_shoot(targets, __func__);
 		CPU_INFO_FOREACH(cii, ci) {
 			if ((mask & (1ULL << ci->ci_cpuid)) == 0)
 				continue;
 			if (i386_fast_ipi(ci, LAPIC_IPI_RELOADCR3) != 0)
-				panic("pmap_tlb_droppmap: ipi failed");
+				pmap_tlb_shootfail();
 		}
 		splx(s);
 	}
+#endif /* MULTIPROCESSOR */
 
 	if (self->ci_curpmap == pm)
 		pmap_activate(curproc);
 
 	pmap_tlb_shootwait();
 }
-
-void
-pmap_tlb_shootwait(void)
-{
-	while (tlb_shoot_wait != 0)
-		CPU_BUSY_CYCLE();
-}
-
-#else
-
-void
-pmap_tlb_shootpage(struct pmap *pm, vaddr_t va)
-{
-	if (pmap_is_curpmap(pm))
-		pmap_update_pg(va);
-
-}
-
-void
-pmap_tlb_shootrange(struct pmap *pm, vaddr_t sva, vaddr_t eva)
-{
-	vaddr_t va;
-
-	for (va = sva; va < eva; va += PAGE_SIZE)
-		pmap_update_pg(va);	
-}
-
-void
-pmap_tlb_shoottlb(void)
-{
-	tlbflush();
-}
-#endif /* MULTIPROCESSOR */
 
 u_int32_t	(*pmap_pte_set_p)(vaddr_t, paddr_t, u_int32_t) =
     pmap_pte_set_86;
@@ -2899,7 +2877,5 @@ void		(*pmap_write_protect_p)(struct pmap *, vaddr_t, vaddr_t,
     vm_prot_t) = pmap_write_protect_86;
 void		(*pmap_pinit_pd_p)(pmap_t) = pmap_pinit_pd_86;
 void		(*pmap_zero_phys_p)(paddr_t) = pmap_zero_phys_86;
-int		(*pmap_zero_page_uncached_p)(paddr_t) =
-    pmap_zero_page_uncached_86;
 void		(*pmap_copy_page_p)(struct vm_page *, struct vm_page *) =
     pmap_copy_page_86;

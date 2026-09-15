@@ -1,4 +1,4 @@
-/*	$OpenBSD: newsyslog.c,v 1.114 2024/04/22 14:20:35 millert Exp $	*/
+/*	$OpenBSD: newsyslog.c,v 1.121 2026/05/27 05:56:57 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 1999, 2002, 2003 Todd C. Miller <millert@openbsd.org>
@@ -88,10 +88,12 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -160,6 +162,8 @@ int	stat_suffix(char *, size_t, char *, struct stat *,
 	    int (*)(const char *, struct stat *));
 off_t	sizefile(struct stat *);
 int	parse_file(struct entrylist *, int *);
+int	is_glob_rotation(struct conf_entry *, const char *);
+int	parse_entry(struct entrylist *, int *, int, struct conf_entry *);
 time_t	parse8601(char *);
 time_t	parseDWM(char *);
 void	child_killer(int);
@@ -190,10 +194,6 @@ main(int argc, char **argv)
 
 	TAILQ_INIT(&config);
 	TAILQ_INIT(&runlist);
-
-	/* Keep passwd and group files open for faster lookups. */
-	setpassent(1);
-	setgroupent(1);
 
 	ret = parse_file(&config, &listlen);
 	if (argc == 0)
@@ -284,6 +284,7 @@ do_entry(struct conf_entry *ent)
 	struct stat sb;
 	int modhours;
 	off_t size;
+	int oversized;
 
 	if (lstat(ent->log, &sb) != 0)
 		return;
@@ -307,8 +308,9 @@ do_entry(struct conf_entry *ent)
 	    (ent->flags & CE_FOLLOW) ? "F" : "",
 	    (ent->flags & CE_MONITOR) && monitormode ? "M" : ""));
 	size = sizefile(&sb);
+	oversized = (ent->size > 0 && size >= ent->size);
 	modhours = age_old_log(ent);
-	if (ent->flags & CE_TRIMAT && !force) {
+	if (ent->flags & CE_TRIMAT && !force && !oversized) {
 		if (timenow < ent->trim_at ||
 		    difftime(timenow, ent->trim_at) >= 60 * 60) {
 			DPRINTF(("--> will trim at %s",
@@ -326,7 +328,7 @@ do_entry(struct conf_entry *ent)
 	if (monitormode && (ent->flags & CE_MONITOR) && domonitor(ent))
 		DPRINTF(("--> monitored\n"));
 	else if (!monitormode &&
-	    (force || (ent->size > 0 && size >= ent->size) ||
+	    (force || oversized ||
 	    (ent->hours <= 0 && (ent->flags & CE_TRIMAT)) ||
 	    (ent->hours > 0 && (modhours >= ent->hours || modhours < 0)
 	    && ((ent->flags & CE_BINARY) || size >= MIN_SIZE)))) {
@@ -471,12 +473,14 @@ int
 parse_file(struct entrylist *list, int *nentries)
 {
 	char line[BUFSIZ], *parse, *q, *errline, *group, *tmp, *ep;
-	struct conf_entry *working;
-	struct stat sb;
+	struct conf_entry *working, *working_glob;
+	size_t i;
 	int lineno = 0;
 	int ret = 0;
 	FILE *f;
+	const char *errstr;
 	long l;
+	glob_t g;
 
 	if (strcmp(conf, "-") == 0)
 		f = stdin;
@@ -504,9 +508,6 @@ nextline:
 		if (working->log == NULL)
 			err(1, NULL);
 
-		if ((working->logbase = strrchr(working->log, '/')) != NULL)
-			working->logbase++;
-
 		q = parse = missing_field(sob(++parse), errline, lineno);
 		*(parse = son(parse)) = '\0';
 		if ((group = strchr(q, ':')) != NULL ||
@@ -515,7 +516,14 @@ nextline:
 			if (*q == '\0') {
 				working->uid = (uid_t)-1;
 			} else if (isnumberstr(q)) {
-				working->uid = atoi(q);
+				working->uid = strtonum(q, 0, UID_MAX, &errstr);
+				if (errstr) {
+					warnx("%s:%d: invalid user %s (%s)"
+					    " --> skipping", conf, lineno, q,
+					    errstr);
+					ret = 1;
+					goto nextline;
+				}
 			} else if (uid_from_user(q, &working->uid) == -1) {
 				warnx("%s:%d: unknown user %s --> skipping",
 				    conf, lineno, q);
@@ -527,7 +535,14 @@ nextline:
 			if (*q == '\0') {
 				working->gid = (gid_t)-1;
 			} else if (isnumberstr(q)) {
-				working->gid = atoi(q);
+				working->gid = strtonum(q, 0, GID_MAX, &errstr);
+				if (errstr) {
+					warnx("%s:%d: invalid group %s (%s)"
+					    " --> skipping", conf, lineno, q,
+					    errstr);
+					ret = 1;
+					goto nextline;
+				}
 			} else if (gid_from_group(q, &working->gid) == -1) {
 				warnx("%s:%d: unknown group %s --> skipping",
 				    conf, lineno, q);
@@ -564,10 +579,18 @@ nextline:
 
 		q = parse = missing_field(sob(++parse), errline, lineno);
 		*(parse = son(parse)) = '\0';
-		if (isdigit((unsigned char)*q))
-			working->size = atoi(q) * 1024;
-		else
+		if (strcmp(q, "*") == 0) {
 			working->size = -1;
+		} else {
+			working->size = strtonum(q, 0, INT64_MAX/1024, &errstr);
+			if (errstr) {
+				warnx("%s:%d: invalid size %s (%s)"
+				    " --> skipping", conf, lineno, q, errstr);
+				ret = 1;
+				goto nextline;
+			}
+			working->size *= 1024;
+		}
 
 		working->flags = 0;
 		q = parse = missing_field(sob(++parse), errline, lineno);
@@ -717,55 +740,150 @@ nextline:
 			goto nextline;
 		}
 
-		/* If there is an arcdir, set working->backdir. */
-		if (arcdir != NULL && working->logbase != NULL) {
-			if (*arcdir == '/') {
-				/* Fully qualified arcdir */
-				working->backdir = arcdir;
-			} else {
-				/* arcdir is relative to log's parent dir */
-				*(working->logbase - 1) = '\0';
-				if ((asprintf(&working->backdir, "%s/%s",
-				    working->log, arcdir)) == -1)
-					err(1, NULL);
-				*(working->logbase - 1) = '/';
-			}
-			/* Ignore arcdir if it doesn't exist. */
-			if (stat(working->backdir, &sb) != 0 ||
-			    !S_ISDIR(sb.st_mode)) {
-				if (working->backdir != arcdir)
-					free(working->backdir);
-				working->backdir = NULL;
-			}
-		} else
-			working->backdir = NULL;
+		if (glob(working->log, GLOB_NOCHECK | GLOB_NOSORT, NULL, &g)) {
+			warnx("%s:%d: cannot glob(3), %s"
+			    " --> skipping",
+			    conf, lineno, strerror(errno));
+			ret = 1;
+			goto nextline;
+		}
 
-		/* Make sure we can't oflow PATH_MAX */
-		if (working->backdir != NULL) {
-			if (snprintf(line, sizeof(line), "%s/%s.%d%s",
-			    working->backdir, working->logbase,
-			    working->numlogs, COMPRESS_POSTFIX) >= PATH_MAX) {
-				warnx("%s:%d: pathname too long: %s"
-				    " --> skipping", conf, lineno, q);
-				ret = 1;
-				goto nextline;
+		for (i = 0; i < g.gl_pathc; i++) {
+			DPRINTF(("%s:%d: expanded logfile name \"%s\" to \"%s\""
+			    " (%zu/%zu)\n",
+			    conf, lineno, working->log, g.gl_pathv[i],
+			    i+1, g.gl_pathc));
+
+			if (is_glob_rotation(working, g.gl_pathv[i])) {
+				DPRINTF(("%s:%d: \"%s\" looks like a rotation"
+				    " --> skipping\n",
+				    conf, lineno, g.gl_pathv[i]));
+				continue;
 			}
-		} else {
-			if (snprintf(line, sizeof(line), "%s.%d%s",
-			    working->log, working->numlogs, COMPRESS_POSTFIX)
-			    >= PATH_MAX) {
-				warnx("%s:%d: pathname too long: %s"
-				    " --> skipping", conf, lineno,
-				    working->log);
+
+			working_glob = malloc(sizeof(*working));
+			if (working_glob == NULL)
+				err(1, NULL);
+
+			memcpy(working_glob, working, sizeof(*working));
+
+			if ((working_glob->log = strdup(g.gl_pathv[i])) == NULL)
+				err(1, NULL);
+
+			if (parse_entry(list, nentries, lineno, working_glob)) {
 				ret = 1;
-				goto nextline;
+				free(working_glob->log);
+				free(working_glob);
+				/* break to free resources below */
+				break;
 			}
 		}
-		TAILQ_INSERT_TAIL(list, working, next);
-		(*nentries)++;
+
+		/*
+		 * Original working is duplicated into working_glob in the for
+		 * loop above and can be freed now. Every struct char pointer
+		 * next to log is identical in each duplicate and used later.
+		 */
+		free(working->log);
+		free(working);
+
+		globfree(&g);
 	}
 	(void)fclose(f);
 	return (ret);
+}
+
+/*
+ * Checks if glob_line seems to be an already rotated filename based on working
+ * as a result of glob(3).
+ */
+int
+is_glob_rotation(struct conf_entry *working, const char *glob_line)
+{
+	size_t endpos;
+
+	/* Ignore empty inputs or identical to the logfile name. */
+	if (*glob_line == '\0' || strcmp(working->log, glob_line) == 0)
+		return 0;
+
+	endpos = strlen(glob_line) - 1;
+
+	/* Suffix check for compressed files. */
+	if (working->flags & CE_COMPACT && endpos >= strlen(COMPRESS_POSTFIX)) {
+		if (strcmp(glob_line + endpos - (strlen(COMPRESS_POSTFIX) - 1),
+		    COMPRESS_POSTFIX) != 0)
+			return 0;
+
+		endpos -= strlen(COMPRESS_POSTFIX);
+	}
+
+	/* Expect at least one digit. */
+	if (endpos == 0 || !isdigit(glob_line[endpos--]))
+		return 0;
+
+	for (; endpos > 0 && isdigit(glob_line[endpos]); endpos--);
+
+	/* Expect dot before digits. */
+	if (endpos == 0 || glob_line[endpos] != '.')
+		return 0;
+
+	return 1;
+}
+
+/*
+ * Parse a single conf_entry and insert it into the entrylist. If the entry is
+ * invalid, a warning is logged and 1 is returned.
+ */
+int
+parse_entry(struct entrylist *list, int *nentries, int lineno,
+    struct conf_entry *working)
+{
+	char line[BUFSIZ];
+	int linelen;
+	struct stat sb;
+
+	if ((working->logbase = strrchr(working->log, '/')) != NULL)
+		working->logbase++;
+
+	/* If there is an arcdir, set working->backdir. */
+	if (arcdir != NULL && working->logbase != NULL) {
+		if (*arcdir == '/') {
+			/* Fully qualified arcdir */
+			working->backdir = arcdir;
+		} else {
+			/* arcdir is relative to log's parent dir */
+			*(working->logbase - 1) = '\0';
+			if ((asprintf(&working->backdir, "%s/%s",
+			    working->log, arcdir)) == -1)
+				err(1, NULL);
+			*(working->logbase - 1) = '/';
+		}
+		/* Ignore arcdir if it doesn't exist. */
+		if (stat(working->backdir, &sb) != 0 ||
+		    !S_ISDIR(sb.st_mode)) {
+			if (working->backdir != arcdir)
+				free(working->backdir);
+			working->backdir = NULL;
+		}
+	} else
+		working->backdir = NULL;
+
+	/* Make sure we can't oflow PATH_MAX */
+	if (working->backdir != NULL)
+		linelen = snprintf(line, sizeof(line), "%s/%s.%d%s",
+		    working->backdir, working->logbase,
+		    working->numlogs, COMPRESS_POSTFIX);
+	else
+		linelen = snprintf(line, sizeof(line), "%s.%d%s",
+		    working->log, working->numlogs, COMPRESS_POSTFIX);
+	if (linelen < 0 || linelen >= sizeof(line) || linelen >= PATH_MAX) {
+		warnx("%s:%d: pathname too long: %s --> skipping", conf, lineno, line);
+		return 1;
+	}
+
+	TAILQ_INSERT_TAIL(list, working, next);
+	(*nentries)++;
+	return 0;
 }
 
 char *
@@ -1156,76 +1274,47 @@ lstat_log(char *file, size_t size, int flags)
 time_t
 parse8601(char *s)
 {
-	struct tm tm, *tmp;
-	char *t;
-	long l;
+	char		 format[16] = { 0 };
+	struct tm	 tm;
+	char		*t;
 
-	tmp = localtime(&timenow);
-	tm = *tmp;
+	if (localtime_r(&timenow, &tm) == NULL)
+		return -1;
 
 	tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+	t = strchr(s, 'T');
 
-	l = strtol(s, &t, 10);
-	if (l < 0 || l >= INT_MAX || (*t != '\0' && *t != 'T'))
-		return (-1);
-
-	/*
-	 * Now t points either to the end of the string (if no time was
-	 * provided) or to the letter `T' which separates date and time in
-	 * ISO 8601.  The pointer arithmetic is the same for either case.
-	 */
-	switch (t - s) {
-	case 8:
-		tm.tm_year = ((l / 1000000) - 19) * 100;
-		l = l % 1000000;
-	case 6:
-		tm.tm_year -= tm.tm_year % 100;
-		tm.tm_year += l / 10000;
-		l = l % 10000;
-	case 4:
-		tm.tm_mon = (l / 100) - 1;
-		l = l % 100;
-	case 2:
-		tm.tm_mday = l;
-	case 0:
-		break;
-	default:
-		return (-1);
-	}
-
-	/* sanity check */
-	if (tm.tm_year < 70 || tm.tm_mon < 0 || tm.tm_mon > 12 ||
-	    tm.tm_mday < 1 || tm.tm_mday > 31)
-		return (-1);
-
-	if (*t != '\0') {
-		s = ++t;
-		l = strtol(s, &t, 10);
-		if (l < 0 || l >= INT_MAX ||
-		    (*t != '\0' && !isspace((unsigned char)*t)))
-			return (-1);
-
-		switch (t - s) {
-		case 6:
-			tm.tm_sec = l % 100;
-			l /= 100;
-		case 4:
-			tm.tm_min = l % 100;
-			l /= 100;
-		case 2:
-			tm.tm_hour = l;
+	if (s != t) {
+		switch (t == NULL ? strlen(s) : t - s) {
+		case 8: strlcat(format, "%C", sizeof format); /* FALLTHROUGH */
+		case 6: strlcat(format, "%y", sizeof format); /* FALLTHROUGH */
+		case 4: strlcat(format, "%m", sizeof format); /* FALLTHROUGH */
+		case 2: strlcat(format, "%d", sizeof format); /* FALLTHROUGH */
 		case 0:
 			break;
 		default:
-			return (-1);
+			return -1;
 		}
-
-		/* sanity check */
-		if (tm.tm_sec < 0 || tm.tm_sec > 60 || tm.tm_min < 0 ||
-		    tm.tm_min > 59 || tm.tm_hour < 0 || tm.tm_hour > 23)
-			return (-1);
 	}
-	return (mktime(&tm));
+
+	if (t != NULL) {
+		strlcat(format, "T", sizeof format);
+
+		switch (strlen(t)) {
+		case 7: strlcat(format, "%H", sizeof format); /* FALLTHROUGH */
+		case 5: strlcat(format, "%M", sizeof format); /* FALLTHROUGH */
+		case 3: strlcat(format, "%S", sizeof format); /* FALLTHROUGH */
+		case 1:
+			break;
+		default:
+			return -1;
+		}
+	}
+
+	if (strptime(s, format, &tm) == NULL)
+		return -1;
+
+	return mktime(&tm);
 }
 
 /*-
@@ -1247,12 +1336,12 @@ parseDWM(char *s)
 {
 	static int mtab[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 	int WMseen = 0, Dseen = 0, nd;
-	struct tm tm, *tmp;
+	struct tm tm;
 	char *t;
 	long l;
 
-	tmp = localtime(&timenow);
-	tm = *tmp;
+	if (localtime_r(&timenow, &tm) == NULL)
+		return -1;
 
 	/* set no. of days per month */
 
@@ -1260,8 +1349,8 @@ parseDWM(char *s)
 
 	if (tm.tm_mon == 1) {
 		if (((tm.tm_year + 1900) % 4 == 0) &&
-		    ((tm.tm_year + 1900) % 100 != 0) &&
-		    ((tm.tm_year + 1900) % 400 == 0)) {
+		    (((tm.tm_year + 1900) % 100 != 0) ||
+		     ((tm.tm_year + 1900) % 400 == 0))) {
 			nd++;	/* leap year, 29 days in february */
 		}
 	}

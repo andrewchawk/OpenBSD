@@ -1,6 +1,6 @@
 define(MACHINE,arm64)dnl
 vers(__file__,
-	{-$OpenBSD: MAKEDEV.md,v 1.16 2023/01/14 12:15:12 kettenis Exp $-},
+	{-$OpenBSD: MAKEDEV.md,v 1.18 2025/09/29 01:00:14 deraadt Exp $-},
 etc.MACHINE)dnl
 dnl
 dnl Copyright (c) 2001-2006 Todd T. Fries <todd@OpenBSD.org>
@@ -24,6 +24,7 @@ _DEV(all)
 _DEV(ramdisk)
 _DEV(std)
 _DEV(local)
+_DEV(redodisks)
 _TITLE(dis)
 _DEV(cd, 15, 6)
 _DEV(rd, 47, 17)
@@ -90,7 +91,7 @@ divert(__mddivert)dnl
 dnl
 ramdisk)
 	_recurse std bpf wd0 sd0 tty00 tty01 rd0 bio diskmap
-	_recurse cd0 ttyC0 wskbd0 wskbd1 wskbd2 random
+	_recurse cd0 ttyC0 wskbd0 wskbd1 wskbd2 random efi
 	;;
 
 _std(1, 2, 50, 7)

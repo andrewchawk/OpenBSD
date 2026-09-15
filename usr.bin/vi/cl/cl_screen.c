@@ -1,4 +1,4 @@
-/*	$OpenBSD: cl_screen.c,v 1.28 2017/04/18 01:45:33 deraadt Exp $	*/
+/*	$OpenBSD: cl_screen.c,v 1.29 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -58,7 +58,7 @@ cl_screen(SCR *sp, u_int32_t flags)
 			return (1);
 		F_CLR(gp, G_SRESTART);
 	}
-	
+
 	/* See if we're already in the right mode. */
 	if ((LF_ISSET(SC_EX) && F_ISSET(sp, SC_SCR_EX)) ||
 	    (LF_ISSET(SC_VI) && F_ISSET(sp, SC_SCR_VI)))

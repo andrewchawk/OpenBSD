@@ -1,4 +1,4 @@
-/*	$OpenBSD: dest6.c,v 1.20 2024/02/13 12:22:09 bluhm Exp $	*/
+/*	$OpenBSD: dest6.c,v 1.25 2026/05/26 20:27:27 bluhm Exp $	*/
 /*	$KAME: dest6.c,v 1.25 2001/02/22 01:39:16 itojun Exp $	*/
 
 /*
@@ -34,34 +34,31 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/errno.h>
-#include <sys/time.h>
-#include <sys/kernel.h>
 
 #include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
-#include <netinet/icmp6.h>
 
 /*
  * Destination options header processing.
  */
 int
-dest6_input(struct mbuf **mp, int *offp, int proto, int af)
+dest6_input(struct mbuf **mp, int *offp, int proto, int af,
+    struct netstack *ns)
 {
 	int off = *offp, dstoptlen, optlen;
 	struct ip6_dest *dstopts;
 	u_int8_t *opt;
 
 	/* validation of the length of the header */
-	IP6_EXTHDR_GET(dstopts, struct ip6_dest *, *mp, off, sizeof(*dstopts));
+	dstopts = ip6_exthdr_get(mp, off, sizeof(*dstopts));
 	if (dstopts == NULL)
 		return IPPROTO_DONE;
 	dstoptlen = (dstopts->ip6d_len + 1) << 3;
 
-	IP6_EXTHDR_GET(dstopts, struct ip6_dest *, *mp, off, dstoptlen);
+	dstopts = ip6_exthdr_get(mp, off, dstoptlen);
 	if (dstopts == NULL)
 		return IPPROTO_DONE;
 	off += dstoptlen;
@@ -85,7 +82,7 @@ dest6_input(struct mbuf **mp, int *offp, int proto, int af)
 			break;
 		default:		/* unknown option */
 			optlen = ip6_unknown_opt(mp, opt,
-			    opt - mtod(*mp, u_int8_t *));
+			    *offp + (opt - (u_int8_t *)dstopts));
 			if (optlen == -1)
 				return (IPPROTO_DONE);
 			optlen += 2;

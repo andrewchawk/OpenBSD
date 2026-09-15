@@ -1,4 +1,4 @@
-/*	$OpenBSD: device.h,v 1.68 2024/08/04 15:30:08 kettenis Exp $	*/
+/*	$OpenBSD: device.h,v 1.72 2026/09/07 21:30:59 kettenis Exp $	*/
 /*	$NetBSD: device.h,v 1.15 1996/04/09 20:55:24 cgd Exp $	*/
 
 /*
@@ -139,6 +139,9 @@ struct cfattach {
 /* For cd_mode, below */
 #define CD_INDIRECT		1
 #define CD_SKIPHIBERNATE	2
+#define CD_COCOVM		4	/* Allow a device on a VM employing
+					 * confidential computing methods,
+					 * e.g. AMD SEV. */
 
 struct cfdriver {
 	void	**cd_devs;		/* devices found */
@@ -199,10 +202,13 @@ void config_pending_decr(void);
 void config_mountroot(struct device *, void (*)(struct device *));
 void config_process_deferred_mountroot(void);
 
+extern int sleep_mode;
+#define SLEEP_RESUME	0
+#define SLEEP_SUSPEND	1
+#define SLEEP_HIBERNATE	2
+
 int	request_sleep(int);
 int	sleep_state(void *, int);
-#define SLEEP_SUSPEND	0x01
-#define SLEEP_HIBERNATE	0x02
 void	sleep_mp(void);
 void	resume_mp(void);
 int	sleep_showstate(void *v, int sleepmode);
@@ -210,6 +216,7 @@ int	sleep_setstate(void *v);
 int	sleep_resume(void *v);
 int	gosleep(void *v);
 int	suspend_finish(void *v);
+int	resuming(void);
 
 struct device *device_mainbus(void);
 struct device *device_mpath(void);

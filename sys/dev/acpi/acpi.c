@@ -1,4 +1,4 @@
-/* $OpenBSD: acpi.c,v 1.436 2024/07/30 19:47:06 mglocker Exp $ */
+/* $OpenBSD: acpi.c,v 1.458 2026/07/31 18:17:22 jan Exp $ */
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  * Copyright (c) 2005 Jordan Hargrave <jordan@openbsd.org>
@@ -47,6 +47,8 @@
 
 #include "wd.h"
 
+extern int cpu_suspended;
+
 #ifdef ACPI_DEBUG
 int	acpi_debug = 16;
 #endif
@@ -54,12 +56,12 @@ int	acpi_debug = 16;
 int	acpi_poll_enabled;
 int	acpi_hasprocfvs;
 int	acpi_haspci;
+int	acpi_legacy_free;
 
 struct pool acpiwqpool;
 
 #define ACPIEN_RETRIES 15
 
-struct aml_node *acpi_pci_match(struct device *, struct pci_attach_args *);
 pcireg_t acpi_pci_min_powerstate(pci_chipset_tag_t, pcitag_t);
 void	 acpi_pci_set_powerstate(pci_chipset_tag_t, pcitag_t, int, int);
 int	acpi_pci_notify(struct aml_node *, int, void *);
@@ -181,7 +183,7 @@ struct acpi_softc *acpi_softc;
 extern struct aml_node aml_root;
 
 struct cfdriver acpi_cd = {
-	NULL, "acpi", DV_DULL
+	NULL, "acpi", DV_DULL, CD_COCOVM
 };
 
 uint8_t
@@ -324,7 +326,8 @@ acpi_gasio(struct acpi_softc *sc, int iodir, int iospace, uint64_t address,
 			return (0);
 		}
 
-		pc = pci_lookup_segment(ACPI_PCI_SEG(address));
+		pc = pci_lookup_segment(ACPI_PCI_SEG(address),
+		    ACPI_PCI_BUS(address));
 		tag = pci_make_tag(pc,
 		    ACPI_PCI_BUS(address), ACPI_PCI_DEV(address),
 		    ACPI_PCI_FN(address));
@@ -545,6 +548,53 @@ acpi_getsta(struct acpi_softc *sc, struct aml_node *node)
 	return sta;
 }
 
+int
+acpi_storaged3enable(struct acpi_softc *sc, struct aml_node *node)
+{
+	struct aml_value dsd;
+	int i;
+
+	/* 5025030f-842f-4ab4-a561-99a5189762d0 */
+	static uint8_t prop_guid[] = {
+		0x0f, 0x03, 0x25, 0x50, 0x2f, 0x84, 0xb4, 0x4a,
+		0xa5, 0x61, 0x99, 0xa5, 0x18, 0x97, 0x62, 0xd0,
+	};
+
+	if (aml_evalname(sc, node, "_DSD", 0, NULL, &dsd))
+		return 0;
+
+	if (dsd.type != AML_OBJTYPE_PACKAGE || dsd.length != 2 ||
+	    dsd.v_package[0]->type != AML_OBJTYPE_BUFFER ||
+	    dsd.v_package[1]->type != AML_OBJTYPE_PACKAGE)
+		return 0;
+
+	/* Check UUID. */
+	if (dsd.v_package[0]->length != sizeof(prop_guid) ||
+	    memcmp(dsd.v_package[0]->v_buffer, prop_guid,
+	    sizeof(prop_guid)) != 0)
+		return 0;
+
+	/* Check properties. */
+	for (i = 0; i < dsd.v_package[1]->length; i++) {
+		struct aml_value *res = dsd.v_package[1]->v_package[i];
+		struct aml_value *val;
+
+		if (res->type != AML_OBJTYPE_PACKAGE || res->length != 2 ||
+		    res->v_package[0]->type != AML_OBJTYPE_STRING ||
+		    strcmp(res->v_package[0]->v_string, "StorageD3Enable") != 0)
+			continue;
+
+		val = res->v_package[1];
+		if (val->type == AML_OBJTYPE_OBJREF)
+			val = val->v_objref.ref;
+
+		if (val->type == AML_OBJTYPE_INTEGER)
+			return val->v_integer;
+	}
+
+	return 0;
+}
+
 /* Map ACPI device node to PCI */
 int
 acpi_getpci(struct aml_node *node, void *arg)
@@ -636,13 +686,14 @@ acpi_getpci(struct aml_node *node, void *arg)
 		pci->_s4w = val;
 	else
 		pci->_s4w = -1;
+	pci->d3cold = acpi_storaged3enable(sc, node);
 
 	/* Check if PCI device exists */
 	if (pci->dev > 0x1F || pci->fun > 7) {
 		free(pci, M_DEVBUF, sizeof(*pci));
 		return (1);
 	}
-	pc = pci_lookup_segment(pci->seg);
+	pc = pci_lookup_segment(pci->seg, pci->bus);
 	tag = pci_make_tag(pc, pci->bus, pci->dev, pci->fun);
 	reg = pci_conf_read(pc, tag, PCI_ID_REG);
 	if (PCI_VENDOR(reg) == PCI_VENDOR_INVALID) {
@@ -794,6 +845,13 @@ acpi_pci_set_powerstate(pci_chipset_tag_t pc, pcitag_t tag, int state, int pre)
 		if (pr->p_state == state)
 			continue;
 
+		/*
+		 * If the device supports D3cold, ignore the Resource
+		 * for the D3 state.
+		 */
+		if (pr->p_res_state == ACPI_STATE_D3 && pdev->d3cold)
+			continue;
+
 		if (pre) {
 			/*
 			 * If a Resource is dependent on this device for
@@ -818,7 +876,6 @@ acpi_pci_set_powerstate(pci_chipset_tag_t pc, pcitag_t tag, int state, int pre)
 
 			pr->p_state = state;
 		}
-
 	}
 #endif /* NACPIPWRRES > 0 */
 
@@ -839,7 +896,7 @@ acpi_pci_notify(struct aml_node *node, int ntype, void *arg)
 	if (ntype != 2)
 		return (0);
 
-	pc = pci_lookup_segment(pdev->seg);
+	pc = pci_lookup_segment(pdev->seg, pdev->bus);
 	tag = pci_make_tag(pc, pdev->bus, pdev->dev, pdev->fun);
 	if (pci_get_capability(pc, tag, PCI_CAP_PWRMGMT, &offset, 0)) {
 		/* Clear the PME Status bit if it is set. */
@@ -886,27 +943,20 @@ acpi_gpio_event_task(void *arg0, int arg1)
 	char name[5];
 
 	if (pin < 256) {
-		if ((ev->tflags & LR_GPIO_MODE) == LR_GPIO_LEVEL) {
+		if ((ev->tflags & LR_GPIO_MODE) == LR_GPIO_LEVEL)
 			snprintf(name, sizeof(name), "_L%.2X", pin);
-			if (aml_evalname(sc, ev->node, name, 0, NULL, NULL)) {
-				if (gpio->intr_enable)
-					gpio->intr_enable(gpio->cookie, pin);
-				return;
-			}
-		} else {
+		else
 			snprintf(name, sizeof(name), "_E%.2X", pin);
-			if (aml_evalname(sc, ev->node, name, 0, NULL, NULL)) {
-				if (gpio->intr_enable)
-					gpio->intr_enable(gpio->cookie, pin);
-				return;
-			}
-		}
+		if (aml_evalname(sc, ev->node, name, 0, NULL, NULL) == 0)
+			goto intr_enable;
 	}
 
 	memset(&evt, 0, sizeof(evt));
 	evt.v_integer = pin;
 	evt.type = AML_OBJTYPE_INTEGER;
 	aml_evalname(sc, ev->node, "_EVT", 1, &evt, NULL);
+
+intr_enable:
 	if ((ev->tflags & LR_GPIO_MODE) == LR_GPIO_LEVEL) {
 		if (gpio->intr_enable)
 			gpio->intr_enable(gpio->cookie, pin);
@@ -916,6 +966,7 @@ acpi_gpio_event_task(void *arg0, int arg1)
 int
 acpi_gpio_event(void *arg)
 {
+	struct acpi_softc *sc = acpi_softc;
 	struct acpi_gpio_event *ev = arg;
 	struct acpi_gpio *gpio = ev->node->gpio;
 
@@ -923,8 +974,17 @@ acpi_gpio_event(void *arg)
 		if(gpio->intr_disable)
 			gpio->intr_disable(gpio->cookie, ev->pin);
 	}
+
+	if (cpu_suspended)
+		cpu_suspended = 0;
+	if (sc->sc_wakegpe == WAKEGPE_NONE) {
+		sc->sc_wakegpe = WAKEGPE_GPIO;
+		sc->sc_wakegpio = ev->pin;
+	}
+
 	acpi_addtask(acpi_softc, acpi_gpio_event_task, ev, ev->pin);
 	acpi_wakeup(acpi_softc);
+
 	return 1;
 }
 
@@ -950,7 +1010,8 @@ acpi_gpio_parse_events(int crsidx, union acpi_resource *crs, void *arg)
 			ev->tflags = crs->lr_gpio.tflags;
 			ev->pin = pin;
 			gpio->intr_establish(gpio->cookie, pin,
-			    crs->lr_gpio.tflags, acpi_gpio_event, ev);
+			    crs->lr_gpio.tflags, IPL_BIO | IPL_WAKEUP,
+			    acpi_gpio_event, ev);
 		}
 		break;
 	default:
@@ -1142,6 +1203,11 @@ acpi_attach_common(struct acpi_softc *sc, paddr_t base)
 	/* Perform post-parsing fixups */
 	aml_postparse();
 
+#if 0
+	if (sc->sc_fadt->hdr_revision > 2 &&
+	    !ISSET(sc->sc_fadt->iapc_boot_arch, FADT_LEGACY_DEVICES))
+		acpi_legacy_free = 1;
+#endif
 
 #ifndef SMALL_KERNEL
 	/* Find available sleeping states */
@@ -1201,6 +1267,7 @@ acpi_attach_common(struct acpi_softc *sc, paddr_t base)
 	if (wakeup_dev_ct > 0)
 		device_register_wakeup(&sc->sc_dev);
 #endif
+#endif /* SMALL_KERNEL */
 
 	/*
 	 * ACPI is enabled now -- attach timer
@@ -1215,7 +1282,6 @@ acpi_attach_common(struct acpi_softc *sc, paddr_t base)
 		aaa.aaa_memt = sc->sc_memt;
 		config_found(&sc->sc_dev, &aaa, acpi_print);
 	}
-#endif /* SMALL_KERNEL */
 
 	/*
 	 * Attach table-defined devices
@@ -1997,12 +2063,6 @@ acpi_sleep_task(void *arg0, int sleepmode)
 
 #endif /* SMALL_KERNEL */
 
-int
-acpi_resuming(struct acpi_softc *sc)
-{
-	return (getuptime() < sc->sc_resume_time + 10);
-}
-
 void
 acpi_reset(void)
 {
@@ -2069,15 +2129,17 @@ acpi_pbtn_task(void *arg0, int dummy)
 	    en | ACPI_PM1_PWRBTN_EN);
 	splx(s);
 
+#ifdef SUSPEND
 	/* Ignore button events if we're resuming. */
-	if (acpi_resuming(sc))
+	if (resuming())
 		return;
+#endif	/* SUSPEND */
 
 	switch (pwr_action) {
 	case 0:
 		break;
 	case 1:
-		acpi_addtask(sc, acpi_powerdown_task, sc, 0);
+		powerbutton_event();
 		break;
 #ifndef SMALL_KERNEL
 	case 2:
@@ -2105,21 +2167,9 @@ acpi_sbtn_task(void *arg0, int dummy)
 	splx(s);
 }
 
-void
-acpi_powerdown_task(void *arg0, int dummy)
-{
-	extern int allowpowerdown;
-
-	if (allowpowerdown == 1) {
-		allowpowerdown = 0;
-		prsignal(initprocess, SIGUSR2);
-	}
-}
-
 int
 acpi_interrupt(void *arg)
 {
-	extern int cpu_suspended;
 	struct acpi_softc *sc = (struct acpi_softc *)arg;
 	uint32_t processed = 0, idx, jdx;
 	uint16_t sts, en;
@@ -2138,10 +2188,10 @@ acpi_interrupt(void *arg)
 				if (!(en & sts & (1L << jdx)))
 					continue;
 
-				if (cpu_suspended) {
+				if (cpu_suspended)
 					cpu_suspended = 0;
+				if (sc->sc_wakegpe == WAKEGPE_NONE)
 					sc->sc_wakegpe = idx + jdx;
-				}
 
 				/* Signal this GPE */
 				gpe = idx + jdx;
@@ -2177,10 +2227,10 @@ acpi_interrupt(void *arg)
 			    ACPI_PM1_PWRBTN_STS);
 			sts &= ~ACPI_PM1_PWRBTN_STS;
 
-			if (cpu_suspended) {
+			if (cpu_suspended)
 				cpu_suspended = 0;
-				sc->sc_wakegpe = -1;
-			}
+			if (sc->sc_wakegpe == WAKEGPE_NONE)
+				sc->sc_wakegpe = WAKEGPE_PWRBTN;
 
 			acpi_addtask(sc, acpi_pbtn_task, sc, 0);
 		}
@@ -2192,13 +2242,28 @@ acpi_interrupt(void *arg)
 			    ACPI_PM1_SLPBTN_STS);
 			sts &= ~ACPI_PM1_SLPBTN_STS;
 
-			if (cpu_suspended) {
+			if (cpu_suspended)
 				cpu_suspended = 0;
-				sc->sc_wakegpe = -2;
-			}
+			if (sc->sc_wakegpe == WAKEGPE_NONE)
+				sc->sc_wakegpe = WAKEGPE_SLPBTN;
 
 			acpi_addtask(sc, acpi_sbtn_task, sc, 0);
 		}
+		if (sts & ACPI_PM1_RTC_STS) {
+			/* Mask and acknowledge */
+			en &= ~ACPI_PM1_RTC_EN;
+			acpi_write_pmreg(sc, ACPIREG_PM1_EN, 0, en);
+			acpi_write_pmreg(sc, ACPIREG_PM1_STS, 0,
+			    ACPI_PM1_RTC_STS);
+			sts &= ~ACPI_PM1_RTC_STS;
+
+			if (cpu_suspended)
+				cpu_suspended = 0;
+
+			if (sc->sc_wakegpe == WAKEGPE_NONE)
+				sc->sc_wakegpe = WAKEGPE_RTC;
+		}
+
 		if (sts) {
 			printf("%s: PM1 stuck (en 0x%x st 0x%x), clearing\n",
 			    sc->sc_dev.dv_xname, en, sts);
@@ -2502,16 +2567,19 @@ acpi_init_states(struct acpi_softc *sc)
 		snprintf(name, sizeof(name), "_S%d_", i);
 		sc->sc_sleeptype[i].slp_typa = -1;
 		sc->sc_sleeptype[i].slp_typb = -1;
-		if (aml_evalname(sc, sc->sc_root, name, 0, NULL, &res) == 0) {
-			if (res.type == AML_OBJTYPE_PACKAGE) {
-				sc->sc_sleeptype[i].slp_typa =
-				    aml_val2int(res.v_package[0]);
-				sc->sc_sleeptype[i].slp_typb =
-				    aml_val2int(res.v_package[1]);
-				printf(" S%d", i);
-			}
+		if (aml_evalname(sc, sc->sc_root, name, 0, NULL, &res) != 0)
+			continue;
+		if (res.type != AML_OBJTYPE_PACKAGE || res.length < 2) {
 			aml_freevalue(&res);
+			continue;
 		}
+		sc->sc_sleeptype[i].slp_typa = aml_val2int(res.v_package[0]);
+		sc->sc_sleeptype[i].slp_typb = aml_val2int(res.v_package[1]);
+		aml_freevalue(&res);
+
+		printf(" S%d", i);
+		if (i == 0 && (sc->sc_fadt->flags & FADT_POWER_S0_IDLE_CAPABLE))
+			printf("ix");
 	}
 }
 
@@ -2590,8 +2658,6 @@ acpi_resume_pm(struct acpi_softc *sc, int fromstate)
 	/* Enable runtime GPEs */
 	acpi_disable_allgpes(sc);
 	acpi_enable_rungpes(sc);
-
-	acpi_indicator(sc, ACPI_SST_WAKING);
 
 	/* 2nd resume AML step: _WAK(fromstate) */
 	aml_node_setval(sc, sc->sc_wak, fromstate);
@@ -2777,7 +2843,7 @@ acpi_create_thread(void *arg)
 		    DEVNAME(sc));
 }
 
-#if __arm64__
+#ifdef __arm64__
 int
 acpi_foundsectwo(struct aml_node *node, void *arg)
 {
@@ -2967,17 +3033,22 @@ acpi_parsehid(struct aml_node *node, void *arg, char *outcdev, char *outdev,
     size_t devlen)
 {
 	struct acpi_softc	*sc = (struct acpi_softc *)arg;
-	struct aml_value	 res;
+	struct aml_value	 res, *cid;
 	const char		*dev;
 
 	/* NB aml_eisaid returns a static buffer, this must come first */
 	if (aml_evalname(acpi_softc, node->parent, "_CID", 0, NULL, &res) == 0) {
-		switch (res.type) {
+		if (res.type == AML_OBJTYPE_PACKAGE && res.length >= 1) {
+			cid = res.v_package[0];
+		} else {
+			cid = &res;
+		}
+		switch (cid->type) {
 		case AML_OBJTYPE_STRING:
-			dev = res.v_string;
+			dev = cid->v_string;
 			break;
 		case AML_OBJTYPE_INTEGER:
-			dev = aml_eisaid(aml_val2int(&res));
+			dev = aml_eisaid(aml_val2int(cid));
 			break;
 		default:
 			dev = "unknown";
@@ -3035,12 +3106,9 @@ const char *acpi_skip_hids[] = {
 
 /* ISA devices for which we attach a driver later */
 const char *acpi_isa_hids[] = {
-	"PNP0303",	/* IBM Enhanced Keyboard (101/102-key, PS/2 Mouse) */
 	"PNP0400",	/* Standard LPT Parallel Port */
 	"PNP0401",	/* ECP Parallel Port */
 	"PNP0700",	/* PC-class Floppy Disk Controller */
-	"PNP0F03",	/* Microsoft PS/2-style Mouse */
-	"PNP0F13",	/* PS/2 Mouse */
 	NULL
 };
 
@@ -3233,7 +3301,9 @@ acpi_foundhid(struct aml_node *node, void *arg)
 		return (0);
 
 	sta = acpi_getsta(sc, node->parent);
-	if ((sta & (STA_PRESENT | STA_ENABLED)) != (STA_PRESENT | STA_ENABLED))
+	if ((sta & STA_PRESENT) == 0 && (sta & STA_DEV_OK) == 0)
+		return (1);
+	if ((sta & STA_ENABLED) == 0)
 		return (0);
 
 	if (aml_evalinteger(sc, node->parent, "_CCA", 0, NULL, &cca))
@@ -3248,7 +3318,6 @@ acpi_foundhid(struct aml_node *node, void *arg)
 	aaa.aaa_node = node->parent;
 	aaa.aaa_dev = dev;
 	aaa.aaa_cdev = cdev;
-	acpi_parse_crs(sc, &aaa);
 
 #ifndef SMALL_KERNEL
 	if (!strcmp(cdev, ACPI_DEV_MOUSE)) {
@@ -3264,6 +3333,8 @@ acpi_foundhid(struct aml_node *node, void *arg)
 	if (acpi_matchhids(&aaa, acpi_skip_hids, "none") ||
 	    acpi_matchhids(&aaa, acpi_isa_hids, "none"))
 		return (0);
+
+	acpi_parse_crs(sc, &aaa);
 
 	aaa.aaa_dmat = acpi_iommu_device_map(node->parent, aaa.aaa_dmat);
 

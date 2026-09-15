@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.144 2023/10/24 13:20:10 claudio Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.149 2026/03/08 17:07:31 deraadt Exp $	*/
 /*
  * Copyright (c) 1998, 1999, 2000, 2001 Steve Murphree, Jr.
  * Copyright (c) 1996 Nivas Madhur
@@ -71,6 +71,7 @@
 #include <sys/mount.h>
 #include <sys/msgbuf.h>
 #include <sys/syscallargs.h>
+#include <sys/pledge.h>
 #include <sys/exec.h>
 #include <sys/sysctl.h>
 #include <sys/errno.h>
@@ -200,7 +201,6 @@ extern int omfb_cnattach(void);	/* in dev/lunafb.c */
 extern void ws_cnattach(void);	/* in dev/lunaws.c */
 
 vaddr_t first_addr;
-vaddr_t last_addr;
 
 extern struct user *proc0paddr;
 
@@ -817,7 +817,7 @@ luna88k_ext_int(struct trapframe *eframe)
 	    !(cur_isr & (1 << (cur_int_level + 17))))
 		goto out;
 
-	uvmexp.intrs++;
+	atomic_inc_int(&uvmexp.intrs);
 
 #ifdef MULTIPROCESSOR
 	/*
@@ -902,10 +902,7 @@ out:
 }
 
 int
-sys_sysarch(p, v, retval)
-	struct proc *p;
-	void *v;
-	register_t *retval;
+sys_sysarch(struct proc *p, void *v, register_t *retval)
 {
 #if 0
 	struct sys_sysarch_args	/* {
@@ -913,6 +910,9 @@ sys_sysarch(p, v, retval)
 	   syscallarg(char *) parm;
 	} */ *uap = v;
 #endif
+
+	if ((p->p_p->ps_flags & PS_PLEDGE))
+		return pledge_fail(p, EINVAL, 0);
 
 	return (ENOSYS);
 }
@@ -977,6 +977,7 @@ luna88k_bootstrap()
 	extern const struct cmmu_p cmmu8820x;
 	extern vaddr_t avail_start;
 	extern vaddr_t avail_end;
+	vaddr_t last_addr;
 #ifndef MULTIPROCESSOR
 	cpuid_t master_cpu;
 #endif
@@ -1026,7 +1027,7 @@ luna88k_bootstrap()
 	avail_end = last_addr;
 
 #ifdef DEBUG
-	printf("LUNA-88K boot: memory from 0x%x to 0x%x\n",
+	printf("LUNA-88K boot: memory from 0x%lx to 0x%lx\n",
 	    avail_start, avail_end);
 #endif
 
@@ -1143,8 +1144,7 @@ get_nvram_data(void)
 }
 
 char *
-nvram_by_symbol(symbol)
-	char *symbol;
+nvram_by_symbol(char *symbol)
 {
 	char *value;
 	int i;

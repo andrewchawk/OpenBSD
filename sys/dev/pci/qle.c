@@ -1,4 +1,4 @@
-/*	$OpenBSD: qle.c,v 1.65 2024/05/24 06:02:58 jsg Exp $ */
+/*	$OpenBSD: qle.c,v 1.67 2025/03/06 09:56:45 kevlo Exp $ */
 
 /*
  * Copyright (c) 2013, 2014 Jonathan Matthew <jmatthew@openbsd.org>
@@ -691,7 +691,7 @@ qle_detach(struct device *self, int flags)
 	struct qle_softc *sc = (struct qle_softc *)self;
 
 	if (sc->sc_ih == NULL) {
-		/* we didnt attach properly, so nothing to detach */
+		/* we didn't attach properly, so nothing to detach */
 		return (0);
 	}
 
@@ -2703,6 +2703,8 @@ qle_load_firmware_chunks(struct qle_softc *sc, const u_int32_t *fw)
 	int res = 0;
 
 	mem = qle_dmamem_alloc(sc, 65536);
+	if (mem == NULL)
+		return ENOMEM;
 	for (;;) {
 		if (qle_load_fwchunk(sc, mem, fw)) {
 			res = 1;

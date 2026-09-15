@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_bge.c,v 1.405 2024/05/24 06:02:53 jsg Exp $	*/
+/*	$OpenBSD: if_bge.c,v 1.408 2025/07/15 13:40:02 jsg Exp $	*/
 
 /*
  * Copyright (c) 2001 Wind River Systems
@@ -1364,7 +1364,7 @@ bge_fill_rx_ring_std(struct bge_softc *sc)
 		bge_writembx(sc, BGE_MBX_RX_STD_PROD_LO, sc->bge_std);
 
 	/*
-	 * bge always needs more than 8 packets on the ring. if we cant do
+	 * bge always needs more than 8 packets on the ring. if we can't do
 	 * that now, then try again later.
 	 */
 	if (if_rxr_inuse(&sc->bge_std_ring) <= 8)
@@ -1468,7 +1468,7 @@ bge_fill_rx_ring_jumbo(struct bge_softc *sc)
 		bge_writembx(sc, BGE_MBX_RX_JUMBO_PROD_LO, sc->bge_jumbo);
 
 	/*
-	 * bge always needs more than 8 packets on the ring. if we cant do
+	 * bge always needs more than 8 packets on the ring. if we can't do
 	 * that now, then try again later.
 	 */
 	if (if_rxr_inuse(&sc->bge_jumbo_ring) <= 8)
@@ -1996,7 +1996,7 @@ bge_blockinit(struct bge_softc *sc)
 		/*
 		 * Bits 31-16: Programmable ring size (2048, 1024, 512, .., 32)
 		 * Bits 15-2 : Maximum RX frame size
-		 * Bit 1     : 1 = Ring Disabled, 0 = Ring ENabled
+		 * Bit 1     : 1 = Ring Disabled, 0 = Ring Enabled
 		 * Bit 0     : Reserved
 		 */
 		rcb->bge_maxlen_flags =
@@ -3251,11 +3251,9 @@ bge_activate(struct device *self, int act)
 {
 	struct bge_softc *sc = (struct bge_softc *)self;
 	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int rv = 0;
 
 	switch (act) {
 	case DVACT_SUSPEND:
-		rv = config_activate_children(self, act);
 		if (ifp->if_flags & IFF_RUNNING)
 			bge_stop(sc, 0);
 		break;
@@ -3263,11 +3261,8 @@ bge_activate(struct device *self, int act)
 		if (ifp->if_flags & IFF_UP)
 			bge_init(sc);
 		break;
-	default:
-		rv = config_activate_children(self, act);
-		break;
 	}
-	return (rv);
+	return (0);
 }
 
 void

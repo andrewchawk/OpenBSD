@@ -1,4 +1,4 @@
-/*	$OpenBSD: unpack_dns.c,v 1.3 2022/01/20 14:18:10 naddy Exp $	*/
+/*	$OpenBSD: unpack_dns.c,v 1.5 2026/04/04 11:01:41 op Exp $	*/
 
 /*
  * Copyright (c) 2011-2014 Eric Faurot <eric@faurot.net>
@@ -147,13 +147,16 @@ dname_expand(const unsigned char *data, size_t len, size_t offset,
 	size_t		 n, count, end, ptr, start;
 	ssize_t		 res;
 
-	if (offset >= len)
-		return (-1);
-
 	res = 0;
 	end = start = offset;
 
-	for (; (n = data[offset]); ) {
+	for (;;) {
+		if (offset >= len)
+			return (-1);
+
+		if (!(n = data[offset]))
+			break;
+
 		if ((n & 0xc0) == 0xc0) {
 			if (offset + 2 > len)
 				return (-1);

@@ -14,7 +14,7 @@ BEGIN
     # use Test::NoWarnings, if available
     my $extra = 0 ;
 
-    my $st = eval { require Test::NoWarnings ;  import Test::NoWarnings; 1; };
+    my $st = eval { require Test::NoWarnings ;  Test::NoWarnings->import; 1; };
     $extra = 1
         if $st ;
 
@@ -583,7 +583,7 @@ EOM
 
             my $io = $CompressClass->new($name);
 
-            is $io->tell(), 0, " tell returns 0"; ;
+            is $io->tell(), 0, " tell returns 0";
 
             my $heisan = "Heisan\n";
             $io->print($heisan) ;
@@ -789,13 +789,13 @@ EOT
 
                 is $io->sysread($buf, 3, 2), 3 ;
                 is $buf, "Ths i"
-                    or print "# [$buf]\n" ;;
+                    or print "# [$buf]\n" ;
                 ok ! $io->eof;
 
                 $buf = "ab" ;
                 is $io->read($buf, 3, 4), 3 ;
                 is $buf, "ab" . "\x00" x 2 . "s a"
-                    or print "# [$buf]\n" ;;
+                    or print "# [$buf]\n" ;
                 ok ! $io->eof;
 
                 # read the rest of the file
@@ -973,7 +973,7 @@ EOT
                 $buf = "ab" ;
                 is $io->read($buf, 3, 4), 3 ;
                 is $buf, "ab" . "\x00" x 2 . "s a"
-                    or print "# [$buf]\n" ;;
+                    or print "# [$buf]\n" ;
                 ok ! $io->eof;
 
                 # read the rest of the file

@@ -1,4 +1,4 @@
-/* $OpenBSD: if_aq_pci.c,v 1.28 2024/05/24 06:02:53 jsg Exp $ */
+/* $OpenBSD: if_aq_pci.c,v 1.38 2026/08/25 01:18:03 jcs Exp $ */
 /*	$NetBSD: if_aq.c,v 1.27 2021/06/16 00:21:18 riastradh Exp $	*/
 
 /*
@@ -153,6 +153,15 @@
 #define AQ_INTR_MASK_REG			0x2060	/* intr mask set */
 #define AQ_INTR_MASK_CLR_REG			0x2070	/* intr mask clear */
 #define AQ_INTR_AUTOMASK_REG			0x2090
+
+#define AQ_SMB_PROVISIONING_REG			0x0604
+#define AQ_SMB_TX_DATA_REG			0x0608
+#define AQ_SMB_BUS_REG				0x0744
+#define  AQ_SMB_BUS_XFER_COMPLETE		(1 << 1)
+#define  AQ_SMB_BUS_REPEAT_DETECT		(1 << 2)
+#define  AQ_SMB_BUS_BUSY			(1 << 7)
+#define  AQ_SMB_BUS_RX_ACK			(1 << 8)
+#define AQ_SMB_RX_DATA_REG			0x0748
 
 /* AQ_INTR_IRQ_MAP_TXRX_REG 0x2100-0x2140 */
 #define AQ_INTR_IRQ_MAP_TXRX_REG(i)		(0x2100 + ((i) / 2) * 4)
@@ -365,6 +374,7 @@
 #define  TPB_TX_BUF_SCP_INS_EN			(1 << 2)
 #define  TPB_TX_BUF_CLK_GATE_EN			(1 << 5)
 #define  TPB_TX_BUF_TC_MODE_EN			(1 << 8)
+#define  TPB_TX_BUF_TC_Q_RAND_MAP_EN		(1 << 9)
 
 
 /* TPB_TXB_BUFSIZE_REG[AQ_TRAFFICCLASS_NUM] 0x7910-7990 */
@@ -467,7 +477,7 @@
 
 #define AQ2_RPF_REDIR2_REG			0x54c8
 #define  AQ2_RPF_REDIR2_INDEX			(1 << 12)
-#define  AQ2_RPF_REDIR2_HASHTYPE		0x00000100
+#define  AQ2_RPF_REDIR2_HASHTYPE		0x000001FF
 #define  AQ2_RPF_REDIR2_HASHTYPE_NONE		0
 #define  AQ2_RPF_REDIR2_HASHTYPE_IP		(1 << 0)
 #define  AQ2_RPF_REDIR2_HASHTYPE_TCP4		(1 << 1)
@@ -478,7 +488,16 @@
 #define  AQ2_RPF_REDIR2_HASHTYPE_IP6EX		(1 << 6)
 #define  AQ2_RPF_REDIR2_HASHTYPE_TCP6EX		(1 << 7)
 #define  AQ2_RPF_REDIR2_HASHTYPE_UDP6EX		(1 << 8)
-#define  AQ2_RPF_REDIR2_HASHTYPE_ALL		0x00000100
+#define  AQ2_RPF_REDIR2_HASHTYPE_ALL		0x000001FF
+
+#define AQ2_RX_Q_TC_MAP_REG(i)			(0x5900 + (i) * 4)
+#define AQ2_TX_Q_TC_MAP_REG(i)			(0x799c + (i) * 4)
+
+#define AQ2_RPF_RSS_REDIR_MAX			64
+#define AQ2_RPF_RSS_REDIR_REG(tc, i)		\
+	 (0x6200 + (0x100 * ((tc) >> 2)) + (i) * 4)
+#define AQ2_RPF_RSS_REDIR_TC_MASK(tc)		\
+	 (0x1f << (5 * ((tc) & 3)))
 
 #define AQ2_RPF_REC_TAB_ENABLE_REG		0x6ff0
 #define  AQ2_RPF_REC_TAB_ENABLE_MASK		0x0000ffff
@@ -773,6 +792,12 @@ enum aq_link_fc {
         AQ_FC_ALL = (AQ_FC_RX | AQ_FC_TX)
 };
 
+#define AQ_SMB_START_TRANSMIT		0x5001
+#define AQ_SMB_START_READ_TRANSMIT	0x5101
+#define AQ_SMB_STOP_TRANSMIT		0x3001
+#define AQ_SMB_REPEAT_TRANSMIT		0x1001
+#define AQ_SMB_REPEAT_NACK_TRANSMIT	0x1011
+
 struct aq_dmamem {
 	bus_dmamap_t		aqm_map;
 	bus_dma_segment_t	aqm_seg;
@@ -976,6 +1001,7 @@ struct aq_softc {
 	void			*sc_ih;
 	bus_space_handle_t	sc_ioh;
 	bus_space_tag_t		sc_iot;
+	bus_size_t		sc_iosize;
 
 	uint32_t		sc_mbox_addr;
 	int			sc_rbl_enabled;
@@ -1105,6 +1131,7 @@ const struct aq_product {
 
 int	aq_match(struct device *, void *, void *);
 void	aq_attach(struct device *, struct device *, void *);
+int	aq_detach(struct device *, int);
 int	aq_activate(struct device *, int);
 int	aq_intr(void *);
 int	aq_intr_link(void *);
@@ -1129,6 +1156,7 @@ void	aq_start(struct ifqueue *);
 void	aq_ifmedia_status(struct ifnet *, struct ifmediareq *);
 int	aq_ifmedia_change(struct ifnet *);
 void	aq_update_link_status(struct aq_softc *);
+int	aq_get_sffpage(struct aq_softc *, struct if_sffpage *);
 
 int	aq1_fw_reboot(struct aq_softc *);
 int	aq1_fw_read_version(struct aq_softc *);
@@ -1204,7 +1232,7 @@ const struct aq_firmware_ops aq2_fw_ops = {
 };
 
 const struct cfattach aq_ca = {
-	sizeof(struct aq_softc), aq_match, aq_attach, NULL,
+	sizeof(struct aq_softc), aq_match, aq_attach, aq_detach,
 	aq_activate
 };
 
@@ -1248,7 +1276,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	pcitag_t tag;
 	struct ifnet *ifp = &sc->sc_arpcom.ac_if;
 	int txmin, txmax, rxmin, rxmax;
-	int irqmode, irqnum;
+	int irqmode, irqnum, multivec;
 	int i;
 
 	mtx_init(&sc->sc_mpi_mutex, IPL_NET);
@@ -1270,7 +1298,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 
 	memtype = pci_mapreg_type(pc, tag, AQ_BAR0);
 	if (pci_mapreg_map(pa, AQ_BAR0, memtype, 0, &sc->sc_iot, &sc->sc_ioh,
-	    NULL, NULL, 0)) {
+	    NULL, &sc->sc_iosize, 0)) {
 		printf(": failed to map BAR0\n");
 		return;
 	}
@@ -1279,20 +1307,21 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_linkstat_irq = AQ_LINKSTAT_IRQ;
 	isr = aq_intr;
 	irqnum = 0;
+	multivec = 0;
 
 	if (pci_intr_map_msix(pa, 0, &ih) == 0) {
 		int nmsix = pci_intr_msix_count(pa);
-		/* don't do rss on aq2 yet */
-		if (aqp->aq_hwtype == HWTYPE_AQ1 && nmsix > 1) {
+		if (nmsix > 1) {
 			nmsix--;
-			sc->sc_intrmap = intrmap_create(&sc->sc_dev,
-			    nmsix, AQ_MAXQ, INTRMAP_POWEROF2);
+			sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+			    MIN(AQ_MAXQ, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 			sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 			KASSERT(sc->sc_nqueues > 0);
 			KASSERT(powerof2(sc->sc_nqueues));
 
 			sc->sc_linkstat_irq = 0;
 			isr = aq_intr_link;
+			multivec = 1;
 			irqnum++;
 		}
 		irqmode = AQ_INTR_CTRL_IRQMODE_MSIX;
@@ -1337,7 +1366,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	if (aq_init_rss(sc))
 		return;
 
-	if (aq_hw_init(sc, irqmode, (sc->sc_nqueues > 1)))
+	if (aq_hw_init(sc, irqmode, multivec))
 		return;
 
 	sc->sc_media_type = aqp->aq_media_type;
@@ -1350,7 +1379,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 	strlcpy(ifp->if_xname, self->dv_xname, IFNAMSIZ);
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX;
-	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
 	ifp->if_ioctl = aq_ioctl;
 	ifp->if_qstart = aq_start;
 	ifp->if_watchdog = aq_watchdog;
@@ -1444,7 +1473,7 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 		snprintf(aq->q_name, sizeof(aq->q_name), "%s:%u",
 		    DEVNAME(sc), i);
 
-		if (sc->sc_nqueues > 1) {
+		if (multivec) {
 			if (pci_intr_map_msix(pa, irqnum, &ih)) {
 				printf(": unable to map msi-x vector %d\n",
 				    irqnum);
@@ -1501,6 +1530,53 @@ aq_attach(struct device *parent, struct device *self, void *aux)
 
 	aq_enable_intr(sc, 1, 0);
 	printf("\n");
+}
+
+int
+aq_detach(struct device *self, int flags)
+{
+	struct aq_softc *sc = (struct aq_softc *)self;
+	struct ifnet *ifp = &sc->sc_arpcom.ac_if;
+	struct aq_queues *aq;
+	int i;
+
+	if (ifp->if_flags & IFF_RUNNING)
+		aq_down(sc);
+
+	aq_enable_intr(sc, 0, 0);
+
+	for (i = 0; i < sc->sc_nqueues; i++) {
+		aq = &sc->sc_queues[i];
+
+		if (aq->q_ihc != NULL) {
+			pci_intr_disestablish(sc->sc_pc, aq->q_ihc);
+			aq->q_ihc = NULL;
+		}
+		timeout_del(&aq->q_rx.rx_refill);
+	}
+
+	if (sc->sc_ih != NULL) {
+		pci_intr_disestablish(sc->sc_pc, sc->sc_ih);
+		sc->sc_ih = NULL;
+	}
+
+	if (sc->sc_intrmap != NULL) {
+		intrmap_destroy(sc->sc_intrmap);
+		sc->sc_intrmap = NULL;
+	}
+
+	if (ifp->if_softc != NULL) {
+		ifmedia_delete_instance(&sc->sc_media, IFM_INST_ANY);
+		ether_ifdetach(ifp);
+		if_detach(ifp);
+	}
+
+	if (sc->sc_iosize != 0) {
+		bus_space_unmap(sc->sc_iot, sc->sc_ioh, sc->sc_iosize);
+		sc->sc_iosize = 0;
+	}
+
+	return 0;
 }
 
 int
@@ -2418,18 +2494,6 @@ aq2_fw_get_stats(struct aq_softc *sc, struct aq_hw_stats_s *w)
 	return 0;
 }
 
-void
-aq_hw_l3_filter_set(struct aq_softc *sc)
-{
-	int i;
-
-	/* clear all filter */
-	for (i = 0; i < 8; i++) {
-		AQ_WRITE_REG_BIT(sc, RPF_L3_FILTER_REG(i),
-		    RPF_L3_FILTER_L4_EN, 0);
-	}
-}
-
 int
 aq_hw_init(struct aq_softc *sc, int irqmode, int multivec)
 {
@@ -2803,6 +2867,26 @@ aq_hw_qos_set(struct aq_softc *sc)
 		AQ_WRITE_REG_BIT(sc, RPF_RPB_RX_TC_UPT_REG,
 		    RPF_RPB_RX_TC_UPT_MASK(i_priority), 0);
 	}
+
+	/* ring to TC mapping */
+	if (HWTYPE_AQ2_P(sc)) {
+		AQ_WRITE_REG_BIT(sc, TPB_TX_BUF_REG,
+		    TPB_TX_BUF_TC_Q_RAND_MAP_EN, 1);
+
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(0), 0x00000000);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(1), 0x00000000);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(2), 0x01010101);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(3), 0x01010101);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(4), 0x02020202);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(5), 0x02020202);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(6), 0x03030303);
+		AQ_WRITE_REG(sc, AQ2_TX_Q_TC_MAP_REG(7), 0x03030303);
+
+		AQ_WRITE_REG(sc, AQ2_RX_Q_TC_MAP_REG(0), 0x00000000);
+		AQ_WRITE_REG(sc, AQ2_RX_Q_TC_MAP_REG(1), 0x11111111);
+		AQ_WRITE_REG(sc, AQ2_RX_Q_TC_MAP_REG(2), 0x22222222);
+		AQ_WRITE_REG(sc, AQ2_RX_Q_TC_MAP_REG(3), 0x33333333);
+	}
 }
 
 int
@@ -2817,10 +2901,23 @@ aq_init_rss(struct aq_softc *sc)
 	if (sc->sc_nqueues == 1)
 		return 0;
 
+	if (HWTYPE_AQ2_P(sc)) {
+		AQ_WRITE_REG_BIT(sc, AQ2_RPF_REDIR2_REG, AQ2_RPF_REDIR2_INDEX, 0);
+		for (i = 0; i < AQ2_RPF_RSS_REDIR_MAX; i++) {
+			int tc;
+			int q;
+			for (tc = 0; tc < 4; tc++) {
+				q = (tc * 8) + (i % sc->sc_nqueues);
+				AQ_WRITE_REG_BIT(sc, AQ2_RPF_RSS_REDIR_REG(tc, i),
+				    AQ2_RPF_RSS_REDIR_TC_MASK(tc), q);
+			}
+		}
+	}
+
 	/* rss key is composed of 32 bit registers */
 	stoeplitz_to_key(rss_key, sizeof(rss_key));
 	for (i = 0; i < nitems(rss_key); i++) {
-		AQ_WRITE_REG(sc, RPF_RSS_KEY_WR_DATA_REG, htole32(rss_key[i]));
+		AQ_WRITE_REG(sc, RPF_RSS_KEY_WR_DATA_REG, htobe32(rss_key[i]));
 		AQ_WRITE_REG_BIT(sc, RPF_RSS_KEY_ADDR_REG, RPF_RSS_KEY_ADDR,
 		    nitems(rss_key) - 1 - i);
 		AQ_WRITE_REG_BIT(sc, RPF_RSS_KEY_ADDR_REG, RPF_RSS_KEY_WR_EN,
@@ -3215,6 +3312,11 @@ aq_start(struct ifqueue *ifq)
 	struct mbuf *m;
 	uint32_t idx, free, used, ctl1, ctl2;
 	int error, i;
+
+	if (!LINK_STATE_IS_UP(sc->sc_arpcom.ac_if.if_link_state)) {
+		ifq_purge(ifq);
+		return;
+	}
 
 	idx = tx->tx_prod;
 	free = tx->tx_cons + AQ_TXD_NUM - tx->tx_prod;
@@ -3799,6 +3901,13 @@ aq_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		error = aq_rxrinfo(sc, (struct if_rxrinfo *)ifr->ifr_data);
 		break;
 
+	case SIOCGIFSFFPAGE:
+		if (sc->sc_media_type == AQ_MEDIA_TYPE_FIBRE)
+			error = aq_get_sffpage(sc, (struct if_sffpage *)data);
+		else
+			error = ENXIO;
+		break;
+
 	default:
 		error = ether_ioctl(ifp, &sc->sc_arpcom, cmd, data);
 	}
@@ -3892,6 +4001,87 @@ aq_iff(struct aq_softc *sc)
 }
 
 int
+aq_smb_bus_wait_result(struct aq_softc *sc, int ack)
+{
+	int error;
+
+	WAIT_FOR(
+	    (AQ_READ_REG(sc, AQ_SMB_BUS_REG) & AQ_SMB_BUS_XFER_COMPLETE) != 0,
+	    100, 10000, &error);
+	if (error != 0)
+		return error;
+	if ((AQ_READ_REG(sc, AQ_SMB_BUS_REG) & AQ_SMB_BUS_RX_ACK) != ack)
+		return EIO;
+	return 0;
+}
+
+int
+aq_get_sffpage(struct aq_softc *sc, struct if_sffpage *sff)
+{
+	int error;
+	int i;
+
+	WAIT_FOR((AQ_READ_REG(sc, AQ_SMB_BUS_REG) & AQ_SMB_BUS_BUSY) == 0,
+	    10, 1000, &error);
+	if (error != 0) {
+		printf("%s: AQ_SMB_BUS_BUSY timeout\n", DEVNAME(sc));
+		return error;
+	}
+
+	AQ_WRITE_REG(sc, AQ_SMB_TX_DATA_REG, sff->sff_addr);
+	AQ_WRITE_REG(sc, AQ_SMB_PROVISIONING_REG, AQ_SMB_START_TRANSMIT);
+	error = aq_smb_bus_wait_result(sc, 0);
+	if (error != 0) {
+		printf("%s: AQ_SMB_START_TRANSMIT timeout\n", DEVNAME(sc));
+		goto out;
+	}
+
+	AQ_WRITE_REG(sc, AQ_SMB_TX_DATA_REG, 0);
+	AQ_WRITE_REG(sc, AQ_SMB_PROVISIONING_REG, AQ_SMB_REPEAT_TRANSMIT);
+	error = aq_smb_bus_wait_result(sc, 0);
+	if (error != 0) {
+		printf("%s: AQ_SMB_REPEAT_TRANSMIT timeout\n", DEVNAME(sc));
+		goto out;
+	}
+
+	AQ_WRITE_REG(sc, AQ_SMB_TX_DATA_REG, sff->sff_addr | 1);
+	AQ_WRITE_REG(sc, AQ_SMB_PROVISIONING_REG, AQ_SMB_START_READ_TRANSMIT);
+	error = aq_smb_bus_wait_result(sc, 0);
+	if (error != 0) {
+		printf("%s: AQ_SMB_START_READ_TRANSMIT timeout\n", DEVNAME(sc));
+		goto out;
+	}
+	if ((AQ_READ_REG(sc, AQ_SMB_BUS_REG) & AQ_SMB_BUS_REPEAT_DETECT) == 0) {
+		error = EIO;
+		goto out;
+	}
+
+	for (i = 0; i < sizeof(sff->sff_data)-1; i++) {
+		AQ_WRITE_REG(sc, AQ_SMB_PROVISIONING_REG,
+		    AQ_SMB_REPEAT_TRANSMIT);
+		error = aq_smb_bus_wait_result(sc, 0);
+		if (error != 0) {
+			printf("%s: AQ_SMB_REPEAT_TRANSMIT %d timeout\n",
+			    DEVNAME(sc), i);
+			goto out;
+		}
+
+		sff->sff_data[i] = AQ_READ_REG(sc, AQ_SMB_RX_DATA_REG);
+	}
+
+	AQ_WRITE_REG(sc, AQ_SMB_PROVISIONING_REG, AQ_SMB_REPEAT_NACK_TRANSMIT);
+	error = aq_smb_bus_wait_result(sc, AQ_SMB_BUS_RX_ACK);
+	if (error != 0) {
+		printf("%s: AQ_SMB_REPEAT_NACK_TRANSMIT failed\n", DEVNAME(sc));
+	}
+	sff->sff_data[i] = AQ_READ_REG(sc, AQ_SMB_RX_DATA_REG);
+
+ out:
+	AQ_WRITE_REG(sc, AQ_SMB_PROVISIONING_REG, AQ_SMB_STOP_TRANSMIT);
+	return error;
+}
+
+int
 aq_dmamem_alloc(struct aq_softc *sc, struct aq_dmamem *aqm,
     bus_size_t size, u_int align)
 {
@@ -3904,7 +4094,7 @@ aq_dmamem_alloc(struct aq_softc *sc, struct aq_dmamem *aqm,
 		return (1);
 	if (bus_dmamem_alloc(sc->sc_dmat, aqm->aqm_size,
 	    align, 0, &aqm->aqm_seg, 1, &aqm->aqm_nsegs,
-	    BUS_DMA_WAITOK | BUS_DMA_ZERO) != 0)
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_64BIT) != 0)
 		goto destroy;
 	if (bus_dmamem_map(sc->sc_dmat, &aqm->aqm_seg, aqm->aqm_nsegs,
 	    aqm->aqm_size, &aqm->aqm_kva,

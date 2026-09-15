@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.24 2024/06/11 16:02:35 jca Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.28 2026/07/07 12:12:44 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2019 Mike Larkin <mlarkin@openbsd.org>
@@ -26,11 +26,13 @@
 
 /*  CTL_MACHDEP definitions. */
 #define	CPU_COMPATIBLE		1	/* compatible property */
-#define	CPU_MAXID		2	/* number of valid machdep ids */
+#define	CPU_LED_BLINK		2	/* int: blink leds? */
+#define	CPU_MAXID		3	/* number of valid machdep ids */
 
 #define	CTL_MACHDEP_NAMES { \
 	{ 0, 0 }, \
 	{ "compatible", CTLTYPE_STRING }, \
+	{ "led_blink", CTLTYPE_INT }, \
 }
 
 #ifdef _KERNEL
@@ -41,6 +43,8 @@
 #include <machine/intr.h>
 #include <machine/frame.h>
 #include <machine/riscvreg.h>
+
+void cpu_identify_cleanup(void);
 
 /* All the CLKF_* macros take a struct clockframe * as an argument. */
 
@@ -141,13 +145,9 @@ struct cpu_info {
 #define CPUF_GO			(1<<5)
 #define CPUF_RUNNING		(1<<6)
 
-static inline struct cpu_info *
-curcpu(void)
-{
-	struct cpu_info *__ci = NULL;
-	__asm volatile("mv %0, tp" : "=&r"(__ci));
-	return (__ci);
-}
+register struct cpu_info *__curcpu asm ("tp");
+
+#define	curcpu()		(__curcpu)
 
 extern uint32_t boot_hart;	/* The hart we booted on. */
 extern struct cpu_info cpu_info_primary;
@@ -267,13 +267,28 @@ void	delay (unsigned);
 
 extern void (*cpu_startclock_fcn)(void);
 
+extern unsigned long riscv_hwcap;
+extern size_t riscv_vlenb;
+
 void fpu_save(struct proc *, struct trapframe *);
 void fpu_load(struct proc *);
+
+int vector_instruction(register_t stval);
+void vector_save(struct proc *, struct trapframe *);
+void vector_load(struct proc *);
 
 extern int cpu_errata_sifive_cip_1200;
 
 #define	cpu_idle_enter()	do { /* nothing */ } while (0)
 #define	cpu_idle_leave()	do { /* nothing */ } while (0)
+
+struct blink_led {
+	void (*bl_func)(void *, int);
+	void *bl_arg;
+	SLIST_ENTRY(blink_led) bl_next;
+};
+
+void blink_led_register(struct blink_led *);
 
 #endif /* _KERNEL */
 

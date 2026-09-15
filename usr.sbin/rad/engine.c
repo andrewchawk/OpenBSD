@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.22 2023/12/14 11:09:34 claudio Exp $	*/
+/*	$OpenBSD: engine.c,v 1.32 2026/08/04 19:06:54 claudio Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -134,7 +134,9 @@ engine(int debug, int verbose)
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
 
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = engine_dispatch_main;
 
 	/* Setup event handlers. */
@@ -159,9 +161,9 @@ __dead void
 engine_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	config_clear(engine_conf);
@@ -187,28 +189,29 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
 	struct imsg_ra_rs	 ra_rs;
-	ssize_t			 n;
 	uint32_t		 if_index;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -270,27 +273,28 @@ engine_dispatch_main(int fd, short event, void *bula)
 	struct ra_rdnss_conf		*ra_rdnss_conf;
 	struct ra_dnssl_conf		*ra_dnssl_conf;
 	struct ra_pref64_conf		*pref64;
-	ssize_t				 n;
-	int				 shut = 0;
+	int				 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -312,7 +316,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 			if (iev_frontend == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_frontend->ibuf, fd);
+			if (imsgbuf_init(&iev_frontend->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_frontend->handler = engine_dispatch_frontend;
 			iev_frontend->events = EV_READ;
 
@@ -347,6 +352,10 @@ engine_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(ra_iface_conf, imsg.data,
 			    sizeof(struct ra_iface_conf));
+			if (ra_iface_conf->name[IF_NAMESIZE - 1] != '\0')
+				fatalx("%s: IMSG_RECONF_RA_IFACE invalid name",
+				    __func__);
+
 			ra_iface_conf->autoprefix = NULL;
 			SIMPLEQ_INIT(&ra_iface_conf->ra_prefix_list);
 			SIMPLEQ_INIT(&ra_iface_conf->ra_options.ra_rdnss_list);
@@ -405,6 +414,10 @@ engine_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(ra_dnssl_conf, imsg.data, sizeof(struct
 			    ra_dnssl_conf));
+			if (ra_dnssl_conf->search[MAX_SEARCH - 1] != '\0')
+				fatalx("%s: IMSG_RECONF_RA_DNSSL invalid "
+				    "search list", __func__);
+
 			SIMPLEQ_INSERT_TAIL(&ra_options->ra_dnssl_list,
 			    ra_dnssl_conf, entry);
 			break;
@@ -526,6 +539,8 @@ parse_rs(struct imsg_ra_rs *rs)
 	while ((size_t)len >= sizeof(struct nd_opt_hdr)) {
 		struct nd_opt_hdr *nd_opt_hdr = (struct nd_opt_hdr *)p;
 
+		if (nd_opt_hdr->nd_opt_len == 0)
+			return;
 		len -= sizeof(struct nd_opt_hdr);
 		p += sizeof(struct nd_opt_hdr);
 

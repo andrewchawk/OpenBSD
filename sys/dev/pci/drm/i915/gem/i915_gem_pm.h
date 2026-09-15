@@ -1,6 +1,5 @@
+/* SPDX-License-Identifier: MIT */
 /*
- * SPDX-License-Identifier: MIT
- *
  * Copyright © 2019 Intel Corporation
  */
 
@@ -8,8 +7,6 @@
 #define __I915_GEM_PM_H__
 
 #include <linux/types.h>
-
-#define drm_i915_private inteldrm_softc
 
 struct drm_i915_private;
 struct work_struct;

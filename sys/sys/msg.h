@@ -1,4 +1,4 @@
-/*	$OpenBSD: msg.h,v 1.22 2024/06/10 04:10:25 jsg Exp $	*/
+/*	$OpenBSD: msg.h,v 1.26 2026/07/08 19:39:33 mvs Exp $	*/
 /*	$NetBSD: msg.h,v 1.9 1996/02/09 18:25:18 christos Exp $	*/
 
 /*
@@ -77,7 +77,9 @@ struct que {
 /* for que_flags */
 #define	MSGQ_READERS	0x01
 #define	MSGQ_WRITERS	0x02
-#define	MSGQ_DYING	0x04
+#define	MSGQ_RCVWAIT	0x04
+#define	MSGQ_RCVWAITING	0x08
+#define	MSGQ_DYING	0x10
 
 #define	QREF(q)	(q)->que_references++
 
@@ -104,9 +106,6 @@ struct msginfo {
 		msgssz,		/* size of a message segment (see notes above) */
 		msgseg;		/* number of message segments */
 };
-#ifdef SYSVMSG
-extern struct msginfo	msginfo;
-#endif
 
 int sysctl_sysvmsg(int *, u_int, void *, size_t *);
 
@@ -133,27 +132,14 @@ struct msg_sysctl_info {
 #define MSGTQL	40
 #endif
 
-/*
- * macros to convert between msqid_ds's and msqid's.
- * XXX unused, going away
- */
-#define MSQID(ix,ds)	((ix) & 0xffff | (((ds).msg_perm.seq << 16) & 0xffff0000))
-#define MSQID_IX(id)	((id) & 0xffff)
-#define MSQID_SEQ(id)	(((id) >> 16) & 0xffff)
-#endif
-
-
-#ifndef _KERNEL
+void msginit(void);
+#else /* !_KERNEL */
 __BEGIN_DECLS
 int msgctl(int, int, struct msqid_ds *);
 int msgget(key_t, int);
 int msgsnd(int, const void *, size_t, int);
 int msgrcv(int, void *, size_t, long, int);
 __END_DECLS
-#else
-struct proc;
-
-void	msginit(void);
-#endif /* !_KERNEL */
+#endif
 
 #endif /* !_SYS_MSG_H_ */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ngbe.c,v 1.5 2024/05/24 06:02:56 jsg Exp $	*/
+/*	$OpenBSD: if_ngbe.c,v 1.8 2025/11/11 17:43:18 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2015-2017 Beijing WangXun Technology Co., Ltd.
@@ -1074,8 +1074,8 @@ ngbe_setup_msix(struct ngbe_softc *sc)
 	/* Give one vector to events. */
 	nmsix--;
 
-	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix, NGBE_MAX_VECTORS,
-	    INTRMAP_POWEROF2);
+	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+	    MIN(NGBE_MAX_VECTORS, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 	sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 
 	return 0;
@@ -1707,7 +1707,7 @@ ngbe_initialize_transmit_unit(struct ngbe_softc *sc)
 	struct tx_ring *txr;
 	uint64_t tdba;
 	uint32_t txdctl;
-	int i, wait_loop = NGBE_MAX_RX_DESC_POLL;;
+	int i, wait_loop = NGBE_MAX_RX_DESC_POLL;
 	int error = 0;
 
 	/* TDM_CTL.TE must be before Tx queues are enabled */
@@ -4461,6 +4461,7 @@ ngbe_txeof(struct tx_ring *txr)
 	struct ngbe_tx_buf *tx_buffer;
 	union ngbe_tx_desc *tx_desc;
 	unsigned int prod, cons, last;
+	int done = 0;
 
 	if (!ISSET(ifp->if_flags, IFF_RUNNING))
 		return;
@@ -4486,6 +4487,7 @@ ngbe_txeof(struct tx_ring *txr)
 		    0, tx_buffer->map->dm_mapsize, BUS_DMASYNC_POSTWRITE);
 		bus_dmamap_unload(txr->txdma.dma_tag, tx_buffer->map);
 		m_freem(tx_buffer->m_head);
+		done = 1;
 
 		tx_buffer->m_head = NULL;
 		tx_buffer->eop_index = -1;
@@ -4505,7 +4507,7 @@ ngbe_txeof(struct tx_ring *txr)
 
 	txr->next_to_clean = cons;
 
-	if (ifq_is_oactive(ifq))
+	if (done && ifq_is_oactive(ifq))
 		ifq_restart(ifq);
 }
 

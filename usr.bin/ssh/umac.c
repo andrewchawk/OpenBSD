@@ -1,4 +1,4 @@
-/* $OpenBSD: umac.c,v 1.23 2023/03/07 01:30:52 djm Exp $ */
+/* $OpenBSD: umac.c,v 1.30 2026/03/03 09:57:26 dtucker Exp $ */
 /* -----------------------------------------------------------------------
  *
  * umac.c -- C Implementation UMAC Message Authentication
@@ -6,7 +6,7 @@
  * Version 0.93b of rfc4418.txt -- 2006 July 18
  *
  * For a full description of UMAC message authentication see the UMAC
- * world-wide-web page at http://www.cs.ucdavis.edu/~rogaway/umac
+ * world-wide-web page at https://fastcrypto.org/umac/
  * Please report bugs and suggestions to the UMAC webpage.
  *
  * Copyright (c) 1999-2006 Ted Krovetz
@@ -40,7 +40,7 @@
   * "Barreto"). The only two files needed are rijndael-alg-fst.c and
   * rijndael-alg-fst.h. Brian Gladman's version is distributed with the GNU
   * Public license at http://fp.gladman.plus.com/AES/index.htm. It
-  * includes a fast IA-32 assembly version. The OpenSSL crypo library is
+  * includes a fast IA-32 assembly version. The OpenSSL crypto library is
   * the third.
   *
   * 5) With FORCE_C_ONLY flags set to 0, incorrect results are sometimes
@@ -53,7 +53,7 @@
 /* ---------------------------------------------------------------------- */
 
 #ifndef UMAC_OUTPUT_LEN
-#define UMAC_OUTPUT_LEN     8  /* Alowable: 4, 8, 12, 16                  */
+#define UMAC_OUTPUT_LEN     8  /* Allowable: 4, 8, 12, 16                  */
 #endif
 /* #define FORCE_C_ONLY        1  ANSI C and 64-bit integers req'd        */
 /* #define AES_IMPLEMENTAION   1  1 = OpenSSL, 2 = Barreto, 3 = Gladman   */
@@ -69,7 +69,7 @@
 #include <endian.h>
 #include <string.h>
 #include <stdarg.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
 
@@ -82,10 +82,10 @@
 /* ---------------------------------------------------------------------- */
 
 /* The following assumptions may need change on your system */
-typedef u_int8_t	UINT8;  /* 1 byte   */
-typedef u_int16_t	UINT16; /* 2 byte   */
-typedef u_int32_t	UINT32; /* 4 byte   */
-typedef u_int64_t	UINT64; /* 8 bytes  */
+typedef uint8_t	UINT8;  /* 1 byte   */
+typedef uint16_t	UINT16; /* 2 byte   */
+typedef uint32_t	UINT32; /* 4 byte   */
+typedef uint64_t	UINT64; /* 8 bytes  */
 typedef unsigned int	UWORD;  /* Register */
 
 /* ---------------------------------------------------------------------- */
@@ -140,10 +140,8 @@ typedef unsigned int	UWORD;  /* Register */
 #define STORE_UINT32_REVERSED(p,v)	put_u32_le(p,v)
 #endif
 
-#define LOAD_UINT32_LITTLE(p)           (get_u32_le(p))
-#define STORE_UINT32_BIG(p,v)           put_u32(p, v)
-
-
+#define LOAD_UINT32_LITTLE(p)		(get_u32_le(p))
+#define STORE_UINT32_BIG(p,v)		put_u32(p, v)
 
 /* ---------------------------------------------------------------------- */
 /* ---------------------------------------------------------------------- */
@@ -185,7 +183,7 @@ static void kdf(void *buffer_ptr, aes_int_key key, UINT8 ndx, int nbytes)
     UINT8 *dst_buf = (UINT8 *)buffer_ptr;
     int i;
 
-    /* Setup the initial value */
+    /* Set up the initial value */
     in_buf[AES_BLOCK_LEN-9] = ndx;
     in_buf[AES_BLOCK_LEN-1] = i = 1;
 
@@ -1085,7 +1083,7 @@ static int uhash_update(uhash_ctx_t ctx, const u_char *input, long len)
          }
 
          /* pass remaining < L1_KEY_LEN bytes of input data to NH */
-         if (len) {
+         if (len > 0 && (unsigned long)len <= UINT32_MAX) {
              nh_update(&ctx->hash, (const UINT8 *)input, len);
              ctx->msg_len += len;
          }

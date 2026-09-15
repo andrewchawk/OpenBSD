@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.h,v 1.12 2024/04/06 18:33:54 kettenis Exp $	*/
+/*	$OpenBSD: pmap.h,v 1.15 2026/04/05 11:48:17 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2019-2020 Brian Bamsch <bbamsch@google.com>
@@ -50,7 +50,6 @@
 
 #define PTED_VA_MANAGED_M	(PMAP_MD3)
 #define PTED_VA_WIRED_M		(PMAP_MD3 << 1)
-#define PTED_VA_EXEC_M		(PMAP_MD3 << 2)
 
 #if defined(_KERNEL) && !defined(_LOCORE)
 /*
@@ -75,6 +74,10 @@ struct pmap {
 #define PMAP_PA_MASK	~((paddr_t)PAGE_MASK) /* to remove the flags */
 #define PMAP_NOCACHE	0x1 /* non-cacheable memory */
 #define PMAP_DEVICE	0x2 /* device memory */
+
+extern uint64_t pmap_pma;
+extern uint64_t pmap_nc;
+extern uint64_t pmap_io;
 
 #define PG_PMAP_MOD		PG_PMAP0
 #define PG_PMAP_REF		PG_PMAP1
@@ -113,6 +116,8 @@ struct pv_entry;
 int	pmap_fault_fixup(pmap_t, vaddr_t, vm_prot_t);
 void	pmap_postinit(void);
 void	pmap_init_percpu(void);
+
+#define __HAVE_PMAP_POPULATE
 
 #endif /* _KERNEL && !_LOCORE */
 

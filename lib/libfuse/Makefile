@@ -1,10 +1,11 @@
-#	$OpenBSD: Makefile,v 1.17 2018/11/28 21:19:11 mpi Exp $
+#	$OpenBSD: Makefile,v 1.20 2026/02/02 09:17:06 helg Exp $
 
 LIB=	fuse
 MAN=	fuse_chan_fd.3 fuse_daemonize.3 fuse_destroy.3 fuse_get_context.3 \
 	fuse_get_session.3 fuse_loop.3 fuse_main.3 fuse_mount.3 fuse_new.3 \
 	fuse_opt.3 fuse_parse_cmdline.3 fuse_set_signal_handlers.3 \
-	fuse_setup.3 fuse_teardown.3 fuse_version.3
+	fuse_setup.3 fuse_teardown.3 fuse_version.3 fuse_session_loop.3 \
+	fuse_lowlevel_new.3 fuse_reply_err.3
 
 CFLAGS+=	-Wall -Wshadow -Wmissing-prototypes
 CFLAGS+=	-Wstrict-prototypes -Wsign-compare
@@ -14,11 +15,11 @@ CDIAGFLAGS+=	-Wmissing-prototypes -Wstrict-prototypes -Wmissing-declarations
 CDIAGFLAGS+=	-Wwrite-strings -Wshadow -Wpointer-arith -Wsign-compare
 CDIAGFLAGS+=	-Wundef -Wbad-function-cast -Winline -Wcast-align
 
-# XXX Shouldn't we use a common fuse.h with proper ifdef _KERNEL part?
 CFLAGS+=	-I${.CURDIR}
 
-SRCS=	debug.c dict.c fuse.c fuse_ops.c fuse_opt.c fuse_subr.c tree.c
-HDRS=	fuse.h fuse_opt.h
+SRCS=	debug.c dict.c fuse.c fuse_ops.c fuse_opt.c fuse_subr.c tree.c \
+	fuse_chan.c fuse_session.c fuse_lowlevel.c
+HDRS=	fuse.h fuse_opt.h fuse_common.h fuse_lowlevel.h
 
 VERSION_SCRIPT=	${.CURDIR}/Symbols.map
 
@@ -26,10 +27,12 @@ PC_FILES=fuse.pc
 CLEANFILES+=${PC_FILES}
 
 includes:
+	${INSTALL} -d -o ${BINOWN} -g ${BINGRP} -m 755 \
+	    ${DESTDIR}/usr/include/fuse
 	@cd ${.CURDIR}; for i in ${HDRS}; do \
-		j="cmp -s $$i ${DESTDIR}/usr/include/$$i || \
+		j="cmp -s $$i ${DESTDIR}/usr/include/fuse/$$i || \
 		    ${INSTALL} ${INSTALL_COPY} -o ${BINOWN} -g ${BINGRP} -m 444 \
-	            $$i ${DESTDIR}/usr/include"; \
+	            $$i ${DESTDIR}/usr/include/fuse"; \
 	        echo $$j; \
 	        eval "$$j"; \
 	done

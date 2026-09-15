@@ -12,29 +12,6 @@ use warnings;
 use feature 'try';
 
 {
-    my $warnings;
-    BEGIN { $SIG{__WARN__} = sub { $warnings .= shift; }; }
-
-    my $x;
-    my ($ltry, $lcatch) = (__LINE__+1, __LINE__+4);
-    try {
-        $x .= "try";
-    }
-    catch ($e) {
-        $x .= "catch";
-    }
-    is($x, "try", 'successful try/catch runs try but not catch');
-
-    is($warnings, "try/catch is experimental at $0 line $ltry.\n" .
-                  "try/catch is experimental at $0 line $lcatch.\n",
-        'compiletime warnings');
-    BEGIN { undef $SIG{__WARN__}; }
-}
-
-
-no warnings 'experimental::try';
-
-{
     my $x;
     try {
         $x .= "try";
@@ -265,6 +242,9 @@ no warnings 'experimental::try';
     is($scalar, "result", 'do { try/catch } with multiple statements');
 }
 
+my $program = $0;
+$program =~ s/\.dp$//; # running under 'cd t; ./TEST -deparse'
+
 # try{} blocks should be invisible to caller()
 {
     my $caller;
@@ -278,10 +258,34 @@ no warnings 'experimental::try';
     my $LINE = __LINE__+1;
     B();
 
-    is($caller, "main::B ($0 line $LINE)", 'try {} block is invisible to caller()');
+    is($caller, "main::B ($program line $LINE)", 'try {} block is invisible to caller()');
 }
 
 # try/catch/finally
+
+# experimental warnings
+{
+    my $warnings;
+    BEGIN { $SIG{__WARN__} = sub { $warnings .= shift; }; }
+
+    my $lfinally = __LINE__; $lfinally += 7;
+    try {
+        1;  # empty line to make line numbers match when being deparsed
+    }
+    catch ($e) {
+        1;  # empty line to make line numbers match when being deparsed
+    }
+    finally {
+        1;  # empty line to make line numbers match when being deparsed
+    }
+
+    is($warnings, "try/catch/finally is experimental at $program line $lfinally.\n",
+        'compiletime warnings');
+    BEGIN { undef $SIG{__WARN__}; }
+}
+
+no warnings 'experimental::try';
+
 {
     my $x;
     try {
@@ -324,6 +328,25 @@ no warnings 'experimental::try';
     }
     is(ff(), "return inside try+finally", 'return inside try+finally');
     ok($finally_invoked, 'finally block still invoked for side-effects');
+}
+
+# Variant of GH#23604
+{
+    my $ok;
+    try {
+        # nothing
+    }
+    catch ($e) {}
+    finally {
+        try {
+            die "Ignore this error\n"
+        }
+        catch ($e) {}
+
+        $ok = "ok";
+    }
+
+    is($ok, "ok", 'try{die} inside try/finally does not stop runloop');
 }
 
 # Nicer compiletime errors

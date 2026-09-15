@@ -1,4 +1,4 @@
-/*	$OpenBSD: findfp.c,v 1.20 2021/11/29 03:20:37 deraadt Exp $ */
+/*	$OpenBSD: findfp.c,v 1.24 2025/08/19 02:34:31 jsg Exp $ */
 /*-
  * Copyright (c) 1990, 1993
  *	The Regents of the University of California.  All rights reserved.
@@ -32,11 +32,13 @@
  */
 
 #include <sys/param.h>	/* ALIGN ALIGNBYTES */
-#include <unistd.h>
-#include <stdio.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
 #include "local.h"
 #include "glue.h"
 #include "thread_private.h"
@@ -45,53 +47,44 @@ int	__sdidinit;
 
 #define	NDYNAMIC 10		/* add ten more whenever necessary */
 
-#define	std(flags, file) \
-	{0,0,0,flags,file,{0},0,__sF+file,__sclose,__sread,__sseek,__swrite, \
-	 {(unsigned char *)(__sFext+file), 0}}
-/*	 p r w flags file _bf z  cookie      close    read    seek    write 
-	 ext */
+
+#define	std(flags, file, cookie) \
+	{ ._flags = (flags), ._file = (file), ._cookie = (cookie), \
+	  ._close = __sclose, ._read = __sread, ._seek = __sseek, \
+	  ._write = __swrite, ._lock = __RCMTX_INITIALIZER() }
 
 				/* the usual - (stdin + stdout + stderr) */
 static FILE usual[FOPEN_MAX - 3];
-static struct __sfileext usualext[FOPEN_MAX - 3];
 static struct glue uglue = { 0, FOPEN_MAX - 3, usual };
 static struct glue *lastglue = &uglue;
 static void *sfp_mutex;
 
-static struct __sfileext __sFext[3];
-FILE __sF[3] = {
-	std(__SRD, STDIN_FILENO),		/* stdin */
-	std(__SWR, STDOUT_FILENO),		/* stdout */
-	std(__SWR|__SNBF, STDERR_FILENO)	/* stderr */
-};
-struct glue __sglue = { &uglue, 3, __sF };
+/*
+ * These are separate variables because they may end up copied
+ * into program images via COPY relocations, so their addresses
+ * won't be related.  That also means they need separate glue :(
+ */
+FILE __stdin[1]  = { std(__SRD,         STDIN_FILENO, __stdin) };
+FILE __stdout[1] = { std(__SWR,        STDOUT_FILENO, __stdout) };
+FILE __stderr[1] = { std(__SWR|__SNBF, STDERR_FILENO, __stderr) };
+
+static struct glue sglue2 = { &uglue, 1, __stderr };
+static struct glue sglue1 = { &sglue2, 1, __stdout };
+struct glue __sglue = { &sglue1, 1, __stdin };
 
 static struct glue *
 moreglue(int n)
 {
 	struct glue *g;
-	FILE *p;
-	struct __sfileext *pext;
-	static FILE empty;
 	char *data;
 
-	data = malloc(sizeof(*g) + ALIGNBYTES + n * sizeof(FILE)
-	    + n * sizeof(struct __sfileext));
+	data = calloc(1, sizeof(*g) + ALIGNBYTES + n * sizeof(FILE));
 	if (data == NULL)
 		return (NULL);
 	g = (struct glue *)data;
-	p = (FILE *)ALIGN(data + sizeof(*g));
-	pext = (struct __sfileext *)
-	    (ALIGN(data + sizeof(*g)) + n * sizeof(FILE));
 	g->next = NULL;
 	g->niobs = n;
-	g->iobs = p;
-	while (--n >= 0) {
-		*p = empty;
-		_FILEEXT_SETUP(p, pext);
-		p++;
-		pext++;
-	}
+	g->iobs = (FILE *)ALIGN(data + sizeof(*g));
 	return (g);
 }
 
@@ -126,17 +119,16 @@ __sfp(void)
 found:
 	fp->_flags = 1;		/* reserve this slot; caller sets real flags */
 	_MUTEX_UNLOCK(&sfp_mutex);
-	fp->_p = NULL;		/* no current pointer */
-	fp->_w = 0;		/* nothing to read or write */
-	fp->_r = 0;
-	fp->_bf._base = NULL;	/* no buffer */
-	fp->_bf._size = 0;
-	fp->_lbfsize = 0;	/* not line buffered */
+
+	/* make sure this next memset covers everything but _flags */
+	extern char _ctassert[(offsetof(FILE, _flags) == 0) ? 1 : -1 ]
+	    __attribute__((__unused__));
+
+	memset((char *)fp + sizeof fp->_flags, 0, sizeof *fp -
+	    sizeof fp->_flags);
 	fp->_file = -1;		/* no file */
-/*	fp->_cookie = <any>; */	/* caller sets cookie, _read/_write etc */
-	fp->_lb._base = NULL;	/* no line buffer */
-	fp->_lb._size = 0;
-	_FILEEXT_INIT(fp);
+	__rcmtx_init(&fp->_lock);
+
 	return (fp);
 }
 
@@ -162,14 +154,11 @@ void
 __sinit(void)
 {
 	static void *sinit_mutex;
-	int i;
 
 	_MUTEX_LOCK(&sinit_mutex);
 	if (__sdidinit)
 		goto out;	/* bail out if caller lost the race */
-	for (i = 0; i < FOPEN_MAX - 3; i++) {
-		_FILEEXT_SETUP(usual+i, usualext+i);
-	}
+
 	/* make sure we clean up on exit */
 	__atexit_register_cleanup(_cleanup); /* conservative */
 	__sdidinit = 1;

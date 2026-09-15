@@ -1,4 +1,4 @@
-/*	$OpenBSD: cmd.c,v 1.2 2023/10/20 19:58:16 kn Exp $	*/
+/*	$OpenBSD: cmd.c,v 1.4 2025/08/22 20:05:31 gkoehler Exp $	*/
 
 /*
  * Copyright (c) 1997-1999 Michael Shalayeff
@@ -252,7 +252,7 @@ readline(char *buf, size_t n, int to)
 	struct timeval tv;
 	fd_set fdset;
 	char *p;
-	int timed_out = 0;
+	int c, timed_out = 0;
 #ifdef DEBUG
 	extern int debug;
 #endif
@@ -271,6 +271,10 @@ readline(char *buf, size_t n, int to)
 		tv.tv_usec = 0;
 		if (select(STDIN_FILENO + 1, &fdset, NULL, NULL, &tv) == 0)
 			timed_out = 1;
+		else if ((c = getchar()) != EOF) {
+			putchar(c);		/* Echo. */
+			ungetc(c, stdin);
+		}
 
 		/* Restore canonical mode. */
 		tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio);
@@ -499,11 +503,12 @@ upgrade(void)
 	path = disk_open(qualify("/bsd.upgrade"));
 	if (path == NULL)
 		return 0;
-	if (stat(path, &sb) == 0 && S_ISREG(sb.st_mode))
+	if (stat(path, &sb) == 0 && S_ISREG(sb.st_mode)) {
 		ret = 1;
-	if ((sb.st_mode & S_IXUSR) == 0) {
-		printf("/bsd.upgrade is not u+x\n");
-		ret = 0;
+		if ((sb.st_mode & S_IXUSR) == 0) {
+			printf("/bsd.upgrade is not u+x\n");
+			ret = 0;
+		}
 	}
 	disk_close();
 

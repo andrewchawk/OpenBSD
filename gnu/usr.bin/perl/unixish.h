@@ -15,8 +15,6 @@
  * here.
  */
 
-#ifndef PERL_MICRO
-
 /* HAS_IOCTL:
  *	This symbol, if defined, indicates that the ioctl() routine is
  *	available to set I/O characteristics
@@ -46,8 +44,6 @@
 #define HAS_KILL
 #define HAS_WAIT
 
-#endif /* !PERL_MICRO */
-  
 /* USEMYBINMODE
  *	This symbol, if defined, indicates that the program should
  *	use the routine my_binmode(FILE *fp, char iotype) to insure
@@ -159,10 +155,10 @@ int afstat(int fd, struct stat *statb);
  * to work, but must NOT be retained in production code. */
 #ifndef PERL_SYS_TERM_BODY
 #  define PERL_SYS_TERM_BODY()                                          \
-                    ENV_TERM; USER_PROP_MUTEX_TERM; LOCALE_TERM;        \
-                    HINTS_REFCNT_TERM; KEYWORD_PLUGIN_MUTEX_TERM;       \
-                    OP_CHECK_MUTEX_TERM; OP_REFCNT_TERM;                \
-                    PERLIO_TERM; MALLOC_TERM;                           \
+                    SHUTDOWN_TERM; ENV_TERM; USER_PROP_MUTEX_TERM;      \
+                    LOCALE_TERM; HINTS_REFCNT_TERM;                     \
+                    KEYWORD_PLUGIN_MUTEX_TERM; OP_CHECK_MUTEX_TERM;     \
+                    OP_REFCNT_TERM; PERLIO_TERM; MALLOC_TERM;           \
                     PLATFORM_SYS_TERM_;
 #endif
 

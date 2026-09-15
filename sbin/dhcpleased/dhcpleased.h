@@ -1,4 +1,4 @@
-/*	$OpenBSD: dhcpleased.h,v 1.16 2024/01/26 21:14:08 jan Exp $	*/
+/*	$OpenBSD: dhcpleased.h,v 1.21 2026/06/15 17:09:29 florian Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021 Florian Obser <florian@openbsd.org>
@@ -158,7 +158,6 @@
 
 #define	MAX_SERVERS	16	/* max servers that can be ignored per if */
 
-#define	IMSG_DATA_SIZE(imsg)	((imsg).hdr.len - IMSG_HEADER_SIZE)
 #define	DHCP_SNAME_LEN		64
 #define	DHCP_FILE_LEN		128
 
@@ -241,7 +240,7 @@ struct ctl_engine_info {
 	struct in_addr		requested_ip;
 	struct in_addr		mask;
 	struct dhcp_route	routes[MAX_DHCP_ROUTES];
-	int			routes_len;
+	uint32_t		routes_len;
 	struct in_addr		nameservers[MAX_RDNS_COUNT];
 	uint32_t		lease_time;
 	uint32_t		renewal_time;
@@ -252,9 +251,9 @@ struct iface_conf {
 	SIMPLEQ_ENTRY(iface_conf)	 entry;
 	char				 name[IF_NAMESIZE];
 	uint8_t				*vc_id;
-	int				 vc_id_len;
+	size_t				 vc_id_len;
 	uint8_t				*c_id;
-	int				 c_id_len;
+	size_t				 c_id_len;
 	char				*h_name;
 	int				 ignore;
 	struct in_addr			 ignore_servers[MAX_SERVERS];
@@ -268,8 +267,18 @@ struct dhcpleased_conf {
 
 #endif	/* SMALL */
 
+/* keep in sync with iface_conf */
+struct imsg_iface_conf {
+	char				 name[IF_NAMESIZE];
+	int				 ignore;
+	struct in_addr			 ignore_servers[MAX_SERVERS];
+	int				 ignore_servers_len;
+	int				 prefer_ipv6;
+};
+
 struct imsg_ifinfo {
 	uint32_t		if_index;
+	char			if_name[IF_NAMESIZE];
 	int			rdomain;
 	int			running;
 	int			link_state;
@@ -280,7 +289,7 @@ struct imsg_ifinfo {
 struct imsg_propose_rdns {
 	uint32_t		if_index;
 	int			rdomain;
-	int			rdns_count;
+	size_t			rdns_count;
 	struct in_addr		rdns[MAX_RDNS_COUNT];
 };
 
@@ -304,12 +313,14 @@ struct imsg_req_dhcp {
 void			 imsg_event_add(struct imsgev *);
 int			 imsg_compose_event(struct imsgev *, uint16_t, uint32_t,
 			     pid_t, int, void *, uint16_t);
+int			 imsg_forward_event(struct imsgev *, struct imsg *);
 #ifndef	SMALL
 void			 config_clear(struct dhcpleased_conf *);
 struct dhcpleased_conf	*config_new_empty(void);
 void			 merge_config(struct dhcpleased_conf *, struct
 			     dhcpleased_conf *);
 const char	*sin_to_str(struct sockaddr_in *);
+const char	*i2s(uint32_t);
 
 /* frontend.c */
 struct iface_conf	*find_iface_conf(struct iface_conf_head *, char *);
@@ -323,6 +334,7 @@ void	print_config(struct dhcpleased_conf *);
 struct dhcpleased_conf	*parse_config(const char *);
 int			 cmdline_symset(char *);
 #else
-#define	sin_to_str(x...)	""
+#define	sin_to_str(x)	""
+#define	i2s(x)		""
 #endif	/* SMALL */
 

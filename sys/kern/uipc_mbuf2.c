@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_mbuf2.c,v 1.45 2020/12/12 11:48:54 jan Exp $	*/
+/*	$OpenBSD: uipc_mbuf2.c,v 1.50 2025/06/25 20:26:32 miod Exp $	*/
 /*	$KAME: uipc_mbuf2.c,v 1.29 2001/02/14 13:42:10 itojun Exp $	*/
 /*	$NetBSD: uipc_mbuf.c,v 1.40 1999/04/01 00:23:25 thorpej Exp $	*/
 
@@ -66,6 +66,7 @@
 #include <sys/systm.h>
 #include <sys/malloc.h>
 #include <sys/pool.h>
+#include <sys/percpu.h>
 #include <sys/mbuf.h>
 
 extern struct pool mtagpool;
@@ -117,6 +118,7 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 	if (len <= n->m_len - off) {
 		struct mbuf *mlast;
 
+		mbstat_inc(mbs_pulldown_alloc);
 		o = m_dup1(n, off, n->m_len - off, M_DONTWAIT);
 		if (o == NULL) {
 			m_freem(m);
@@ -158,6 +160,7 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 	 */
 	if ((off == 0 || offp) && m_trailingspace(n) >= tlen &&
 	    !sharedcluster) {
+		mbstat_inc(mbs_pulldown_copy);
 		m_copydata(n->m_next, 0, tlen, mtod(n, caddr_t) + n->m_len);
 		n->m_len += tlen;
 		m_adj(n->m_next, tlen);
@@ -167,7 +170,8 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 	    !sharedcluster && n->m_next->m_len >= tlen) {
 		n->m_next->m_data -= hlen;
 		n->m_next->m_len += hlen;
-		memmove(mtod(n->m_next, caddr_t), mtod(n, caddr_t) + off, hlen);
+		mbstat_inc(mbs_pulldown_copy);
+		memcpy(mtod(n->m_next, caddr_t), mtod(n, caddr_t) + off, hlen);
 		n->m_len -= hlen;
 		n = n->m_next;
 		off = 0;
@@ -182,6 +186,7 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 		m_freem(m);
 		return (NULL);
 	}
+	mbstat_inc(mbs_pulldown_alloc);
 	MGET(o, M_DONTWAIT, m->m_type);
 	if (o && len > MLEN) {
 		MCLGETL(o, M_DONTWAIT, len);
@@ -196,7 +201,7 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 	}
 	/* get hlen from <n, off> into <o, 0> */
 	o->m_len = hlen;
-	memmove(mtod(o, caddr_t), mtod(n, caddr_t) + off, hlen);
+	memcpy(mtod(o, caddr_t), mtod(n, caddr_t) + off, hlen);
 	n->m_len -= hlen;
 	/* get tlen from <n->m_next, 0> into <o, hlen> */
 	m_copydata(n->m_next, 0, tlen, mtod(o, caddr_t) + o->m_len);
@@ -208,6 +213,7 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 	off = 0;
 
 ok:
+	KASSERT(n->m_len >= off + len);
 	if (offp)
 		*offp = off;
 	return (n);
@@ -365,13 +371,6 @@ m_tag_copy_chain(struct mbuf *to, struct mbuf *from, int wait)
 		to->m_pkthdr.ph_tagsset |= t->m_tag_id;
 	}
 	return (0);
-}
-
-/* Initialize tags on an mbuf. */
-void
-m_tag_init(struct mbuf *m)
-{
-	SLIST_INIT(&m->m_pkthdr.ph_tags);
 }
 
 /* Get first tag in chain. */

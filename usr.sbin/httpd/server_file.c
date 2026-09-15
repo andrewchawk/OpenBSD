@@ -1,4 +1,4 @@
-/*	$OpenBSD: server_file.c,v 1.80 2024/04/29 16:17:46 florian Exp $	*/
+/*	$OpenBSD: server_file.c,v 1.84 2026/07/26 14:46:32 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2017 Reyk Floeter <reyk@openbsd.org>
@@ -41,19 +41,19 @@
 #define MAXIMUM(a, b)	(((a) > (b)) ? (a) : (b))
 
 int		 server_file_access(struct httpd *, struct client *,
-		    char *, size_t);
+    char *, size_t);
 int		 server_file_request(struct httpd *, struct client *,
-		    struct media_type *, int, const struct stat *);
+    struct media_type *, int, const struct stat *);
 int		 server_partial_file_request(struct httpd *, struct client *,
-		    struct media_type *, int, const struct stat *,
-		    char *);
+    struct media_type *, int, const struct stat *,
+    char *);
 int		 server_file_index(struct httpd *, struct client *, int,
-		    struct stat *);
+    struct stat *);
 int		 server_file_modified_since(struct http_descriptor *,
-		    const struct timespec *);
+    const struct timespec *);
 int		 server_file_method(struct client *);
-int		 parse_range_spec(char *, size_t, struct range *);
-int		 parse_ranges(struct client *, char *, size_t);
+int		 parse_range_spec(char *, off_t, struct range *);
+int		 parse_ranges(struct client *, char *, off_t);
 static int	 select_visible(const struct dirent *);
 
 int
@@ -268,8 +268,8 @@ server_file_method(struct client *clt)
 }
 
 int
-server_file_request(struct httpd *env, struct client *clt, struct media_type
-    *media, int fd, const struct stat *st)
+server_file_request(struct httpd *env, struct client *clt,
+    struct media_type *media, int fd, const struct stat *st)
 {
 	struct server_config	*srv_conf = clt->clt_srv_conf;
 	const char		*errstr = NULL;
@@ -281,8 +281,8 @@ server_file_request(struct httpd *env, struct client *clt, struct media_type
 		goto abort;
 	}
 
-	if ((ret = server_file_modified_since(clt->clt_descreq, &st->st_mtim))
-	    != -1) {
+	if ((ret = server_file_modified_since(clt->clt_descreq,
+	    &st->st_mtim)) != -1) {
 		/* send the header without a body */
 		if ((ret = server_response_http(clt, ret, media, -1,
 		    MINIMUM(time(NULL), st->st_mtim.tv_sec))) == -1)
@@ -351,7 +351,8 @@ server_partial_file_request(struct httpd *env, struct client *clt,
 	struct media_type	 multipart_media;
 	struct range_data	*r = &clt->clt_ranges;
 	struct range		*range;
-	size_t			 content_length = 0, bufsiz;
+	off_t			 content_length = 0, range_length;
+	size_t			 bufsiz;
 	int			 code = 500, i, nranges, ret;
 	char			 content_range[64];
 	const char		*errstr = NULL;
@@ -396,12 +397,21 @@ server_partial_file_request(struct httpd *env, struct client *clt,
 				goto abort;
 
 			/* Add data length */
-			content_length += ret + range->end - range->start + 1;
-
+			range_length = range->end - range->start + 1;
+			if (content_length > LLONG_MAX - ret ||
+			    range_length > LLONG_MAX - content_length - ret) {
+				errno = EOVERFLOW;
+				goto abort;
+			}
+			content_length += ret + range_length;
 		}
 		if ((ret = snprintf(NULL, 0, "\r\n--%llu--\r\n",
 		    clt->clt_boundary)) < 0)
 			goto abort;
+		if (content_length > LLONG_MAX - ret) {
+			errno = EOVERFLOW;
+			goto abort;
+		}
 		content_length += ret;
 
 		/* prepare multipart/byteranges media type */
@@ -468,14 +478,14 @@ server_partial_file_request(struct httpd *env, struct client *clt,
 }
 
 /* ignore hidden files starting with a dot */
-static int 
+static int
 select_visible(const struct dirent *dp)
 {
-    if (dp->d_name[0] == '.' &&
-	!(dp->d_name[1] == '.' && dp->d_name[2] == '\0'))
-	    return 0;
-    else
-	    return 1;
+	if (dp->d_name[0] == '.' &&
+	    !(dp->d_name[1] == '.' && dp->d_name[2] == '\0'))
+		return 0;
+	else
+		return 1;
 }
 
 int
@@ -495,7 +505,7 @@ server_file_index(struct httpd *env, struct client *clt, int fd,
 	char			 *escapeduri, *escapedhtml, *escapedpath;
 	struct tm		  tm;
 	time_t			  t, dir_mtime;
-	char 			  human_size[FMT_SCALED_STRSIZE];
+	char			  human_size[FMT_SCALED_STRSIZE];
 
 	if ((ret = server_file_method(clt)) != 0) {
 		code = ret;
@@ -579,19 +589,19 @@ server_file_index(struct httpd *env, struct client *clt, int fd,
 			    "<td><a href=\"%s%s/\">%s/</a></td>\n"
 			    "    <td data-o=\"%lld\">%s</td><td>%s</td></tr>\n",
 			    strchr(escapeduri, ':') != NULL ? "./" : "",
-			    escapeduri, escapedhtml, 
+			    escapeduri, escapedhtml,
 			    (long long)t, tmstr, "-") == -1)
 				skip = 1;
 		} else if (S_ISREG(subst.st_mode)) {
 			if ((fmt_scaled(subst.st_size, human_size) != 0) ||
-			   (evbuffer_add_printf(evb,
-			    "<tr><td><a href=\"%s%s\">%s</a></td>\n"
-			    "    <td data-o=\"%lld\">%s</td>"
-			    "<td title=\"%llu\">%s</td></tr>\n",
-			    strchr(escapeduri, ':') != NULL ? "./" : "",
-			    escapeduri, escapedhtml,
-			    (long long)t, tmstr, 
-			    subst.st_size, human_size) == -1))
+			    (evbuffer_add_printf(evb,
+			     "<tr><td><a href=\"%s%s\">%s</a></td>\n"
+			     "    <td data-o=\"%lld\">%s</td>"
+			     "<td title=\"%llu\">%s</td></tr>\n",
+			     strchr(escapeduri, ':') != NULL ? "./" : "",
+			     escapeduri, escapedhtml,
+			     (long long)t, tmstr,
+			     subst.st_size, human_size) == -1))
 				skip = 1;
 		}
 		free(escapeduri);
@@ -713,11 +723,12 @@ server_file_error(struct bufferevent *bev, short error, void *arg)
 }
 
 int
-server_file_modified_since(struct http_descriptor *desc, const struct timespec
-    *mtim)
+server_file_modified_since(struct http_descriptor *desc,
+    const struct timespec *mtim)
 {
 	struct kv	 key, *since;
 	struct tm	 tm;
+	time_t		 t;
 
 	key.kv_key = "If-Modified-Since";
 	if ((since = kv_find(&desc->http_headers, &key)) != NULL &&
@@ -729,8 +740,12 @@ server_file_modified_since(struct http_descriptor *desc, const struct timespec
 		 * the requested time.
 		 */
 		if (strptime(since->kv_value,
-		    "%a, %d %h %Y %T %Z", &tm) != NULL &&
-		    timegm(&tm) >= mtim->tv_sec)
+		    "%a, %d %h %Y %T %Z", &tm) == NULL)
+			return (-1);
+		tm.tm_wday = -1;	/* sentinel for error */
+		if ((t = timegm(&tm)) == -1 && tm.tm_wday == -1)
+			return (-1);
+		if (t >= mtim->tv_sec)
 			return (304);
 	}
 
@@ -738,7 +753,7 @@ server_file_modified_since(struct http_descriptor *desc, const struct timespec
 }
 
 int
-parse_ranges(struct client *clt, char *str, size_t file_sz)
+parse_ranges(struct client *clt, char *str, off_t file_sz)
 {
 	int			 i = 0;
 	char			*p, *q;
@@ -778,9 +793,10 @@ parse_ranges(struct client *clt, char *str, size_t file_sz)
 }
 
 int
-parse_range_spec(char *str, size_t size, struct range *r)
+parse_range_spec(char *str, off_t size, struct range *r)
 {
 	size_t		 start_str_len, end_str_len;
+	off_t		 value;
 	char		*p, *start_str, *end_str;
 	const char	*errstr;
 
@@ -797,27 +813,41 @@ parse_range_spec(char *str, size_t size, struct range *r)
 	if ((start_str_len == 0) && (end_str_len == 0))
 		return (0);
 
-	if (end_str_len) {
-		r->end = strtonum(end_str, 0, LLONG_MAX, &errstr);
-		if (errstr)
-			return (0);
+	if (size == 0)
+		return (0);
 
-		if ((size_t)r->end >= size)
+	if (start_str_len == 0) {
+		if (*end_str < '0' || *end_str > '9')
+			return (0);
+		value = strtonum(end_str, 0, size, &errstr);
+		if (errstr != NULL && errno != ERANGE)
+			return (0);
+		if (errstr != NULL)
+			r->start = 0;
+		else if (value == 0)
+			return (0);
+		else
+			r->start = size - value;
+		r->end = size - 1;
+		return (1);
+	}
+
+	if (*start_str < '0' || *start_str > '9')
+		return (0);
+	r->start = strtonum(start_str, 0, size - 1, &errstr);
+	if (errstr != NULL)
+		return (0);
+
+	if (end_str_len) {
+		if (*end_str < '0' || *end_str > '9')
+			return (0);
+		r->end = strtonum(end_str, 0, size - 1, &errstr);
+		if (errstr != NULL && errno != ERANGE)
+			return (0);
+		if (errstr != NULL)
 			r->end = size - 1;
 	} else
 		r->end = size - 1;
-
-	if (start_str_len) {
-		r->start = strtonum(start_str, 0, LLONG_MAX, &errstr);
-		if (errstr)
-			return (0);
-
-		if ((size_t)r->start >= size)
-			return (0);
-	} else {
-		r->start = size - r->end;
-		r->end = size - 1;
-	}
 
 	if (r->end < r->start)
 		return (0);

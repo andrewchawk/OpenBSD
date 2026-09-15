@@ -1,4 +1,4 @@
-/*	$OpenBSD: spl.c,v 1.3 2024/05/15 14:43:32 claudio Exp $ */
+/*	$OpenBSD: spl.c,v 1.20 2026/09/03 17:19:30 tb Exp $ */
 /*
  * Copyright (c) 2024 Job Snijders <job@fastly.com>
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
@@ -32,46 +32,14 @@
 #include <openssl/x509v3.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*spl_oid;
+#include "rpki-asn1.h"
 
 /*
- * Types and templates for the SPL eContent.
+ * SPL eContent definition in draft-ietf-sidrops-rpki-prefixlist-04, section 3.
  */
 
-ASN1_ITEM_EXP AddressFamilyPrefixes_it;
 ASN1_ITEM_EXP SignedPrefixList_it;
-
-DECLARE_STACK_OF(ASN1_BIT_STRING);
-
-typedef struct {
-	ASN1_OCTET_STRING		*addressFamily;
-	STACK_OF(ASN1_BIT_STRING)	*addressPrefixes;
-} AddressFamilyPrefixes;
-
-DECLARE_STACK_OF(AddressFamilyPrefixes);
-
-ASN1_SEQUENCE(AddressFamilyPrefixes) = {
-	ASN1_SIMPLE(AddressFamilyPrefixes, addressFamily, ASN1_OCTET_STRING),
-	ASN1_SEQUENCE_OF(AddressFamilyPrefixes, addressPrefixes,
-	    ASN1_BIT_STRING),
-} ASN1_SEQUENCE_END(AddressFamilyPrefixes);
-
-#ifndef DEFINE_STACK_OF
-#define sk_ASN1_BIT_STRING_num(st)	SKM_sk_num(ASN1_BIT_STRING, (st))
-#define sk_ASN1_BIT_STRING_value(st, i)	SKM_sk_value(ASN1_BIT_STRING, (st), (i))
-
-#define sk_AddressFamilyPrefixes_num(st)	\
-    SKM_sk_num(AddressFamilyPrefixes, (st))
-#define sk_AddressFamilyPrefixes_value(st, i)	\
-    SKM_sk_value(AddressFamilyPrefixes, (st), (i))
-#endif
-
-typedef struct {
-	ASN1_INTEGER			*version;
-	ASN1_INTEGER			*asid;
-	STACK_OF(AddressFamilyPrefixes)	*prefixBlocks;
-} SignedPrefixList;
+ASN1_ITEM_EXP AddressFamilyPrefixes_it;
 
 ASN1_SEQUENCE(SignedPrefixList) = {
 	ASN1_EXP_OPT(SignedPrefixList, version, ASN1_INTEGER, 0),
@@ -79,8 +47,13 @@ ASN1_SEQUENCE(SignedPrefixList) = {
 	ASN1_SEQUENCE_OF(SignedPrefixList, prefixBlocks, AddressFamilyPrefixes)
 } ASN1_SEQUENCE_END(SignedPrefixList);
 
-DECLARE_ASN1_FUNCTIONS(SignedPrefixList);
 IMPLEMENT_ASN1_FUNCTIONS(SignedPrefixList);
+
+ASN1_SEQUENCE(AddressFamilyPrefixes) = {
+	ASN1_SIMPLE(AddressFamilyPrefixes, addressFamily, ASN1_OCTET_STRING),
+	ASN1_SEQUENCE_OF(AddressFamilyPrefixes, addressPrefixes,
+	    ASN1_BIT_STRING),
+} ASN1_SEQUENCE_END(AddressFamilyPrefixes);
 
 /*
  * Comparator to help sorting elements in SPL prefixBlocks and VSPs.
@@ -125,15 +98,16 @@ prefix_cmp(enum afi afi, const struct ip_addr *a, const struct ip_addr *b)
  * Returns zero on failure, non-zero on success.
  */
 static int
-spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
+spl_parse_econtent(const char *fn, void *obj, const unsigned char *d,
     size_t dsz)
 {
+	struct spl			*spl = obj;
 	const unsigned char		*oder;
 	SignedPrefixList		*spl_asn1;
 	const AddressFamilyPrefixes	*afp;
 	const STACK_OF(ASN1_BIT_STRING)	*prefixes;
 	const ASN1_BIT_STRING		*prefix_asn1;
-	int				 afpsz, prefixesz;
+	int				 num_afps, num_prefixes;
 	enum afi			 afi;
 	struct ip_addr			 ip_addr;
 	struct spl_pfx			*prefix;
@@ -142,8 +116,7 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 
 	oder = d;
 	if ((spl_asn1 = d2i_SignedPrefixList(NULL, &d, dsz)) == NULL) {
-		warnx("%s: RFC 6482 section 3: failed to parse "
-		    "SignedPrefixList", fn);
+		warnx("%s: failed to parse SignedPrefixList", fn);
 		goto out;
 	}
 	if (d != oder + dsz) {
@@ -160,25 +133,25 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 		goto out;
 	}
 
-	afpsz = sk_AddressFamilyPrefixes_num(spl_asn1->prefixBlocks);
-	if (afpsz < 0 || afpsz > 2) {
+	num_afps = sk_AddressFamilyPrefixes_num(spl_asn1->prefixBlocks);
+	if (num_afps < 0 || num_afps > 2) {
 		warnx("%s: unexpected number of AddressFamilyAddressPrefixes"
-		    "(got %d, expected 0, 1, or 2)", fn, afpsz);
+		    "(got %d, expected 0, 1, or 2)", fn, num_afps);
 		goto out;
 	}
 
-	for (i = 0; i < afpsz; i++) {
+	for (i = 0; i < num_afps; i++) {
 		struct ip_addr *prev_ip_addr = NULL;
 
 		afp = sk_AddressFamilyPrefixes_value(spl_asn1->prefixBlocks, i);
 		prefixes = afp->addressPrefixes;
-		prefixesz = sk_ASN1_BIT_STRING_num(afp->addressPrefixes);
+		num_prefixes = sk_ASN1_BIT_STRING_num(afp->addressPrefixes);
 
-		if (prefixesz == 0) {
+		if (num_prefixes == 0) {
 			warnx("%s: empty AddressFamilyAddressPrefixes", fn);
 			goto out;
 		}
-		if (spl->pfxsz + prefixesz >= MAX_IP_SIZE) {
+		if (spl->num_prefixes + num_prefixes >= MAX_IP_SIZE) {
 			warnx("%s: too many addressPrefixes entries", fn);
 			goto out;
 		}
@@ -207,12 +180,12 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 			}
 		}
 
-		spl->pfxs = recallocarray(spl->pfxs, spl->pfxsz,
-		    spl->pfxsz + prefixesz, sizeof(struct spl_pfx));
-		if (spl->pfxs == NULL)
+		spl->prefixes = recallocarray(spl->prefixes, spl->num_prefixes,
+		    spl->num_prefixes + num_prefixes, sizeof(spl->prefixes[0]));
+		if (spl->prefixes == NULL)
 			err(1, NULL);
 
-		for (j = 0; j < prefixesz; j++) {
+		for (j = 0; j < num_prefixes; j++) {
 			prefix_asn1 = sk_ASN1_BIT_STRING_value(prefixes, j);
 
 			if (!ip_addr_parse(prefix_asn1, afi, fn, &ip_addr))
@@ -224,7 +197,7 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 				goto out;
 			}
 
-			prefix = &spl->pfxs[spl->pfxsz++];
+			prefix = &spl->prefixes[spl->num_prefixes++];
 			prefix->prefix = ip_addr;
 			prefix->afi = afi;
 			prev_ip_addr = &prefix->prefix;
@@ -237,87 +210,77 @@ spl_parse_econtent(const char *fn, struct spl *spl, const unsigned char *d,
 	return rc;
 }
 
-/*
- * Parse a full Signed Prefix List file.
- * Returns the SPL, or NULL if the object was malformed.
- */
-struct spl *
-spl_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
-    size_t len)
+static int
+spl_cert_info(const char *fn, void *obj, const struct cert *cert)
 {
-	struct spl	*spl;
-	size_t		 cmsz;
-	unsigned char	*cms;
-	struct cert	*cert = NULL;
-	time_t		 signtime = 0;
-	int		 rc = 0;
+	if (x509_any_inherits(cert->x509)) {
+		warnx("%s: inherit elements not allowed in EE cert", fn);
+		return 0;
+	}
 
-	cms = cms_parse_validate(x509, fn, der, len, spl_oid, &cmsz, &signtime);
-	if (cms == NULL)
-		return NULL;
+	if (cert->num_ases == 0) {
+		warnx("%s: AS Resources extension missing", fn);
+		return 0;
+	}
+
+	if (cert->num_ips > 0) {
+		warnx("%s: superfluous IP Resources extension present", fn);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int
+spl_validate(const char *fn, void *obj, struct cert *cert)
+{
+	struct spl *spl = obj;
+
+	spl->valid = valid_spl(fn, cert, spl);
+
+	return 1; /* XXX */
+}
+
+static const ASN1_OBJECT *
+spl_obj_oid(void)
+{
+	return spl_oid;
+}
+
+static void *
+spl_obj_new(size_t der_len, time_t signtime)
+{
+	struct spl *spl;
 
 	if ((spl = calloc(1, sizeof(*spl))) == NULL)
 		err(1, NULL);
 	spl->signtime = signtime;
 
-	if (!x509_get_aia(*x509, fn, &spl->aia))
-		goto out;
-	if (!x509_get_aki(*x509, fn, &spl->aki))
-		goto out;
-	if (!x509_get_sia(*x509, fn, &spl->sia))
-		goto out;
-	if (!x509_get_ski(*x509, fn, &spl->ski))
-		goto out;
-	if (spl->aia == NULL || spl->aki == NULL || spl->sia == NULL ||
-	    spl->ski == NULL) {
-		warnx("%s: RFC 6487 section 4.8: "
-		    "missing AIA, AKI, SIA, or SKI X509 extension", fn);
-		goto out;
-	}
-
-	if (!x509_get_notbefore(*x509, fn, &spl->notbefore))
-		goto out;
-	if (!x509_get_notafter(*x509, fn, &spl->notafter))
-		goto out;
-
-	if (!spl_parse_econtent(fn, spl, cms, cmsz))
-		goto out;
-
-	if (x509_any_inherits(*x509)) {
-		warnx("%s: inherit elements not allowed in EE cert", fn);
-		goto out;
-	}
-
-	if ((cert = cert_parse_ee_cert(fn, talid, *x509)) == NULL)
-		goto out;
-
-	if (cert->asz == 0) {
-		warnx("%s: AS Resources extension missing", fn);
-		goto out;
-	}
-
-	if (cert->ipsz > 0) {
-		warnx("%s: superfluous IP Resources extension present", fn);
-		goto out;
-	}
-
-	/*
-	 * If the SPL isn't valid, we accept it anyway and depend upon
-	 * the code around spl_read() to check the "valid" field itself.
-	 */
-	spl->valid = valid_spl(fn, cert, spl);
-
-	rc = 1;
- out:
-	if (rc == 0) {
-		spl_free(spl);
-		spl = NULL;
-		X509_free(*x509);
-		*x509 = NULL;
-	}
-	cert_free(cert);
-	free(cms);
 	return spl;
+}
+
+static void
+spl_obj_free(void *obj)
+{
+	spl_free(obj);
+}
+
+static const struct signed_obj spl_signed_obj = {
+	.rtype = RTYPE_SPL,
+
+	.new = spl_obj_new,
+	.free = spl_obj_free,
+	.cert_info = spl_cert_info,
+	.parse_econtent = spl_parse_econtent,
+	.validate = spl_validate,
+
+	.oid = spl_obj_oid,
+};
+
+const struct signed_obj *
+spl_obj(void)
+{
+	return &spl_signed_obj;
 }
 
 void
@@ -326,11 +289,7 @@ spl_free(struct spl *s)
 	if (s == NULL)
 		return;
 
-	free(s->aia);
-	free(s->aki);
-	free(s->sia);
-	free(s->ski);
-	free(s->pfxs);
+	free(s->prefixes);
 	free(s);
 }
 
@@ -344,14 +303,11 @@ spl_buffer(struct ibuf *b, const struct spl *s)
 	io_simple_buffer(b, &s->valid, sizeof(s->valid));
 	io_simple_buffer(b, &s->asid, sizeof(s->asid));
 	io_simple_buffer(b, &s->talid, sizeof(s->talid));
-	io_simple_buffer(b, &s->pfxsz, sizeof(s->pfxsz));
+	io_simple_buffer(b, &s->num_prefixes, sizeof(s->num_prefixes));
 	io_simple_buffer(b, &s->expires, sizeof(s->expires));
 
-	io_simple_buffer(b, s->pfxs, s->pfxsz * sizeof(s->pfxs[0]));
-
-	io_str_buffer(b, s->aia);
-	io_str_buffer(b, s->aki);
-	io_str_buffer(b, s->ski);
+	io_simple_buffer(b, s->prefixes,
+	    s->num_prefixes * sizeof(s->prefixes[0]));
 }
 
 /*
@@ -370,17 +326,16 @@ spl_read(struct ibuf *b)
 	io_read_buf(b, &s->valid, sizeof(s->valid));
 	io_read_buf(b, &s->asid, sizeof(s->asid));
 	io_read_buf(b, &s->talid, sizeof(s->talid));
-	io_read_buf(b, &s->pfxsz, sizeof(s->pfxsz));
+	io_read_buf(b, &s->num_prefixes, sizeof(s->num_prefixes));
 	io_read_buf(b, &s->expires, sizeof(s->expires));
 
-	if ((s->pfxs = calloc(s->pfxsz, sizeof(struct spl_pfx))) == NULL)
-		err(1, NULL);
-	io_read_buf(b, s->pfxs, s->pfxsz * sizeof(s->pfxs[0]));
-
-	io_read_str(b, &s->aia);
-	io_read_str(b, &s->aki);
-	io_read_str(b, &s->ski);
-	assert(s->aia && s->aki && s->ski);
+	if (s->num_prefixes > 0) {
+		if ((s->prefixes = calloc(s->num_prefixes,
+		    sizeof(s->prefixes[0]))) == NULL)
+			err(1, NULL);
+		io_read_buf(b, s->prefixes,
+		    s->num_prefixes * sizeof(s->prefixes[0]));
+	}
 
 	return s;
 }
@@ -399,11 +354,11 @@ spl_pfx_cmp(const struct spl_pfx *a, const struct spl_pfx *b)
 static void
 insert_vsp(struct vsp *vsp, size_t idx, struct spl_pfx *pfx)
 {
-	if (idx < vsp->prefixesz)
+	if (idx < vsp->num_prefixes)
 		memmove(vsp->prefixes + idx + 1, vsp->prefixes + idx,
-		    (vsp->prefixesz - idx) * sizeof(*vsp->prefixes));
+		    (vsp->num_prefixes - idx) * sizeof(vsp->prefixes[0]));
 	vsp->prefixes[idx] = *pfx;
-	vsp->prefixesz++;
+	vsp->num_prefixes++;
 }
 
 /*
@@ -424,8 +379,7 @@ spl_insert_vsps(struct vsp_tree *tree, struct spl *spl, struct repo *rp)
 	vsp->asid = spl->asid;
 	vsp->talid = spl->talid;
 	vsp->expires = spl->expires;
-	if (rp != NULL)
-		vsp->repoid = repo_id(rp);
+	vsp->repoid = repo_id(rp);
 
 	if ((found = RB_INSERT(vsp_tree, tree, vsp)) != NULL) {
 		/* already exists */
@@ -447,7 +401,7 @@ spl_insert_vsps(struct vsp_tree *tree, struct spl *spl, struct repo *rp)
 
 	/* merge content of multiple SPLs */
 	vsp->prefixes = reallocarray(vsp->prefixes,
-	    vsp->prefixesz + spl->pfxsz, sizeof(struct spl_pfx));
+	    vsp->num_prefixes + spl->num_prefixes, sizeof(vsp->prefixes[0]));
 	if (vsp->prefixes == NULL)
 		err(1, NULL);
 
@@ -456,16 +410,17 @@ spl_insert_vsps(struct vsp_tree *tree, struct spl *spl, struct repo *rp)
 	 * all SPL->pfxs, and insert them in the right place in
 	 * vsp->prefixes while keeping the order of the array.
 	 */
-	for (i = 0, j = 0; i < spl->pfxsz; ) {
+	for (i = 0, j = 0; i < spl->num_prefixes; ) {
 		cmp = -1;
-		if (j == vsp->prefixesz ||
-		    (cmp = spl_pfx_cmp(&spl->pfxs[i], &vsp->prefixes[j])) < 0) {
-			insert_vsp(vsp, j, &spl->pfxs[i]);
+		if (j == vsp->num_prefixes ||
+		    (cmp = spl_pfx_cmp(&spl->prefixes[i],
+		     &vsp->prefixes[j])) < 0) {
+			insert_vsp(vsp, j, &spl->prefixes[i]);
 			i++;
 		} else if (cmp == 0)
 			i++;
 
-		if (j < vsp->prefixesz)
+		if (j < vsp->num_prefixes)
 			j++;
 	}
 }

@@ -1,4 +1,4 @@
-.\"	$OpenBSD: dhcp6leased.conf.5,v 1.3 2024/06/03 11:08:31 florian Exp $
+.\"	$OpenBSD: dhcp6leased.conf.5,v 1.6 2025/07/08 14:26:45 schwarze Exp $
 .\"
 .\" Copyright (c) 2018, 2021, 2024 Florian Obser <florian@openbsd.org>
 .\" Copyright (c) 2005 Esben Norby <norby@openbsd.org>
@@ -18,7 +18,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 3 2024 $
+.Dd $Mdocdate: July 8 2025 $
 .Dt DHCP6LEASED.CONF 5
 .Os
 .Sh NAME
@@ -34,27 +34,32 @@ The
 .Nm
 config file is divided into the following main sections:
 .Bl -tag -width xxxx
-.It Sy Macros
-User-defined variables may be defined and used later, simplifying the
+.It Sx Macros
+Definitions of variables that can be used later, simplifying the
 configuration file.
-.It Sy Global Configuration
+.It Sx Global configuration
 Global settings for
 .Xr dhcp6leased 8 .
-.It Sy Prefix delegation
+.It Sx Prefix delegation
 .Xr dhcp6leased 8
 requests prefix delegation from a DHCPv6 server and assigns prefixes
 to interfaces.
 This section defines on which interfaces prefix delegation should be
 requested and to which interfaces prefixes should be assigned.
 .El
-.Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example,
+.Ss Macros
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic interface ) .
-Macros are not expanded inside quotes.
-.Sh GLOBAL CONFIGURATION
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
+.Ss Global configuration
 These settings affect the operation of the
 .Xr dhcp6leased 8
 daemon as a whole.
@@ -63,16 +68,16 @@ daemon as a whole.
 Send the rapid commit DHCPv6 option, requesting a two-message exchange
 from the server instead of the normal four-message exchange.
 .El
-.Sh PREFIX DELEGATION
+.Ss Prefix delegation
 A list of interfaces on which to request prefix delegation:
-.Bd -unfilled -offset indent
-.Ic request prefix delegation on Ar name Ic for Ar { name/prefix Oo Ar name/prefix ... Oc }
-.Ed
+.Bl -tag -width Ds
+.It Ic request prefix delegation on Ar name Ic for Brq Ar name Ns Oo / Ns Ar prefix Oc Ar ...
+.El
 .Pp
-This requests a prefix delegation on
+This requests a prefix delegation on the upstream network interface
 .Ar name
-upstream network interface for the list of
-.Ar name/prefix
+for the list of
+.Ar name Ns Op / Ns Ar prefix
 network interfaces.
 If
 .Ar prefix

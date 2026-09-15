@@ -1,4 +1,4 @@
-/*	$OpenBSD: wchar.h,v 1.5 2024/07/14 09:51:18 jca Exp $	*/
+/*	$OpenBSD: wchar.h,v 1.7 2026/06/30 19:18:53 kettenis Exp $	*/
 /*
  * Copyright (c) 2015 Philip Guenther <guenther@openbsd.org>
  *
@@ -18,7 +18,13 @@
 #ifndef _LIBC_WCHAR_H_
 #define _LIBC_WCHAR_H_
 
+#ifndef _STDFILES_DECLARED
+#define _STDFILES_DECLARED
+typedef struct __sFILE FILE;
+#endif
+
 #include_next <wchar.h>
+#include <_stdio.h>		/* struct __sFILE, std{in,out,err} */
 
 PROTO_NORMAL(btowc);
 PROTO_NORMAL(fgetwc);
@@ -60,7 +66,7 @@ PROTO_NORMAL(wcsdup);
 PROTO_STD_DEPRECATED(wcsftime);
 PROTO_NORMAL(wcslcat);
 PROTO_NORMAL(wcslcpy);
-PROTO_NORMAL(wcslen);
+/*PROTO_NORMAL(wcslen);			use declaration from namespace.h */
 PROTO_NORMAL(wcsncasecmp);
 PROTO_NORMAL(wcsncat);
 PROTO_NORMAL(wcsncmp);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ah.c,v 1.174 2022/05/03 09:18:11 claudio Exp $ */
+/*	$OpenBSD: ip_ah.c,v 1.181 2026/08/12 18:23:14 bluhm Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -49,7 +49,6 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
 
 #ifdef INET6
 #include <netinet/ip6.h>
@@ -73,7 +72,7 @@
 #ifdef ENCDEBUG
 #define DPRINTF(fmt, args...)						\
 	do {								\
-		if (encdebug)						\
+		if (atomic_load_int(&encdebug))				\
 			printf("%s: " fmt "\n", __func__, ## args);	\
 	} while (0)
 #else
@@ -364,7 +363,7 @@ ah_massage_headers(struct mbuf **mp, int af, int skip, int alg, int out)
 		}
 
 		/* Let's deal with the remaining headers (if any). */
-		if (skip - sizeof(struct ip6_hdr) > 0) {
+		if (skip > sizeof(struct ip6_hdr)) {
 			if (m->m_len <= skip) {
 				ptr = malloc(skip - sizeof(struct ip6_hdr),
 				    M_XDATA, M_NOWAIT);
@@ -394,9 +393,9 @@ ah_massage_headers(struct mbuf **mp, int af, int skip, int alg, int out)
 
 		nxt = ip6.ip6_nxt;  /* Next header type. */
 
-		for (off = 0; off < skip - sizeof(struct ip6_hdr);) {
-			if (off + sizeof(struct ip6_ext) >
-			    skip - sizeof(struct ip6_hdr))
+		for (off = 0; off + sizeof(struct ip6_hdr) < skip;) {
+			if (off + sizeof(struct ip6_hdr) +
+			    sizeof(struct ip6_ext) > skip)
 				goto error6;
 			ip6e = (struct ip6_ext *)(ptr + off);
 
@@ -406,7 +405,7 @@ ah_massage_headers(struct mbuf **mp, int af, int skip, int alg, int out)
 				noff = off + ((ip6e->ip6e_len + 1) << 3);
 
 				/* Sanity check. */
-				if (noff > skip - sizeof(struct ip6_hdr))
+				if (noff + sizeof(struct ip6_hdr) > skip)
 					goto error6;
 
 				/*
@@ -527,7 +526,8 @@ error6:
  * passes authentication.
  */
 int
-ah_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
+ah_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff,
+    struct netstack *ns)
 {
 	const struct auth_hash *ahx = tdb->tdb_authalgxform;
 	struct mbuf *m = *mp, *m1, *m0;
@@ -545,17 +545,26 @@ ah_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 	uint8_t calc[AH_ALEN_MAX];
 
 	rplen = AH_FLENGTH + sizeof(u_int32_t);
+	if (m->m_pkthdr.len < skip + rplen) {
+		ahstat_inc(ahs_hdrops);
+		goto drop;
+	}
 
 	/* Save the AH header, we use it throughout. */
 	m_copydata(m, skip + offsetof(struct ah, ah_hl), sizeof(u_int8_t), &hl);
 
 	/* Replay window checking, if applicable. */
 	if (tdb->tdb_wnd > 0) {
+		int chk_rpl;
+
 		m_copydata(m, skip + offsetof(struct ah, ah_rpl),
 		    sizeof(u_int32_t), &btsx);
 		btsx = ntohl(btsx);
 
-		switch (checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 0)) {
+		mtx_enter(&tdb->tdb_mtx);
+		chk_rpl = checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 0);
+		mtx_leave(&tdb->tdb_mtx);
+		switch (chk_rpl) {
 		case 0: /* All's well. */
 			break;
 		case 1:
@@ -725,11 +734,16 @@ ah_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 
 	/* Replay window checking, if applicable. */
 	if (tdb->tdb_wnd > 0) {
+		int chk_rpl;
+
 		m_copydata(m, skip + offsetof(struct ah, ah_rpl),
 		    sizeof(u_int32_t), &btsx);
 		btsx = ntohl(btsx);
 
-		switch (checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 1)) {
+		mtx_enter(&tdb->tdb_mtx);
+		chk_rpl = checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 1);
+		mtx_leave(&tdb->tdb_mtx);
+		switch (chk_rpl) {
 		case 0: /* All's well. */
 #if NPFSYNC > 0
 			pfsync_update_tdb(tdb,0);
@@ -842,7 +856,7 @@ ah_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 			m->m_pkthdr.len -= rplen + ahx->authsize;
 		}
 
-	return ipsec_common_input_cb(mp, tdb, skip, protoff);
+	return ipsec_common_input_cb(mp, tdb, skip, protoff, ns);
 
  drop:
 	free(ptr, M_XDATA, 0);
@@ -878,13 +892,11 @@ ah_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 		encif->if_obytes += m->m_pkthdr.len;
 
 		if (encif->if_bpf) {
-			struct enchdr hdr;
-
-			memset(&hdr, 0, sizeof(hdr));
-
-			hdr.af = tdb->tdb_dst.sa.sa_family;
-			hdr.spi = tdb->tdb_spi;
-			hdr.flags |= M_AUTH;
+			struct enchdr hdr = {
+				.af = htonl(tdb->tdb_dst.sa.sa_family),
+				.spi = tdb->tdb_spi,
+				.flags = htonl(M_AUTH),
+			};
 
 			bpf_mtap_hdr(encif->if_bpf, (char *)&hdr,
 			    ENC_HDRLEN, m, BPF_DIRECTION_OUT);
@@ -893,19 +905,6 @@ ah_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 #endif
 
 	ahstat_inc(ahs_output);
-
-	/*
-	 * Check for replay counter wrap-around in automatic (not
-	 * manual) keying.
-	 */
-	if ((tdb->tdb_rpl == 0) && (tdb->tdb_wnd > 0)) {
-		DPRINTF("SA %s/%08x should have expired",
-		    ipsp_address(&tdb->tdb_dst, buf, sizeof(buf)),
-		    ntohl(tdb->tdb_spi));
-		ahstat_inc(ahs_wrap);
-		error = EINVAL;
-		goto drop;
-	}
 
 	rplen = AH_FLENGTH + sizeof(u_int32_t);
 
@@ -1018,7 +1017,9 @@ ah_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 	/* Zeroize authenticator. */
 	m_copyback(m, skip + rplen, ahx->authsize, ipseczeroes, M_NOWAIT);
 
+	mtx_enter(&tdb->tdb_mtx);
 	replay64 = tdb->tdb_rpl++;
+	mtx_leave(&tdb->tdb_mtx);
 	ah->ah_rpl = htonl((u_int32_t)replay64);
 #if NPFSYNC > 0
 	pfsync_update_tdb(tdb,1);

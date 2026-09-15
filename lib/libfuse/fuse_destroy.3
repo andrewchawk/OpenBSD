@@ -1,4 +1,4 @@
-.\" $OpenBSD: fuse_destroy.3,v 1.2 2018/07/08 06:17:10 jmc Exp $
+.\" $OpenBSD: fuse_destroy.3,v 1.5 2025/09/23 09:28:28 schwarze Exp $
 .\"
 .\" Copyright (c) 2018 Helg Bredow <helg.bredow@openbsd.org>
 .\"
@@ -14,21 +14,26 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: July 8 2018 $
+.Dd $Mdocdate: September 23 2025 $
 .Dt FUSE_DESTROY 3
 .Os
 .Sh NAME
 .Nm fuse_destroy
 .Nd free memory associated with a FUSE handle
 .Sh SYNOPSIS
+.Lb libfuse
 .In fuse.h
 .Ft void
 .Fn fuse_destroy "struct fuse *f"
 .Sh DESCRIPTION
 .Fn fuse_destroy
-closes the FUSE device and frees memory associated with the FUSE channel
-and FUSE handle specified by
+frees memory associated with the FUSE channel and FUSE handle specified by
 .Fa f .
+The file system's destroy operation is called if
+.Xr fuse_loop 3
+did not receive the
+.Dv FBT_DESTROY
+message, usually due to terminating from a signal.
 .Pp
 This function does not unmount the file system, which should be done
 with

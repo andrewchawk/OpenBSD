@@ -3,7 +3,6 @@
 #ifndef _LINUX_DMA_MAPPING_H
 #define _LINUX_DMA_MAPPING_H
 
-#include <linux/sizes.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-direction.h>
 
@@ -12,6 +11,10 @@ struct device;
 #define DMA_BIT_MASK(n)	(((n) == 64) ? ~0ULL : (1ULL<<(n)) -1)
 
 #define DMA_MAPPING_ERROR (dma_addr_t)-1
+
+#define DMA_ATTR_SKIP_CPU_SYNC		(1 << 1)
+#define DMA_ATTR_NO_KERNEL_MAPPING	(1 << 2)
+#define DMA_ATTR_NO_WARN		(1 << 3)
 
 static inline int
 dma_set_coherent_mask(struct device *dev, uint64_t m)
@@ -49,10 +52,22 @@ dma_map_page(void *dev, struct vm_page *page, size_t offset,
 {
 	return VM_PAGE_TO_PHYS(page);
 }
+static inline dma_addr_t
+dma_map_page_attrs(void *dev, struct vm_page *page, size_t offset,
+    size_t size, enum dma_data_direction dir, unsigned long attrs)
+{
+	return VM_PAGE_TO_PHYS(page);
+}
 
 static inline void
 dma_unmap_page(void *dev, dma_addr_t addr, size_t size,
     enum dma_data_direction dir)
+{
+}
+
+static inline void
+dma_unmap_page_attrs(void *dev, dma_addr_t addr, size_t size,
+    enum dma_data_direction dir, unsigned long attrs)
 {
 }
 
@@ -71,6 +86,19 @@ dmam_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dva, int gfp)
 	return dma_alloc_coherent(dev, size, dva, gfp);
 }
 
+static inline int
+dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
+    enum dma_data_direction dir, unsigned long attrs)
+{
+	return nents;
+}
+
+static inline void
+dma_unmap_sg(struct device *dev, struct scatterlist *sgl, int nents,
+     enum dma_data_direction dir)
+{
+}
+
 int	dma_get_sgtable(struct device *, struct sg_table *, void *,
 	    dma_addr_t, size_t);
 int	dma_map_sgtable(struct device *, struct sg_table *,
@@ -79,6 +107,8 @@ void	dma_unmap_sgtable(struct device *, struct sg_table *,
 	    enum dma_data_direction, u_long);
 
 dma_addr_t dma_map_resource(struct device *, phys_addr_t, size_t,
+    enum dma_data_direction, u_long);
+void	dma_unmap_resource(struct device *, dma_addr_t, size_t,
     enum dma_data_direction, u_long);
 
 #endif

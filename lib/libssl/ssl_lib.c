@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_lib.c,v 1.329 2024/08/03 04:50:27 tb Exp $ */
+/* $OpenBSD: ssl_lib.c,v 1.336 2026/08/14 06:44:53 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -752,7 +752,6 @@ SSL_set_rfd(SSL *s, int fd)
 }
 LSSL_ALIAS(SSL_set_rfd);
 
-
 /* return length of latest Finished message we sent, copy to 'buf' */
 size_t
 SSL_get_finished(const SSL *s, void *buf, size_t count)
@@ -780,7 +779,6 @@ SSL_get_peer_finished(const SSL *s, void *buf, size_t count)
 	return (ret);
 }
 LSSL_ALIAS(SSL_get_peer_finished);
-
 
 int
 SSL_get_verify_mode(const SSL *s)
@@ -1298,7 +1296,7 @@ SSL_shutdown(SSL *s)
 		return (-1);
 	}
 
-	if (s != NULL && !SSL_in_init(s))
+	if (!SSL_in_init(s))
 		return (s->method->ssl_shutdown(s));
 
 	return (1);
@@ -1308,6 +1306,11 @@ LSSL_ALIAS(SSL_shutdown);
 int
 SSL_renegotiate(SSL *s)
 {
+	if ((s->options & SSL_OP_NO_RENEGOTIATION) != 0) {
+		SSLerror(s, SSL_R_NO_RENEGOTIATION);
+		return 0;
+	}
+
 	if (s->renegotiate == 0)
 		s->renegotiate = 1;
 
@@ -1320,6 +1323,11 @@ LSSL_ALIAS(SSL_renegotiate);
 int
 SSL_renegotiate_abbreviated(SSL *s)
 {
+	if ((s->options & SSL_OP_NO_RENEGOTIATION) != 0) {
+		SSLerror(s, SSL_R_NO_RENEGOTIATION);
+		return 0;
+	}
+
 	if (s->renegotiate == 0)
 		s->renegotiate = 1;
 
@@ -1372,10 +1380,8 @@ SSL_ctrl(SSL *s, int cmd, long larg, void *parg)
 		s->max_cert_list = larg;
 		return (l);
 	case SSL_CTRL_SET_MTU:
-#ifndef OPENSSL_NO_DTLS1
 		if (larg < (long)dtls1_min_mtu())
 			return (0);
-#endif
 		if (SSL_is_dtls(s)) {
 			s->d1->mtu = larg;
 			return (larg);
@@ -2161,7 +2167,7 @@ SSL_CTX_new(const SSL_METHOD *meth)
 
 	ret->max_send_fragment = SSL3_RT_MAX_PLAIN_LENGTH;
 
-	ret->tlsext_servername_callback = 0;
+	ret->tlsext_servername_callback = NULL;
 	ret->tlsext_servername_arg = NULL;
 
 	/* Setup RFC4507 ticket keys */
@@ -2169,14 +2175,10 @@ SSL_CTX_new(const SSL_METHOD *meth)
 	arc4random_buf(ret->tlsext_tick_hmac_key, 16);
 	arc4random_buf(ret->tlsext_tick_aes_key, 16);
 
-	ret->tlsext_status_cb = 0;
+	ret->tlsext_status_cb = NULL;
 	ret->tlsext_status_arg = NULL;
 
-	/*
-	 * Default is to connect to non-RI servers. When RI is more widely
-	 * deployed might change this.
-	 */
-	ret->options |= SSL_OP_LEGACY_SERVER_CONNECT;
+	ret->options = 0;
 
 	return (ret);
  err:
@@ -3000,8 +3002,9 @@ SSL_dup(SSL *s)
 
 	/* Dup the client_CA list */
 	if (s->client_CA != NULL) {
-		if ((sk = sk_X509_NAME_dup(s->client_CA)) == NULL) goto err;
-			ret->client_CA = sk;
+		if ((sk = sk_X509_NAME_dup(s->client_CA)) == NULL)
+			goto err;
+		ret->client_CA = sk;
 		for (i = 0; i < sk_X509_NAME_num(sk); i++) {
 			xn = sk_X509_NAME_value(sk, i);
 			if (sk_X509_NAME_set(sk, i,
@@ -3489,7 +3492,6 @@ SSL_set_tmp_ecdh_callback(SSL *ssl, EC_KEY *(*ecdh)(SSL *ssl, int is_export,
 }
 LSSL_ALIAS(SSL_set_tmp_ecdh_callback);
 
-
 void
 SSL_CTX_set_msg_callback(SSL_CTX *ctx, void (*cb)(int write_p, int version,
     int content_type, const void *buf, size_t len, SSL *ssl, void *arg))
@@ -3561,6 +3563,7 @@ SSL_set_min_proto_version(SSL *ssl, uint16_t version)
 	    &ssl->min_proto_version);
 }
 LSSL_ALIAS(SSL_set_min_proto_version);
+
 int
 SSL_get_max_proto_version(SSL *ssl)
 {

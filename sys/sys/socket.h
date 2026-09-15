@@ -1,4 +1,4 @@
-/*	$OpenBSD: socket.h,v 1.105 2022/09/03 21:13:48 mbuhl Exp $	*/
+/*	$OpenBSD: socket.h,v 1.108 2025/08/04 04:59:30 guenther Exp $	*/
 /*	$NetBSD: socket.h,v 1.14 1996/02/09 18:25:36 christos Exp $	*/
 
 /*
@@ -72,14 +72,19 @@ typedef	__sa_family_t	sa_family_t;	/* sockaddr address family type */
 /*
  * Socket creation flags
  */
-#if __BSD_VISIBLE
+#if __POSIX_VISIBLE >= 202405 || __BSD_VISIBLE
 #define	SOCK_CLOEXEC		0x8000	/* set FD_CLOEXEC */
 #define	SOCK_NONBLOCK		0x4000	/* set O_NONBLOCK */
+#endif
+#if __BSD_VISIBLE
 #ifdef _KERNEL
 #define	SOCK_NONBLOCK_INHERIT	0x2000	/* inherit O_NONBLOCK from listener */
 #endif
 #define	SOCK_DNS		0x1000	/* set SS_DNS */
 #endif /* __BSD_VISIBLE */
+#if __POSIX_VISIBLE >= 202405
+#define	SOCK_CLOFORK		0x0800	/* set FD_CLOFORK */
+#endif
 
 /*
  * Option flags per-socket.
@@ -109,7 +114,6 @@ typedef	__sa_family_t	sa_family_t;	/* sockaddr address family type */
 #define	SO_RCVTIMEO	0x1006		/* receive timeout */
 #define	SO_ERROR	0x1007		/* get error status and clear */
 #define	SO_TYPE		0x1008		/* get socket type */
-#define	SO_NETPROC	0x1020		/* multiplex; network processing */
 #define	SO_RTABLE	0x1021		/* routing table to be used */
 #define	SO_PEERCRED	0x1022		/* get connect-time credentials */
 #define	SO_SPLICE	0x1023		/* splice data to other socket */
@@ -200,7 +204,8 @@ struct	splice {
 #define AF_MPLS         33              /* MPLS */
 #define pseudo_AF_PFLOW 34		/* pflow */
 #define pseudo_AF_PIPEX 35		/* PIPEX */
-#define AF_MAX          36
+#define AF_FRAME        36		/* frame (Ethernet) sockets */
+#define AF_MAX          37
 
 /*
  * Structure used by kernel to store most
@@ -284,6 +289,7 @@ struct sockproto {
 #define PF_MPLS		AF_MPLS
 #define PF_PFLOW	pseudo_AF_PFLOW
 #define PF_PIPEX	pseudo_AF_PIPEX
+#define PF_FRAME	AF_FRAME
 #define	PF_MAX		AF_MAX
 
 /*
@@ -510,6 +516,7 @@ struct timespec;
 #define	MSG_NOSIGNAL		0x400	/* do not send SIGPIPE */
 #define	MSG_CMSG_CLOEXEC	0x800	/* set FD_CLOEXEC on received fds */
 #define	MSG_WAITFORONE		0x1000	/* nonblocking but wait for one msg */
+#define	MSG_CMSG_CLOFORK	0x2000	/* set FD_CLOFORK on received fds */
 
 /*
  * Header for ancillary data objects in msg_control buffer.
@@ -585,7 +592,7 @@ int	sockatmark(int);
 int	socket(int, int, int);
 int	socketpair(int, int, int, int *);
 
-#if __BSD_VISIBLE
+#if __POSIX_VISIBLE >= 202405 || __BSD_VISIBLE
 int	accept4(int, struct sockaddr *__restrict, socklen_t *__restrict, int);
 #endif
 

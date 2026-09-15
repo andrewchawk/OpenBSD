@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.27 2023/11/11 18:35:35 robert Exp $
+# $OpenBSD: Makefile,v 1.31 2026/06/23 10:50:23 jca Exp $
 
 .include <bsd.own.mk>
 
@@ -8,7 +8,9 @@
 SUBDIR=	include/llvm/Config
 SUBDIR+=libLLVMSupport
 SUBDIR+=libLLVMTableGen
+SUBDIR+=llvm-min-tblgen
 SUBDIR+=llvm-tblgen
+SUBDIR+=include/llvm/Analysis
 SUBDIR+=include/llvm/ExecutionEngine/JITLink
 SUBDIR+=include/llvm/IR
 SUBDIR+=include/llvm/Frontend/OpenACC
@@ -29,6 +31,7 @@ SUBDIR+=libclangSupport
 SUBDIR+=clang-tblgen
 SUBDIR+=include/clang
 
+SUBDIR+=libclangAPINotes
 SUBDIR+=libclangBasic
 SUBDIR+=libclangBasicTargets
 SUBDIR+=libclangLex
@@ -38,6 +41,7 @@ SUBDIR+=libclangASTMatchers
 SUBDIR+=libclangSema
 SUBDIR+=libclangCodeGen
 SUBDIR+=libclangAnalysis
+SUBDIR+=libclangAnalysisLifetimeSafety
 SUBDIR+=libclangEdit
 SUBDIR+=libclangRewrite
 SUBDIR+=libclangDriver
@@ -47,8 +51,13 @@ SUBDIR+=libclangRewriteFrontend
 SUBDIR+=libclangFrontendTool
 SUBDIR+=libclangExtractAPI
 SUBDIR+=libclangIndex
+SUBDIR+=libclangInstallAPI
+SUBDIR+=libclangOptions
+SUBDIR+=libclangDependencyScanning
+SUBDIR+=libclangTooling
 
 SUBDIR+=clang
+SUBDIR+=clang-scan-deps
 
 SUBDIR+=include/lld/ELF
 
@@ -77,6 +86,7 @@ SUBDIR+=liblldbHostOpenBSD
 SUBDIR+=liblldbHostPOSIX
 SUBDIR+=liblldbInitialization
 SUBDIR+=liblldbInterpreter
+SUBDIR+=liblldbInterpreterInterfaces
 SUBDIR+=liblldbPluginArchitecture
 SUBDIR+=liblldbPluginDisassembler
 SUBDIR+=liblldbPluginDynamicLoader
@@ -91,9 +101,11 @@ SUBDIR+=liblldbPluginObjectContainer
 SUBDIR+=liblldbPluginObjectFile
 SUBDIR+=liblldbPluginPlatform
 SUBDIR+=liblldbPluginProcess
+SUBDIR+=liblldbPluginRegisterTypeBuilder
 SUBDIR+=liblldbPluginScriptInterpreter
 SUBDIR+=liblldbPluginStructuredData
 SUBDIR+=liblldbPluginSymbolFile
+SUBDIR+=liblldbPluginSymbolLocator
 SUBDIR+=liblldbPluginSymbolVendor
 SUBDIR+=liblldbPluginSystemRuntime
 SUBDIR+=liblldbPluginTypeSystem
@@ -101,6 +113,7 @@ SUBDIR+=liblldbPluginUnwindAssembly
 SUBDIR+=liblldbSymbol
 SUBDIR+=liblldbTarget
 SUBDIR+=liblldbUtility
+SUBDIR+=liblldbValueObject
 
 SUBDIR+=lldb
 SUBDIR+=lldb-server
@@ -113,6 +126,8 @@ SUBDIR+=include/llvm-objdump
 SUBDIR+=llvm-objdump
 SUBDIR+=include/llvm-readobj
 SUBDIR+=llvm-readobj
+SUBDIR+=include/llvm-symbolizer
+SUBDIR+=llvm-symbolizer
 
 SUBDIR+=llvm-profdata
 SUBDIR+=llvm-cov

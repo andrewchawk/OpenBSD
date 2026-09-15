@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_proto.h,v 1.49 2024/05/29 00:48:15 jsg Exp $	*/
+/*	$OpenBSD: ieee80211_proto.h,v 1.51 2026/03/19 16:50:32 chris Exp $	*/
 /*	$NetBSD: ieee80211_proto.h,v 1.3 2003/10/13 04:23:56 dyoung Exp $	*/
 
 /*-
@@ -137,6 +137,7 @@ extern	u_int8_t *ieee80211_add_xrates(u_int8_t *,
 extern	u_int8_t *ieee80211_add_htcaps(u_int8_t *, struct ieee80211com *);
 extern	u_int8_t *ieee80211_add_htop(u_int8_t *, struct ieee80211com *);
 extern	u_int8_t *ieee80211_add_vhtcaps(u_int8_t *, struct ieee80211com *);
+extern	u_int8_t *ieee80211_add_hecaps(u_int8_t *, struct ieee80211com *);
 extern	u_int8_t *ieee80211_add_tie(u_int8_t *, u_int8_t, u_int32_t);
 
 extern	int ieee80211_parse_rsn(struct ieee80211com *, const u_int8_t *,
@@ -169,6 +170,8 @@ extern	void ieee80211_ht_negotiate(struct ieee80211com *,
     struct ieee80211_node *);
 extern	void ieee80211_vht_negotiate(struct ieee80211com *,
     struct ieee80211_node *);
+extern	void ieee80211_he_negotiate(struct ieee80211com *,
+    struct ieee80211_node *);
 extern	void ieee80211_tx_ba_timeout(void *);
 extern	void ieee80211_rx_ba_timeout(void *);
 extern	int ieee80211_addba_request(struct ieee80211com *,
@@ -184,10 +187,6 @@ extern	void ieee80211_addba_resp_accept(struct ieee80211com *,
 extern	void ieee80211_addba_resp_refuse(struct ieee80211com *,
 	    struct ieee80211_node *, uint8_t, uint16_t);
 extern	void ieee80211_output_ba_move_window(struct ieee80211com *,
-	    struct ieee80211_node *, uint8_t, uint16_t);
-extern	void ieee80211_output_ba_move_window_to_first_unacked(
-	    struct ieee80211com *, struct ieee80211_node *, uint8_t, uint16_t);
-extern	void ieee80211_output_ba_record_ack(struct ieee80211com *,
 	    struct ieee80211_node *, uint8_t, uint16_t);
 
 #endif /* _NET80211_IEEE80211_PROTO_H_ */

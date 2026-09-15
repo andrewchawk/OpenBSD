@@ -1,4 +1,4 @@
-/*	$OpenBSD: aucat.c,v 1.79 2021/11/07 20:51:47 ratchov Exp $	*/
+/*	$OpenBSD: aucat.c,v 1.85 2026/08/12 10:58:19 ratchov Exp $	*/
 /*
  * Copyright (c) 2008 Alexandre Ratchov <alex@caoua.org>
  *
@@ -35,7 +35,6 @@
 
 #include "aucat.h"
 #include "debug.h"
-
 
 /*
  * read a message, return 0 if not completed
@@ -205,16 +204,9 @@ _aucat_wdata(struct aucat *hdl, const void *buf, size_t len,
 static int
 aucat_mkcookie(unsigned char *cookie)
 {
-#define COOKIE_DIR	"/.sndio"
-#define COOKIE_SUFFIX	"/.sndio/cookie"
-#define TEMPL_SUFFIX	".XXXXXXXX"
 	struct stat sb;
-	char *home, *path = NULL, *tmp = NULL;
-	size_t home_len, path_len;
+	char *home, *dir = NULL, *path = NULL, *tmp = NULL;
 	int fd, len;
-
-	/* please gcc */
-	path_len = 0xdeadbeef;
 
 	/*
 	 * try to load the cookie
@@ -222,14 +214,11 @@ aucat_mkcookie(unsigned char *cookie)
 	home = issetugid() ? NULL : getenv("HOME");
 	if (home == NULL)
 		goto bad_gen;
-	home_len = strlen(home);
-	path = malloc(home_len + sizeof(COOKIE_SUFFIX));
-	if (path == NULL)
+	if (asprintf(&dir, "%s/.sndio", home) == -1)
 		goto bad_gen;
-	memcpy(path, home, home_len);
-	memcpy(path + home_len, COOKIE_SUFFIX, sizeof(COOKIE_SUFFIX));
-	path_len = home_len + sizeof(COOKIE_SUFFIX) - 1;
-	fd = open(path, O_RDONLY);
+	if (asprintf(&path, "%s/cookie", dir) == -1)
+		goto bad_gen;
+	fd = open(path, O_RDONLY|O_CLOEXEC);
 	if (fd == -1) {
 		if (errno != ENOENT)
 			DPERROR(path);
@@ -266,21 +255,12 @@ bad_gen:
 	 * try to save the cookie
 	 */
 
-	if (home == NULL)
+	if (path == NULL)
 		goto done;
-	tmp = malloc(path_len + sizeof(TEMPL_SUFFIX));
-	if (tmp == NULL)
+	if (mkdir(dir, 0755) == -1 && errno != EEXIST)
 		goto done;
-
-	/* create ~/.sndio directory */
-	memcpy(tmp, home, home_len);
-	memcpy(tmp + home_len, COOKIE_DIR, sizeof(COOKIE_DIR));
-	if (mkdir(tmp, 0755) == -1 && errno != EEXIST)
+	if (asprintf(&tmp, "%s.XXXXXXXX", path) == -1)
 		goto done;
-
-	/* create cookie file in it */
-	memcpy(tmp, path, path_len);
-	memcpy(tmp + path_len, TEMPL_SUFFIX, sizeof(TEMPL_SUFFIX));
 	fd = mkstemp(tmp);
 	if (fd == -1) {
 		DPERROR(tmp);
@@ -300,6 +280,7 @@ bad_gen:
 done:
 	free(tmp);
 	free(path);
+	free(dir);
 	return 1;
 }
 
@@ -414,14 +395,14 @@ _aucat_open(struct aucat *hdl, const char *str, unsigned int mode)
 	int eof;
 	char host[NI_MAXHOST], opt[AMSG_OPTMAX];
 	const char *p;
-	unsigned int unit, devnum, type;
+	unsigned int unit, type;
 
 	if ((p = _sndio_parsetype(str, "snd")) != NULL)
-		type = 0;
+		type = AMSG_TYPE_SND;
 	else if ((p = _sndio_parsetype(str, "midithru")) != NULL)
-		type = 1;
+		type = AMSG_TYPE_MIDITHRU;
 	else if ((p = _sndio_parsetype(str, "midi")) != NULL)
-		type = 2;
+		type = AMSG_TYPE_MIDI;
 	else {
 		DPRINTF("%s: unsupported device type\n", str);
 		return -1;
@@ -443,36 +424,14 @@ _aucat_open(struct aucat *hdl, const char *str, unsigned int mode)
 		return 0;
 	}
 	p++;
-	if (type == 0) {
-		if (*p < '0' || *p > '9') {
-			devnum = AMSG_NODEV;
-			p = parsestr(p, opt, AMSG_OPTMAX);
-			if (p == NULL)
-				return 0;
-		} else {
-			p = _sndio_parsenum(p, &devnum, 15);
-			if (p == NULL)
-				return 0;
-			if (*p == '.') {
-				p = parsestr(++p, opt, AMSG_OPTMAX);
-				if (p == NULL)
-					return 0;
-			} else
-				strlcpy(opt, "default", AMSG_OPTMAX);
-		}
-	} else {
-		p = _sndio_parsenum(p, &devnum, 15);
-		if (p == NULL)
-			return 0;
-		memset(opt, 0, sizeof(opt));
-	}
+	p = parsestr(p, opt, AMSG_OPTMAX);
+	if (p == NULL)
+		return 0;
 	if (*p != '\0') {
 		DPRINTF("%s: junk at end of dev name\n", p);
 		return 0;
 	}
-	devnum += type * 16; /* XXX */
-	DPRINTFN(2, "_aucat_open: host=%s unit=%u devnum=%u opt=%s\n",
-	    host, unit, devnum, opt);
+	DPRINTFN(2, "_aucat_open: host=%s unit=%u opt=%s\n", host, unit, opt);
 	if (host[0] != '\0') {
 		if (!aucat_connect_tcp(hdl, host, unit))
 			return 0;
@@ -500,7 +459,7 @@ _aucat_open(struct aucat *hdl, const char *str, unsigned int mode)
 	hdl->wmsg.cmd = htonl(AMSG_HELLO);
 	hdl->wmsg.u.hello.version = AMSG_VERSION;
 	hdl->wmsg.u.hello.mode = htons(mode);
-	hdl->wmsg.u.hello.devnum = devnum;
+	hdl->wmsg.u.hello.type = AMSG_TYPE_MAGIC | type;
 	hdl->wmsg.u.hello.id = htonl(getpid());
 	strlcpy(hdl->wmsg.u.hello.who, __progname,
 	    sizeof(hdl->wmsg.u.hello.who));

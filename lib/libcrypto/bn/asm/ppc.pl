@@ -204,9 +204,9 @@ $data=<<EOF;
 #	bn_sub_words
 #	bn_add_words
 #	bn_div_words
-#	bn_sqr_words
-#	bn_mul_words
-#	bn_mul_add_words
+#	bn_sqr_word_wise
+#	bn_mulw_words
+#	bn_mulw_add_words
 #
 #	NOTE:	It is possible to optimize this code more for
 #	specific PowerPC or Power architectures. On the Northstar
@@ -248,9 +248,9 @@ $data=<<EOF;
 	.globl	.bn_sub_words
 	.globl	.bn_add_words
 	.globl	.bn_div_words
-	.globl	.bn_sqr_words
-	.globl	.bn_mul_words
-	.globl	.bn_mul_add_words
+	.globl	.bn_sqr_word_wise
+	.globl	.bn_mulw_words
+	.globl	.bn_mulw_add_words
 	
 # .text section
 	
@@ -1702,16 +1702,16 @@ Lppcasm_div9:
 
 #
 #	NOTE:	The following label name should be changed to
-#		"bn_sqr_words" i.e. remove the first dot
+#		"bn_sqr_word_wise" i.e. remove the first dot
 #		for the gcc compiler. This should be automatically
 #		done in the build
 #
 .align	4
-.bn_sqr_words:
+.bn_sqr_word_wise:
 #
-#	Optimized version of bn_sqr_words
+#	Optimized version of bn_sqr_word_wise
 #
-#	void bn_sqr_words(BN_ULONG *r, BN_ULONG *a, int n)
+#	void bn_sqr_word_wise(BN_ULONG *r, BN_ULONG *a, int n)
 #
 #	r3 = r
 #	r4 = a
@@ -1740,15 +1740,15 @@ Lppcasm_sqr_adios:
 
 #
 #	NOTE:	The following label name should be changed to
-#		"bn_mul_words" i.e. remove the first dot
+#		"bn_mulw_words" i.e. remove the first dot
 #		for the gcc compiler. This should be automatically
 #		done in the build
 #
 
 .align	4	
-.bn_mul_words:
+.bn_mulw_words:
 #
-# BN_ULONG bn_mul_words(BN_ULONG *rp, BN_ULONG *ap, int num, BN_ULONG w)
+# BN_ULONG bn_mulw_words(BN_ULONG *rp, BN_ULONG *ap, int num, BN_ULONG w)
 #
 # r3 = rp
 # r4 = ap
@@ -1842,15 +1842,15 @@ Lppcasm_mw_OVER:
 
 #
 #	NOTE:	The following label name should be changed to
-#		"bn_mul_add_words" i.e. remove the first dot
+#		"bn_mulw_add_words" i.e. remove the first dot
 #		for the gcc compiler. This should be automatically
 #		done in the build
 #
 
 .align	4
-.bn_mul_add_words:
+.bn_mulw_add_words:
 #
-# BN_ULONG bn_mul_add_words(BN_ULONG *rp, BN_ULONG *ap, int num, BN_ULONG w)
+# BN_ULONG bn_mulw_add_words(BN_ULONG *rp, BN_ULONG *ap, int num, BN_ULONG w)
 #
 # r3 = rp
 # r4 = ap

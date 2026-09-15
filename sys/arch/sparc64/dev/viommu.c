@@ -1,8 +1,8 @@
-/*	$OpenBSD: viommu.c,v 1.20 2021/05/16 15:10:19 deraadt Exp $	*/
+/*	$OpenBSD: viommu.c,v 1.23 2025/10/09 18:43:26 claudio Exp $	*/
 /*	$NetBSD: iommu.c,v 1.47 2002/02/08 20:03:45 eeh Exp $	*/
 
 /*
- * Coptright (c) 2008 Mark Kettenis
+ * Copyright (c) 2008 Mark Kettenis
  * Copyright (c) 2003 Henric Jungheim
  * Copyright (c) 2001, 2002 Eduardo Horvath
  * Copyright (c) 1999, 2000 Matthew R. Green
@@ -48,7 +48,6 @@
 
 #include <machine/bus.h>
 #include <sparc64/sparc64/cache.h>
-#include <sparc64/dev/iommureg.h>
 #include <sparc64/dev/iommuvar.h>
 #include <sparc64/dev/viommuvar.h>
 
@@ -97,7 +96,7 @@ void _viommu_dvmamap_sync(bus_dma_tag_t, bus_dma_tag_t, bus_dmamap_t,
     bus_addr_t, bus_size_t, int);
 
 /*
- * initialise the UltraSPARC IOMMU (Hypervisior):
+ * initialise the UltraSPARC IOMMU (Hypervisor):
  *	- allocate and setup the iotsb.
  *	- enable the IOMMU
  *	- create a private DVMA map.
@@ -654,7 +653,8 @@ viommu_dvmamap_append_range(bus_dma_tag_t t, bus_dmamap_t map, paddr_t pa,
 	 */
 	if (i > 0) {
 		seg = &map->dm_segs[i - 1];
-		if (sgstart == seg->ds_addr + seg->ds_len) {
+		if (sgstart == seg->ds_addr + seg->ds_len &&
+		    length + seg->ds_len <= map->_dm_maxsegsz) {
 			length += seg->ds_len;
 			sgstart = seg->ds_addr;
 			sgend = sgstart + length - 1;

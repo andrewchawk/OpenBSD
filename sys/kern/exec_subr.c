@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_subr.c,v 1.67 2024/04/02 08:39:16 deraadt Exp $	*/
+/*	$OpenBSD: exec_subr.c,v 1.72 2026/08/15 18:52:28 kettenis Exp $	*/
 /*	$NetBSD: exec_subr.c,v 1.9 1994/12/04 03:10:42 mycroft Exp $	*/
 
 /*
@@ -40,16 +40,13 @@
 #include <sys/mman.h>
 #include <sys/resourcevar.h>
 
-#include <uvm/uvm_extern.h>
+#include <uvm/uvm_vnode.h>
 
-#ifdef DEBUG
 /*
  * new_vmcmd():
  *	create a new vmcmd structure and fill in its fields based
  *	on function call arguments.  make sure objects ref'd by
  *	the vmcmd are 'held'.
- *
- * If not debugging, this is a macro, so it's expanded inline.
  */
 
 void
@@ -71,7 +68,6 @@ new_vmcmd(struct exec_vmcmd_set *evsp,
 	vcp->ev_prot = prot;
 	vcp->ev_flags = flags;
 }
-#endif /* DEBUG */
 
 void
 vmcmdset_extend(struct exec_vmcmd_set *evsp)
@@ -106,7 +102,7 @@ kill_vmcmds(struct exec_vmcmd_set *evsp)
 
 	for (i = 0; i < evsp->evs_used; i++) {
 		vcp = &evsp->evs_cmds[i];
-		if (vcp->ev_vp != NULLVP)
+		if (vcp->ev_vp != NULL)
 			vrele(vcp->ev_vp);
 	}
 
@@ -238,10 +234,11 @@ vmcmd_map_readvn(struct proc *p, struct exec_vmcmd *cmd)
 
 	if (cmd->ev_len == 0)
 		return (0);
+	if (cmd->ev_addr & PAGE_MASK)
+		return (EINVAL);
 
 	prot = cmd->ev_prot;
 
-	KASSERT((cmd->ev_addr & PAGE_MASK) == 0);
 	error = uvm_map(&p->p_vmspace->vm_map, &cmd->ev_addr,
 	    round_page(cmd->ev_len), NULL, UVM_UNKNOWN_OFFSET, 0,
 	    UVM_MAPFLAG(prot | PROT_WRITE, PROT_MASK, MAP_INHERIT_COPY,
@@ -264,7 +261,7 @@ vmcmd_map_readvn(struct proc *p, struct exec_vmcmd *cmd)
 		 * uvm_map_protect() to fix up the protection.  ICK.
 		 */
 		error = (uvm_map_protect(&p->p_vmspace->vm_map,
-		    cmd->ev_addr, round_page(cmd->ev_len),
+		    cmd->ev_addr, round_page(cmd->ev_addr + cmd->ev_len),
 		    prot, 0, FALSE, TRUE));
 	}
 	if (error == 0) {
@@ -426,18 +423,18 @@ exec_setup_stack(struct proc *p, struct exec_package *epp)
 	NEW_VMCMD2(&epp->ep_vmcmds, vmcmd_map_zero,
 	    ((epp->ep_minsaddr - epp->ep_ssize) - epp->ep_maxsaddr),
 	    epp->ep_maxsaddr + epp->ep_ssize,
-	    NULLVP, 0, PROT_NONE,  VMCMD_IMMUTABLE);
+	    NULL, 0, PROT_NONE,  VMCMD_IMMUTABLE);
 	NEW_VMCMD2(&epp->ep_vmcmds, vmcmd_map_zero, epp->ep_ssize,
 	    epp->ep_maxsaddr,
-	    NULLVP, 0, PROT_READ | PROT_WRITE, VMCMD_STACK | VMCMD_IMMUTABLE);
+	    NULL, 0, PROT_READ | PROT_WRITE, VMCMD_STACK | VMCMD_IMMUTABLE);
 #else
 	NEW_VMCMD2(&epp->ep_vmcmds, vmcmd_map_zero,
 	    ((epp->ep_minsaddr - epp->ep_ssize) - epp->ep_maxsaddr),
 	    epp->ep_maxsaddr,
-	    NULLVP, 0, PROT_NONE, VMCMD_IMMUTABLE);
+	    NULL, 0, PROT_NONE, VMCMD_IMMUTABLE);
 	NEW_VMCMD2(&epp->ep_vmcmds, vmcmd_map_zero, epp->ep_ssize,
 	    (epp->ep_minsaddr - epp->ep_ssize),
-	    NULLVP, 0, PROT_READ | PROT_WRITE, VMCMD_STACK | VMCMD_IMMUTABLE);
+	    NULL, 0, PROT_READ | PROT_WRITE, VMCMD_STACK | VMCMD_IMMUTABLE);
 #endif
 
 	return (0);

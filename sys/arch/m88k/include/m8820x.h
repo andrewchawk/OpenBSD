@@ -1,4 +1,4 @@
-/*	$OpenBSD: m8820x.h,v 1.10 2013/05/17 22:33:25 miod Exp $ */
+/*	$OpenBSD: m8820x.h,v 1.13 2026/07/15 18:49:57 miod Exp $ */
 /*
  * Copyright (c) 2004, Miodrag Vallat.
  *
@@ -179,16 +179,24 @@
 #define	BATC8_VA		0xfff00000
 #define	BATC9_VA		0xfff80000
 
-#define NBSG    	(1 << (PDT_BITS + PG_BITS))	/* segment size */
-
 #ifndef _LOCORE
 
 /*
  * CMMU kernel information
  */
+struct m8820x_cmmu;
+
 struct m8820x_cmmu {
 	volatile u_int32_t *cmmu_regs;	/* CMMU "base" area */
 	u_int32_t	cmmu_idr;
+	/*
+	 * These two pointers point to the next CMMU tied to the same CPU,
+	 * and the next CMMU _of the same I/D type_ tied to the same CPU,
+	 * respectively.
+	 */
+	struct m8820x_cmmu *cmmu_next;
+	struct m8820x_cmmu *cmmu_next_same_mode;
+
 #ifdef M88200_HAS_SPLIT_ADDRESS
 	vaddr_t		cmmu_addr;	/* address range */
 	vaddr_t		cmmu_addr_mask;	/* address mask */
@@ -199,14 +207,9 @@ struct m8820x_cmmu {
 #define	DATA_CMMU	0x01	/* odd number */
 #define	CMMU_MODE(num)	((num) & 1)
 
-#ifdef	M88200_HAS_ASYMMETRICAL_ASSOCIATION
-#define MAX_CMMUS	16		/* maximum cmmus on the board */
-#else
-#define MAX_CMMUS	8		/* maximum cmmus on the board */
-#endif
-extern struct m8820x_cmmu m8820x_cmmu[MAX_CMMUS];
-extern u_int cmmu_shift;
-extern u_int max_cmmus;
+extern const struct m8820x_cmmu m8820x_cmmu[];
+extern const u_int cmmu_shift;
+extern const u_int max_cmmus;
 
 void	m8820x_setup_board_config(void);
 cpuid_t	m8820x_cpu_number(void);

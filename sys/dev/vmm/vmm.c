@@ -1,4 +1,4 @@
-/* $OpenBSD: vmm.c,v 1.2 2023/05/13 23:15:28 dv Exp $ */
+/* $OpenBSD: vmm.c,v 1.11 2026/09/02 19:01:29 dv Exp $ */
 /*
  * Copyright (c) 2014-2023 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -25,6 +25,9 @@
 #include <sys/malloc.h>
 #include <sys/signalvar.h>
 
+#include <uvm/uvm_extern.h>
+#include <uvm/uvm_aobj.h>
+
 #include <machine/vmmvar.h>
 
 #include <dev/vmm/vmm.h>
@@ -48,7 +51,7 @@ vmm_probe(struct device *parent, void *match, void *aux)
 
 	if (strcmp(*busname, vmm_cd.cd_name) != 0)
 		return (0);
-	return (1);
+	return (vmm_probe_machdep(parent, match, aux));
 }
 
 void
@@ -184,7 +187,7 @@ vm_find(uint32_t id, struct vm **res)
 			 * The managing vmm parent process can lookup all
 			 * all VMs and is indicated by PLEDGE_PROC.
 			 */
-			if (((p->p_p->ps_pledge &
+			if (((p->p_pledge &
 			    (PLEDGE_VMM | PLEDGE_PROC)) == PLEDGE_VMM) &&
 			    (vm->vm_creator_pid != p->p_p->ps_pid))
 				ret = EPERM;
@@ -291,7 +294,7 @@ pledge_ioctl_vmm(struct proc *p, long com)
 	case VMM_IOC_INFO:
 	case VMM_IOC_SHAREMEM:
 		/* The "parent" process in vmd forks and manages VMs */
-		if (p->p_p->ps_pledge & PLEDGE_PROC)
+		if (p->p_pledge & PLEDGE_PROC)
 			return (0);
 		break;
 	case VMM_IOC_TERM:
@@ -352,10 +355,13 @@ vm_find_vcpu(struct vm *vm, uint32_t id)
 int
 vm_create(struct vm_create_params *vcp, struct proc *p)
 {
-	int i, ret;
+	int i, ret = EINVAL;
 	size_t memsize;
 	struct vm *vm;
 	struct vcpu *vcpu;
+	struct uvm_object *uao;
+	struct vm_mem_range *vmr;
+	unsigned int uvmflags = 0;
 
 	memsize = vm_create_check_mem_ranges(vcp);
 	if (memsize == 0)
@@ -365,30 +371,83 @@ vm_create(struct vm_create_params *vcp, struct proc *p)
 	if (vcp->vcp_ncpus != 1)
 		return (EINVAL);
 
-	/* Bail early if we're already at vcpu capacity. */
-	rw_enter_read(&vmm_softc->vm_lock);
+	/*
+	 * Increment global counts early to see if the capacity limits
+	 * would be violated and prevent vmm(4) from disabling any
+	 * virtualization extensions on the host while creating a vm.
+	 */
+	rw_enter_write(&vmm_softc->vm_lock);
 	if (vmm_softc->vcpu_ct + vcp->vcp_ncpus > vmm_softc->vcpu_max) {
 		DPRINTF("%s: maximum vcpus (%lu) reached\n", __func__,
 		    vmm_softc->vcpu_max);
-		rw_exit_read(&vmm_softc->vm_lock);
+		rw_exit_write(&vmm_softc->vm_lock);
 		return (ENOMEM);
 	}
-	rw_exit_read(&vmm_softc->vm_lock);
+	vmm_softc->vcpu_ct += vcp->vcp_ncpus;
+	vmm_softc->vm_ct++;
+	rw_exit_write(&vmm_softc->vm_lock);
 
 	/* Instantiate and configure the new vm. */
 	vm = pool_get(&vm_pool, PR_WAITOK | PR_ZERO);
 
+	/* Create the VM's identity. */
 	vm->vm_creator_pid = p->p_p->ps_pid;
+	strncpy(vm->vm_name, vcp->vcp_name, VMM_MAX_NAME_LEN - 1);
+
+	/* Create the pmap for nested paging. */
+	vm->vm_pmap = pmap_create();
+
+	/* Initialize memory slots. */
 	vm->vm_nmemranges = vcp->vcp_nmemranges;
 	memcpy(vm->vm_memranges, vcp->vcp_memranges,
 	    vm->vm_nmemranges * sizeof(vm->vm_memranges[0]));
-	vm->vm_memory_size = memsize;
-	strncpy(vm->vm_name, vcp->vcp_name, VMM_MAX_NAME_LEN - 1);
+	vm->vm_memory_size = memsize; /* Calculated above. */
+
+	uvmflags = UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
+	    MAP_INHERIT_NONE, MADV_NORMAL, UVM_FLAG_CONCEAL);
+	for (i = 0; i < vm->vm_nmemranges; i++) {
+		vmr = &vm->vm_memranges[i];
+		if (vmr->vmr_type == VM_MEM_MMIO)
+			continue;
+
+		uao = NULL;
+		uao = uao_create(vmr->vmr_size, UAO_FLAG_CANFAIL);
+		if (uao == NULL) {
+			printf("%s: failed to initialize memory slot\n",
+			    __func__);
+			ret = ENOMEM;
+			goto err;
+		}
+
+		/* Map the UVM aobj into the process. It owns this reference. */
+		ret = uvm_map(&p->p_vmspace->vm_map, &vmr->vmr_va,
+		    vmr->vmr_size, uao, 0, 0, uvmflags);
+		if (ret) {
+			printf("%s: uvm_map failed: %d\n", __func__, ret);
+			uao_detach(uao);
+			ret = ENOMEM;
+			goto err;
+		}
+
+		/* Make this mapping immutable so userland cannot change it. */
+		ret = uvm_map_immutable(&p->p_vmspace->vm_map, vmr->vmr_va,
+		    vmr->vmr_va + vmr->vmr_size, 1);
+		if (ret) {
+			printf("%s: uvm_map_immutable failed: %d\n", __func__,
+			    ret);
+			uvm_unmap(&p->p_vmspace->vm_map, vmr->vmr_va,
+			    vmr->vmr_va + vmr->vmr_size);
+			goto err;
+		}
+
+		uao_reference(uao);	/* Take a reference for vmm. */
+		vm->vm_memory_slot[i] = uao;
+	}
 
 	if (vm_impl_init(vm, p)) {
 		printf("failed to init arch-specific features for vm %p\n", vm);
-		vm_teardown(&vm);
-		return (ENOMEM);
+		ret = ENOMEM;
+		goto err;
 	}
 
 	vm->vm_vcpu_ct = 0;
@@ -399,43 +458,43 @@ vm_create(struct vm_create_params *vcp, struct proc *p)
 		vcpu = pool_get(&vcpu_pool, PR_WAITOK | PR_ZERO);
 
 		vcpu->vc_parent = vm;
-		if ((ret = vcpu_init(vcpu)) != 0) {
-			printf("failed to init vcpu %d for vm %p\n", i, vm);
-			vm_teardown(&vm);
-			return (ret);
-		}
 		vcpu->vc_id = vm->vm_vcpu_ct;
 		vm->vm_vcpu_ct++;
+
+		if ((ret = vcpu_init(vcpu, vcp)) != 0) {
+			printf("failed to init vcpu %d for vm %p\n", i, vm);
+			pool_put(&vcpu_pool, vcpu);
+			goto err;
+		}
 		/* Publish vcpu to list, inheriting the reference. */
 		SLIST_INSERT_HEAD(&vm->vm_vcpu_list, vcpu, vc_vcpu_link);
 	}
 
-	/* Attempt to register the vm now that it's configured. */
+	/* Increment the global index and insert into the list. */
 	rw_enter_write(&vmm_softc->vm_lock);
-
-	if (vmm_softc->vcpu_ct + vm->vm_vcpu_ct > vmm_softc->vcpu_max) {
-		/* Someone already took our capacity. */
-		printf("%s: maximum vcpus (%lu) reached\n", __func__,
-		    vmm_softc->vcpu_max);
-		rw_exit_write(&vmm_softc->vm_lock);
-		vm_teardown(&vm);
-		return (ENOMEM);
-	}
-
-	/* Update the global index and identify the vm. */
 	vmm_softc->vm_idx++;
 	vm->vm_id = vmm_softc->vm_idx;
 	vcp->vcp_id = vm->vm_id;
 
-	/* Publish the vm into the list and update counts. */
 	refcnt_init(&vm->vm_refcnt);
 	SLIST_INSERT_HEAD(&vmm_softc->vm_list, vm, vm_link);
-	vmm_softc->vm_ct++;
-	vmm_softc->vcpu_ct += vm->vm_vcpu_ct;
-
 	rw_exit_write(&vmm_softc->vm_lock);
 
+	/* Update the userland process's view of guest memory. */
+	memcpy(vcp->vcp_memranges, vm->vm_memranges,
+	    vcp->vcp_nmemranges * sizeof(vcp->vcp_memranges[0]));
+
 	return (0);
+
+err:
+	vm_teardown(&vm);
+	rw_enter_write(&vmm_softc->vm_lock);
+	vmm_softc->vm_ct--;
+	vmm_softc->vcpu_ct -= vcp->vcp_ncpus;
+	if (vmm_softc->vm_ct < 1)
+		vmm_stop();
+	rw_exit_write(&vmm_softc->vm_lock);
+	return (ret);
 }
 
 /*
@@ -482,19 +541,6 @@ vm_create_check_mem_ranges(struct vm_create_params *vcp)
 		}
 
 		/*
-		 * Make sure that all virtual addresses are within the address
-		 * space of the process and that they do not wrap around.
-		 * Calling uvm_share() when creating the VM will take care of
-		 * further checks.
-		 */
-		if (vmr->vmr_va < VM_MIN_ADDRESS ||
-		    vmr->vmr_va >= VM_MAXUSER_ADDRESS ||
-		    vmr->vmr_size >= VM_MAXUSER_ADDRESS - vmr->vmr_va) {
-			DPRINTF("guest va not within range or wraps\n");
-			return (0);
-		}
-
-		/*
 		 * Make sure that guest physical memory ranges do not overlap
 		 * and that they are ascending.
 		 */
@@ -529,10 +575,11 @@ vm_create_check_mem_ranges(struct vm_create_params *vcp)
 void
 vm_teardown(struct vm **target)
 {
-	size_t nvcpu = 0;
+	size_t i, nvcpu = 0;
+	vaddr_t sva, eva;
 	struct vcpu *vcpu, *tmp;
 	struct vm *vm = *target;
-	struct vmspace *vm_vmspace;
+	struct uvm_object *uao;
 
 	KERNEL_ASSERT_UNLOCKED();
 
@@ -540,21 +587,28 @@ vm_teardown(struct vm **target)
 	SLIST_FOREACH_SAFE(vcpu, &vm->vm_vcpu_list, vc_vcpu_link, tmp) {
 		SLIST_REMOVE(&vm->vm_vcpu_list, vcpu, vcpu, vc_vcpu_link);
 		vcpu_deinit(vcpu);
-
 		pool_put(&vcpu_pool, vcpu);
 		nvcpu++;
 	}
 
-	vm_impl_deinit(vm);
-
-	/* teardown guest vmspace */
-	KERNEL_LOCK();
-	vm_vmspace = vm->vm_vmspace;
-	if (vm_vmspace != NULL) {
-		vm->vm_vmspace = NULL;
-		uvmspace_free(vm_vmspace);
+	/* Remove guest mappings from our nested page tables. */
+	for (i = 0; i < vm->vm_nmemranges; i++) {
+		sva = vm->vm_memranges[i].vmr_gpa;
+		eva = sva + vm->vm_memranges[i].vmr_size - 1;
+		pmap_remove(vm->vm_pmap, sva, eva);
 	}
-	KERNEL_UNLOCK();
+
+	/* Release UVM anon objects backing our guest memory. */
+	for (i = 0; i < vm->vm_nmemranges; i++) {
+		uao = vm->vm_memory_slot[i];
+		vm->vm_memory_slot[i] = NULL;
+		if (uao != NULL)
+			uao_detach(uao);
+	}
+
+	/* At this point, no UVM-managed pages should reference our pmap. */
+	pmap_destroy(vm->vm_pmap);
+	vm->vm_pmap = NULL;
 
 	pool_put(&vm_pool, vm);
 	*target = NULL;
@@ -612,7 +666,7 @@ vm_get_info(struct vm_info_params *vip)
 
 		out[i].vir_memory_size = vm->vm_memory_size;
 		out[i].vir_used_size =
-		    pmap_resident_count(vm->vm_map->pmap) * PAGE_SIZE;
+		    pmap_resident_count(vm->vm_pmap) * PAGE_SIZE;
 		out[i].vir_ncpus = vm->vm_vcpu_ct;
 		out[i].vir_id = vm->vm_id;
 		out[i].vir_creator_pid = vm->vm_creator_pid;
@@ -668,6 +722,12 @@ vm_terminate(struct vm_terminate_params *vtp)
 	error = vm_find(vtp->vtp_vm_id, &vm);
 	if (error)
 		return (error);
+
+	/* Only proceed through remove and teardown once. */
+	if (atomic_cas_uint(&vm->vm_dying, 0, 1) == 1) {
+		refcnt_rele_wake(&vm->vm_refcnt);
+		return (EBUSY);
+	}
 
 	/* Pop the vm out of the global vm list. */
 	rw_enter_write(&vmm_softc->vm_lock);
@@ -759,12 +819,13 @@ out:
 }
 
 /*
- * vcpu_must_stop
+ * vcpu_must_yield
  *
  * Check if we need to (temporarily) stop running the VCPU for some reason,
  * such as:
  * - the VM was requested to terminate
  * - the proc running this VCPU has pending signals
+ * - the scheduler asks us to yield
  *
  * Parameters:
  *  vcpu: the VCPU to check
@@ -774,14 +835,20 @@ out:
  *  0: no stop is needed
  */
 int
-vcpu_must_stop(struct vcpu *vcpu)
+vcpu_must_yield(struct vcpu *vcpu)
 {
-	struct proc *p = curproc;
+	struct cpu_info *ci;
 
 	if (vcpu->vc_state == VCPU_STATE_REQTERM)
 		return (1);
-	if (SIGPENDING(p) != 0)
+
+	if (SIGPENDING(curproc) != 0)
 		return (1);
+
+	ci = curcpu();
+	if (ci->ci_schedstate.spc_schedflags & SPCF_SHOULDYIELD)
+		return (1);
+
 	return (0);
 }
 
@@ -793,17 +860,17 @@ vcpu_must_stop(struct vcpu *vcpu)
  * Return values:
  *  0: if successful
  *  ENOENT: if the vm cannot be found by vm_find
- *  EPERM: if the vm cannot be accessed by the current process
- *  EINVAL: if the provide memory ranges fail checks
- *  ENOMEM: if uvm_share fails to find available memory in the destination map
+ *  other errno on uvm_map or uvm_map_immutable failures
  */
 int
 vm_share_mem(struct vm_sharemem_params *vsp, struct proc *p)
 {
-	int ret = EINVAL;
-	size_t i, n;
+	int ret = EINVAL, unmap = 0;
+	size_t i, failed_uao = 0, n;
 	struct vm *vm;
 	struct vm_mem_range *src, *dst;
+	struct uvm_object *uao;
+	unsigned int uvmflags;
 
 	ret = vm_find(vsp->vsp_vm_id, &vm);
 	if (ret)
@@ -830,36 +897,52 @@ vm_share_mem(struct vm_sharemem_params *vsp, struct proc *p)
 		if (src->vmr_size != dst->vmr_size)
 			goto out;
 
-		/* Check our intended destination is page-aligned. */
-		if (dst->vmr_va & PAGE_MASK)
+		/* The virtual addresses will be chosen by uvm_map(). */
+		if (vsp->vsp_va[i] != 0)
 			goto out;
 	}
 
-	/*
-	 * Share each range individually with the calling process. We do
-	 * not need PROC_EXEC as the emulated devices do not need to execute
-	 * instructions from guest memory.
-	 */
+	/* Share each UVM aobj with the calling process. */
+	uvmflags = UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
+	    MAP_INHERIT_NONE, MADV_NORMAL, UVM_FLAG_CONCEAL);
 	for (i = 0; i < n; i++) {
-		src = &vm->vm_memranges[i];
 		dst = &vsp->vsp_memranges[i];
-
-		/* Skip MMIO range. */
-		if (src->vmr_type == VM_MEM_MMIO)
+		if (dst->vmr_type == VM_MEM_MMIO)
 			continue;
 
-		DPRINTF("sharing gpa=0x%lx for pid %d @ va=0x%lx\n",
-		    src->vmr_gpa, p->p_p->ps_pid, dst->vmr_va);
-		ret = uvm_share(&p->p_vmspace->vm_map, dst->vmr_va,
-		    PROT_READ | PROT_WRITE, vm->vm_map, src->vmr_gpa,
-		    src->vmr_size);
+		uao = vm->vm_memory_slot[i];
+		KASSERT(uao != NULL);
+
+		ret = uvm_map(&p->p_p->ps_vmspace->vm_map, &vsp->vsp_va[i],
+		    dst->vmr_size, uao, 0, 0, uvmflags);
 		if (ret) {
-			printf("%s: uvm_share failed (%d)\n", __func__, ret);
-			break;
+			printf("%s: uvm_map failed: %d\n", __func__, ret);
+			unmap = (i > 0) ? 1 : 0;
+			failed_uao = i;
+			goto out;
+		}
+		uao_reference(uao);	/* Add a reference for the process. */
+
+		ret = uvm_map_immutable(&p->p_p->ps_vmspace->vm_map,
+		    vsp->vsp_va[i], vsp->vsp_va[i] + dst->vmr_size, 1);
+		if (ret) {
+			printf("%s: uvm_map_immutable failed: %d\n",
+			    __func__, ret);
+			unmap = 1;
+			failed_uao = i + 1;
+			goto out;
 		}
 	}
 	ret = 0;
 out:
+	if (unmap) {
+		/* Unmap mapped aobjs, which drops the process's reference. */
+		for (i = 0; i < failed_uao; i++) {
+			dst = &vsp->vsp_memranges[i];
+			uvm_unmap(&p->p_p->ps_vmspace->vm_map,
+			    vsp->vsp_va[i], vsp->vsp_va[i] + dst->vmr_size);
+		}
+	}
 	refcnt_rele_wake(&vm->vm_refcnt);
 	return (ret);
 }

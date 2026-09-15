@@ -1,4 +1,4 @@
-/*	$OpenBSD: output-bgpd.c,v 1.31 2024/04/08 14:02:13 tb Exp $ */
+/*	$OpenBSD: output-bgpd.c,v 1.36 2026/07/07 13:38:54 claudio Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -20,20 +20,19 @@
 #include "extern.h"
 
 int
-output_bgpd(FILE *out, struct vrp_tree *vrps, struct brk_tree *brks,
-    struct vap_tree *vaps, struct vsp_tree *vsps, struct stats *st)
+output_bgpd(FILE *out, struct validation_data *vd, struct stats *st)
 {
 	struct vrp	*vrp;
 	struct vap	*vap;
 	size_t		 i;
 
-	if (outputheader(out, st) < 0)
+	if (outputheader(out, vd, st) < 0)
 		return -1;
 
 	if (fprintf(out, "roa-set {\n") < 0)
 		return -1;
 
-	RB_FOREACH(vrp, vrp_tree, vrps) {
+	RB_FOREACH(vrp, vrp_tree, &vd->vrps) {
 		char ipbuf[64], maxlenbuf[100];
 
 		ip_addr_print(&vrp->addr, vrp->afi, ipbuf, sizeof(ipbuf));
@@ -57,17 +56,17 @@ output_bgpd(FILE *out, struct vrp_tree *vrps, struct brk_tree *brks,
 
 	if (fprintf(out, "\naspa-set {\n") < 0)
 		return -1;
-	RB_FOREACH(vap, vap_tree, vaps) {
+	RB_FOREACH(vap, vap_tree, &vd->vaps) {
 		if (vap->overflowed)
 			continue;
-		if (fprintf(out, "\tcustomer-as %d expires %lld "
+		if (fprintf(out, "\tcustomer-as %u expires %lld "
 		    "provider-as { ", vap->custasid,
 		    (long long)vap->expires) < 0)
 			return -1;
-		for (i = 0; i < vap->providersz; i++) {
+		for (i = 0; i < vap->num_providers; i++) {
 			if (fprintf(out, "%u", vap->providers[i]) < 0)
 				return -1;
-			if (i + 1 < vap->providersz)
+			if (i + 1 < vap->num_providers)
 				if (fprintf(out, ", ") < 0)
 					return -1;
 		}

@@ -1,4 +1,4 @@
-/*	$OpenBSD: qcgpio_fdt.c,v 1.4 2024/07/02 19:43:52 patrick Exp $	*/
+/*	$OpenBSD: qcgpio_fdt.c,v 1.9 2026/09/04 18:06:36 kettenis Exp $	*/
 /*
  * Copyright (c) 2022 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -24,6 +24,10 @@
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_gpio.h>
 #include <dev/ofw/fdt.h>
+
+#ifdef SUSPEND
+extern int cpu_suspended;
+#endif
 
 /* Registers. */
 #define TLMM_GPIO_CFG(pin)		(0x0000 + 0x1000 * (pin))
@@ -59,6 +63,7 @@ struct qcgpio_intrhand {
 	void *ih_arg;
 	void *ih_sc;
 	int ih_pin;
+	int ih_wakeup;
 };
 
 struct qcgpio_softc {
@@ -71,6 +76,7 @@ struct qcgpio_softc {
 
 	uint32_t		sc_npins;
 	struct qcgpio_intrhand	*sc_pin_ih;
+	uint32_t		*sc_pin_intr_cfg;
 
 	struct gpio_controller	sc_gc;
 	struct interrupt_controller sc_ic;
@@ -78,14 +84,18 @@ struct qcgpio_softc {
 
 int	qcgpio_fdt_match(struct device *, void *, void *);
 void	qcgpio_fdt_attach(struct device *, struct device *, void *);
+int	qcgpio_fdt_activate(struct device *, int);
 
 const struct cfattach qcgpio_fdt_ca = {
-	sizeof(struct qcgpio_softc), qcgpio_fdt_match, qcgpio_fdt_attach
+	sizeof(struct qcgpio_softc), qcgpio_fdt_match, qcgpio_fdt_attach, NULL,
+	qcgpio_fdt_activate
 };
 
 void	qcgpio_fdt_config_pin(void *, uint32_t *, int);
 int	qcgpio_fdt_get_pin(void *, uint32_t *);
 void	qcgpio_fdt_set_pin(void *, uint32_t *, int);
+void	*qcgpio_fdt_intr_establish_pin(void *, uint32_t *, int,
+	    struct cpu_info *, int (*)(void *), void *, char *);
 
 void	*qcgpio_fdt_intr_establish(void *, int *, int, struct cpu_info *,
 	    int (*)(void *), void *, char *);
@@ -100,7 +110,8 @@ qcgpio_fdt_match(struct device *parent, void *match, void *aux)
 {
 	struct fdt_attach_args *faa = aux;
 
-	return (OF_is_compatible(faa->fa_node, "qcom,sc8280xp-tlmm") ||
+	return (OF_is_compatible(faa->fa_node, "qcom,sc7280-pinctrl") ||
+	    OF_is_compatible(faa->fa_node, "qcom,sc8280xp-tlmm") ||
 	    OF_is_compatible(faa->fa_node, "qcom,x1e80100-tlmm"));
 }
 
@@ -117,12 +128,16 @@ qcgpio_fdt_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 
-	if (OF_is_compatible(faa->fa_node, "qcom,sc8280xp-tlmm"))
+	if (OF_is_compatible(faa->fa_node, "qcom,sc7280-pinctrl"))
+		sc->sc_npins = 175;
+	else if (OF_is_compatible(faa->fa_node, "qcom,sc8280xp-tlmm"))
 		sc->sc_npins = 230;
 	else
 		sc->sc_npins = 239;
-	sc->sc_pin_ih = mallocarray(sc->sc_npins, sizeof(*sc->sc_pin_ih),
-	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->sc_pin_ih = mallocarray(sc->sc_npins,
+	    sizeof(*sc->sc_pin_ih), M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->sc_pin_intr_cfg = mallocarray(sc->sc_npins,
+	    sizeof(*sc->sc_pin_intr_cfg), M_DEVBUF, M_WAITOK | M_ZERO);
 
 	sc->sc_ih = fdt_intr_establish(faa->fa_node, IPL_BIO, qcgpio_fdt_intr,
 	    sc, sc->sc_dev.dv_xname);
@@ -136,6 +151,7 @@ qcgpio_fdt_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_gc.gc_config_pin = qcgpio_fdt_config_pin;
 	sc->sc_gc.gc_get_pin = qcgpio_fdt_get_pin;
 	sc->sc_gc.gc_set_pin = qcgpio_fdt_set_pin;
+	sc->sc_gc.gc_intr_establish = qcgpio_fdt_intr_establish_pin;
 	gpio_controller_register(&sc->sc_gc);
 
 	sc->sc_ic.ic_node = faa->fa_node;
@@ -154,7 +170,43 @@ unmap:
 	if (sc->sc_ih)
 		fdt_intr_disestablish(sc->sc_ih);
 	free(sc->sc_pin_ih, M_DEVBUF, sc->sc_npins * sizeof(*sc->sc_pin_ih));
+	free(sc->sc_pin_intr_cfg, M_DEVBUF,
+	    sc->sc_npins * sizeof(*sc->sc_pin_intr_cfg));
 	bus_space_unmap(sc->sc_iot, sc->sc_ioh, faa->fa_reg[0].size);
+}
+
+int
+qcgpio_fdt_activate(struct device *self, int act)
+{
+	struct qcgpio_softc *sc = (struct qcgpio_softc *)self;
+	int pin, rv = 0;
+
+	switch (act) {
+	case DVACT_SUSPEND:
+		for (pin = 0; pin < sc->sc_npins; pin++) {
+			if (sc->sc_pin_ih[pin].ih_func == NULL)
+				continue;
+
+			sc->sc_pin_intr_cfg[pin] =
+			    HREAD4(sc, TLMM_GPIO_INTR_CFG(pin));
+			if (sc->sc_pin_ih[pin].ih_wakeup) {
+				HCLR4(sc, TLMM_GPIO_INTR_CFG(pin),
+				    TLMM_GPIO_INTR_CFG_INTR_ENABLE);
+			}
+		}
+		break;
+	case DVACT_RESUME:
+		for (pin = 0; pin < sc->sc_npins; pin++) {
+			if (sc->sc_pin_ih[pin].ih_func == NULL)
+				continue;
+
+			HWRITE4(sc, TLMM_GPIO_INTR_CFG(pin),
+			    sc->sc_pin_intr_cfg[pin]);
+		}
+		break;
+	}
+
+	return rv;
 }
 
 void
@@ -214,6 +266,19 @@ qcgpio_fdt_set_pin(void *cookie, uint32_t *cells, int val)
 }
 
 void *
+qcgpio_fdt_intr_establish_pin(void *cookie, uint32_t *cells, int ipl,
+    struct cpu_info *ci, int (*func)(void *), void *arg, char *name)
+{
+	struct qcgpio_softc *sc = cookie;
+	uint32_t icells[2];
+
+	icells[0] = cells[0];
+	icells[1] = 3; /* both edges */
+
+	return qcgpio_fdt_intr_establish(sc, icells, ipl, ci, func, arg, name);
+}
+
+void *
 qcgpio_fdt_intr_establish(void *cookie, int *cells, int ipl,
     struct cpu_info *ci, int (*func)(void *), void *arg, char *name)
 {
@@ -229,6 +294,11 @@ qcgpio_fdt_intr_establish(void *cookie, int *cells, int ipl,
 	sc->sc_pin_ih[pin].ih_arg = arg;
 	sc->sc_pin_ih[pin].ih_pin = pin;
 	sc->sc_pin_ih[pin].ih_sc = sc;
+
+	if (ipl & IPL_WAKEUP) {
+		sc->sc_pin_ih[pin].ih_wakeup = 1;
+		intr_set_wakeup(sc->sc_ih);
+	}
 
 	reg = HREAD4(sc, TLMM_GPIO_INTR_CFG(pin));
 	reg &= ~TLMM_GPIO_INTR_CFG_INTR_DECT_CTL_MASK;
@@ -322,6 +392,14 @@ qcgpio_fdt_intr(void *arg)
 	for (pin = 0; pin < sc->sc_npins; pin++) {
 		if (sc->sc_pin_ih[pin].ih_func == NULL)
 			continue;
+#ifdef SUSPEND
+		/*
+		 * If we're suspend and this is not a wakeup pin,
+		 * ignore the event and stay suspended.
+		 */
+		if (cpu_suspended && !sc->sc_pin_ih[pin].ih_wakeup)
+			continue;
+#endif
 
 		stat = HREAD4(sc, TLMM_GPIO_INTR_STATUS(pin));
 		if (stat & TLMM_GPIO_INTR_STATUS_INTR_STATUS) {

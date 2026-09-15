@@ -1,4 +1,4 @@
-/*	$OpenBSD: in_pcb.c,v 1.303 2024/07/12 19:50:35 bluhm Exp $	*/
+/*	$OpenBSD: in_pcb.c,v 1.322 2025/12/02 15:52:04 bluhm Exp $	*/
 /*	$NetBSD: in_pcb.c,v 1.25 1996/02/13 23:41:53 christos Exp $	*/
 
 /*
@@ -75,9 +75,7 @@
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/domain.h>
-#include <sys/mount.h>
 #include <sys/pool.h>
 #include <sys/proc.h>
 
@@ -101,6 +99,11 @@
 #include <net/toeplitz.h>
 #endif
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+
 const struct in_addr zeroin_addr;
 const union inpaddru zeroin46_addr;
 
@@ -108,10 +111,10 @@ const union inpaddru zeroin46_addr;
  * These configure the range of local port addresses assigned to
  * "unspecified" outgoing connections/packets/whatever.
  */
-int ipport_firstauto = IPPORT_RESERVED;
-int ipport_lastauto = IPPORT_USERRESERVED;
-int ipport_hifirstauto = IPPORT_HIFIRSTAUTO;
-int ipport_hilastauto = IPPORT_HILASTAUTO;
+int ipport_firstauto = IPPORT_RESERVED;		/* [a] */
+int ipport_lastauto = IPPORT_USERRESERVED;	/* [a] */
+int ipport_hifirstauto = IPPORT_HIFIRSTAUTO;	/* [a] */
+int ipport_hilastauto = IPPORT_HILASTAUTO;	/* [a] */
 
 struct baddynamicports baddynamicports;
 struct baddynamicports rootonlyports;
@@ -179,7 +182,6 @@ void
 in_pcbinit(struct inpcbtable *table, int hashsize)
 {
 	mtx_init(&table->inpt_mtx, IPL_SOFTNET);
-	rw_init(&table->inpt_notify, "inpnotify");
 	TAILQ_INIT(&table->inpt_queue);
 	table->inpt_hashtbl = hashinit(hashsize, M_PCB, M_WAITOK,
 	    &table->inpt_mask);
@@ -203,7 +205,7 @@ in_baddynamic(u_int16_t port, u_int16_t proto)
 	case IPPROTO_UDP:
 #ifdef IPSEC
 		/* Cannot preset this as it is a sysctl */
-		if (port == udpencap_port)
+		if (port == atomic_load_int(&udpencap_port))
 			return (1);
 #endif
 		return (DP_ISSET(baddynamicports.udp, port));
@@ -237,7 +239,7 @@ in_pcballoc(struct socket *so, struct inpcbtable *table, int wait)
 	if (inp == NULL)
 		return (ENOBUFS);
 	inp->inp_table = table;
-	inp->inp_socket = so;
+	inp->inp_socket = soref(so);
 	refcnt_init_trace(&inp->inp_refcnt, DT_REFCNT_IDX_INPCB);
 	inp->inp_seclevel.sl_auth = IPSEC_AUTH_LEVEL_DEFAULT;
 	inp->inp_seclevel.sl_esp_trans = IPSEC_ESP_TRANS_LEVEL_DEFAULT;
@@ -451,16 +453,16 @@ in_pcbpickport(u_int16_t *lport, const void *laddr, int wild,
 	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 
 	if (inp->inp_flags & INP_HIGHPORT) {
-		first = ipport_hifirstauto;	/* sysctl */
-		last = ipport_hilastauto;
+		first = atomic_load_int(&ipport_hifirstauto);	/* sysctl */
+		last = atomic_load_int(&ipport_hilastauto);
 	} else if (inp->inp_flags & INP_LOWPORT) {
 		if (suser(p))
 			return (EACCES);
 		first = IPPORT_RESERVED-1; /* 1023 */
 		last = 600;		   /* not IPPORT_RESERVED/2 */
 	} else {
-		first = ipport_firstauto;	/* sysctl */
-		last = ipport_lastauto;
+		first = atomic_load_int(&ipport_firstauto);	/* sysctl */
+		last = atomic_load_int(&ipport_lastauto);
 	}
 	if (first < last) {
 		lower = first;
@@ -584,12 +586,9 @@ in_pcbdetach(struct inpcb *inp)
 	struct socket *so = inp->inp_socket;
 	struct inpcbtable *table = inp->inp_table;
 
+	soassertlocked(so);
+
 	so->so_pcb = NULL;
-	/*
-	 * As long as the NET_LOCK() is the default lock for Internet
-	 * sockets, do not release it to not introduce new sleeping
-	 * points.
-	 */
 	sofree(so, 1);
 	if (inp->inp_route.ro_rt) {
 		rtfree(inp->inp_route.ro_rt);
@@ -619,6 +618,34 @@ in_pcbdetach(struct inpcb *inp)
 	in_pcbunref(inp);
 }
 
+struct socket *
+in_pcbsolock(struct inpcb *inp)
+{
+	struct socket *so = inp->inp_socket;
+
+	NET_ASSERT_LOCKED();
+
+	if (so == NULL)
+		return NULL;
+	rw_enter_write(&so->so_lock);
+	if (so->so_pcb == NULL) {
+		rw_exit_write(&so->so_lock);
+		return NULL;
+	}
+	KASSERT(inp->inp_socket == so && sotoinpcb(so) == inp);
+	return so;
+}
+
+void
+in_pcbsounlock(struct inpcb *inp, struct socket *so)
+{
+	if (so == NULL)
+		return;
+	if (inp != NULL && so->so_pcb != NULL)
+		KASSERT(inp->inp_socket == so && sotoinpcb(so) == inp);
+	rw_exit_write(&so->so_lock);
+}
+
 struct inpcb *
 in_pcbref(struct inpcb *inp)
 {
@@ -635,6 +662,7 @@ in_pcbunref(struct inpcb *inp)
 		return;
 	if (refcnt_rele(&inp->inp_refcnt) == 0)
 		return;
+	sorele(inp->inp_socket);
 	KASSERT((LIST_NEXT(inp, inp_hash) == NULL) ||
 	    (LIST_NEXT(inp, inp_hash) == _Q_INVALID));
 	KASSERT((LIST_NEXT(inp, inp_lhash) == NULL) ||
@@ -642,6 +670,49 @@ in_pcbunref(struct inpcb *inp)
 	KASSERT((TAILQ_NEXT(inp, inp_queue) == NULL) ||
 	    (TAILQ_NEXT(inp, inp_queue) == _Q_INVALID));
 	pool_put(&inpcb_pool, inp);
+}
+
+struct inpcb *
+in_pcb_iterator(struct inpcbtable *table, struct inpcb *inp,
+    struct inpcb_iterator *iter)
+{
+	struct inpcb *tmp;
+
+	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
+
+	if (inp)
+		tmp = TAILQ_NEXT((struct inpcb *)iter, inp_queue);
+	else
+		tmp = TAILQ_FIRST(&table->inpt_queue);
+
+	while (tmp && tmp->inp_table == NULL)
+		tmp = TAILQ_NEXT(tmp, inp_queue);
+
+	if (inp) {
+		TAILQ_REMOVE(&table->inpt_queue, (struct inpcb *)iter,
+		    inp_queue);
+		in_pcbunref(inp);
+	}
+	if (tmp) {
+		TAILQ_INSERT_AFTER(&table->inpt_queue, tmp,
+		    (struct inpcb *)iter, inp_queue);
+		in_pcbref(tmp);
+	}
+
+	return tmp;
+}
+
+void
+in_pcb_iterator_abort(struct inpcbtable *table, struct inpcb *inp,
+    struct inpcb_iterator *iter)
+{
+	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
+
+	if (inp) {
+		TAILQ_REMOVE(&table->inpt_queue, (struct inpcb *)iter,
+		    inp_queue);
+		in_pcbunref(inp);
+	}
 }
 
 void
@@ -708,6 +779,17 @@ in_peeraddr(struct socket *so, struct mbuf *nam)
 	return (0);
 }
 
+int
+in_flowid(struct socket *so)
+{
+	struct inpcb *inp;
+
+	inp = sotoinpcb(so);
+	if (inp == NULL)
+		return (0);
+	return (inp->inp_flowid);
+}
+
 /*
  * Pass some notification to all connections of a protocol
  * associated with address dst.  The "usual action" will be
@@ -720,8 +802,8 @@ void
 in_pcbnotifyall(struct inpcbtable *table, const struct sockaddr_in *dst,
     u_int rtable, int errno, void (*notify)(struct inpcb *, int))
 {
-	SIMPLEQ_HEAD(, inpcb) inpcblist;
-	struct inpcb *inp;
+	struct inpcb_iterator iter = { .inp_table = NULL };
+	struct inpcb *inp = NULL;
 	u_int rdomain;
 
 	if (dst->sin_addr.s_addr == INADDR_ANY)
@@ -729,37 +811,25 @@ in_pcbnotifyall(struct inpcbtable *table, const struct sockaddr_in *dst,
 	if (notify == NULL)
 		return;
 
-	/*
-	 * Use a temporary notify list protected by rwlock to run over
-	 * selected PCB.  This is necessary as the list of all PCB is
-	 * protected by a mutex.  Notify may call ip_output() eventually
-	 * which may sleep as pf lock is a rwlock.  Also the SRP
-	 * implementation of the routing table might sleep.
-	 * The same inp_notify list entry and inpt_notify rwlock are
-	 * used for UDP multicast and raw IP delivery.
-	 */
-	SIMPLEQ_INIT(&inpcblist);
 	rdomain = rtable_l2(rtable);
-	rw_enter_write(&table->inpt_notify);
 	mtx_enter(&table->inpt_mtx);
-	TAILQ_FOREACH(inp, &table->inpt_queue, inp_queue) {
+	while ((inp = in_pcb_iterator(table, inp, &iter)) != NULL) {
+		struct socket *so;
+
 		KASSERT(!ISSET(inp->inp_flags, INP_IPV6));
 
 		if (inp->inp_faddr.s_addr != dst->sin_addr.s_addr ||
 		    rtable_l2(inp->inp_rtableid) != rdomain) {
 			continue;
 		}
-		in_pcbref(inp);
-		SIMPLEQ_INSERT_TAIL(&inpcblist, inp, inp_notify);
+		mtx_leave(&table->inpt_mtx);
+		so = in_pcbsolock(inp);
+		if (so != NULL)
+			(*notify)(inp, errno);
+		in_pcbsounlock(inp, so);
+		mtx_enter(&table->inpt_mtx);
 	}
 	mtx_leave(&table->inpt_mtx);
-
-	while ((inp = SIMPLEQ_FIRST(&inpcblist)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&inpcblist, inp_notify);
-		(*notify)(inp, errno);
-		in_pcbunref(inp);
-	}
-	rw_exit_write(&table->inpt_notify);
 }
 
 /*
@@ -805,8 +875,10 @@ in_losing(struct inpcb *inp)
  * and allocate a (hopefully) better one.
  */
 void
-in_rtchange(struct inpcb *inp, int errno)
+in_pcbrtchange(struct inpcb *inp, int errno)
 {
+	soassertlocked(inp->inp_socket);
+
 	if (inp->inp_route.ro_rt) {
 		rtfree(inp->inp_route.ro_rt);
 		inp->inp_route.ro_rt = NULL;
@@ -898,6 +970,8 @@ in_pcblookup_local_lock(struct inpcbtable *table, const void *laddrp,
 struct rtentry *
 in_pcbrtentry(struct inpcb *inp)
 {
+	soassertlocked(inp->inp_socket);
+
 #ifdef INET6
 	if (ISSET(inp->inp_flags, INP_IPV6))
 		return in6_pcbrtentry(inp);
@@ -916,12 +990,13 @@ in_pcbrtentry(struct inpcb *inp)
  * an entry to the caller for later use.
  */
 int
-in_pcbselsrc(struct in_addr *insrc, struct sockaddr_in *sin,
+in_pcbselsrc(struct in_addr *insrc, const struct sockaddr_in *dstsock,
     struct inpcb *inp)
 {
-	struct ip_moptions *mopts = inp->inp_moptions;
-	struct rtentry *rt;
+	const struct in_addr *dst = &dstsock->sin_addr;
 	const struct in_addr *laddr = &inp->inp_laddr;
+	struct rtentry *rt;
+	struct ip_moptions *mopts = inp->inp_moptions;
 	u_int rtableid = inp->inp_rtableid;
 	struct sockaddr	*ip4_source = NULL;
 	struct in_ifaddr *ia = NULL;
@@ -942,14 +1017,14 @@ in_pcbselsrc(struct in_addr *insrc, struct sockaddr_in *sin,
 	 * been set as a multicast option, use the address of that
 	 * interface as our source address.
 	 */
-	if ((IN_MULTICAST(sin->sin_addr.s_addr) ||
-	    sin->sin_addr.s_addr == INADDR_BROADCAST) && mopts != NULL) {
+	if ((IN_MULTICAST(dst->s_addr) || dst->s_addr == INADDR_BROADCAST) &&
+	    mopts != NULL) {
 		struct ifnet *ifp;
 
 		ifp = if_get(mopts->imo_ifidx);
 		if (ifp != NULL) {
 			if (ifp->if_rdomain == rtable_l2(rtableid))
-				IFP_TO_IA(ifp, ia);
+				ia = in_ifp2ia(ifp);
 			if (ia == NULL) {
 				if_put(ifp);
 				return (EADDRNOTAVAIL);
@@ -965,7 +1040,7 @@ in_pcbselsrc(struct in_addr *insrc, struct sockaddr_in *sin,
 	 * If route is known or can be allocated now,
 	 * our src addr is taken from the i/f, else punt.
 	 */
-	rt = route_mpath(&inp->inp_route, &sin->sin_addr, NULL, rtableid);
+	rt = route_mpath(&inp->inp_route, dst, NULL, rtableid);
 
 	/*
 	 * If we found a route, use the address
@@ -980,8 +1055,7 @@ in_pcbselsrc(struct in_addr *insrc, struct sockaddr_in *sin,
 	 * - preferred source address is set
 	 * - output interface is UP
 	 */
-	if (rt != NULL && !(rt->rt_flags & RTF_LLINFO) &&
-	    !(rt->rt_flags & RTF_HOST)) {
+	if (rt != NULL && ISSET(rt->rt_flags, RTF_GATEWAY)) {
 		ip4_source = rtable_getsource(rtableid, AF_INET);
 		if (ip4_source != NULL) {
 			struct ifaddr *ifa;
@@ -1098,6 +1172,8 @@ in_pcbresize(struct inpcbtable *table, int hashsize)
 	table->inpt_size = hashsize;
 
 	TAILQ_FOREACH(inp, &table->inpt_queue, inp_queue) {
+		if (in_pcb_is_iterator(inp))
+			continue;
 		LIST_REMOVE(inp, inp_lhash);
 		LIST_REMOVE(inp, inp_hash);
 		in_pcbhash_insert(inp);
@@ -1258,33 +1334,50 @@ in_pcbset_rtableid(struct inpcb *inp, u_int rtableid)
 	return (0);
 }
 
-void
-in_pcbset_laddr(struct inpcb *inp, const struct sockaddr *sa, u_int rtableid)
+int
+in_pcbset_addr(struct inpcb *inp, const struct sockaddr *fsa,
+    const struct sockaddr *lsa, u_int rtableid)
 {
 	struct inpcbtable *table = inp->inp_table;
+	const struct sockaddr_in *fsin, *lsin;
+	struct inpcb *t;
 
-	mtx_enter(&table->inpt_mtx);
-	inp->inp_rtableid = rtableid;
 #ifdef INET6
 	if (ISSET(inp->inp_flags, INP_IPV6)) {
-		const struct sockaddr_in6 *sin6;
-
-		KASSERT(sa->sa_family == AF_INET6);
-		sin6 = satosin6_const(sa);
-		inp->inp_lport = sin6->sin6_port;
-		inp->inp_laddr6 = sin6->sin6_addr;
-	} else
-#endif
-	{
-		const struct sockaddr_in *sin;
-
-		KASSERT(sa->sa_family == AF_INET);
-		sin = satosin_const(sa);
-		inp->inp_lport = sin->sin_port;
-		inp->inp_laddr = sin->sin_addr;
+		KASSERT(fsa->sa_family == AF_INET6);
+		KASSERT(lsa->sa_family == AF_INET6);
+		return in6_pcbset_addr(inp, satosin6_const(fsa),
+		    satosin6_const(lsa), rtableid);
 	}
+#endif
+	KASSERT(fsa->sa_family == AF_INET);
+	KASSERT(lsa->sa_family == AF_INET);
+	fsin = satosin_const(fsa);
+	lsin = satosin_const(lsa);
+
+	mtx_enter(&table->inpt_mtx);
+
+	t = in_pcblookup_lock(inp->inp_table, fsin->sin_addr, fsin->sin_port,
+	    lsin->sin_addr, lsin->sin_port, rtableid, IN_PCBLOCK_HOLD);
+	if (t != NULL) {
+		mtx_leave(&table->inpt_mtx);
+		return (EADDRINUSE);
+	}
+
+	inp->inp_rtableid = rtableid;
+	inp->inp_laddr = lsin->sin_addr;
+	inp->inp_lport = lsin->sin_port;
+	inp->inp_faddr = fsin->sin_addr;
+	inp->inp_fport = fsin->sin_port;
 	in_pcbrehash(inp);
+
 	mtx_leave(&table->inpt_mtx);
+
+#if NSTOEPLITZ > 0
+	inp->inp_flowid = stoeplitz_ip4port(inp->inp_faddr.s_addr,
+	    inp->inp_laddr.s_addr, inp->inp_fport, inp->inp_lport);
+#endif
+	return (0);
 }
 
 void

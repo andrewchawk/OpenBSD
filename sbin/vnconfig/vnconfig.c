@@ -1,4 +1,4 @@
-/*	$OpenBSD: vnconfig.c,v 1.13 2023/05/14 18:34:02 krw Exp $	*/
+/*	$OpenBSD: vnconfig.c,v 1.15 2025/11/30 23:46:03 jsg Exp $	*/
 /*
  * Copyright (c) 1993 University of Utah.
  * Copyright (c) 1990, 1993
@@ -73,7 +73,6 @@ main(int argc, char **argv)
 	char	*key = NULL, *rounds = NULL, *saltopt = NULL;
 	char	*file, *vnd;
 	size_t	 keylen = 0;
-	extern char *__progname;
 	struct disklabel *dp = NULL;
 
 	action = VND_CONFIG;
@@ -362,7 +361,8 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage: vnconfig [-v] [-k | -K rounds [-S saltfile]] "
-	    "[-t disktype] [vnd_dev] image\n"
+	    "[-t disktype] [vnd_dev]\n"
+	    "                image\n"
 	    "       vnconfig -l [vnd_dev]\n"
 	    "       vnconfig -u [-v] vnd_dev\n");
 	exit(1);

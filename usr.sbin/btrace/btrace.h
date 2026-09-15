@@ -1,4 +1,4 @@
-/*	$OpenBSD: btrace.h,v 1.15 2024/05/21 05:00:48 jsg Exp $ */
+/*	$OpenBSD: btrace.h,v 1.17 2025/12/04 22:55:17 jsg Exp $ */
 
 /*
  * Copyright (c) 2019 - 2020 Martin Pieuchot <mpi@openbsd.org>
@@ -19,6 +19,8 @@
 #ifndef BTRACE_H
 #define BTRACE_H
 
+#include <dev/dt/dtvar.h>
+
 #ifndef nitems
 #define nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
 #endif
@@ -33,14 +35,15 @@ const char *		 ba_name(struct bt_arg *);
 long			 ba2long(struct bt_arg *, struct dt_evt *);
 const char		*ba2str(struct bt_arg *, struct dt_evt *);
 long			 bacmp(struct bt_arg *, struct bt_arg *);
-unsigned long		 dt_get_offset(pid_t);
 
 /* ksyms.c */
 struct syms;
-struct syms		*kelf_open(const char *);
+struct syms		*kelf_open_kernel(const char *);
 void			 kelf_close(struct syms *);
-int			 kelf_snprintsym(struct syms *, char *, size_t,
-			    unsigned long, unsigned long);
+int			 kelf_snprintsym_proc(int, pid_t, char *, size_t,
+			    unsigned long);
+int			 kelf_snprintsym_kernel(struct syms *, char *, size_t,
+			    unsigned long);
 
 /* map.c */
 struct map;

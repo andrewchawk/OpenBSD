@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_mmap.c,v 1.191 2024/04/05 14:16:05 deraadt Exp $	*/
+/*	$OpenBSD: uvm_mmap.c,v 1.204 2026/02/11 22:34:41 deraadt Exp $	*/
 /*	$NetBSD: uvm_mmap.c,v 1.49 2001/02/18 21:19:08 chs Exp $	*/
 
 /*
@@ -74,6 +74,11 @@
 #include <uvm/uvm.h>
 #include <uvm/uvm_device.h>
 #include <uvm/uvm_vnode.h>
+
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
 
 int uvm_mmapanon(vm_map_t, vaddr_t *, vsize_t, vm_prot_t, vm_prot_t, int,
     vsize_t, struct proc *);
@@ -163,7 +168,7 @@ sys_mquery(struct proc *p, void *v, register_t *retval)
 	return error;
 }
 
-int	uvm_wxabort;
+int	uvm_wxabort;	/* [a] */
 
 /*
  * W^X violations are only allowed on permitted filesystems.
@@ -175,10 +180,10 @@ uvm_wxcheck(struct proc *p, char *call)
 	int wxallowed = (pr->ps_textvp->v_mount &&
 	    (pr->ps_textvp->v_mount->mnt_flag & MNT_WXALLOWED));
 
-	if (wxallowed && (pr->ps_flags & PS_WXNEEDED))
+	if (wxallowed && (pr->ps_iflags & PSI_WXNEEDED))
 		return 0;
 
-	if (uvm_wxabort) {
+	if (atomic_load_int(&uvm_wxabort)) {
 		KERNEL_LOCK();
 		/* Report W^X failures */
 		if (pr->ps_wxcounter++ == 0)
@@ -602,14 +607,23 @@ sys_pinsyscalls(struct proc *p, void *v, register_t *retval)
 	} */ *uap = v;
 	struct process *pr = p->p_p;
 	struct vm_map *map = &p->p_vmspace->vm_map;
-	int npins, error = 0, i;
+	int npins, error = 0, i, map_flags;
 	vaddr_t base;
 	size_t len;
 	u_int *pins;
 
-	if (pr->ps_libcpin.pn_start ||
-	    (pr->ps_vmspace->vm_map.flags & VM_MAP_PINSYSCALL_ONCE))
+	/* Must be called before any threads are created */
+	if (P_HASSIBLING(p))
 		return (EPERM);
+
+	/* Only allow libc syscall pinning once per process */
+	mtx_enter(&pr->ps_vmspace->vm_map.flags_lock);
+	map_flags = pr->ps_vmspace->vm_map.flags;
+	pr->ps_vmspace->vm_map.flags |= VM_MAP_PINSYSCALL_ONCE;
+	mtx_leave(&pr->ps_vmspace->vm_map.flags_lock);
+	if (map_flags & VM_MAP_PINSYSCALL_ONCE)
+		return (EPERM);
+
 	base = (vaddr_t)SCARG(uap, base);
 	len = (vsize_t)SCARG(uap, len);
 	if (base > SIZE_MAX - len)
@@ -617,12 +631,10 @@ sys_pinsyscalls(struct proc *p, void *v, register_t *retval)
 	if (base < map->min_offset || base+len > map->max_offset)
 		return (EINVAL);
 
-	/* XXX MP unlock */
-
 	npins = SCARG(uap, npins);
 	if (npins < 1 || npins > SYS_MAXSYSCALL)
 		return (E2BIG);
-	pins = malloc(npins * sizeof(u_int), M_PINSYSCALL, M_WAITOK|M_ZERO);
+	pins = mallocarray(npins, sizeof(u_int), M_PINSYSCALL, M_WAITOK|M_ZERO);
 	if (pins == NULL)
 		return (ENOMEM);
 	error = copyin(SCARG(uap, pins), pins, npins * sizeof(u_int));
@@ -647,7 +659,6 @@ err:
 	pr->ps_libcpin.pn_end = base + len;
 	pr->ps_libcpin.pn_pins = pins;
 	pr->ps_libcpin.pn_npins = npins;
-	pr->ps_flags |= PS_LIBCPIN;
 
 #ifdef PMAP_CHECK_COPYIN
 	/* Assume (and insist) on libc.so text being execute-only */
@@ -664,8 +675,8 @@ int
 sys_mimmutable(struct proc *p, void *v, register_t *retval)
 {
 	struct sys_mimmutable_args /* {
-		immutablearg(void *) addr;
-		immutablearg(size_t) len;
+		syscallarg(void *) addr;
+		syscallarg(size_t) len;
 	} */ *uap = v;
 	vaddr_t addr;
 	vsize_t size, pageoff;
@@ -823,7 +834,7 @@ sys_mlock(struct proc *p, void *v, register_t *retval)
 	if (addr > SIZE_MAX - size)
 		return EINVAL;		/* disallow wrap-around. */
 
-	if (atop(size) + uvmexp.wired > uvmexp.wiredmax)
+	if (atop(size) + atomic_load_sint(&uvmexp.wired) > uvmexp.wiredmax)
 		return EAGAIN;
 
 #ifdef pmap_wired_count
@@ -937,7 +948,7 @@ uvm_mmaplock(vm_map_t map, vaddr_t *addr, vsize_t size, vm_prot_t prot,
 	vm_map_lock(map);
 	if (map->flags & VM_MAP_WIREFUTURE) {
 		KERNEL_LOCK();
-		if ((atop(size) + uvmexp.wired) > uvmexp.wiredmax
+		if ((atop(size) + atomic_load_sint(&uvmexp.wired)) > uvmexp.wiredmax
 #ifdef pmap_wired_count
 		    || (locklimit != 0 && (size +
 			 ptoa(pmap_wired_count(vm_map_pmap(map)))) >
@@ -1002,10 +1013,8 @@ uvm_mmapanon(vm_map_t map, vaddr_t *addr, vsize_t size, vm_prot_t prot,
 	if ((flags & MAP_FIXED) == 0 && size >= __LDPGSZ)
 		align = __LDPGSZ;
 	if ((flags & MAP_SHARED) == 0)
-		/* XXX: defer amap create */
 		uvmflag |= UVM_FLAG_COPYONW;
 	else
-		/* shared: create amap now */
 		uvmflag |= UVM_FLAG_OVERLAY;
 	if (flags & MAP_STACK)
 		uvmflag |= UVM_FLAG_STACK;

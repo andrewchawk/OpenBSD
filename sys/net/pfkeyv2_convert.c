@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfkeyv2_convert.c,v 1.83 2023/11/28 13:23:20 bluhm Exp $	*/
+/*	$OpenBSD: pfkeyv2_convert.c,v 1.85 2026/08/12 18:23:14 bluhm Exp $	*/
 /*
  * The author of this code is Angelos D. Keromytis (angelos@keromytis.org)
  *
@@ -96,9 +96,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/mbuf.h>
-#include <sys/kernel.h>
 #include <sys/socket.h>
-#include <sys/timeout.h>
 #include <net/route.h>
 #include <net/if.h>
 
@@ -856,7 +854,9 @@ export_replay(void **p, struct tdb *tdb)
 {
 	struct sadb_x_replay *sreplay = (struct sadb_x_replay *)*p;
 
+	mtx_enter(&tdb->tdb_mtx);
 	sreplay->sadb_x_replay_count = tdb->tdb_rpl;
+	mtx_leave(&tdb->tdb_mtx);
 	sreplay->sadb_x_replay_len =
 	    sizeof(struct sadb_x_replay) / sizeof(uint64_t);
 	*p += sizeof(struct sadb_x_replay);

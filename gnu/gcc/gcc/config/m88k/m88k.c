@@ -1,6 +1,6 @@
 /* Subroutines for insn-output.c for Motorola 88000.
    Copyright (C) 1988, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000,
-   2001, 2002 Free Software Foundation, Inc. 
+   2001, 2002 Free Software Foundation, Inc.
    Contributed by Michael Tiemann (tiemann@mcc.com)
    Currently maintained by (gcc@dg-rtp.dg.com)
 
@@ -39,6 +39,7 @@ Boston, MA 02110-1301, USA.  */
 #include "libfuncs.h"
 #include "c-tree.h"
 #include "flags.h"
+#include "ggc.h"
 #include "recog.h"
 #include "toplev.h"
 #include "tm_p.h"
@@ -47,37 +48,57 @@ Boston, MA 02110-1301, USA.  */
 #include "tree-gimple.h"
 
 #ifdef REGISTER_PREFIX
-const char *m88k_register_prefix = REGISTER_PREFIX;
+static const char *m88k_register_prefix = REGISTER_PREFIX;
 #else
-const char *m88k_register_prefix = "";
+static const char *m88k_register_prefix = "";
 #endif
+
+/* A C structure for machine-specific, per-function data.
+   This is added to the cfun structure.  */
+struct machine_function GTY(())
+{
+  /* Offset of hardware frame pointer (r30) if used.  */
+  int hardfp_offset;
+  /* Size of frame, rounded to a 16 byte boundary.  */
+  int frame_size;
+  /* Total size of allocated stack.  */
+  int stack_size;
+  /* Number of argument registers to save for proper va_list operation.  */
+  int saved_va_regcnt;
+  /* Number of general registers (but r1 and r30) needing to be saved.  */
+  int saved_gregs;
+  /* Number of extended registers needing to be saved.  */
+  int saved_xregs;
+  /* Registers needing to be saved. */
+  char save_regs[LAST_EXTENDED_REGISTER + 1];
+  /* Above data is valid and final.  */
+  bool initialized;
+};
+
 char m88k_volatile_code;
-
-int m88k_fp_offset	= 0;	/* offset of frame pointer if used */
-int m88k_stack_size	= 0;	/* size of allocated stack (including frame) */
 int m88k_case_index;
-
-rtx m88k_compare_reg;		/* cmp output pseudo register */
-rtx m88k_compare_op0;		/* cmpsi operand 0 */
-rtx m88k_compare_op1;		/* cmpsi operand 1 */
+rtx m88k_compare_reg = NULL_RTX;	/* cmp output pseudo register */
+rtx m88k_compare_op0 = NULL_RTX;	/* cmpsi operand 0 */
+rtx m88k_compare_op1 = NULL_RTX;	/* cmpsi operand 1 */
 
 enum processor_type m88k_cpu;	/* target cpu */
 
+static struct machine_function *m88k_init_machine_status (void);
 static void m88k_maybe_dead (rtx);
-static void m88k_output_function_epilogue (FILE *, HOST_WIDE_INT);
-static rtx m88k_struct_value_rtx (tree, int);
+
+static void m88k_output_file_start (void);
 static int m88k_adjust_cost (rtx, rtx, rtx, int);
 static bool m88k_handle_option (size_t, const char *, int);
+static bool m88k_rtx_costs (rtx, int, int, int *);
+static int m88k_address_cost (rtx);
+static tree m88k_build_va_list (void);
+static tree m88k_gimplify_va_arg (tree, tree, tree *, tree *);
+static rtx m88k_struct_value_rtx (tree, int);
 static bool m88k_pass_by_reference (CUMULATIVE_ARGS *, enum machine_mode,
 				    tree, bool);
 static bool m88k_return_in_memory (tree, tree);
 static void m88k_setup_incoming_varargs (CUMULATIVE_ARGS *, enum machine_mode,
 					 tree, int *, int);
-static tree m88k_build_va_list (void);
-static tree m88k_gimplify_va_arg (tree, tree, tree *, tree *);
-static bool m88k_rtx_costs (rtx, int, int, int *);
-static int m88k_address_cost (rtx);
-static void m88k_output_file_start (void);
 
 /* Initialize the GCC target structure.  */
 #if !defined(OBJECT_FORMAT_ELF)
@@ -93,14 +114,38 @@ static void m88k_output_file_start (void);
 #define TARGET_ASM_UNALIGNED_SI_OP "\tuaword\t"
 #endif
 
-#undef TARGET_ASM_FUNCTION_EPILOGUE
-#define TARGET_ASM_FUNCTION_EPILOGUE m88k_output_function_epilogue
+#undef TARGET_ASM_FILE_START
+#define TARGET_ASM_FILE_START m88k_output_file_start
 
 #undef TARGET_SCHED_ADJUST_COST
 #define TARGET_SCHED_ADJUST_COST m88k_adjust_cost
 
+#undef TARGET_DEFAULT_TARGET_FLAGS
+#define TARGET_DEFAULT_TARGET_FLAGS (TARGET_DEFAULT)
+
 #undef TARGET_HANDLE_OPTION
 #define TARGET_HANDLE_OPTION m88k_handle_option
+
+#undef TARGET_RTX_COSTS
+#define TARGET_RTX_COSTS m88k_rtx_costs
+
+#undef TARGET_ADDRESS_COST
+#define TARGET_ADDRESS_COST m88k_address_cost
+
+#undef TARGET_BUILD_BUILTIN_VA_LIST
+#define TARGET_BUILD_BUILTIN_VA_LIST m88k_build_va_list
+
+#undef TARGET_GIMPLIFY_VA_ARG_EXPR
+#define TARGET_GIMPLIFY_VA_ARG_EXPR m88k_gimplify_va_arg
+
+#undef TARGET_PROMOTE_FUNCTION_ARGS
+#define TARGET_PROMOTE_FUNCTION_ARGS hook_bool_tree_true
+
+#undef TARGET_PROMOTE_FUNCTION_RETURN
+#define TARGET_PROMOTE_FUNCTION_RETURN hook_bool_tree_true
+
+#undef TARGET_PROMOTE_PROTOTYPES
+#define TARGET_PROMOTE_PROTOTYPES hook_bool_tree_true
 
 #undef TARGET_STRUCT_VALUE_RTX
 #define TARGET_STRUCT_VALUE_RTX m88k_struct_value_rtx
@@ -111,38 +156,30 @@ static void m88k_output_file_start (void);
 #undef TARGET_RETURN_IN_MEMORY
 #define TARGET_RETURN_IN_MEMORY m88k_return_in_memory
 
-#undef TARGET_PROMOTE_PROTOTYPES
-#define TARGET_PROMOTE_PROTOTYPES hook_bool_tree_true
-
-#undef TARGET_PROMOTE_FUNCTION_ARGS
-#define TARGET_PROMOTE_FUNCTION_ARGS hook_bool_tree_true
-
-#undef TARGET_PROMOTE_FUNCTION_RETURN
-#define TARGET_PROMOTE_FUNCTION_RETURN hook_bool_tree_true
-
 #undef TARGET_SETUP_INCOMING_VARARGS
 #define TARGET_SETUP_INCOMING_VARARGS m88k_setup_incoming_varargs
 
-#undef TARGET_BUILD_BUILTIN_VA_LIST
-#define TARGET_BUILD_BUILTIN_VA_LIST m88k_build_va_list
-
-#undef TARGET_GIMPLIFY_VA_ARG_EXPR
-#define TARGET_GIMPLIFY_VA_ARG_EXPR m88k_gimplify_va_arg
-
-#undef TARGET_RTX_COSTS
-#define TARGET_RTX_COSTS m88k_rtx_costs
-
-#undef TARGET_ADDRESS_COST
-#define TARGET_ADDRESS_COST m88k_address_cost
-
-#undef TARGET_ASM_FILE_START
-#define TARGET_ASM_FILE_START m88k_output_file_start
-/* from elfos.h
-#undef TARGET_ASM_FILE_START_FILE_DIRECTIVE
-#define TARGET_ASM_FILE_START_FILE_DIRECTIVE true
-*/
-
 struct gcc_target targetm = TARGET_INITIALIZER;
+
+const enum reg_class m88k_regno_reg_class[FIRST_PSEUDO_REGISTER] =
+{
+  AP_REG, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  GENERAL_REGS, GENERAL_REGS, GENERAL_REGS, GENERAL_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+  XRF_REGS, XRF_REGS, XRF_REGS, XRF_REGS,
+};
 
 /* Worker function for TARGET_STRUCT_VALUE_RTX.  */
 
@@ -241,8 +278,7 @@ output_load_const_int (enum machine_mode mode, rtx *operands)
       "or.u %0,%#r0,%X1\n\tor %0,%0,%x1",
     };
 
-  gcc_assert (REG_P (operands[0])
-	      && GET_CODE (operands[1]) == CONST_INT);
+  gcc_assert (REG_P (operands[0]) && CONST_INT_P (operands[1]));
   return patterns[classify_integer (mode, INTVAL (operands[1]))];
 }
 
@@ -317,23 +353,23 @@ emit_move_sequence (rtx *operands, enum machine_mode mode, rtx scratch)
   if (CONSTANT_P (operand1) && flag_pic
       && pic_address_needs_scratch (operand1))
     operands[1] = operand1 = legitimize_address (1, operand1, NULL_RTX,
-						 NULL_RTX);
+						 scratch);
 
   /* Handle most common case first: storing into a register.  */
   if (register_operand (operand0, mode))
     {
       if (register_operand (operand1, mode)
-	  || (GET_CODE (operand1) == CONST_INT && SMALL_INT (operand1))
+	  || (CONST_INT_P (operand1) && SMALL_INT (operand1))
 	  || GET_CODE (operand1) == HIGH
 	  /* Only `general_operands' can come here, so MEM is ok.  */
-	  || GET_CODE (operand1) == MEM)
+	  || MEM_P (operand1))
 	{
 	  /* Run this case quickly.  */
 	  emit_insn (gen_rtx_SET (VOIDmode, operand0, operand1));
 	  return 1;
 	}
     }
-  else if (GET_CODE (operand0) == MEM)
+  else if (MEM_P (operand0))
     {
       if (register_operand (operand1, mode)
 	  || (operand1 == const0_rtx && GET_MODE_SIZE (mode) <= UNITS_PER_WORD))
@@ -352,8 +388,7 @@ emit_move_sequence (rtx *operands, enum machine_mode mode, rtx scratch)
   /* Simplify the source if we need to.  */
   if (GET_CODE (operand1) != HIGH && immediate_operand (operand1, mode))
     {
-      if (GET_CODE (operand1) != CONST_INT
-	  && GET_CODE (operand1) != CONST_DOUBLE)
+      if (!CONST_INT_P (operand1) && GET_CODE (operand1) != CONST_DOUBLE)
 	{
 	  rtx temp = ((reload_in_progress || reload_completed)
 		      ? operand0 : NULL_RTX);
@@ -377,10 +412,10 @@ emit_move_sequence (rtx *operands, enum machine_mode mode, rtx scratch)
    and we need a second temp register, then we use SCRATCH, which is
    provided via the SECONDARY_INPUT_RELOAD_CLASS mechanism.  */
 
-struct rtx_def *
+rtx
 legitimize_address (int pic, rtx orig, rtx reg, rtx scratch)
 {
-  rtx addr = (GET_CODE (orig) == MEM ? XEXP (orig, 0) : orig);
+  rtx addr = MEM_P (orig) ? XEXP (orig, 0) : orig;
   rtx new = orig;
   rtx temp, insn;
 
@@ -428,6 +463,8 @@ legitimize_address (int pic, rtx orig, rtx reg, rtx scratch)
 	{
 	  rtx base;
 
+	  gcc_assert (GET_CODE (XEXP (addr, 0)) == PLUS);
+
 	  if (GET_CODE (XEXP (addr, 0)) == PLUS
 	      && XEXP (XEXP (addr, 0), 0) == pic_offset_table_rtx)
 	    return orig;
@@ -438,14 +475,12 @@ legitimize_address (int pic, rtx orig, rtx reg, rtx scratch)
 	      reg = gen_reg_rtx (Pmode);
 	    }
 
-	  gcc_assert (GET_CODE (XEXP (addr, 0)) == PLUS);
-
 	  base = legitimize_address (1, XEXP (XEXP (addr, 0), 0), reg,
 				     NULL_RTX);
 	  addr = legitimize_address (1, XEXP (XEXP (addr, 0), 1),
 				     base == reg ? NULL_RTX : reg, NULL_RTX);
 
-	  if (GET_CODE (addr) == CONST_INT)
+	  if (CONST_INT_P (addr))
 	    {
 	      if (ADD_INT (addr))
 		return plus_constant (base, INTVAL (addr));
@@ -481,12 +516,164 @@ legitimize_address (int pic, rtx orig, rtx reg, rtx scratch)
       new = gen_rtx_LO_SUM (SImode, reg, addr);
     }
 
-  if (GET_CODE (orig) == MEM)
+  if (MEM_P (orig))
     {
       new = gen_rtx_MEM (GET_MODE (orig), new);
       MEM_COPY_ATTRIBUTES (new, orig);
     }
   return new;
+}
+
+bool m88k_regno_ok_for_index_p (int regno)
+{
+  if (regno >= FIRST_PSEUDO_REGISTER && reg_renumber[regno] >= 0)
+    regno = reg_renumber[regno];
+  return regno != 0 && regno < FIRST_EXTENDED_REGISTER;
+}
+
+bool m88k_regno_ok_for_base_p (int regno)
+{
+  if (regno >= FIRST_PSEUDO_REGISTER && reg_renumber[regno] >= 0)
+    regno = reg_renumber[regno];
+  return regno < FIRST_EXTENDED_REGISTER;
+}
+
+/* The macros REG_OK_FOR..._P (now functions below) assume that the arg
+   is a REG rtx and check its validity for a certain class.
+   We have two alternate definitions for each of them.
+   The usual definition accepts all pseudo regs; the other rejects
+   them unless they have been allocated suitable hard regs.
+   The symbol REG_OK_STRICT causes the latter definition to be used.
+
+   Most source files want to accept pseudo regs in the hope that
+   they will get allocated to the class that the insn wants them to be in.
+   Source files for reload pass need to be strict.
+   After reload, it makes no difference, since pseudo regs have
+   been eliminated by then.  */
+
+/* Nonzero if X is a hard reg (or a pseudo reg if not strict) that can be
+   used as a base reg.  */
+static inline bool reg_ok_for_base_p (rtx x, int strict)
+{
+  int regno = REGNO (x);
+  if (regno >= FIRST_PSEUDO_REGISTER && !strict)
+    return true;
+  return m88k_regno_ok_for_base_p (regno);
+}
+
+/* Nonzero if X is a hard reg (or a pseudo reg if not strict) that can be
+   used as a an index.  */
+static inline bool reg_ok_for_index_p (rtx x, int strict)
+{
+  int regno = REGNO (x);
+  if (regno >= FIRST_PSEUDO_REGISTER && !strict)
+    return true;
+  return m88k_regno_ok_for_index_p (regno);
+}
+
+static inline bool rtx_ok_for_base_p (rtx x, int strict)
+{
+  if (GET_CODE (x) == SUBREG)
+    x = SUBREG_REG (x);
+  return REG_P (x) && reg_ok_for_base_p (x, strict);
+}
+
+static bool legitimate_index_p (rtx x, enum machine_mode mode, int strict)
+{
+  if (CONST_INT_P (x) && SMALL_INT (x))
+    return true;
+  if (REG_P (x) && reg_ok_for_index_p (x, strict))
+    return true;
+  if (GET_CODE (x) == MULT
+      && REG_P (XEXP (x, 0))
+      && reg_ok_for_index_p (XEXP (x, 0), strict)
+      && CONST_INT_P (XEXP (x, 1))
+      && INTVAL (XEXP (x, 1)) == GET_MODE_SIZE (mode))
+    return true;
+
+  return false;
+}
+
+bool m88k_legitimate_address_p (enum machine_mode mode, rtx x, int strict)
+{
+  if (REG_P (x))
+    {
+      if (reg_ok_for_base_p (x, strict))
+	return true;
+    }
+  else if (GET_CODE (x) == PLUS)
+    {
+      rtx x0 = XEXP (x, 0);
+      rtx x1 = XEXP (x, 1);
+      if (flag_pic && x0 == pic_offset_table_rtx)
+	{
+	  if (flag_pic == 2)
+	    {
+	      if (rtx_ok_for_base_p (x1, strict))
+		return true;
+	    }
+	  else if (GET_CODE (x1) == SYMBOL_REF || GET_CODE (x1) == LABEL_REF)
+	    return true;
+	}
+      if (rtx_ok_for_base_p (x0, strict) && legitimate_index_p (x1, mode, strict))
+	return true;
+      if (rtx_ok_for_base_p (x1, strict) && legitimate_index_p (x0, mode, strict))
+	return true;
+      /* Before reload (strict == 0), also allow stack accesses. With the
+	 frame going downwards, local variables are at negative offsets
+	 from the logical stack pointer, and thus satisfy
+	 rtx_ok_for_base_p (x0) but not legitimate_index_p (x1) above.  */
+      if (!strict
+	  && (x0 == virtual_incoming_args_rtx
+	      || x0 == virtual_outgoing_args_rtx
+	      || x0 == virtual_stack_dynamic_rtx
+	      || x0 == virtual_stack_vars_rtx
+	      || x0 == frame_pointer_rtx
+	      || x0 == arg_pointer_rtx)
+	  && CONST_INT_P (x1))
+	return true;
+    }
+  else if (GET_CODE (x) == LO_SUM)
+    {
+      rtx x0 = XEXP (x, 0);
+      rtx x1 = XEXP (x, 1);
+      if (rtx_ok_for_base_p (x0, strict) && CONSTANT_P (x1))
+	return true;
+    }
+  else if (CONST_INT_P (x) && SMALL_INT (x))
+    return true;
+
+  return false;
+}
+
+/* On the m88000, change REG+N into REG+REG, and REG+(X*Y) into REG+REG.  */
+rtx m88k_legitimize_address (rtx x, enum machine_mode mode)
+{
+  if (GET_CODE (x) == PLUS)
+    {
+      if (CONSTANT_ADDRESS_P (XEXP (x, 1)))
+	x = gen_rtx_PLUS (SImode, XEXP (x, 0),
+			  copy_to_mode_reg (SImode, XEXP (x, 1)));
+      else if (CONSTANT_ADDRESS_P (XEXP (x, 0)))
+	x = gen_rtx_PLUS (SImode, XEXP (x, 1),
+			  copy_to_mode_reg (SImode, XEXP (x, 0)));
+      else if (GET_CODE (XEXP (x, 0)) == MULT)
+	x = gen_rtx_PLUS (SImode, XEXP (x, 1),
+			  force_operand (XEXP (x, 0), 0));
+      else if (GET_CODE (XEXP (x, 1)) == MULT)
+	x = gen_rtx_PLUS (SImode, XEXP (x, 0),
+			  force_operand (XEXP (x, 1), 0));
+      else if (GET_CODE (XEXP (x, 0)) == PLUS)
+	x = gen_rtx_PLUS (Pmode, force_operand (XEXP (x, 0), NULL_RTX),
+			  XEXP (x, 1));
+      else if (GET_CODE (XEXP (x, 1)) == PLUS)
+	x = gen_rtx_PLUS (Pmode, XEXP (x, 0),
+			  force_operand (XEXP (x, 1), NULL_RTX));
+    }
+  if (GET_CODE (x) == SYMBOL_REF || GET_CODE (x) == CONST
+      || GET_CODE (x) == LABEL_REF)
+    x = legitimize_address (flag_pic, x, NULL_RTX, NULL_RTX);
+  return x;
 }
 
 /* Support functions for code to emit a block move.  There are two methods
@@ -499,24 +686,29 @@ static const enum machine_mode mode_from_align[] =
 			      {VOIDmode, QImode, HImode, VOIDmode, SImode,
 			       VOIDmode, VOIDmode, VOIDmode, DImode};
 
-static void block_move_sequence (rtx, rtx, rtx, rtx, int, int);
+static void block_move_sequence (rtx, rtx, int, int);
 
-/* Emit code to perform a block move.  Choose the best method.
+/* Emit code to perform a block move, and return 1 if successful.
+   Return 0 if we should let the compiler generate a call to memcpy().
 
    OPERANDS[0] is the destination.
    OPERANDS[1] is the source.
    OPERANDS[2] is the size.
    OPERANDS[3] is the alignment safe to use.  */
 
-void
-expand_block_move (rtx dest_mem, rtx src_mem, rtx *operands)
+int
+expand_block_move (rtx *operands)
 {
+  rtx dest, src;
   int align = INTVAL (operands[3]);
-  int constp = (GET_CODE (operands[2]) == CONST_INT);
-  int bytes = (constp ? INTVAL (operands[2]) : 0);
+  int constp = CONST_INT_P (operands[2]);
+  int bytes = constp ? INTVAL (operands[2]) : 0;
 
-  if (constp && bytes <= 0)
-    return;
+  if (!constp)
+    return 0;
+
+  if (bytes <= 0)
+    return 1; /* nothing to do.  */
 
   /* Determine machine mode to do move with.  */
   if (align > 4 && !TARGET_88110)
@@ -524,40 +716,33 @@ expand_block_move (rtx dest_mem, rtx src_mem, rtx *operands)
   else
     gcc_assert (align > 0 && align != 3); /* block move invalid alignment.  */
 
-  if (constp && bytes <= 3 * align)
-    block_move_sequence (operands[0], dest_mem, operands[1], src_mem,
-			 bytes, align);
+  dest = operands[0];
+  src = operands[1];
 
-  else
-    {
-      emit_library_call (gen_rtx_SYMBOL_REF (Pmode, "memcpy"), 0,
-			 VOIDmode, 3,
-			 operands[0], Pmode,
-			 operands[1], Pmode,
-			 convert_to_mode (TYPE_MODE (sizetype), operands[2],
-					  TYPE_UNSIGNED (sizetype)),
-			 TYPE_MODE (sizetype));
-    }
+  if (bytes > (optimize_size ? 3 : 6) * align)
+    return 0;
+
+  block_move_sequence (dest, src, bytes, align);
+  return 1;
 }
 
 /* Emit code to perform a block move with an offset sequence of ld/st
    instructions (..., ld 0, st 1, ld 1, st 0, ...).  SIZE and ALIGN are
-   known constants.  DEST and SRC are registers.  */
+   known constants.  DEST and SRC are memory addresses.  */
 
 static void
-block_move_sequence (rtx dest, rtx dest_mem, rtx src, rtx src_mem, int size,
-		     int align)
+block_move_sequence (rtx dest_mem, rtx src_mem, int size, int align)
 {
   rtx temp[2];
   enum machine_mode mode[2];
   int amount[2];
-  int active[2];
+  bool active[2];
   int phase = 0;
   int next;
   int offset_ld = 0;
   int offset_st = 0;
 
-  active[0] = active[1] = FALSE;
+  active[0] = active[1] = false;
 
   /* Establish parameters for the first load and for the second load if
      it is known to be the same mode as the first.  */
@@ -573,7 +758,7 @@ block_move_sequence (rtx dest, rtx dest_mem, rtx src, rtx src_mem, int size,
   do
     {
       next = phase;
-      phase = !phase;
+      phase ^= 1;
 
       if (size > 0)
 	{
@@ -676,265 +861,124 @@ output_xor (rtx operands[])
 const char *
 output_call (rtx operands[], rtx addr)
 {
+  const char *pattern;
+
   operands[0] = addr;
-  if (final_sequence)
+  pattern = REG_P (addr)
+	    ? "jsr%. %0"
+	    : (flag_pic ? "bsr%. %0#plt" : "bsr%. %0");
+
+  if (final_sequence
+      && ! INSN_ANNULLED_BRANCH_P (XVECEXP (final_sequence, 0, 0)))
     {
       rtx jump;
-      rtx seq_insn;
 
       /* This can be generalized, but there is currently no need.  */
       gcc_assert (XVECLEN (final_sequence, 0) == 2);
 
       /* The address of interior insns is not computed, so use the sequence.  */
-      seq_insn = NEXT_INSN (PREV_INSN (XVECEXP (final_sequence, 0, 0)));
       jump = XVECEXP (final_sequence, 0, 1);
-      if (GET_CODE (jump) == JUMP_INSN)
+      if (JUMP_P (jump))
 	{
-	  const char *last;
 	  rtx dest = XEXP (SET_SRC (PATTERN (jump)), 0);
-	  int delta = 4 * (INSN_ADDRESSES (INSN_UID (dest))
-			   - INSN_ADDRESSES (INSN_UID (seq_insn))
-			   - 2);
-
-	  /* Delete the jump.  */
-	  PUT_CODE (jump, NOTE);
-	  NOTE_LINE_NUMBER (jump) = NOTE_INSN_DELETED;
-	  NOTE_SOURCE_FILE (jump) = 0;
+	  rtx seq_insn = NEXT_INSN (PREV_INSN (XVECEXP (final_sequence, 0, 0)));
+	  /* Note that this doesn't need to be exact - since length attributes
+	     in m88k.md are upper bounds - but it must not be smaller than the
+	     real value, as we can only perform this optimization if the
+	     displacement fits in a short branch offset.  */
+	  int delta =
+	    INSN_ADDRESSES (INSN_UID (dest))
+	    - INSN_ADDRESSES (INSN_UID (seq_insn))
+	    - 8;
 
 	  /* We only do this optimization if -O2, modifying the value of
 	     r1 in the delay slot confuses debuggers and profilers on some
 	     systems.
 
-	     If we loose, we must use the non-delay form.  This is unlikely
+	     If we can't, we must use the non-delay form.  This is unlikely
 	     to ever happen.  If it becomes a problem, claim that a call
 	     has two delay slots and only the second can be filled with
-	     a jump.  
+	     a jump.
 
 	     The 88110 can lose when a jsr.n r1 is issued and a page fault
 	     occurs accessing the delay slot.  So don't use jsr.n form when
 	     jumping thru r1.
 	   */
-	  if (optimize < 2
-	      || ! ADD_INTVAL (delta)
-	      || (REG_P (addr) && REGNO (addr) == 1))
+	  if (optimize >= 2
+	      && ADD_INTVAL (delta)
+	      && (!REG_P (addr) || REGNO (addr) != 1))
 	    {
-	      operands[1] = dest;
-	      return (REG_P (addr)
-		      ? "jsr %0\n\tbr %l1"
-		      : (flag_pic
-			 ? "bsr %0#plt\n\tbr %l1"
-			 : "bsr %0\n\tbr %l1"));
+	      const char *last;
+
+	      /* Delete the jump.  */
+	      PUT_CODE (jump, NOTE);
+	      NOTE_LINE_NUMBER (jump) = NOTE_INSN_DELETED;
+	      NOTE_SOURCE_FILE (jump) = 0;
+	      
+	      /* Output the short branch form.  */
+	      output_asm_insn (pattern, operands);
+	      
+	      last = (delta < 0
+		      ? "subu %#r1,%#r1,.-%l0+4"
+		      : "addu %#r1,%#r1,%l0-.-4");
+	      operands[0] = dest;
+
+	      return last;
 	    }
-
-	  /* Output the short branch form.  */
-	  output_asm_insn ((REG_P (addr)
-			    ? "jsr.n %0"
-			    : (flag_pic ? "bsr.n %0#plt" : "bsr.n %0")),
-			   operands);
-
-	  last = (delta < 0
-		  ? "subu %#r1,%#r1,.-%l0+4"
-		  : "addu %#r1,%#r1,%l0-.-4");
-	  operands[0] = dest;
-
-	  return last;
 	}
     }
-  return (REG_P (addr)
-	  ? "jsr%. %0"
-	  : (flag_pic ? "bsr%. %0#plt" : "bsr%. %0"));
+  return pattern;
 }
 
 /* Return truth value of the statement that this conditional branch is likely
-   to fall through.  CONDITION, is the condition that JUMP_INSN is testing.  */
+   to fall through.  */
 
 bool
-mostly_false_jump (rtx jump_insn, rtx condition)
+mostly_false_jump (rtx jump_insn)
 {
-  rtx target_label = JUMP_LABEL (jump_insn);
-  rtx insnt, insnj;
+  rtx note;
 
   /* Much of this isn't computed unless we're optimizing.  */
   if (optimize == 0)
     return false;
 
-  /* Determine if one path or the other leads to a return.  */
-  for (insnt = NEXT_INSN (target_label);
-       insnt;
-       insnt = NEXT_INSN (insnt))
+  /* If branch probabilities are available, trust them.  */
+  note = find_reg_note (jump_insn, REG_BR_PROB, 0);
+  if (note)
     {
-      if (GET_CODE (insnt) == JUMP_INSN)
-	break;
-      else if (GET_CODE (insnt) == INSN
-	       && GET_CODE (PATTERN (insnt)) == SEQUENCE
-	       && GET_CODE (XVECEXP (PATTERN (insnt), 0, 0)) == JUMP_INSN)
-	{
-	  insnt = XVECEXP (PATTERN (insnt), 0, 0);
-	  break;
-	}
-    }
-  if (insnt
-      && (GET_CODE (PATTERN (insnt)) == RETURN
-	  || (GET_CODE (PATTERN (insnt)) == SET
-	      && GET_CODE (SET_SRC (PATTERN (insnt))) == REG
-	      && REGNO (SET_SRC (PATTERN (insnt))) == 1)))
-    insnt = NULL_RTX;
-
-  for (insnj = NEXT_INSN (jump_insn);
-       insnj;
-       insnj = NEXT_INSN (insnj))
-    {
-      if (GET_CODE (insnj) == JUMP_INSN)
-	break;
-      else if (GET_CODE (insnj) == INSN
-	       && GET_CODE (PATTERN (insnj)) == SEQUENCE
-	       && GET_CODE (XVECEXP (PATTERN (insnj), 0, 0)) == JUMP_INSN)
-	{
-	  insnj = XVECEXP (PATTERN (insnj), 0, 0);
-	  break;
-	}
-    }
-  if (insnj
-      && (GET_CODE (PATTERN (insnj)) == RETURN
-	  || (GET_CODE (PATTERN (insnj)) == SET
-	      && GET_CODE (SET_SRC (PATTERN (insnj))) == REG
-	      && REGNO (SET_SRC (PATTERN (insnj))) == 1)))
-    insnj = NULL_RTX;
-
-  /* Predict to not return.  */
-  if ((insnt == NULL_RTX) != (insnj == NULL_RTX))
-    return (insnt == NULL_RTX);
-
-  /* Predict loops to loop.  */
-  for (insnt = PREV_INSN (target_label);
-       insnt && GET_CODE (insnt) == NOTE;
-       insnt = PREV_INSN (insnt))
-    if (NOTE_LINE_NUMBER (insnt) == NOTE_INSN_LOOP_END)
-      return true;
-    else if (NOTE_LINE_NUMBER (insnt) == NOTE_INSN_LOOP_BEG)
+      int prob = INTVAL (XEXP (note, 0));
+      if (prob < REG_BR_PROB_BASE / 2)
+	return true;
       return false;
-
-  /* Predict backward branches usually take.  */
-  if (final_sequence)
-    insnj = NEXT_INSN (PREV_INSN (XVECEXP (final_sequence, 0, 0)));
-  else
-    insnj = jump_insn;
-  if (INSN_ADDRESSES (INSN_UID (insnj))
-      > INSN_ADDRESSES (INSN_UID (target_label)))
-    return false;
-
-  /* EQ tests are usually false and NE tests are usually true.  Also,
-     most quantities are positive, so we can make the appropriate guesses
-     about signed comparisons against zero.  Consider unsigned comparisons
-     to be a range check and assume quantities to be in range.  */
-  switch (GET_CODE (condition))
-    {
-    case CONST_INT:
-      /* Unconditional branch.  */
-      return false;
-    case EQ:
-      return true;
-    case NE:
-      return false;
-    case LE:
-    case LT:
-    case GEU:
-    case GTU: /* Must get casesi right at least.  */
-      if (XEXP (condition, 1) == const0_rtx)
-        return true;
-      break;
-    case GE:
-    case GT:
-    case LEU:
-    case LTU:
-      if (XEXP (condition, 1) == const0_rtx)
-	return false;
-      break;
-    default:
-      break;
     }
 
   return false;
-}
-
-/* Return true if the operand is a power of two and is a floating
-   point type (to optimize division by power of two into multiplication).  */
-
-bool
-real_power_of_2_operand (rtx op)
-{
-  REAL_VALUE_TYPE d;
-  union {
-    long l[2];
-    struct {				/* IEEE double precision format */
-      unsigned sign	 :  1;
-      unsigned exponent  : 11;
-      unsigned mantissa1 : 20;
-      unsigned mantissa2;
-    } s;
-    struct {				/* IEEE double format to quick check */
-      unsigned sign	 :  1;		/* if it fits in a float */
-      unsigned exponent1 :  4;
-      unsigned exponent2 :  7;
-      unsigned mantissa1 : 20;
-      unsigned mantissa2;
-    } s2;
-  } u;
-
-  if (GET_MODE (op) != DFmode && GET_MODE (op) != SFmode)
-    return false;
-
-  if (GET_CODE (op) != CONST_DOUBLE)
-    return false;
-
-  REAL_VALUE_FROM_CONST_DOUBLE (d, op);
-  REAL_VALUE_TO_TARGET_DOUBLE (d, u.l);
-
-  if (u.s.mantissa1 != 0 || u.s.mantissa2 != 0	/* not a power of two */
-      || u.s.exponent == 0			/* constant 0.0 */
-      || u.s.exponent == 0x7ff			/* NaN */
-      || (u.s2.exponent1 != 0x8 && u.s2.exponent1 != 0x7))
-    return false;				/* const won't fit in float */
-
-  return true;
 }
 
 /* Make OP legitimate for mode MODE.  Currently this only deals with DFmode
    operands, putting them in registers and making CONST_DOUBLE values
    SFmode where possible.  */
 
-struct rtx_def *
+rtx
 legitimize_operand (rtx op, enum machine_mode mode)
 {
   rtx temp;
   REAL_VALUE_TYPE d;
-  union {
-    long l[2];
-    struct {				/* IEEE double precision format */
-      unsigned sign	 :  1;
-      unsigned exponent  : 11;
-      unsigned mantissa1 : 20;
-      unsigned mantissa2;
-    } s;
-    struct {				/* IEEE double format to quick check */
-      unsigned sign	 :  1;		/* if it fits in a float */
-      unsigned exponent1 :  4;
-      unsigned exponent2 :  7;
-      unsigned mantissa1 : 20;
-      unsigned mantissa2;
-    } s2;
-  } u;
+  long l[2];
+  int exponent;
 
-  if (GET_CODE (op) == REG || mode != DFmode)
+  if (REG_P (op) || mode != DFmode)
     return op;
 
   if (GET_CODE (op) == CONST_DOUBLE)
     {
       REAL_VALUE_FROM_CONST_DOUBLE (d, op);
-      REAL_VALUE_TO_TARGET_DOUBLE (d, u.l);
-      if (u.s.exponent != 0x7ff /* NaN */
-	  && u.s.mantissa2 == 0 /* Mantissa fits */
-	  && (u.s2.exponent1 == 0x8 || u.s2.exponent1 == 0x7) /* Exponent fits */
+      REAL_VALUE_TO_TARGET_DOUBLE (d, l);
+      exponent = (l[0] >> 20) & 0x7ff; /* not sign-extended */
+      if (exponent != 0x7ff /* NaN */
+	  && l[1] == 0 /* Mantissa fits */
+	  && ((exponent >> 7) == 0x8
+	      || (exponent >> 7) == 0x7) /* Exponent fits */
 	  && (temp = simplify_unary_operation (FLOAT_TRUNCATE, SFmode,
 					       op, mode)) != 0)
 	return gen_rtx_FLOAT_EXTEND (mode, force_reg (SFmode, temp));
@@ -961,7 +1005,7 @@ symbolic_address_p (rtx op)
       op = XEXP (op, 0);
       return ((GET_CODE (XEXP (op, 0)) == SYMBOL_REF
 	       || GET_CODE (XEXP (op, 0)) == LABEL_REF)
-	      && GET_CODE (XEXP (op, 1)) == CONST_INT);
+	      && CONST_INT_P (XEXP (op, 1)));
 
     default:
       return false;
@@ -992,39 +1036,8 @@ m88k_output_file_start (void)
 
    The prologue is responsible for setting up the stack frame,
    initializing the frame pointer register, saving registers that must be
-   saved, and allocating SIZE additional bytes of storage for the
-   local variables.  SIZE is an integer.  FILE is a stdio
-   stream to which the assembler code should be output.
-
-   The label for the beginning of the function need not be output by this
-   macro.  That has already been done when the macro is run.
-
-   To determine which registers to save, the macro can refer to the array
-   `regs_ever_live': element R is nonzero if hard register
-   R is used anywhere within the function.  This implies the
-   function prologue should save register R, but not if it is one
-   of the call-used registers.
-
-   On machines where functions may or may not have frame-pointers, the
-   function entry code must vary accordingly; it must set up the frame
-   pointer if one is wanted, and not otherwise.  To determine whether a
-   frame pointer is in wanted, the macro can refer to the variable
-   `frame_pointer_needed'.  The variable's value will be 1 at run
-   time in a function that needs a frame pointer.
-
-   On machines where an argument may be passed partly in registers and
-   partly in memory, this macro must examine the variable
-   `current_function_pretend_args_size', and allocate that many bytes
-   of uninitialized space on the stack just underneath the first argument
-   arriving on the stack.  (This may not be at the very end of the stack,
-   if the calling sequence has pushed anything else since pushing the stack
-   arguments.  But usually, on such machines, nothing else has been pushed
-   yet, because the function prologue itself does all the pushing.)
-
-   If `ACCUMULATE_OUTGOING_ARGS' is defined, the variable
-   `current_function_outgoing_args_size' contains the size in bytes
-   required for the outgoing arguments.  This macro must add that
-   amount of uninitialized space to very bottom of the stack.
+   saved, and allocating the required bytes of storage for the
+   local variables.
 
    The stack frame we use looks like this:
 
@@ -1033,77 +1046,80 @@ m88k_output_file_start (void)
         |                caller's frame                |
         |==============================================|
         |     [caller's outgoing memory arguments]     |
-  sp -> |==============================================| <- ap
+  sp -> |==============================================| <- ap, logical fp
         |            [local variable space]            |
         |----------------------------------------------|
         |            [return address (r1)]             |
         |----------------------------------------------|
         |        [previous frame pointer (r30)]        |
-        |==============================================| <- fp
+        |==============================================| <- hardware fp (r30)
+        |      [va_args register copy (optional)]      |
+        |----------------------------------------------|
         |       [preserved registers (r25..r14)]       |
         |----------------------------------------------|
         |       [preserved registers (x29..x22)]       |
-        |==============================================|
+        |==============================================| <- sp at function entry
         |    [dynamically allocated space (alloca)]    |
         |==============================================|
         |     [callee's outgoing memory arguments]     |
-        |==============================================| <- sp
+        |==============================================| <- sp (r31)
 
-  Notes:
-
-  r1 and r30 must be saved if debugging.
-
-  fp (if present) is located two words down from the local
-  variable space.
   */
 
 static rtx emit_add (rtx, rtx, int);
-static void preserve_registers (int, int);
+static void preserve_registers (bool);
 static void emit_ldst (int, int, enum machine_mode, int);
 
-static int  nregs;
-static int  nxregs;
-static char save_regs[FIRST_PSEUDO_REGISTER];
-static int  frame_laid_out;
-static int  frame_size;
+/* Round to the next highest integer that meets the alignment.  */
+#define CEIL_ROUND(VALUE,ALIGN)	(((VALUE) + (ALIGN) - 1) & ~((ALIGN)- 1))
 
 #define STACK_UNIT_BOUNDARY (STACK_BOUNDARY / BITS_PER_UNIT)
-#define ROUND_CALL_BLOCK_SIZE(BYTES) \
-  (((BYTES) + (STACK_UNIT_BOUNDARY - 1)) & ~(STACK_UNIT_BOUNDARY - 1))
+#define ROUND_CALL_BLOCK_SIZE(BYTES) CEIL_ROUND(BYTES, STACK_UNIT_BOUNDARY)
+
 
+/* Function to init struct machine_function.
+   This will be called, via a pointer variable,
+   from push_function_context.  */
+static struct machine_function *
+m88k_init_machine_status (void)
+{
+  return (struct machine_function *)
+	 ggc_alloc_cleared (sizeof (struct machine_function));
+}
+
 /* Establish the position of the FP relative to the SP.  This is done
    either during output_function_prologue() or by
    INITIAL_ELIMINATION_OFFSET.  */
 
-void
+static void
 m88k_layout_frame (void)
 {
   int regno, sp_size;
 
-  if (frame_laid_out && reload_completed)
+  if (cfun->machine->initialized)
     return;
 
-  frame_laid_out = 1;
+  memset (cfun->machine->save_regs, 0, sizeof (cfun->machine->save_regs));
+  cfun->machine->saved_gregs = cfun->machine->saved_xregs = 0;
 
-  memset ((char *) &save_regs[0], 0, sizeof (save_regs));
-  sp_size = nregs = nxregs = 0;
-  frame_size = get_frame_size ();
-
-  /* Profiling requires a stack frame.  */
-  if (current_function_profile)
+  /* Profiling requires a stack frame, and so do variadic functions (due to
+     the saved register area being relative to r30).  */
+  if (current_function_profile || cfun->machine->saved_va_regcnt != 0)
     frame_pointer_needed = 1;
 
-  /* If we are producing debug information, store r1 and r30 where the
-     debugger wants to find them (r30 at r30+0, r1 at r30+4).  Space has
-     already been reserved for r1/r30 in STARTING_FRAME_OFFSET.  */
-  if (write_symbols != NO_DEBUG)
-    save_regs[1] = 1;
-
-  /* If we are producing PIC, save the addressing base register and r1.  */
-  if (flag_pic && current_function_uses_pic_offset_table)
+  /* If we are producing PIC, save the addressing base register and r1.
+     We also need to preserve the PIC register for the sake of exception
+     handling.  */
+  if (flag_pic)
     {
-      save_regs[PIC_OFFSET_TABLE_REGNUM] = 1;
-      nregs++;
+      if (current_function_uses_pic_offset_table
+	  || current_function_calls_eh_return)
+	cfun->machine->save_regs[PIC_OFFSET_TABLE_REGNUM] = 1;
+      if (current_function_uses_pic_offset_table)
+	{
+	  cfun->machine->saved_gregs++;
+	  cfun->machine->save_regs[1] = 1;
+	}
     }
 
   /* If a frame is requested, save the previous FP, and the return
@@ -1111,82 +1127,92 @@ m88k_layout_frame (void)
      information.  Otherwise, simply save the FP if it is used as
      a preserve register.  */
   if (frame_pointer_needed)
-    save_regs[FRAME_POINTER_REGNUM] = save_regs[1] = 1;
+    {
+      cfun->machine->save_regs[HARD_FRAME_POINTER_REGNUM] = 1;
+      cfun->machine->save_regs[1] = 1;
+    }
   else
     {
-      if (regs_ever_live[FRAME_POINTER_REGNUM])
-	save_regs[FRAME_POINTER_REGNUM] = 1;
+      if (regs_ever_live[HARD_FRAME_POINTER_REGNUM])
+	cfun->machine->save_regs[HARD_FRAME_POINTER_REGNUM] = 1;
       /* If there is a call, r1 needs to be saved as well.  */
       if (regs_ever_live[1])
-	save_regs[1] = 1;
+	cfun->machine->save_regs[1] = 1;
     }
 
-  /* Figure out which extended register(s) needs to be saved.  */
-  for (regno = FIRST_EXTENDED_REGISTER + 1; regno < FIRST_PSEUDO_REGISTER;
+  /* Figure out which extended registers need to be saved.  */
+  for (regno = FIRST_EXTENDED_REGISTER + 1; regno <= LAST_EXTENDED_REGISTER;
        regno++)
     if (regs_ever_live[regno] && ! call_used_regs[regno])
       {
-	save_regs[regno] = 1;
-	nxregs++;
+	cfun->machine->save_regs[regno] = 1;
+	cfun->machine->saved_xregs++;
       }
 
-  /* Figure out which normal register(s) needs to be saved.  */
-  for (regno = 2; regno < FRAME_POINTER_REGNUM; regno++)
+  /* Figure out which normal registers need to be saved.  */
+  for (regno = 2; regno < HARD_FRAME_POINTER_REGNUM; regno++)
     if (regs_ever_live[regno] && ! call_used_regs[regno])
       {
-	save_regs[regno] = 1;
-	nregs++;
+	cfun->machine->save_regs[regno] = 1;
+	cfun->machine->saved_gregs++;
       }
 
-  /* Achieve greatest use of double memory ops.  Either we end up saving
-     r30 or we use that slot to align the registers we do save.  */
-  if (nregs >= 2 && save_regs[1] && !save_regs[FRAME_POINTER_REGNUM])
-    sp_size += 4;
+  /* Figure out which exception-used registers need to be saved.  */
+  if (current_function_calls_eh_return)
+    {
+      unsigned int i;
+      for (i = 0; ; i++)
+	{
+	  regno = EH_RETURN_DATA_REGNO (i);
+	  if (regno == INVALID_REGNUM)
+	    break;
+	  if (!cfun->machine->save_regs[regno])
+	    {
+	      cfun->machine->save_regs[regno] = 1;
+	      cfun->machine->saved_gregs++;
+	    }
+	}
+    }
 
-  nregs += save_regs[1] + save_regs[FRAME_POINTER_REGNUM];
-  /* if we need to align extended registers, add a word */
-  if (nxregs > 0 && (nregs & 1) != 0)
+  sp_size = CEIL_ROUND(current_function_outgoing_args_size, 2 * UNITS_PER_WORD);
+  sp_size += 4 * cfun->machine->saved_gregs;
+  /* If we need to align extended registers, add a word.  */
+  if (cfun->machine->saved_xregs > 0 && (cfun->machine->saved_gregs & 1) != 0)
     sp_size +=4;
-  sp_size += 4 * nregs;
-  sp_size += 8 * nxregs;
-  sp_size += current_function_outgoing_args_size;
+  sp_size += 8 * cfun->machine->saved_xregs;
+  sp_size += cfun->machine->saved_va_regcnt * UNITS_PER_WORD;
+  cfun->machine->hardfp_offset = ROUND_CALL_BLOCK_SIZE (sp_size);
 
   /* The first two saved registers are placed above the new frame pointer
-     if any.  In the only case this matters, they are r1 and r30. */
-  if (frame_pointer_needed || sp_size)
-    m88k_fp_offset = ROUND_CALL_BLOCK_SIZE (sp_size - STARTING_FRAME_OFFSET);
+     if any. Then, local variables are placed on top of it, with the end
+     of local variables aligned to a stack boundary. */
+  if (cfun->machine->save_regs[1]
+      || cfun->machine->save_regs[HARD_FRAME_POINTER_REGNUM])
+    {
+      cfun->machine->saved_gregs
+	+= cfun->machine->save_regs[1]
+	   + cfun->machine->save_regs[HARD_FRAME_POINTER_REGNUM];
+      cfun->machine->frame_size = 8;
+    }
   else
-    m88k_fp_offset = -STARTING_FRAME_OFFSET;
-  m88k_stack_size = m88k_fp_offset + STARTING_FRAME_OFFSET;
-
-  /* First, combine m88k_stack_size and size.  If m88k_stack_size is
-     nonzero, align the frame size to 8 mod 16; otherwise align the
-     frame size to 0 mod 16.  (If stacks are 8 byte aligned, this ends
-     up as a NOP.  */
-  {
-    int need
-      = ((m88k_stack_size ? STACK_UNIT_BOUNDARY - STARTING_FRAME_OFFSET : 0)
-	 - (frame_size % STACK_UNIT_BOUNDARY));
-    if (need < 0)
-      need += STACK_UNIT_BOUNDARY;
-    m88k_stack_size
-      = ROUND_CALL_BLOCK_SIZE (m88k_stack_size + frame_size + need
-			       + current_function_pretend_args_size);
-  }
+    cfun->machine->frame_size = 0;
+  cfun->machine->frame_size += get_frame_size ();
+  cfun->machine->frame_size = ROUND_CALL_BLOCK_SIZE (cfun->machine->frame_size);
+  cfun->machine->stack_size
+    = cfun->machine->hardfp_offset
+    + cfun->machine->frame_size
+    + current_function_pretend_args_size;
+  cfun->machine->initialized = reload_completed;
 }
 
-/* Return true if this function is known to have a null prologue.  */
-
-bool
-null_prologue (void)
+int
+m88k_initial_elimination_offset (int from, int to)
 {
-  if (! reload_completed)
-    return false;
   m88k_layout_frame ();
-  return (! frame_pointer_needed
-	  && nregs == 0
-	  && nxregs == 0
-	  && m88k_stack_size == 0);
+  if (to == HARD_FRAME_POINTER_REGNUM)
+    return cfun->machine->frame_size;
+  else /* to == STACK_POINTER_REGNUM */
+    return cfun->machine->frame_size + cfun->machine->hardfp_offset;
 }
 
 static void
@@ -1204,38 +1230,43 @@ m88k_expand_prologue (void)
 
   m88k_layout_frame ();
 
-  if (warn_stack_larger_than && m88k_stack_size > stack_larger_than_size)
-    warning (0, "stack usage is %d bytes", m88k_stack_size);
+  if (warn_stack_larger_than
+      && cfun->machine->stack_size > stack_larger_than_size)
+    warning (0, "stack usage is %d bytes", cfun->machine->stack_size);
 
-  if (m88k_stack_size)
+  if (cfun->machine->stack_size)
     {
-      insn = emit_add (stack_pointer_rtx, stack_pointer_rtx, -m88k_stack_size);
+      insn = emit_add (stack_pointer_rtx, stack_pointer_rtx,
+		       -cfun->machine->stack_size);
       RTX_FRAME_RELATED_P (insn) = 1;
 
       /* If the stack pointer adjustment has required a temporary register,
 	 tell the DWARF code how to understand this sequence.  */
-      if (! ADD_INTVAL (m88k_stack_size))
+      if (! ADD_INTVAL (cfun->machine->stack_size))
 	REG_NOTES (insn)
 	  = gen_rtx_EXPR_LIST (REG_FRAME_RELATED_EXPR,
-			       gen_rtx_SET (VOIDmode, stack_pointer_rtx,
-				     gen_rtx_PLUS (Pmode, stack_pointer_rtx,
-						   GEN_INT (-m88k_stack_size))),
-			       REG_NOTES(insn));
+	      gen_rtx_SET (VOIDmode, stack_pointer_rtx,
+		           gen_rtx_PLUS (Pmode, stack_pointer_rtx,
+					 GEN_INT (-cfun->machine->stack_size))),
+	      REG_NOTES(insn));
     }
 
-  if (nregs || nxregs)
-    preserve_registers (m88k_fp_offset + 4, 1);
-
-  if (frame_pointer_needed)
+  if (cfun->machine->saved_gregs || cfun->machine->saved_xregs)
     {
+      preserve_registers (true);
       /* Be sure to emit this instruction after all register saves, DWARF
 	 information depends on this.  */
       emit_insn (gen_blockage ());
-      insn = emit_add (frame_pointer_rtx, stack_pointer_rtx, m88k_fp_offset);
+    }
+
+  if (frame_pointer_needed)
+    {
+      insn = emit_add (hard_frame_pointer_rtx, stack_pointer_rtx,
+		       cfun->machine->hardfp_offset);
       RTX_FRAME_RELATED_P (insn) = 1;
     }
 
-  if (flag_pic && save_regs[PIC_OFFSET_TABLE_REGNUM])
+  if (flag_pic && cfun->machine->save_regs[PIC_OFFSET_TABLE_REGNUM])
     {
       rtx return_reg = gen_rtx_REG (SImode, 1);
       rtx label = gen_label_rtx ();
@@ -1250,39 +1281,20 @@ m88k_expand_prologue (void)
     emit_insn (gen_blockage ());
 }
 
-/* This function generates the assembly code for function exit,
-   on machines that need it.
-
-   The function epilogue should not depend on the current stack pointer!
-   It should use the frame pointer only, if there is a frame pointer.
-   This is mandatory because of alloca; we also take advantage of it to
-   omit stack adjustments before returning.  */
-
-static void
-m88k_output_function_epilogue (FILE *stream,
-			       HOST_WIDE_INT size ATTRIBUTE_UNUSED)
-{ 
-  frame_laid_out = 0;
-}
-
 void
 m88k_expand_epilogue (void)
 {
-  if (frame_pointer_needed)
-    {
-      emit_insn (gen_blockage ());
-      emit_add (stack_pointer_rtx, frame_pointer_rtx, -m88k_fp_offset);
-    }
-
-  if (nregs || nxregs)
-    preserve_registers (m88k_fp_offset + 4, 0);
-
   emit_insn (gen_blockage ());
 
-  if (m88k_stack_size)
-    {
-      emit_add (stack_pointer_rtx, stack_pointer_rtx, m88k_stack_size);
-    }
+  if (frame_pointer_needed)
+    emit_add (stack_pointer_rtx, hard_frame_pointer_rtx,
+	      -cfun->machine->hardfp_offset);
+
+  if (cfun->machine->saved_gregs || cfun->machine->saved_xregs)
+    preserve_registers (false);
+
+  if (cfun->machine->stack_size)
+    emit_add (stack_pointer_rtx, stack_pointer_rtx, cfun->machine->stack_size);
 
   emit_insn (gen_indirect_jump (INCOMING_RETURN_ADDR_RTX));
 
@@ -1307,104 +1319,84 @@ emit_add (rtx dstreg, rtx srcreg, int amount)
 							    incr));
 }
 
-/* Save/restore the preserve registers.  base is the highest offset from
-   r31 at which a register is stored.  store_p is true if stores are to
+/* Save/restore the preserve registers.  store_p is true if stores are to
    be done; otherwise loads.  */
 
 static void
-preserve_registers (int base, int store_p)
+preserve_registers (bool store_p)
 {
   int regno, offset;
   struct mem_op {
-    int regno;
-    int nregs;
     int offset;
+    enum machine_mode mode;
   } mem_op[FIRST_PSEUDO_REGISTER];
-  struct mem_op *mo_ptr = mem_op;
+
+  memset (&mem_op, 0, sizeof (mem_op));
 
   /* The 88open OCS mandates that preserved registers be stored in
      increasing order.  For compatibility with current practice,
      the order is r1, r30, then the preserve registers.  */
 
-  offset = base;
-  if (save_regs[1])
+  if (cfun->machine->save_regs[1])
     {
-      /* An extra word is given in this case to make best use of double
-	 memory ops.  */
-      if (nregs > 2 && !save_regs[FRAME_POINTER_REGNUM])
-	offset -= 4;
       /* Do not reload r1 in the epilogue unless really necessary */
-      if (store_p || regs_ever_live[1]
-	  || (flag_pic && save_regs[PIC_OFFSET_TABLE_REGNUM]))
-	emit_ldst (store_p, 1, SImode, offset);
-      offset -= 4;
-      base = offset;
+      if (store_p || regs_ever_live[1] || current_function_calls_eh_return
+	  || (flag_pic && cfun->machine->save_regs[PIC_OFFSET_TABLE_REGNUM]))
+	emit_ldst (store_p, 1, SImode, cfun->machine->hardfp_offset + 4);
     }
 
-  /* Walk the registers to save recording all single memory operations.  */
-  for (regno = FRAME_POINTER_REGNUM; regno > 1; regno--)
-    if (save_regs[regno])
+  if (cfun->machine->save_regs[HARD_FRAME_POINTER_REGNUM])
+    {
+      emit_ldst (store_p, HARD_FRAME_POINTER_REGNUM, SImode,
+		 cfun->machine->hardfp_offset);
+    }
+
+  offset = CEIL_ROUND(current_function_outgoing_args_size, 2 * UNITS_PER_WORD);
+
+  /* Process all the extended registers. */
+  for (regno = FIRST_EXTENDED_REGISTER; regno <= LAST_EXTENDED_REGISTER;
+       regno++)
+    if (cfun->machine->save_regs[regno])
       {
-	if ((offset & 7) != 4 || (regno & 1) != 1 || !save_regs[regno-1])
-	  {
-	    mo_ptr->nregs = 1;
-	    mo_ptr->regno = regno;
-	    mo_ptr->offset = offset;
-	    mo_ptr++;
-	    offset -= 4;
-	  }
-        else
-	  {
-	    regno--;
-	    offset -= 2*4;
-	  }
+	mem_op[regno].offset = offset;
+	mem_op[regno].mode = DImode;
+	offset += 2*4;
       }
 
-  /* Walk the registers to save recording all double memory operations.
-     This avoids a delay in the epilogue (ld.d/ld).  */
-  offset = base;
-  for (regno = FRAME_POINTER_REGNUM; regno > 1; regno--)
-    if (save_regs[regno])
+  /* Process all the register pairs using double memory operations.  */
+  for (regno = 2; regno < HARD_FRAME_POINTER_REGNUM; regno += 2)
+    if (cfun->machine->save_regs[regno] && cfun->machine->save_regs[regno + 1])
       {
-	if ((offset & 7) != 4 || (regno & 1) != 1 || !save_regs[regno-1])
-	  {
-	    offset -= 4;
-	  }
-        else
-	  {
-	    mo_ptr->nregs = 2;
-	    mo_ptr->regno = regno-1;
-	    mo_ptr->offset = offset-4;
-	    mo_ptr++;
-	    regno--;
-	    offset -= 2*4;
-	  }
+	mem_op[regno].offset = offset;
+	mem_op[regno].mode = DImode;
+	offset += 2*4;
       }
 
-  /* Walk the extended registers to record all memory operations.  */
-  /*  Be sure the offset is double word aligned.  */
-  offset = (offset - 1) & ~7;
-  for (regno = FIRST_PSEUDO_REGISTER - 1; regno > FIRST_EXTENDED_REGISTER;
-       regno--)
-    if (save_regs[regno])
-      {
-	mo_ptr->nregs = 2;
-	mo_ptr->regno = regno;
-	mo_ptr->offset = offset;
-	mo_ptr++;
-	offset -= 2*4;
-      }
-
-  mo_ptr->regno = 0;
+  /* Process all the remaining registers using single memory operations.  */
+  for (regno = 2; regno < HARD_FRAME_POINTER_REGNUM; regno += 2)
+    {
+      if (cfun->machine->save_regs[regno])
+	{
+	  if (cfun->machine->save_regs[regno + 1])
+	    continue; /* done earlier */
+	  mem_op[regno].offset = offset;
+	  mem_op[regno].mode = SImode;
+	  offset += 4;
+	}
+      if (cfun->machine->save_regs[regno + 1])
+	{
+	  mem_op[regno + 1].offset = offset;
+	  mem_op[regno + 1].mode = SImode;
+	  offset += 4;
+	}
+    }
 
   /* Output the memory operations.  */
-  for (mo_ptr = mem_op; mo_ptr->regno; mo_ptr++)
-    {
-      if (mo_ptr->nregs)
-	emit_ldst (store_p, mo_ptr->regno,
-		   (mo_ptr->nregs > 1 ? DImode : SImode),
-		   mo_ptr->offset);
-    }
+  for (regno = 2; regno <= LAST_EXTENDED_REGISTER; regno++)
+    if (mem_op[regno].mode != 0)
+      {
+	emit_ldst (store_p, regno, mem_op[regno].mode, mem_op[regno].offset);
+      }
 }
 
 static void
@@ -1420,8 +1412,7 @@ emit_ldst (int store_p, int regno, enum machine_mode mode, int offset)
     }
   else
     {
-      /* offset is too large for immediate index must use register */
-
+      /* offset is too large for immediate index, must use register */
       rtx disp = GEN_INT (offset);
       rtx temp = gen_rtx_REG (SImode, TEMP_REGNUM);
       rtx regi = gen_rtx_PLUS (SImode, stack_pointer_rtx, temp);
@@ -1434,31 +1425,35 @@ emit_ldst (int store_p, int regno, enum machine_mode mode, int offset)
     {
       insn = emit_move_insn (mem, reg);
       RTX_FRAME_RELATED_P (insn) = 1;
+
+      /* If this is a double-register operation, the DWARF code translating
+	 this into CFI data will lose the double-width information, so we
+	 must synthesize what would have been the pair of single-register
+	 instructions in the notes, to let the DWARF code understand this
+	 sequence correctly.  */
+      if (mode == DImode && ! XRF_REGNO_P (regno))
+	{
+	  rtx m1 = gen_rtx_MEM (SImode,
+				plus_constant (stack_pointer_rtx, offset));
+	  rtx m2 = gen_rtx_MEM (SImode,
+				plus_constant (stack_pointer_rtx, offset + 4));
+	  rtx r1 = gen_rtx_REG (SImode, regno);
+	  rtx r2 = gen_rtx_REG (SImode, regno + 1);
+	  rtx op1 = gen_rtx_SET (VOIDmode, m1, r1);
+	  rtx op2 = gen_rtx_SET (VOIDmode, m2, r2);
+	  rtvec vec;
+
+	  RTX_FRAME_RELATED_P (op1) = 1;
+	  RTX_FRAME_RELATED_P (op2) = 1;
+	  vec = gen_rtvec (2, op1, op2);
+	  REG_NOTES (insn)
+	    = gen_rtx_EXPR_LIST (REG_FRAME_RELATED_EXPR,
+				 gen_rtx_SEQUENCE (VOIDmode, vec),
+				 REG_NOTES(insn));
+	}
     }
   else
     emit_move_insn (reg, mem);
-}
-
-/* Convert the address expression REG to a CFA offset.  */
-
-int
-m88k_debugger_offset (rtx reg, int offset)
-{
-  if (GET_CODE (reg) == PLUS)
-    {
-      offset = INTVAL (XEXP (reg, 1));
-      reg = XEXP (reg, 0);
-    }
-
-  /* Put the offset in terms of the CFA (arg pointer).  */
-  if (reg == frame_pointer_rtx)
-    offset += m88k_fp_offset - m88k_stack_size;
-  else if (reg == stack_pointer_rtx)
-    offset -= m88k_stack_size;
-  else if (reg != arg_pointer_rtx)
-    return 0;
-
-  return offset;
 }
 
 /* Output assembler code to FILE to increment profiler label # LABELNO
@@ -1511,6 +1506,22 @@ output_function_profiler (FILE *file, int labelno, const char *name)
   asm_fprintf (file, "\taddu\t %R%s,%R%s,32\n", reg_names[31], reg_names[31]);
 }
 
+void
+m88k_order_regs_for_local_alloc (void)
+{
+  static const int leaf[] = REG_LEAF_ALLOC_ORDER;
+  static const int nonleaf[] = REG_ALLOC_ORDER;
+  /* 1 below because reg_alloc_order is initialized with REG_ALLOC_ORDER */
+  static int last_alloc_order = 1;
+
+  if (regs_ever_live[1] != last_alloc_order)
+    {
+      last_alloc_order = regs_ever_live[1];
+      memcpy (reg_alloc_order, last_alloc_order ? nonleaf : leaf,
+	      FIRST_PSEUDO_REGISTER * sizeof (int));
+    }
+}
+
 /* Determine whether a function argument is passed in a register, and
    which register.
 
@@ -1540,7 +1551,7 @@ output_function_profiler (FILE *file, int labelno, const char *name)
    where GCC did not expect to have register arguments, followed
    by stack arguments, followed by register arguments.  */
 
-struct rtx_def *
+rtx
 m88k_function_arg (CUMULATIVE_ARGS args_so_far, enum machine_mode mode,
 		   tree type, int named ATTRIBUTE_UNUSED)
 {
@@ -1671,7 +1682,7 @@ m88k_return_in_memory (tree type, tree fndecl ATTRIBUTE_UNUSED)
    variable number of arguments.
 
    CUM is a variable of type CUMULATIVE_ARGS which gives info about
-    the preceding args and about the function being called.
+   the preceding args and about the function being called.
 
    MODE and TYPE are the mode and type of the current parameter.
 
@@ -1688,8 +1699,8 @@ m88k_setup_incoming_varargs (CUMULATIVE_ARGS *cum, enum machine_mode mode,
 {
   CUMULATIVE_ARGS next_cum;
   tree fntype;
-  int stdarg_p;
-  int regcnt, delta;
+  bool stdarg_p;
+  int regcnt;
 
   fntype = TREE_TYPE (current_function_decl);
   stdarg_p = (TYPE_ARG_TYPES (fntype) != NULL_TREE
@@ -1703,50 +1714,46 @@ m88k_setup_incoming_varargs (CUMULATIVE_ARGS *cum, enum machine_mode mode,
     m88k_function_arg_advance(&next_cum, mode, type, 1);
 
   regcnt = next_cum < 8 ? 8 - next_cum : 0;
-  delta = regcnt & 1;
 
   if (! no_rtl && regcnt != 0)
     {
-      rtx mem, dst;
-      int set, regno, offs;
+      rtx mem;
+      HOST_WIDE_INT set;
+      int regno, offs;
 
+      offs = 0;
       set = get_varargs_alias_set ();
-      mem = gen_rtx_MEM (BLKmode,
-			 plus_constant (virtual_incoming_args_rtx,
-					- (regcnt + delta) * UNITS_PER_WORD));
+      mem = gen_rtx_MEM (BLKmode, hard_frame_pointer_rtx);
+      mem = adjust_address (mem, BLKmode, -regcnt * UNITS_PER_WORD);
       MEM_NOTRAP_P (mem) = 1;
       set_mem_alias_set (mem, set);
 
       /* Now store the incoming registers.  */
       /* The following is equivalent to
-	 move_block_from_reg (2 + next_cum,
-			      adjust_address (mem, Pmode,
-					      delta * UNITS_PER_WORD),
+	 move_block_from_reg (2 + next_cum, mem,
 			      regcnt, UNITS_PER_WORD * regcnt);
-	 but using double store instruction since the stack is properly
-	 aligned.  */
+	 but using as many double store instruction as possible,
+	 since the stack is properly aligned.  */
       regno = 2 + next_cum;
-      dst = mem;
 
-      if (delta != 0)
+      if (regcnt & 1)
 	{
-	  dst = adjust_address (dst, Pmode, UNITS_PER_WORD);
-	  emit_move_insn (operand_subword (dst, 0, 1, BLKmode),
+	  emit_move_insn (adjust_address (mem, SImode, 0),
 			  gen_rtx_REG (SImode, regno));
 	  regno++;
+	  offs += UNITS_PER_WORD;
 	}
 
-      offs = delta;
       while (regno < 10)
 	{
-	  emit_move_insn (adjust_address (dst, DImode, offs * UNITS_PER_WORD),
+	  emit_move_insn (adjust_address (mem, DImode, offs),
 			  gen_rtx_REG (DImode, regno));
-	  offs += 2;
+	  offs += 2 * UNITS_PER_WORD;
 	  regno += 2;
-        }
-
-      *pretend_size = (regcnt + delta) * UNITS_PER_WORD;
+	}
     }
+
+  cfun->machine->saved_va_regcnt = regcnt;
 }
 
 /* Define the `__builtin_va_list' type for the ABI.  */
@@ -1815,7 +1822,7 @@ m88k_va_start (tree valist, rtx nextarg ATTRIBUTE_UNUSED)
   expand_expr (t, const0_rtx, VOIDmode, EXPAND_NORMAL);
 
   /* Store the arg pointer in the __va_stk member.  */
-  offset = XINT (current_function_arg_offset_rtx, 0);
+  offset = INTVAL (current_function_arg_offset_rtx);
   if (current_function_args_info >= 8 && ! stdarg_p)
     offset -= UNITS_PER_WORD;
   t = make_tree (TREE_TYPE (stk), virtual_incoming_args_rtx);
@@ -1825,9 +1832,9 @@ m88k_va_start (tree valist, rtx nextarg ATTRIBUTE_UNUSED)
   expand_expr (t, const0_rtx, VOIDmode, EXPAND_NORMAL);
 
   /* Setup __va_reg */
-  t = make_tree (TREE_TYPE (reg), virtual_incoming_args_rtx);
+  t = make_tree (TREE_TYPE (reg), hard_frame_pointer_rtx);
   t = build2 (PLUS_EXPR, TREE_TYPE (reg), t,
-	     build_int_cst (NULL_TREE, -8 * UNITS_PER_WORD));
+	      build_int_cst (NULL_TREE, - 8 * UNITS_PER_WORD));
   t = build2 (MODIFY_EXPR, TREE_TYPE (reg), reg, t);
   TREE_SIDE_EFFECTS (t) = 1;
   expand_expr (t, const0_rtx, VOIDmode, EXPAND_NORMAL);
@@ -1933,8 +1940,8 @@ m88k_gimplify_va_arg (tree valist, tree type, tree *pre_p, tree *post_p)
     align = type == NULL_TREE ? 0 : TYPE_ALIGN (type) / BITS_PER_UNIT;
     if (align > UNITS_PER_WORD)
       {
-        t = build2 (PLUS_EXPR, TREE_TYPE (stk), stk, size_int (align - 1));
-        t = build2 (BIT_AND_EXPR, TREE_TYPE (t), t,
+	t = build2 (PLUS_EXPR, TREE_TYPE (stk), stk, size_int (align - 1));
+	t = build2 (BIT_AND_EXPR, TREE_TYPE (t), t,
 		    build_int_cst (NULL_TREE, -align));
 	gimplify_expr (&t, pre_p, NULL, is_gimple_val, fb_rvalue);
       }
@@ -1965,7 +1972,7 @@ m88k_gimplify_va_arg (tree valist, tree type, tree *pre_p, tree *post_p)
    expression describing the test of operator OP.  */
 
 rtx
-emit_test (enum rtx_code op, enum machine_mode mode)
+m88k_emit_test (enum rtx_code op, enum machine_mode mode)
 {
   if (m88k_compare_reg == NULL_RTX)
     emit_insn (gen_test (m88k_compare_op0, m88k_compare_op1));
@@ -1978,26 +1985,26 @@ emit_test (enum rtx_code op, enum machine_mode mode)
    as needed.  */
 
 void
-emit_bcnd (enum rtx_code op, rtx label)
+m88k_emit_bcnd (enum rtx_code op, rtx label)
 {
   if (m88k_compare_op1 == const0_rtx)
     emit_jump_insn (gen_bcnd
 		    (gen_rtx_fmt_ee (op, VOIDmode, m88k_compare_op0, const0_rtx),
 		     label));
-  else if (m88k_compare_op0 == const0_rtx)
+  else if (m88k_compare_op0 == const0_rtx && swap_condition (op) != op)
     emit_jump_insn (gen_bcnd
 		    (gen_rtx_fmt_ee (swap_condition (op),
 				     VOIDmode, m88k_compare_op1, const0_rtx),
 		     label));
   else if (op != EQ && op != NE)
-    emit_jump_insn (gen_bxx (emit_test (op, VOIDmode), label));
+    emit_jump_insn (gen_bxx (m88k_emit_test (op, VOIDmode), label));
   else
     {
       rtx zero = gen_reg_rtx (SImode);
       rtx reg, constant;
       int value;
 
-      if (GET_CODE (m88k_compare_op1) == CONST_INT)
+      if (CONST_INT_P (m88k_compare_op1))
 	{
 	  reg = force_reg (SImode, m88k_compare_op0);
 	  constant = m88k_compare_op1;
@@ -2010,9 +2017,9 @@ emit_bcnd (enum rtx_code op, rtx label)
       value = INTVAL (constant);
 
       /* Perform an arithmetic computation to make the compared-to value
-	 zero, but avoid loosing if the bcnd is later changed into sxx.  */
+	 zero, but avoid losing if the bcnd is later changed into sxx.  */
       if (SMALL_INTVAL (value))
-	emit_jump_insn (gen_bxx (emit_test (op, VOIDmode), label));
+	emit_jump_insn (gen_bxx (m88k_emit_test (op, VOIDmode), label));
       else
 	{
 	  if (SMALL_INTVAL (-value))
@@ -2026,6 +2033,17 @@ emit_bcnd (enum rtx_code op, rtx label)
 				    label));
 	}
     }
+}
+
+/* Use instead of emit_label for the last label in an expansion.  */
+
+void
+m88k_emit_trailing_label (rtx label)
+{
+  emit_label (label);
+  /* Allow REG_NOTES to be set on last insn (labels don't have enough
+     fields, and can't be used for REG_NOTES anyway).  */
+  emit_insn (gen_rtx_USE (VOIDmode, stack_pointer_rtx));
 }
 
 /* Print an operand.  Recognize special options, documented below.  */
@@ -2073,26 +2091,20 @@ print_operand (FILE *file, rtx x, int code)
 	     The mechanism below is completed by having CC_STATUS_INIT set
 	     the code to the unknown value.  */
 
-	  /*
-	     hassey 6/30/93
-	     A problem with 88110 4.1 & 4.2 makes the use of fldcr for
-	     this purpose undesirable.  Instead we will use tb1, this will
-	     cause serialization on the 88100 but such is life.
-	  */
-
 	  static rtx last_addr = NULL_RTX;
 	  if (code == 'V' /* Only need to serialize before a load.  */
 	      && m88k_volatile_code != 'V' /* Loads complete in FIFO order.  */
 	      && !(m88k_volatile_code == 'v'
 		   && GET_CODE (XEXP (x, 0)) == LO_SUM
 		   && rtx_equal_p (XEXP (XEXP (x, 0), 1), last_addr)))
-	    asm_fprintf (file,
-#if 0
-			 "fldcr\t %R%s,%Rfcr63\n\t",
-#else /* 0 */
-			 "tb1\t 1,%R%s,0xff\n\t",
-#endif /* 0 */
-			 reg_names[0]);
+	    {
+	      /* 88110 cpus up to revision 4.2 can misbehave if the fldcr
+		 instruction is the last one of a page. We simply force it
+		 to be aligned to an 8-byte boundary to make sure this can
+		 never happen. */
+	      ASM_OUTPUT_ALIGN (file, 3);
+	      asm_fprintf (file, "\tfldcr\t %R%s,%Rfcr63\n\t", reg_names[0]);
+	    }
 	  m88k_volatile_code = code;
 	  last_addr = (GET_CODE (XEXP (x, 0)) == LO_SUM
 		       ? XEXP (XEXP (x, 0), 1) : 0);
@@ -2176,7 +2188,7 @@ print_operand (FILE *file, rtx x, int code)
     case '!': /* Reverse the following condition. */
       sequencep++;
       reversep = 1;
-      return; 
+      return;
     case 'R': /* reverse the condition of the next print_operand
 		 if operand is a label_ref.  */
       sequencep++;
@@ -2184,8 +2196,6 @@ print_operand (FILE *file, rtx x, int code)
       return;
 
     case 'B': /* bcnd branch values */
-      if (0) /* SVR4 */
-	fputs (m88k_register_prefix, file);
       switch (xc)
 	{
 	case EQ: fputs ("eq0", file); return;
@@ -2198,10 +2208,14 @@ print_operand (FILE *file, rtx x, int code)
 	}
 
     case 'C': /* bb0/bb1 branch values for comparisons */
-      if (0) /* SVR4 */
-	fputs (m88k_register_prefix, file);
       switch (xc)
 	{
+	case UNORDERED:
+	  fputs ("nc", file);
+	  return;
+	case ORDERED:
+	  fputs ("cp", file);
+	  return;
 	case EQ:  fputs ("eq", file); return;
 	case NE:  fputs ("ne", file); return;
 	case GT:  fputs ("gt", file); return;
@@ -2221,13 +2235,9 @@ print_operand (FILE *file, rtx x, int code)
 	case EQ: fputs ("0xa", file); return;
 	case NE: fputs ("0x5", file); return;
 	case GT:
-	  if (0) /* SVR4 */
-	    fputs (m88k_register_prefix, file);
 	  fputs ("gt0", file);
 	  return;
 	case LE:
-	  if (0) /* SVR4 */
-	    fputs (m88k_register_prefix, file);
 	  fputs ("le0", file);
 	  return;
 	case LT: fputs ("0x4", file); return;
@@ -2322,7 +2332,7 @@ print_operand_address (FILE *file, rtx addr)
     case PLUS:
       reg0 = XEXP (addr, 0);
       reg1 = XEXP (addr, 1);
-      if (GET_CODE (reg0) == MULT || GET_CODE (reg0) == CONST_INT)
+      if (GET_CODE (reg0) == MULT || CONST_INT_P (reg0))
 	{
 	  rtx tmp = reg0;
 	  reg0 = reg1;
@@ -2338,7 +2348,7 @@ print_operand_address (FILE *file, rtx addr)
 	    asm_fprintf (file, "%R%s,%R%s",
 			 reg_names [REGNO (reg0)], reg_names [REGNO (reg1)]);
 
-	  else if (GET_CODE (reg1) == CONST_INT)
+	  else if (CONST_INT_P (reg1))
 	    asm_fprintf (file, "%R%s,%d",
 			 reg_names [REGNO (reg0)], INTVAL (reg1));
 
@@ -2389,20 +2399,20 @@ print_operand_address (FILE *file, rtx addr)
     }
 }
 
-/* Return true if X is an address which needs a temporary register when 
+/* Return true if X is an address which needs a temporary register when
    reloaded while generating PIC code.  */
 
 bool
 pic_address_needs_scratch (rtx x)
 {
-  /* An address which is a symbolic plus a non SMALL_INT needs a temp reg.  */
+  /* An address which is a symbolic plus a non ADD_INT needs a temp reg.  */
   if (GET_CODE (x) == CONST)
     {
       x = XEXP (x, 0);
       if (GET_CODE (x) == PLUS)
 	{
 	  if (GET_CODE (XEXP (x, 0)) == SYMBOL_REF
-	      && GET_CODE (XEXP (x, 1)) == CONST_INT
+	      && CONST_INT_P (XEXP (x, 1))
 	      && ! ADD_INT (XEXP (x, 1)))
 	    return true;
 	}
@@ -2426,10 +2436,9 @@ m88k_adjust_cost (rtx insn, rtx link, rtx dep, int cost)
     return 0;  /* Anti or output dependence.  */
 
   if (TARGET_88110
-      && recog_memoized (insn) >= 0
       && get_attr_type (insn) == TYPE_STORE
       && SET_SRC (PATTERN (insn)) == SET_DEST (PATTERN (dep)))
-    return cost - 4;  /* 88110 store reservation station.  */
+    return cost - COSTS_N_INSNS (1);  /* 88110 store reservation station.  */
 
   return cost;
 }
@@ -2469,12 +2478,13 @@ m88k_rtx_costs (rtx x, int code, int outer_code, int *total)
 	 indicate 0 cost, in an attempt to get GCC not to optimize things
 	 like comparison against a constant.  */
       if (SMALL_INT (x))
-        *total = 0;
+	*total = 0;
       else if (SMALL_INTVAL (- INTVAL (x)))
-        *total = 2;
+	*total = 2;
       else if (classify_integer (SImode, INTVAL (x)) != m88k_oru_or)
-        *total = 4;
-      *total = 7;
+	*total = 4;
+      else
+	*total = 7;
       return true;
 
     case HIGH:
@@ -2485,9 +2495,9 @@ m88k_rtx_costs (rtx x, int code, int outer_code, int *total)
     case LABEL_REF:
     case SYMBOL_REF:
       if (flag_pic)
-        *total = (flag_pic == 2) ? 11 : 8;
+	*total = (flag_pic == 2) ? 11 : 8;
       else
-        *total = 5;
+	*total = 5;
       return true;
 
       /* The cost of CONST_DOUBLE is zero (if it can be placed in an insn,
@@ -2510,7 +2520,10 @@ m88k_rtx_costs (rtx x, int code, int outer_code, int *total)
     case UDIV:
     case MOD:
     case UMOD:
-      *total = COSTS_N_INSNS (38);
+      if (TARGET_88110)
+	*total = COSTS_N_INSNS (18);
+      else
+	*total = COSTS_N_INSNS (38);
       return true;
 
     default:
@@ -2564,22 +2577,15 @@ m88k_override_options (void)
   if (TARGET_TRAP_LARGE_SHIFT && TARGET_HANDLE_LARGE_SHIFT)
     error ("-mtrap-large-shift and -mhandle-large-shift are incompatible");
 
-  if (TARGET_OMIT_LEAF_FRAME_POINTER)	/* keep nonleaf frame pointers */
-    flag_omit_frame_pointer = 1;
-
   /* On the m88100, it is desirable to align functions to a cache line.
      The m88110 cache is small, so align to an 8 byte boundary.  */
   if (align_functions == 0)
     align_functions = TARGET_88100 ? 16 : 8;
 
-#if 1 /* XXX breaks -freorder-blocks and even without it, tree-cfg.c */
+  /* XXX -fdelayed-branch (enabled at -O2) does not work reliably yet.  */
   flag_delayed_branch = 0;
-#endif
 
-  /* XXX -freorder-blocks (enabled at -O2) does not work with -fdelayed-branch
-     yet.  */
-  if (flag_delayed_branch)
-    {
-      flag_reorder_blocks = flag_reorder_blocks_and_partition = 0;
-    }
+  init_machine_status = m88k_init_machine_status;
 }
+
+#include "gt-m88k.h"

@@ -1,4 +1,4 @@
-/*	$OpenBSD: dt_dev.c,v 1.33 2024/04/06 11:18:02 mpi Exp $ */
+/*	$OpenBSD: dt_dev.c,v 1.49 2026/05/16 12:59:37 daniel Exp $ */
 
 /*
  * Copyright (c) 2019 Martin Pieuchot <mpi@openbsd.org>
@@ -25,6 +25,15 @@
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/ptrace.h>
+#include <sys/vnode.h>
+#include <uvm/uvm.h>
+#include <uvm/uvm_map.h>
+#include <uvm/uvm_vnode.h>
+#include <sys/file.h>
+#include <sys/filedesc.h>
+#include <sys/fcntl.h>
+
+#include <machine/intr.h>
 
 #include <dev/dt/dtvar.h>
 
@@ -84,29 +93,49 @@
 #define DPRINTF(x...) /* nothing */
 
 /*
+ *  Locks used to protect struct members and variables in this file:
+ *	a	atomic
+ *	I	invariant after initialization
+ *	K	kernel lock
+ *	D	dtrace rw-lock dt_lock
+ *	r	owned by thread doing read(2)
+ *	c	owned by CPU
+ *	s	sliced ownership, based on read/write indexes
+ *	p	written by CPU, read by thread doing read(2)
+ */
+
+/*
+ * Per-CPU Event States
+ */
+struct dt_cpubuf {
+	unsigned int		 dc_prod;	/* [r] read index */
+	unsigned int		 dc_cons;	/* [c] write index */
+	struct dt_evt		*dc_ring;	/* [s] ring of event states */
+	unsigned int	 	 dc_inevt;	/* [c] in event already? */
+
+	/* Counters */
+	unsigned int		 dc_dropevt;	/* [p] # of events dropped */
+	unsigned int		 dc_skiptick;	/* [p] # of ticks skipped */
+	unsigned int		 dc_recurevt;	/* [p] # of recursive events */
+	unsigned int		 dc_readevt;	/* [r] # of events read */
+};
+
+/*
  * Descriptor associated with each program opening /dev/dt.  It is used
  * to keep track of enabled PCBs.
- *
- *  Locks used to protect struct members in this file:
- *	m	per-softc mutex
- *	K	kernel lock
  */
 struct dt_softc {
 	SLIST_ENTRY(dt_softc)	 ds_next;	/* [K] descriptor list */
 	int			 ds_unit;	/* [I] D_CLONE unique unit */
 	pid_t			 ds_pid;	/* [I] PID of tracing program */
-
-	struct mutex		 ds_mtx;
+	void			*ds_si;		/* [I] to defer wakeup(9) */
 
 	struct dt_pcb_list	 ds_pcbs;	/* [K] list of enabled PCBs */
-	struct dt_evt		*ds_bufqueue;	/* [K] copy evts to userland */
-	size_t			 ds_bufqlen;	/* [K] length of the queue */
-	int			 ds_recording;	/* [K] currently recording? */
-	int			 ds_evtcnt;	/* [m] # of readable evts */
+	int			 ds_recording;	/* [D] currently recording? */
+	unsigned int		 ds_evtcnt;	/* [a] # of readable evts */
 
-	/* Counters */
-	uint64_t		 ds_readevt;	/* [m] # of events read */
-	uint64_t		 ds_dropevt;	/* [m] # of events dropped */
+	struct dt_cpubuf	 ds_cpu[MAXCPUS]; /* [I] Per-cpu event states */
+	unsigned int		 ds_lastcpu;	/* [r] last CPU ring read(2). */
 };
 
 SLIST_HEAD(, dt_softc) dtdev_list;	/* [K] list of open /dev/dt nodes */
@@ -119,17 +148,19 @@ unsigned int			dt_nprobes;	/* [I] # of probes available */
 SIMPLEQ_HEAD(, dt_probe)	dt_probe_list;	/* [I] list of probes */
 
 struct rwlock			dt_lock = RWLOCK_INITIALIZER("dtlk");
-volatile uint32_t		dt_tracing = 0;	/* [K] # of processes tracing */
+volatile uint32_t		dt_tracing = 0;	/* [D] # of processes tracing */
 
-int allowdt;
+int allowdt;					/* [a] */
 
-void	dtattach(struct device *, struct device *, void *);
+void	dtattach(int);
 int	dtopen(dev_t, int, int, struct proc *);
 int	dtclose(dev_t, int, int, struct proc *);
 int	dtread(dev_t, struct uio *, int);
 int	dtioctl(dev_t, u_long, caddr_t, int, struct proc *);
 
 struct	dt_softc *dtlookup(int);
+struct	dt_softc *dtalloc(void);
+void	dtfree(struct dt_softc *);
 
 int	dt_ioctl_list_probes(struct dt_softc *, struct dtioc_probe *);
 int	dt_ioctl_get_args(struct dt_softc *, struct dtioc_arg *);
@@ -138,12 +169,15 @@ int	dt_ioctl_record_start(struct dt_softc *);
 void	dt_ioctl_record_stop(struct dt_softc *);
 int	dt_ioctl_probe_enable(struct dt_softc *, struct dtioc_req *);
 int	dt_ioctl_probe_disable(struct dt_softc *, struct dtioc_req *);
-int	dt_ioctl_get_auxbase(struct dt_softc *, struct dtioc_getaux *);
+int	dt_ioctl_rd_vnode(struct dt_softc *, struct dtioc_rdvn *);
 
-int	dt_pcb_ring_copy(struct dt_pcb *, struct dt_evt *, size_t, uint64_t *);
+int	dt_ring_copy(struct dt_cpubuf *, struct uio *, size_t, size_t *);
+
+void	dt_wakeup(struct dt_softc *);
+void	dt_deferred_wakeup(void *);
 
 void
-dtattach(struct device *parent, struct device *self, void *aux)
+dtattach(int count)
 {
 	SLIST_INIT(&dtdev_list);
 	SIMPLEQ_INIT(&dt_probe_list);
@@ -161,43 +195,26 @@ int
 dtopen(dev_t dev, int flags, int mode, struct proc *p)
 {
 	struct dt_softc *sc;
-	struct dt_evt *queue;
-	size_t qlen;
 	int unit = minor(dev);
 
-	if (!allowdt)
+	if (atomic_load_int(&allowdt) == 0)
 		return EPERM;
 
-	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK|M_CANFAIL|M_ZERO);
+	sc = dtalloc();
 	if (sc == NULL)
 		return ENOMEM;
 
-	/*
-	 * Enough space to empty 2 full rings of events in a single read.
-	 */
-	qlen = 2 * DT_EVTRING_SIZE;
-	queue = mallocarray(qlen, sizeof(*queue), M_DEVBUF, M_WAITOK|M_CANFAIL);
-	if (queue == NULL) {
-		free(sc, M_DEVBUF, sizeof(*sc));
-		return ENOMEM;
-	}
-
 	/* no sleep after this point */
 	if (dtlookup(unit) != NULL) {
-		free(queue, M_DEVBUF, qlen * sizeof(*queue));
-		free(sc, M_DEVBUF, sizeof(*sc));
+		dtfree(sc);
 		return EBUSY;
 	}
 
 	sc->ds_unit = unit;
 	sc->ds_pid = p->p_p->ps_pid;
 	TAILQ_INIT(&sc->ds_pcbs);
-	mtx_init(&sc->ds_mtx, IPL_HIGH);
-	sc->ds_bufqlen = qlen;
-	sc->ds_bufqueue = queue;
+	sc->ds_lastcpu = 0;
 	sc->ds_evtcnt = 0;
-	sc->ds_readevt = 0;
-	sc->ds_dropevt = 0;
 
 	SLIST_INSERT_HEAD(&dtdev_list, sc, ds_next);
 
@@ -220,10 +237,7 @@ dtclose(dev_t dev, int flags, int mode, struct proc *p)
 	SLIST_REMOVE(&dtdev_list, sc, dt_softc, ds_next);
 	dt_ioctl_record_stop(sc);
 	dt_pcb_purge(&sc->ds_pcbs);
-
-	free(sc->ds_bufqueue, M_DEVBUF,
-	    sc->ds_bufqlen * sizeof(*sc->ds_bufqueue));
-	free(sc, M_DEVBUF, sizeof(*sc));
+	dtfree(sc);
 
 	return 0;
 }
@@ -232,50 +246,44 @@ int
 dtread(dev_t dev, struct uio *uio, int flags)
 {
 	struct dt_softc *sc;
-	struct dt_evt *estq;
-	struct dt_pcb *dp;
-	int error = 0, unit = minor(dev);
-	size_t qlen, count, read = 0;
-	uint64_t dropped = 0;
+	struct dt_cpubuf *dc;
+	int i, error = 0, unit = minor(dev);
+	size_t count, max, read = 0;
 
 	sc = dtlookup(unit);
 	KASSERT(sc != NULL);
 
-	count = howmany(uio->uio_resid, sizeof(struct dt_evt));
-	if (count < 1)
+	max = howmany(uio->uio_resid, sizeof(struct dt_evt));
+	if (max < 1)
 		return (EMSGSIZE);
 
-	while (!sc->ds_evtcnt) {
+	while (!atomic_load_int(&sc->ds_evtcnt)) {
 		sleep_setup(sc, PWAIT | PCATCH, "dtread");
-		error = sleep_finish(0, !sc->ds_evtcnt);
+		error = sleep_finish(INFSLP, !atomic_load_int(&sc->ds_evtcnt));
 		if (error == EINTR || error == ERESTART)
 			break;
 	}
 	if (error)
 		return error;
 
-	estq = sc->ds_bufqueue;
-	qlen = MIN(sc->ds_bufqlen, count);
-
 	KERNEL_ASSERT_LOCKED();
-	TAILQ_FOREACH(dp, &sc->ds_pcbs, dp_snext) {
-		count = dt_pcb_ring_copy(dp, estq, qlen, &dropped);
+	for (i = 0; i < ncpusfound; i++) {
+		count = 0;
+		dc = &sc->ds_cpu[(sc->ds_lastcpu + i) % ncpusfound];
+		error = dt_ring_copy(dc, uio, max, &count);
+		if (error && count == 0)
+			break;
+
 		read += count;
-		estq += count; /* pointer arithmetic */
-		qlen -= count;
-		if (qlen == 0)
+		max -= count;
+		if (max == 0)
 			break;
 	}
-	if (read > 0)
-		uiomove(sc->ds_bufqueue, read * sizeof(struct dt_evt), uio);
+	sc->ds_lastcpu += i % ncpusfound;
 
-	mtx_enter(&sc->ds_mtx);
-	sc->ds_evtcnt -= read;
-	sc->ds_readevt += read;
-	sc->ds_dropevt += dropped;
-	mtx_leave(&sc->ds_mtx);
+	atomic_sub_int(&sc->ds_evtcnt, read);
 
-	return 0;
+	return error;
 }
 
 int
@@ -298,7 +306,7 @@ dtioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
 	case DTIOCRECORD:
 	case DTIOCPRBENABLE:
 	case DTIOCPRBDISABLE:
-	case DTIOCGETAUXBASE:
+	case DTIOCRDVNODE:
 		/* root only ioctl(2) */
 		break;
 	default:
@@ -322,8 +330,8 @@ dtioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
 	case DTIOCPRBDISABLE:
 		error = dt_ioctl_probe_disable(sc, (struct dtioc_req *)addr);
 		break;
-	case DTIOCGETAUXBASE:
-		error = dt_ioctl_get_auxbase(sc, (struct dtioc_getaux *)addr);
+	case DTIOCRDVNODE:
+		error = dt_ioctl_rd_vnode(sc, (struct dtioc_rdvn *)addr);
 		break;
 	default:
 		KASSERT(0);
@@ -345,6 +353,55 @@ dtlookup(int unit)
 	}
 
 	return sc;
+}
+
+struct dt_softc *
+dtalloc(void)
+{
+	struct dt_softc *sc;
+	struct dt_evt *dtev;
+	int i;
+
+	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK|M_CANFAIL|M_ZERO);
+	if (sc == NULL)
+		return NULL;
+
+	for (i = 0; i < ncpusfound; i++) {
+		dtev = mallocarray(DT_EVTRING_SIZE, sizeof(*dtev), M_DEVBUF,
+		    M_WAITOK|M_CANFAIL|M_ZERO);
+		if (dtev == NULL)
+			break;
+		sc->ds_cpu[i].dc_ring = dtev;
+	}
+	if (i < ncpusfound) {
+		dtfree(sc);
+		return NULL;
+	}
+
+	sc->ds_si = softintr_establish(IPL_SOFTCLOCK | IPL_MPSAFE,
+	    dt_deferred_wakeup, sc);
+	if (sc->ds_si == NULL) {
+		dtfree(sc);
+		return NULL;
+	}
+
+	return sc;
+}
+
+void
+dtfree(struct dt_softc *sc)
+{
+	struct dt_evt *dtev;
+	int i;
+
+	if (sc->ds_si != NULL)
+		softintr_disestablish(sc->ds_si);
+
+	for (i = 0; i < ncpusfound; i++) {
+		dtev = sc->ds_cpu[i].dc_ring;
+		free(dtev, M_DEVBUF, DT_EVTRING_SIZE * sizeof(*dtev));
+	}
+	free(sc, M_DEVBUF, sizeof(*sc));
 }
 
 int
@@ -442,11 +499,25 @@ dt_ioctl_get_args(struct dt_softc *sc, struct dtioc_arg *dtar)
 int
 dt_ioctl_get_stats(struct dt_softc *sc, struct dtioc_stat *dtst)
 {
-	mtx_enter(&sc->ds_mtx);
-	dtst->dtst_readevt = sc->ds_readevt;
-	dtst->dtst_dropevt = sc->ds_dropevt;
-	mtx_leave(&sc->ds_mtx);
+	struct dt_cpubuf *dc;
+	uint64_t readevt, dropevt, skiptick, recurevt;
+	int i;
 
+	readevt = dropevt = skiptick = 0;
+	for (i = 0; i < ncpusfound; i++) {
+		dc = &sc->ds_cpu[i];
+
+		membar_consumer();
+		dropevt += dc->dc_dropevt;
+		skiptick = dc->dc_skiptick;
+		recurevt = dc->dc_recurevt;
+		readevt += dc->dc_readevt;
+	}
+
+	dtst->dtst_readevt = readevt;
+	dtst->dtst_dropevt = dropevt;
+	dtst->dtst_skiptick = skiptick;
+	dtst->dtst_recurevt = recurevt;
 	return 0;
 }
 
@@ -455,15 +526,20 @@ dt_ioctl_record_start(struct dt_softc *sc)
 {
 	uint64_t now;
 	struct dt_pcb *dp;
-
-	if (sc->ds_recording)
-		return EBUSY;
-
-	KERNEL_ASSERT_LOCKED();
-	if (TAILQ_EMPTY(&sc->ds_pcbs))
-		return ENOENT;
+	int error = 0;
 
 	rw_enter_write(&dt_lock);
+	if (sc->ds_recording) {
+		error = EBUSY;
+		goto out;
+	}
+
+	KERNEL_ASSERT_LOCKED();
+	if (TAILQ_EMPTY(&sc->ds_pcbs)) {
+		error = ENOENT;
+		goto out;
+	}
+
 	now = nsecuptime();
 	TAILQ_FOREACH(dp, &sc->ds_pcbs, dp_snext) {
 		struct dt_probe *dtp = dp->dp_dtp;
@@ -479,12 +555,12 @@ dt_ioctl_record_start(struct dt_softc *sc)
 			    now + dp->dp_nsecs);
 		}
 	}
-	rw_exit_write(&dt_lock);
-
 	sc->ds_recording = 1;
 	dt_tracing++;
 
-	return 0;
+ out:
+	rw_exit_write(&dt_lock);
+	return error;
 }
 
 void
@@ -492,15 +568,16 @@ dt_ioctl_record_stop(struct dt_softc *sc)
 {
 	struct dt_pcb *dp;
 
-	if (!sc->ds_recording)
+	rw_enter_write(&dt_lock);
+	if (!sc->ds_recording) {
+		rw_exit_write(&dt_lock);
 		return;
+	}
 
 	DPRINTF("dt%d: pid %d disable\n", sc->ds_unit, sc->ds_pid);
 
 	dt_tracing--;
 	sc->ds_recording = 0;
-
-	rw_enter_write(&dt_lock);
 	TAILQ_FOREACH(dp, &sc->ds_pcbs, dp_snext) {
 		struct dt_probe *dtp = dp->dp_dtp;
 
@@ -526,7 +603,11 @@ dt_ioctl_probe_enable(struct dt_softc *sc, struct dtioc_req *dtrq)
 {
 	struct dt_pcb_list plist;
 	struct dt_probe *dtp;
+	struct dt_pcb *dp;
 	int error;
+
+	if (sc->ds_recording)
+		return EBUSY;
 
 	SIMPLEQ_FOREACH(dtp, &dt_probe_list, dtp_next) {
 		if (dtp->dtp_pbn == dtrq->dtrq_pbn)
@@ -534,6 +615,12 @@ dt_ioctl_probe_enable(struct dt_softc *sc, struct dtioc_req *dtrq)
 	}
 	if (dtp == NULL)
 		return ENOENT;
+
+	/* Only allow one probe of each type. */
+	TAILQ_FOREACH(dp, &sc->ds_pcbs, dp_snext) {
+		if (dp->dp_dtp->dtp_pbn == dtrq->dtrq_pbn)
+			return EEXIST;
+	}
 
 	TAILQ_INIT(&plist);
 	error = dtp->dtp_prov->dtpv_alloc(dtp, sc, &plist, dtrq);
@@ -555,6 +642,9 @@ dt_ioctl_probe_disable(struct dt_softc *sc, struct dtioc_req *dtrq)
 	struct dt_probe *dtp;
 	int error;
 
+	if (sc->ds_recording)
+		return EBUSY;
+
 	SIMPLEQ_FOREACH(dtp, &dt_probe_list, dtp_next) {
 		if (dtp->dtp_pbn == dtrq->dtrq_pbn)
 			break;
@@ -575,39 +665,75 @@ dt_ioctl_probe_disable(struct dt_softc *sc, struct dtioc_req *dtrq)
 }
 
 int
-dt_ioctl_get_auxbase(struct dt_softc *sc, struct dtioc_getaux *dtga)
+dt_ioctl_rd_vnode(struct dt_softc *sc, struct dtioc_rdvn *dtrv)
 {
-	struct uio uio;
-	struct iovec iov;
-	struct process *pr;
+	struct process *ps;
 	struct proc *p = curproc;
-	AuxInfo auxv[ELF_AUX_ENTRIES];
-	int i, error;
+	boolean_t ok;
+	struct vm_map_entry *e;
+	int err = 0;
+	int fd;
+	struct uvm_vnode *uvn;
+	struct vnode *vn;
+	struct file *fp;
 
-	dtga->dtga_auxbase = 0;
-
-	if ((pr = prfind(dtga->dtga_pid)) == NULL)
+	if ((ps = prfind(dtrv->dtrv_pid)) == NULL)
 		return ESRCH;
 
-	iov.iov_base = auxv;
-	iov.iov_len = sizeof(auxv);
-	uio.uio_iov = &iov;
-	uio.uio_iovcnt = 1;
-	uio.uio_offset = pr->ps_auxinfo;
-	uio.uio_resid = sizeof(auxv);
-	uio.uio_segflg = UIO_SYSSPACE;
-	uio.uio_procp = p;
-	uio.uio_rw = UIO_READ;
+	vm_map_lock_read(&ps->ps_vmspace->vm_map);
 
-	error = process_domem(p, pr, &uio, PT_READ_D);
-	if (error)
-		return error;
+	ok = uvm_map_lookup_entry(&ps->ps_vmspace->vm_map,
+	    (vaddr_t)dtrv->dtrv_va, &e);
+	if (ok == 0 || (e->etype & UVM_ET_OBJ) == 0 ||
+	    (e->protection & PROT_EXEC) == 0 ||
+	    !UVM_OBJ_IS_VNODE(e->object.uvm_obj)) {
+		err = ENOENT;
+		vn = NULL;
+		DPRINTF("%s no mapping for %p\n", __func__, dtrv->dtrv_va);
+	} else {
+		uvn = (struct uvm_vnode *)e->object.uvm_obj;
+		vn = uvn->u_vnode;
+		vref(vn);
 
-	for (i = 0; i < ELF_AUX_ENTRIES; i++)
-		if (auxv[i].au_id == AUX_base)
-			dtga->dtga_auxbase = auxv[i].au_v;
+		dtrv->dtrv_len = (size_t)uvn->u_size;
+		dtrv->dtrv_start = (caddr_t)e->start;
+		dtrv->dtrv_offset = (caddr_t)e->offset;
+	}
 
-	return 0;
+	vm_map_unlock_read(&ps->ps_vmspace->vm_map);
+
+	if (vn != NULL) {
+		fdplock(p->p_fd);
+	        err = falloc(p, &fp, &fd);
+		fdpunlock(p->p_fd);
+		if (err != 0) {
+			vrele(vn);
+			DPRINTF("%s fdopen failed (%d)\n", __func__, err);
+			return err;
+		}
+		err = VOP_OPEN(vn, O_RDONLY, p->p_p->ps_ucred, p);
+		if (err == 0) {
+			fp->f_flag = FREAD;
+			fp->f_type = DTYPE_VNODE;
+			fp->f_ops = &vnops;
+			fp->f_data = vn;
+			dtrv->dtrv_fd = fd;
+			fdplock(p->p_fd);
+			fdinsert(p->p_fd, fd, UF_EXCLOSE, fp);
+			fdpunlock(p->p_fd);
+			FRELE(fp, p);
+		} else {
+			DPRINTF("%s vopen() failed (%d)\n", __func__,
+			    err);
+			vrele(vn);
+			fdplock(p->p_fd);
+			fdremove(p->p_fd, fd);
+			fdpunlock(p->p_fd);
+			FRELE(fp, p);
+		}
+	}
+
+	return err;
 }
 
 struct dt_probe *
@@ -645,28 +771,16 @@ dt_pcb_alloc(struct dt_probe *dtp, struct dt_softc *sc)
 
 	dp = malloc(sizeof(*dp), M_DT, M_WAITOK|M_CANFAIL|M_ZERO);
 	if (dp == NULL)
-		goto bad;
+		return NULL;
 
-	dp->dp_ring = mallocarray(DT_EVTRING_SIZE, sizeof(*dp->dp_ring), M_DT,
-	    M_WAITOK|M_CANFAIL|M_ZERO);
-	if (dp->dp_ring == NULL)
-		goto bad;
-
-	mtx_init(&dp->dp_mtx, IPL_HIGH);
 	dp->dp_sc = sc;
 	dp->dp_dtp = dtp;
 	return dp;
-bad:
-	dt_pcb_free(dp);
-	return NULL;
 }
 
 void
 dt_pcb_free(struct dt_pcb *dp)
 {
-	if (dp == NULL)
-		return;
-	free(dp->dp_ring, M_DT, DT_EVTRING_SIZE * sizeof(*dp->dp_ring));
 	free(dp, M_DT, sizeof(*dp));
 }
 
@@ -681,6 +795,15 @@ dt_pcb_purge(struct dt_pcb_list *plist)
 	}
 }
 
+void
+dt_pcb_ring_skiptick(struct dt_pcb *dp, unsigned int skip)
+{
+	struct dt_cpubuf *dc = &dp->dp_sc->ds_cpu[cpu_number()];
+
+	dc->dc_skiptick += skip;
+	membar_producer();
+}
+
 /*
  * Get a reference to the next free event state from the ring.
  */
@@ -689,21 +812,34 @@ dt_pcb_ring_get(struct dt_pcb *dp, int profiling)
 {
 	struct proc *p = curproc;
 	struct dt_evt *dtev;
-	int distance;
+	int prod, cons, distance;
+	struct dt_cpubuf *dc = &dp->dp_sc->ds_cpu[cpu_number()];
 
-	mtx_enter(&dp->dp_mtx);
-	distance = dp->dp_prod - dp->dp_cons;
+	if (dc->dc_inevt == 1) {
+		dc->dc_recurevt++;
+		membar_producer();
+		return NULL;
+	}
+
+	dc->dc_inevt = 1;
+
+	membar_consumer();
+	prod = dc->dc_prod;
+	cons = dc->dc_cons;
+	distance = prod - cons;
 	if (distance == 1 || distance == (1 - DT_EVTRING_SIZE)) {
 		/* read(2) isn't finished */
-		dp->dp_dropevt++;
-		mtx_leave(&dp->dp_mtx);
+		dc->dc_dropevt++;
+		membar_producer();
+
+		dc->dc_inevt = 0;
 		return NULL;
 	}
 
 	/*
 	 * Save states in next free event slot.
 	 */
-	dtev = &dp->dp_ring[dp->dp_cons];
+	dtev = &dc->dc_ring[cons];
 	memset(dtev, 0, sizeof(*dtev));
 
 	dtev->dtev_pbn = dp->dp_dtp->dtp_pbn;
@@ -730,34 +866,35 @@ dt_pcb_ring_get(struct dt_pcb *dp, int profiling)
 void
 dt_pcb_ring_consume(struct dt_pcb *dp, struct dt_evt *dtev)
 {
-	MUTEX_ASSERT_LOCKED(&dp->dp_mtx);
-	KASSERT(dtev == &dp->dp_ring[dp->dp_cons]);
+	struct dt_cpubuf *dc = &dp->dp_sc->ds_cpu[cpu_number()];
 
-	dp->dp_cons = (dp->dp_cons + 1) % DT_EVTRING_SIZE;
-	mtx_leave(&dp->dp_mtx);
+	KASSERT(dtev == &dc->dc_ring[dc->dc_cons]);
 
-	mtx_enter(&dp->dp_sc->ds_mtx);
-	dp->dp_sc->ds_evtcnt++;
-	mtx_leave(&dp->dp_sc->ds_mtx);
-	wakeup(dp->dp_sc);
+	dc->dc_cons = (dc->dc_cons + 1) % DT_EVTRING_SIZE;
+	membar_producer();
+
+	atomic_inc_int(&dp->dp_sc->ds_evtcnt);
+	dc->dc_inevt = 0;
+
+	dt_wakeup(dp->dp_sc);
 }
 
 /*
- * Copy at most `qlen' events from `dp', producing the same amount
+ * Copy at most `max' events from `dc', producing the same amount
  * of free slots.
  */
 int
-dt_pcb_ring_copy(struct dt_pcb *dp, struct dt_evt *estq, size_t qlen,
-    uint64_t *dropped)
+dt_ring_copy(struct dt_cpubuf *dc, struct uio *uio, size_t max, size_t *rcvd)
 {
 	size_t count, copied = 0;
 	unsigned int cons, prod;
+	int error = 0;
 
-	KASSERT(qlen > 0);
+	KASSERT(max > 0);
 
-	mtx_enter(&dp->dp_mtx);
-	cons = dp->dp_cons;
-	prod = dp->dp_prod;
+	membar_consumer();
+	cons = dc->dc_cons;
+	prod = dc->dc_prod;
 
 	if (cons < prod)
 		count = DT_EVTRING_SIZE - prod;
@@ -765,30 +902,55 @@ dt_pcb_ring_copy(struct dt_pcb *dp, struct dt_evt *estq, size_t qlen,
 		count = cons - prod;
 
 	if (count == 0)
-		goto out;
+		return 0;
 
-	*dropped += dp->dp_dropevt;
-	dp->dp_dropevt = 0;
-
-	count = MIN(count, qlen);
-
-	memcpy(&estq[0], &dp->dp_ring[prod], count * sizeof(*estq));
+	count = MIN(count, max);
+	error = uiomove(&dc->dc_ring[prod], count * sizeof(struct dt_evt), uio);
+	if (error)
+		return error;
 	copied += count;
 
 	/* Produce */
 	prod = (prod + count) % DT_EVTRING_SIZE;
 
-	/* If the queue is full or the ring didn't wrap, stop here. */
-	if (qlen == copied || prod != 0 || cons == 0)
+	/* If the ring didn't wrap, stop here. */
+	if (max == copied || prod != 0 || cons == 0)
 		goto out;
 
-	count = MIN(cons, (qlen - copied));
-	memcpy(&estq[copied], &dp->dp_ring[0], count * sizeof(*estq));
+	count = MIN(cons, (max - copied));
+	error = uiomove(&dc->dc_ring[0], count * sizeof(struct dt_evt), uio);
+	if (error)
+		goto out;
+
 	copied += count;
 	prod += count;
 
 out:
-	dp->dp_prod = prod;
-	mtx_leave(&dp->dp_mtx);
-	return copied;
+	dc->dc_readevt += copied;
+	dc->dc_prod = prod;
+	membar_producer();
+
+	*rcvd = copied;
+	return error;
+}
+
+void
+dt_wakeup(struct dt_softc *sc)
+{
+	/*
+	 * It is not always safe or possible to call wakeup(9) and grab
+	 * the SCHED_LOCK() from a given tracepoint.  This is true for
+	 * any tracepoint that might trigger inside the scheduler or at
+	 * any IPL higher than IPL_SCHED.  For this reason use a soft-
+	 * interrupt to defer the wakeup.
+	 */
+	softintr_schedule(sc->ds_si);
+}
+
+void
+dt_deferred_wakeup(void *arg)
+{
+	struct dt_softc *sc = arg;
+
+	wakeup(sc);
 }

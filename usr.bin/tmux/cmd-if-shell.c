@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-if-shell.c,v 1.84 2021/10/11 10:55:30 nicm Exp $ */
+/* $OpenBSD: cmd-if-shell.c,v 1.87 2026/08/25 06:04:33 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Tiago Cunha <me@tiagocunha.org>
@@ -98,6 +98,7 @@ cmd_if_shell_exec(struct cmd *self, struct cmdq_item *item)
 			return (CMD_RETURN_ERROR);
 		new_item = cmdq_get_command(cmdlist, cmdq_get_state(item));
 		cmdq_insert_after(item, new_item);
+		cmd_list_free(cmdlist);
 		return (CMD_RETURN_NORMAL);
 	}
 
@@ -124,7 +125,7 @@ cmd_if_shell_exec(struct cmd *self, struct cmdq_item *item)
 	    -1) == NULL) {
 		cmdq_error(item, "failed to run command: %s", shellcmd);
 		free(shellcmd);
-		free(cdata);
+		cmd_if_shell_free(cdata);
 		return (CMD_RETURN_ERROR);
 	}
 	free(shellcmd);
@@ -157,16 +158,18 @@ cmd_if_shell_callback(struct job *job)
 	if (cmdlist == NULL) {
 		if (cdata->item == NULL) {
 			*error = toupper((u_char)*error);
-			status_message_set(c, -1, 1, 0, "%s", error);
+			status_message_set(c, -1, 1, 0, 0, "%s", error);
 		} else
 			cmdq_error(cdata->item, "%s", error);
 		free(error);
 	} else if (item == NULL) {
 		new_item = cmdq_get_command(cmdlist, NULL);
 		cmdq_append(c, new_item);
+		cmd_list_free(cmdlist);
 	} else {
 		new_item = cmdq_get_command(cmdlist, cmdq_get_state(item));
 		cmdq_insert_after(item, new_item);
+		cmd_list_free(cmdlist);
 	}
 
 out:

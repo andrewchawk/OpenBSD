@@ -1,11 +1,11 @@
-/*	$OpenBSD: ip_id.c,v 1.25 2021/03/10 10:21:48 jsg Exp $ */
+/*	$OpenBSD: ip_id.c,v 1.27 2026/06/21 21:17:07 mvs Exp $ */
 
 /*
  * Copyright (c) 2008 Theo de Raadt, Ryan McBride
- * 
+ *
  * Slightly different algorithm from the one designed by
  * Matthew Dillon <dillon@backplane.com> for The DragonFly Project
- * 
+ *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
@@ -43,28 +43,8 @@ u_int16_t ip_randomid(void);
 u_int16_t
 ip_randomid(void)
 {
-	static int ipid_initialized;
 	u_int16_t si, r;
 	int i, i2;
-
-	if (!ipid_initialized) {
-		ipid_initialized = 1;
-
-		/*
-		 * Initialize with a random permutation. Do so using Knuth
-		 * which avoids the exchange in the Durstenfeld shuffle.
-		 * (See "The Art of Computer Programming, Vol 2" 3rd ed, pg. 145).
-		 *
-		 * Even if our PRNG is imperfect at boot time, we have deferred
-		 * doing this until the first packet being sent and now must
-		 * generate an ID.
-		 */
-		for (i = 0; i < nitems(ip_shuffle); ++i) {
-			i2 = arc4random_uniform(i + 1);
-			ip_shuffle[i] = ip_shuffle[i2];
-			ip_shuffle[i2] = i;
-		}
-	}
 
 	do {
 		arc4random_buf(&si, sizeof(si));
@@ -77,4 +57,21 @@ ip_randomid(void)
 	} while (r == 0);
 
 	return (r);
+}
+
+void
+ip_randomid_init(void)
+{
+	int i, i2;
+
+	/*
+	 * Initialize with a random permutation. Do so using Knuth
+	 * which avoids the exchange in the Durstenfeld shuffle.
+	 * (See "The Art of Computer Programming, Vol 2" 3rd ed, pg. 145).
+	 */
+	for (i = 0; i < nitems(ip_shuffle); ++i) {
+		i2 = arc4random_uniform(i + 1);
+		ip_shuffle[i] = ip_shuffle[i2];
+		ip_shuffle[i2] = i;
+	}
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.296 2024/07/29 18:43:11 kettenis Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.313 2026/09/08 00:47:00 jsg Exp $	*/
 /*	$NetBSD: machdep.c,v 1.3 2003/05/07 22:58:18 fvdl Exp $	*/
 
 /*-
@@ -100,6 +100,8 @@
 #include <machine/mpbiosvar.h>
 #include <machine/kcore.h>
 #include <machine/tss.h>
+#include <machine/ghcb.h>
+#include <machine/kexec.h>
 
 #include <dev/isa/isareg.h>
 #include <dev/ic/i8042reg.h>
@@ -139,6 +141,7 @@ extern int db_console;
 
 #ifdef HIBERNATE
 #include <machine/hibernate_var.h>
+#include <sys/hibernate.h>
 #endif /* HIBERNATE */
 
 #include "ukbd.h"
@@ -199,6 +202,7 @@ paddr_t lo32_paddr;
 paddr_t tramp_pdirpa;
 
 int kbd_reset;
+int hibernate_delay;
 int lid_action = 1;
 int pwr_action = 1;
 int forceukbd;
@@ -317,6 +321,8 @@ cpu_startup(void)
 
 	bufinit();
 
+	sched_blockcpu = CPUTYP_SMT | CPUTYP_L;
+
 	if (boothowto & RB_CONFIG) {
 #ifdef BOOT_CONFIG
 		user_config();
@@ -339,6 +345,10 @@ cpu_startup(void)
 
 	/* initialize CPU0's TSS and GDT and put them in the u-k maps */
 	cpu_enter_pages(&cpu_info_full_primary);
+
+#ifdef HIBERNATE
+	preallocate_hibernate_memory();
+#endif /* HIBERNATE */
 }
 
 /*
@@ -456,15 +466,16 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	bios_diskinfo_t *pdi;
 	int biosdev;
 
-	/* all sysctl names at this level except diskinfo are terminal */
-	if (namelen != 1 && name[0] != BIOS_DISKINFO)
-		return (ENOTDIR);	       /* overloaded */
+	if (namelen < 1)
+		return (ENOTDIR);
 
 	if (!(bootapiver & BAPIV_VECTOR))
 		return EOPNOTSUPP;
 
 	switch (name[0]) {
 	case BIOS_DEV:
+		if (namelen != 1)
+			return ENOTDIR;
 		if ((pdi = bios_getdiskinfo(bootdev)) == NULL)
 			return ENXIO;
 		biosdev = pdi->bios_number;
@@ -476,6 +487,8 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 			return ENXIO;
 		return sysctl_rdstruct(oldp, oldlenp, newp, pdi, sizeof(*pdi));
 	case BIOS_CKSUMLEN:
+		if (namelen != 1)
+			return ENOTDIR;
 		return sysctl_rdint(oldp, oldlenp, newp, bios_cksumlen);
 	default:
 		return EOPNOTSUPP;
@@ -486,9 +499,11 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 extern int tsc_is_invariant;
 extern int amd64_has_xcrypt;
 extern int need_retpoline;
+extern int cpu_sev_guestmode;
 
 const struct sysctl_bounded_args cpuctl_vars[] = {
-	{ CPU_LIDACTION, &lid_action, 0, 2 },
+	{ CPU_HIBERNATEDELAY, &hibernate_delay, 0, 86400 },
+	{ CPU_LIDACTION, &lid_action, -1, 2 },
 	{ CPU_PWRACTION, &pwr_action, 0, 2 },
 	{ CPU_CPUID, &cpu_id, SYSCTL_INT_READONLY },
 	{ CPU_CPUFEATURE, &cpu_feature, SYSCTL_INT_READONLY },
@@ -505,6 +520,7 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen, struct proc *p)
 {
 	extern uint64_t tsc_frequency;
+	char vmmode[16];
 	dev_t consdev;
 	dev_t dev;
 
@@ -560,6 +576,19 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 #endif
 	case CPU_TSCFREQ:
 		return (sysctl_rdquad(oldp, oldlenp, newp, tsc_frequency));
+	case CPU_VMMODE:
+		if (ISSET(cpu_ecxfeature, CPUIDECX_HV)) {
+			if (ISSET(cpu_sev_guestmode, SEV_STAT_SNP_ACTIVE))
+				strlcpy(vmmode, "SEV-SNP", sizeof(vmmode));
+			else if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED))
+				strlcpy(vmmode, "SEV-ES", sizeof(vmmode));
+			else if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
+				strlcpy(vmmode, "SEV", sizeof(vmmode));
+			else
+				strlcpy(vmmode, "guest", sizeof(vmmode));
+		} else
+			strlcpy(vmmode, "host", sizeof(vmmode));
+		return sysctl_rdstring(oldp, oldlenp, newp, vmmode);
 	default:
 		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen));
@@ -573,7 +602,7 @@ maybe_enable_user_cet(struct proc *p)
 #ifndef SMALL_KERNEL
 	/* Enable indirect-branch tracking if present and not disabled */
 	if ((xsave_mask & XFEATURE_CET_U) &&
-	    (p->p_p->ps_flags & PS_NOBTCFI) == 0) {
+	    (p->p_p->ps_iflags & PSI_NOBTCFI) == 0) {
 		uint64_t msr = rdmsr(MSR_U_CET);
 		wrmsr(MSR_U_CET, msr | MSR_CET_ENDBR_EN | MSR_CET_NO_TRACK_EN);
 	}
@@ -1309,6 +1338,40 @@ cpu_init_idt(void)
 	lidt(&region);
 }
 
+#ifdef AMDSEV
+uint64_t early_gdt[GDT_SIZE / 8];
+
+void
+cpu_init_early_vctrap(paddr_t addr)
+{
+	struct region_descriptor region;
+
+	extern void Xvctrap_early(void);
+
+	/* Setup temporary "early" longmode GDT, will be reset soon */
+	memset(early_gdt, 0, sizeof(early_gdt));
+	set_mem_segment(GDT_ADDR_MEM(early_gdt, GCODE_SEL), 0, 0xfffff,
+	    SDT_MEMERA, SEL_KPL, 1, 0, 1);
+	set_mem_segment(GDT_ADDR_MEM(early_gdt, GDATA_SEL), 0, 0xfffff,
+	    SDT_MEMRWA, SEL_KPL, 1, 0, 1);
+	setregion(&region, early_gdt, GDT_SIZE - 1);
+	lgdt(&region);
+
+	/* Setup temporary "early" longmode #VC entry, will be reset soon */
+	idt = early_idt;
+	memset((void *)idt, 0, NIDT * sizeof(idt[0]));
+	setgate(&idt[T_VC], Xvctrap_early, 0, SDT_SYS386IGT, SEL_KPL,
+	    GSEL(GCODE_SEL, SEL_KPL));
+	cpu_init_idt();
+
+	/* Tell the hypervisor about our GHCB. */
+	ghcb_paddr = addr;
+	ghcb_vaddr = addr + KERNBASE;
+	memset((void *)ghcb_vaddr, 0, 2 * PAGE_SIZE);
+	wrmsr(MSR_SEV_GHCB, ghcb_paddr);
+}
+#endif	/* AMDSEV */
+
 void
 cpu_init_extents(void)
 {
@@ -1427,7 +1490,26 @@ init_x86_64(paddr_t first_avail)
 	struct region_descriptor region;
 	bios_memmap_t *bmp;
 	int x, ist;
-	uint64_t max_dm_size = ((uint64_t)512 * NUM_L4_SLOT_DIRECT) << 30;
+	uint64_t max_dm_size = DIRECT_MAP_SIZE;
+	extern vaddr_t pmap_direct_base, pmap_direct_end;
+	extern char pmap_direct_rand;
+
+	pmap_direct_base = (VA_SIGN_NEG((L4_SLOT_DIRECT * NBPD_L4)));
+	pmap_direct_base = (VA_SIGN_NEG((pmap_direct_base +
+	    ((pmap_direct_rand & DIRECT_MAP_START_MASK) * NBPD_L4))));
+	pmap_direct_end = pmap_direct_base + DIRECT_MAP_SIZE;
+
+#ifdef AMDSEV
+	/*
+	 * locore0 mapped 2 pages for use as GHCB before pmap is initialized.
+	 */
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED)) {
+		cpu_init_early_vctrap(first_avail);
+		first_avail += 2 * NBPG;
+	}
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ENABLED))
+		boothowto |= RB_COCOVM;
+#endif
 
 	/*
 	 * locore0 mapped 3 pages for use before the pmap is initialized
@@ -1525,6 +1607,13 @@ init_x86_64(paddr_t first_avail)
 		avail_start = HIBERNATE_HIBALLOC_PAGE + PAGE_SIZE;
 #endif /* HIBERNATE */
 
+#ifdef BOOT_KERNEL
+	if (avail_start < KEXEC_TRAMPOLINE + PAGE_SIZE)
+		avail_start = KEXEC_TRAMPOLINE + PAGE_SIZE;
+	if (avail_start < KEXEC_TRAMP_DATA + PAGE_SIZE)
+		avail_start = KEXEC_TRAMP_DATA + PAGE_SIZE;
+#endif
+
 	/*
 	 * We need to go through the BIOS memory map given, and
 	 * fill out mem_clusters and mem_cluster_cnt stuff, taking
@@ -1566,8 +1655,8 @@ init_x86_64(paddr_t first_avail)
 		}
 
 		/*
-		 * The direct map is limited to 512GB * NUM_L4_SLOT_DIRECT of
-		 * memory, so discard anything above that.
+		 * The direct map is limited to DIRECT_MAP_SIZE of memory, so
+		 * discard anything above that.
 		 */
 		if (e1 >= max_dm_size) {
 			e1 = max_dm_size;

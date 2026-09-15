@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_pfsync.h,v 1.62 2024/05/13 01:15:53 jsg Exp $	*/
+/*	$OpenBSD: if_pfsync.h,v 1.66 2026/04/12 03:16:04 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2001 Michael Shalayeff
@@ -112,7 +112,7 @@ struct pfsync_header {
 	u_int8_t			version;
 	u_int8_t			_pad;
 	u_int16_t			len; /* in bytes */
-	u_int8_t			pfcksum[PF_MD5_DIGEST_LENGTH];
+	u_int8_t			spare[16];
 } __packed;
 
 /*
@@ -273,8 +273,6 @@ struct pfsyncreq {
 
 #ifdef _KERNEL
 
-#include <sys/percpu.h>
-
 enum pfsync_counters {
 	pfsyncs_ipackets,
 	pfsyncs_ipackets6,
@@ -310,7 +308,8 @@ enum pfsync_counters {
 #define PFSYNC_S_PFSYNC	0xd2
 #define PFSYNC_S_DEAD	0xde
 
-int			pfsync_input4(struct mbuf **, int *, int, int);
+int			pfsync_input4(struct mbuf **, int *, int, int,
+			    struct netstack *);
 int			pfsync_sysctl(int *, u_int,  void *, size_t *,
 			    void *, size_t);
 
@@ -318,8 +317,6 @@ int			pfsync_sysctl(int *, u_int,  void *, size_t *,
 #define	PFSYNC_SI_CKSUM		0x02
 #define	PFSYNC_SI_ACK		0x04
 #define	PFSYNC_SI_PFSYNC	0x08
-void			pfsync_state_export(struct pfsync_state *,
-			    struct pf_state *);
 
 void			pfsync_init_state(struct pf_state *,
 			    const struct pf_state_key *,

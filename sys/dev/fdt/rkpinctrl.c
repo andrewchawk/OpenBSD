@@ -1,4 +1,4 @@
-/*	$OpenBSD: rkpinctrl.c,v 1.15 2024/02/11 16:01:09 kettenis Exp $	*/
+/*	$OpenBSD: rkpinctrl.c,v 1.18 2026/03/12 18:46:58 kettenis Exp $	*/
 /*
  * Copyright (c) 2017, 2018 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -79,6 +79,28 @@
 #define RK3399_GRF_GPIO2A_IOMUX		0xe000
 #define RK3399_PMUGRF_GPIO0A_IOMUX	0x0000
 
+/* RK3528 registers */
+#define RK3528_GRF_GPIO0_IOMUX		0x00000
+#define RK3528_GRF_GPIO0_DS		0x00100
+#define RK3528_GRF_GPIO0_P		0x00200
+#define RK3528_GRF_GPIO0_ST		0x00400
+#define RK3528_GRF_GPIO1_IOMUX		0x20020
+#define RK3528_GRF_GPIO1_DS		0x20120
+#define RK3528_GRF_GPIO1_P		0x20210
+#define RK3528_GRF_GPIO1_ST		0x20410
+#define RK3528_GRF_GPIO2_IOMUX		0x30040
+#define RK3528_GRF_GPIO2_DS		0x30160
+#define RK3528_GRF_GPIO2_P		0x30220
+#define RK3528_GRF_GPIO2_ST		0x30420
+#define RK3528_GRF_GPIO3_IOMUX		0x20060
+#define RK3528_GRF_GPIO3_DS		0x20190
+#define RK3528_GRF_GPIO3_P		0x20230
+#define RK3528_GRF_GPIO3_ST		0x20430
+#define RK3528_GRF_GPIO4_IOMUX		0x10080
+#define RK3528_GRF_GPIO4_DS		0x101c0
+#define RK3528_GRF_GPIO4_P		0x10240
+#define RK3528_GRF_GPIO4_ST		0x10440
+
 /* RK3568 registers */
 #define RK3568_GRF_GPIO1A_IOMUX_L	0x0000
 #define RK3568_GRF_GPIO1A_P		0x0080
@@ -104,8 +126,8 @@ struct rockchip_route_table {
 struct rkpinctrl_softc {
 	struct simplebus_softc	sc_sbus;
 
-	struct regmap		*sc_grf;
-	struct regmap		*sc_pmu;
+	uint32_t		sc_grf;
+	uint32_t		sc_pmu;
 };
 
 int	rkpinctrl_match(struct device *, void *, void *);
@@ -123,8 +145,14 @@ int	rk3288_pinctrl(uint32_t, void *);
 int	rk3308_pinctrl(uint32_t, void *);
 int	rk3328_pinctrl(uint32_t, void *);
 int	rk3399_pinctrl(uint32_t, void *);
+int	rk3528_pinctrl(uint32_t, void *);
 int	rk3568_pinctrl(uint32_t, void *);
+int	rk3576_pinctrl(uint32_t, void *);
 int	rk3588_pinctrl(uint32_t, void *);
+
+int	rk3588_pull(uint32_t, uint32_t, uint32_t);
+int	rk3588_strength(uint32_t, uint32_t, uint32_t);
+int	rk3588_schmitt(uint32_t, uint32_t, uint32_t);
 
 int
 rkpinctrl_match(struct device *parent, void *match, void *aux)
@@ -135,7 +163,9 @@ rkpinctrl_match(struct device *parent, void *match, void *aux)
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3308-pinctrl") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3328-pinctrl") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3399-pinctrl") ||
+	    OF_is_compatible(faa->fa_node, "rockchip,rk3528-pinctrl") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3568-pinctrl") ||
+	    OF_is_compatible(faa->fa_node, "rockchip,rk3576-pinctrl") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3588-pinctrl"));
 }
 
@@ -144,14 +174,11 @@ rkpinctrl_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct rkpinctrl_softc *sc = (struct rkpinctrl_softc *)self;
 	struct fdt_attach_args *faa = aux;
-	uint32_t grf, pmu;
 
-	grf = OF_getpropint(faa->fa_node, "rockchip,grf", 0);
-	pmu = OF_getpropint(faa->fa_node, "rockchip,pmu", 0);
-	sc->sc_grf = regmap_byphandle(grf);
-	sc->sc_pmu = regmap_byphandle(pmu);
+	sc->sc_grf = OF_getpropint(faa->fa_node, "rockchip,grf", 0);
+	sc->sc_pmu = OF_getpropint(faa->fa_node, "rockchip,pmu", 0);
 
-	if (sc->sc_grf == NULL && sc->sc_pmu == NULL) {
+	if (sc->sc_grf == 0 && sc->sc_pmu == 0) {
 		printf(": no registers\n");
 		return;
 	}
@@ -164,8 +191,12 @@ rkpinctrl_attach(struct device *parent, struct device *self, void *aux)
 		pinctrl_register(faa->fa_node, rk3328_pinctrl, sc);
 	else if (OF_is_compatible(faa->fa_node, "rockchip,rk3399-pinctrl"))
 		pinctrl_register(faa->fa_node, rk3399_pinctrl, sc);
+	else if (OF_is_compatible(faa->fa_node, "rockchip,rk3528-pinctrl"))
+		pinctrl_register(faa->fa_node, rk3528_pinctrl, sc);
 	else if (OF_is_compatible(faa->fa_node, "rockchip,rk3568-pinctrl"))
 		pinctrl_register(faa->fa_node, rk3568_pinctrl, sc);
+	else if (OF_is_compatible(faa->fa_node, "rockchip,rk3576-pinctrl"))
+		pinctrl_register(faa->fa_node, rk3576_pinctrl, sc);
 	else
 		pinctrl_register(faa->fa_node, rk3588_pinctrl, sc);
 
@@ -234,9 +265,6 @@ rk3288_pinctrl(uint32_t phandle, void *cookie)
 	uint32_t *pins;
 	int node, len, i;
 
-	KASSERT(sc->sc_grf);
-	KASSERT(sc->sc_pmu);
-
 	node = OF_getnodebyphandle(phandle);
 	if (node == 0)
 		return -1;
@@ -269,12 +297,13 @@ rk3288_pinctrl(uint32_t phandle, void *cookie)
 
 		/* Bank 0 lives in the PMU. */
 		if (bank < 1) {
-			rm = sc->sc_pmu;
+			rm = regmap_byphandle(sc->sc_pmu);
 			base = RK3288_PMUGRF_GPIO0A_IOMUX;
 		} else {
-			rm = sc->sc_grf;
+			rm = regmap_byphandle(sc->sc_grf);
 			base = RK3288_GRF_GPIO1A_IOMUX - 0x10;
 		}
+		KASSERT(rm);
 
 		s = splhigh();
 
@@ -374,10 +403,11 @@ int
 rk3308_pinctrl(uint32_t phandle, void *cookie)
 {
 	struct rkpinctrl_softc *sc = cookie;
+	struct regmap *rm = regmap_byphandle(sc->sc_grf);
 	uint32_t *pins;
 	int node, len, i;
 
-	KASSERT(sc->sc_grf);
+	KASSERT(rm);
 
 	node = OF_getnodebyphandle(phandle);
 	if (node == 0)
@@ -392,7 +422,6 @@ rk3308_pinctrl(uint32_t phandle, void *cookie)
 		goto fail;
 
 	for (i = 0; i < len / sizeof(uint32_t); i += 4) {
-		struct regmap *rm = sc->sc_grf;
 		bus_size_t base, off;
 		uint32_t bank, idx, mux;
 		int pull, strength;
@@ -520,10 +549,11 @@ int
 rk3328_pinctrl(uint32_t phandle, void *cookie)
 {
 	struct rkpinctrl_softc *sc = cookie;
+	struct regmap *rm = regmap_byphandle(sc->sc_grf);
 	uint32_t *pins;
 	int node, len, i;
 
-	KASSERT(sc->sc_grf);
+	KASSERT(rm);
 
 	node = OF_getnodebyphandle(phandle);
 	if (node == 0)
@@ -538,7 +568,6 @@ rk3328_pinctrl(uint32_t phandle, void *cookie)
 		goto fail;
 
 	for (i = 0; i < len / sizeof(uint32_t); i += 4) {
-		struct regmap *rm = sc->sc_grf;
 		bus_size_t base, off;
 		uint32_t bank, idx, mux;
 		int pull, strength;
@@ -715,9 +744,6 @@ rk3399_pinctrl(uint32_t phandle, void *cookie)
 	uint32_t *pins;
 	int node, len, i;
 
-	KASSERT(sc->sc_grf);
-	KASSERT(sc->sc_pmu);
-
 	node = OF_getnodebyphandle(phandle);
 	if (node == 0)
 		return -1;
@@ -750,12 +776,13 @@ rk3399_pinctrl(uint32_t phandle, void *cookie)
 
 		/* Bank 0 and 1 live in the PMU. */
 		if (bank < 2) {
-			rm = sc->sc_pmu;
+			rm = regmap_byphandle(sc->sc_pmu);
 			base = RK3399_PMUGRF_GPIO0A_IOMUX;
 		} else {
-			rm = sc->sc_grf;
+			rm = regmap_byphandle(sc->sc_grf);
 			base = RK3399_GRF_GPIO2A_IOMUX - 0x20;
 		}
+		KASSERT(rm);
 
 		s = splhigh();
 
@@ -788,6 +815,174 @@ rk3399_pinctrl(uint32_t phandle, void *cookie)
 				regmap_write_4(rm, base + off + 0x04,
 				    (mask & 0xffff0000) | bits >> 16);
 			}
+		}
+
+		splx(s);
+	}
+
+	free(pins, M_TEMP, len);
+	return 0;
+
+fail:
+	free(pins, M_TEMP, len);
+	return -1;
+}
+
+/* 
+ * Rockchip RK3528
+ */
+
+int
+rk3528_pull(uint32_t bank, uint32_t idx, uint32_t phandle)
+{
+	int node;
+
+	node = OF_getnodebyphandle(phandle);
+	if (node == 0)
+		return -1;
+
+	if (OF_getproplen(node, "bias-disable") == 0)
+		return 0;
+	if (OF_getproplen(node, "bias-pull-up") == 0)
+		return 1;
+	if (OF_getproplen(node, "bias-pull-down") == 0)
+		return 2;
+
+	return -1;
+}
+
+int
+rk3528_strength(uint32_t bank, uint32_t idx, uint32_t phandle)
+{
+	int node;
+
+	node = OF_getnodebyphandle(phandle);
+	if (node == 0)
+		return -1;
+
+	return OF_getpropint(node, "drive-strength", -1);
+}
+
+int
+rk3528_schmitt(uint32_t bank, uint32_t idx, uint32_t phandle)
+{
+	int node;
+
+	node = OF_getnodebyphandle(phandle);
+	if (node == 0)
+		return -1;
+
+	if (OF_getproplen(node, "input-schmitt-disable") == 0)
+		return 0;
+	if (OF_getproplen(node, "input-schmitt-enable") == 0)
+		return 1;
+
+	return -1;
+}
+
+int
+rk3528_pinctrl(uint32_t phandle, void *cookie)
+{
+	struct rkpinctrl_softc *sc = cookie;
+	struct regmap *rm = regmap_byphandle(sc->sc_grf);
+	uint32_t *pins;
+	int node, len, i;
+
+	KASSERT(rm);
+
+	node = OF_getnodebyphandle(phandle);
+	if (node == 0)
+		return -1;
+
+	len = OF_getproplen(node, "rockchip,pins");
+	if (len <= 0)
+		return -1;
+
+	pins = malloc(len, M_TEMP, M_WAITOK);
+	if (OF_getpropintarray(node, "rockchip,pins", pins, len) != len)
+		goto fail;
+
+	for (i = 0; i < len / sizeof(uint32_t); i += 4) {
+		bus_size_t iomux_base, p_base, ds_base, st_base, off;
+		uint32_t bank, idx, mux;
+		int pull, strength, schmitt;
+		uint32_t mask, bits;
+		int s;
+
+		bank = pins[i];
+		idx = pins[i + 1];
+		mux = pins[i + 2];
+
+		if (bank > 4 || idx >= 32 || mux > 7)
+			continue;
+
+		pull = rk3528_pull(bank, idx, pins[i + 3]);
+		strength = rk3528_strength(bank, idx, pins[i + 3]);
+		schmitt = rk3528_schmitt(bank, idx, pins[i + 3]);
+
+		switch (bank) {
+		case 0:
+			iomux_base = RK3528_GRF_GPIO0_IOMUX;
+			p_base = RK3528_GRF_GPIO0_P;
+			ds_base = RK3528_GRF_GPIO0_DS;
+			st_base = RK3528_GRF_GPIO0_ST;
+			break;
+		case 1:
+			iomux_base = RK3528_GRF_GPIO1_IOMUX;
+			p_base = RK3528_GRF_GPIO1_P;
+			ds_base = RK3528_GRF_GPIO1_DS;
+			st_base = RK3528_GRF_GPIO1_ST;
+			break;
+		case 2:
+			iomux_base = RK3528_GRF_GPIO2_IOMUX;
+			p_base = RK3528_GRF_GPIO2_P;
+			ds_base = RK3528_GRF_GPIO2_DS;
+			st_base = RK3528_GRF_GPIO2_ST;
+			break;
+		case 3:
+			iomux_base = RK3528_GRF_GPIO3_IOMUX;
+			p_base = RK3528_GRF_GPIO3_P;
+			ds_base = RK3528_GRF_GPIO3_DS;
+			st_base = RK3528_GRF_GPIO3_ST;
+			break;
+		case 4:
+			iomux_base = RK3528_GRF_GPIO4_IOMUX;
+			p_base = RK3528_GRF_GPIO4_P;
+			ds_base = RK3528_GRF_GPIO4_DS;
+			st_base = RK3528_GRF_GPIO4_ST;
+			break;
+		}
+
+		s = splhigh();
+
+		/* IOMUX control */
+		off = (idx / 4) * 0x04;
+		mask = (0x7 << ((idx % 4) * 4));
+		bits = (mux << ((idx % 4) * 4));
+		regmap_write_4(rm, iomux_base + off, mask << 16 | bits);
+
+		/* GPIO pad pull down and pull up control */
+		if (pull >= 0) {
+			off = (idx / 8) * 0x04;
+			mask = (0x3 << ((idx % 8) * 2));
+			bits = (pull << ((idx % 8) * 2));
+			regmap_write_4(rm, p_base + off, mask << 16 | bits);
+		}
+
+		/* GPIO drive strength control */
+		if (strength >= 0) {
+			off = (idx / 2) * 0x04;
+			mask = (0x3f << ((idx % 2) * 8));
+			bits = ((1 << (strength + 1)) - 1) << ((idx % 2) * 8);
+			regmap_write_4(rm, ds_base + off, mask << 16 | bits);
+		}
+
+		/* GPIO Schmitt trigger. */
+		if (schmitt >= 0) {
+			off = (idx / 8) * 0x04;
+			mask = (0x1 << (idx % 8));
+			bits = schmitt << (idx % 8);
+			regmap_write_4(rm, st_base + off, mask << 16 | bits);
 		}
 
 		splx(s);
@@ -953,7 +1148,12 @@ rk3568_route(struct rkpinctrl_softc *sc, uint32_t *pins)
 	if (route == NULL)
 		return;
 
-	rm = route->grf ? sc->sc_pmu : sc->sc_grf;
+	if (route->grf == ROUTE_PMU)
+		rm = regmap_byphandle(sc->sc_pmu);
+	else
+		rm = regmap_byphandle(sc->sc_grf);
+	KASSERT(rm);
+
 	regmap_write_4(rm, route->reg, route->val);
 }
 
@@ -963,9 +1163,6 @@ rk3568_pinctrl(uint32_t phandle, void *cookie)
 	struct rkpinctrl_softc *sc = cookie;
 	uint32_t *pins;
 	int node, len, i;
-
-	KASSERT(sc->sc_grf);
-	KASSERT(sc->sc_pmu);
 
 	node = OF_getnodebyphandle(phandle);
 	if (node == 0)
@@ -1000,19 +1197,20 @@ rk3568_pinctrl(uint32_t phandle, void *cookie)
 
 		/* Bank 0 lives in the PMU. */
 		if (bank < 1) {
-			rm = sc->sc_pmu;
+			rm = regmap_byphandle(sc->sc_pmu);
 			iomux_base = RK3568_PMUGRF_GPIO0A_IOMUX_L;
 			p_base = RK3568_PMUGRF_GPIO0A_P;
 			ds_base = RK3568_PMUGRF_GPIO0A_DS_0;
 			ie_base = RK3568_PMUGRF_GPIO0A_IE;
 		} else {
-			rm = sc->sc_grf;
+			rm = regmap_byphandle(sc->sc_grf);
 			iomux_base = RK3568_GRF_GPIO1A_IOMUX_L;
 			p_base = RK3568_GRF_GPIO1A_P;
 			ds_base = RK3568_GRF_GPIO1A_DS_0;
 			ie_base = RK3568_GRF_GPIO1A_IE;
 			bank = bank - 1;
 		}
+		KASSERT(rm);
 
 		s = splhigh();
 
@@ -1058,6 +1256,139 @@ fail:
 	return -1;
 }
 
+/* Rockchip RK3576 */
+
+#define RK3576_GRF_PMU0_IOC	0x0000
+#define RK3576_GRF_PMU1_IOC	0x2000
+#define RK3576_GRF_TOP_IOC	0x4000
+#define RK3576_GRF_VCCIO_IOC	0x6000
+#define RK3576_GRF_VCCIO6_IOC	0xa000
+#define RK3576_GRF_VCCIO7_IOC	0xb000
+
+int
+rk3576_pinctrl(uint32_t phandle, void *cookie)
+{
+	struct rkpinctrl_softc *sc = cookie;
+	struct regmap *rm = regmap_byphandle(sc->sc_grf);
+	uint32_t *pins;
+	int node, len, i;
+
+	KASSERT(rm);
+
+	node = OF_getnodebyphandle(phandle);
+	if (node == 0)
+		return -1;
+
+	len = OF_getproplen(node, "rockchip,pins");
+	if (len <= 0)
+		return -1;
+
+	pins = malloc(len, M_TEMP, M_WAITOK);
+	if (OF_getpropintarray(node, "rockchip,pins", pins, len) != len)
+		goto fail;
+
+	for (i = 0; i < len / sizeof(uint32_t); i += 4) {
+		bus_size_t iomux_base, p_base, ds_base, smt_base, off;
+		uint32_t bank, idx, mux;
+		int pull, strength, schmitt;
+		uint32_t mask, bits;
+		int s;
+
+		bank = pins[i];
+		idx = pins[i + 1];
+		mux = pins[i + 2];
+
+		if (bank > 4 || idx >= 32 || mux > 15)
+			continue;
+
+		pull = rk3588_pull(bank, idx, pins[i + 3]);
+		strength = rk3588_strength(bank, idx, pins[i + 3]);
+		schmitt = rk3588_schmitt(bank, idx, pins[i + 3]);
+
+		switch (bank) {
+		case 0:
+			if (idx < 12) {
+				iomux_base = RK3576_GRF_PMU0_IOC;
+				p_base = RK3576_GRF_PMU0_IOC + 0x0020;
+				ds_base = RK3576_GRF_PMU0_IOC + 0x0010;
+				smt_base = RK3576_GRF_PMU0_IOC + 0x0030;
+			} else {
+				iomux_base = RK3576_GRF_PMU1_IOC - 0x000c;
+				p_base = RK3576_GRF_PMU1_IOC + 0x0024;
+				ds_base = RK3576_GRF_PMU1_IOC + 0x0008;
+				smt_base = RK3576_GRF_PMU1_IOC + 0x003c;
+			}
+			break;
+		case 1:
+		case 2:
+		case 3:
+			iomux_base = RK3576_GRF_TOP_IOC;
+			p_base = RK3576_GRF_VCCIO_IOC + 0x0100;
+			ds_base = RK3576_GRF_VCCIO_IOC + 0x0000;
+			smt_base = RK3576_GRF_VCCIO_IOC + 0x0200;
+			break;
+		case 4:
+			if (idx < 16) {
+				iomux_base = RK3576_GRF_TOP_IOC;
+				p_base = RK3576_GRF_VCCIO_IOC + 0x0100;
+				ds_base = RK3576_GRF_VCCIO_IOC + 0x0000;
+				smt_base = RK3576_GRF_VCCIO_IOC + 0x0200;
+			} else if (idx < 24) {
+				iomux_base = RK3576_GRF_VCCIO6_IOC + 0x0300;
+				p_base = RK3576_GRF_VCCIO6_IOC + 0x0100;
+				ds_base = RK3576_GRF_VCCIO6_IOC + 0x0000;
+				smt_base = RK3576_GRF_VCCIO6_IOC + 0x0200;
+			} else {
+				iomux_base = RK3576_GRF_VCCIO7_IOC + 0x0300;
+				p_base = RK3576_GRF_VCCIO7_IOC + 0x0100;
+				ds_base = RK3576_GRF_VCCIO7_IOC + 0x0000;
+				smt_base = RK3576_GRF_VCCIO7_IOC + 0x0200;
+			}
+			break;
+		}
+
+		s = splhigh();
+
+		/* IOMUX control */
+		off = bank * 0x20 + (idx / 4) * 0x04;
+		mask = (0xf << ((idx % 4) * 4));
+		bits = (mux << ((idx % 4) * 4));
+		regmap_write_4(rm, iomux_base + off, mask << 16 | bits);
+
+		/* GPIO pad pull down and pull up control */
+		if (pull >= 0) {
+			off = bank * 0x10 + (idx / 8) * 0x04;
+			mask = (0x3 << ((idx % 8) * 2));
+			bits = (pull << ((idx % 8) * 2));
+			regmap_write_4(rm, p_base + off, mask << 16 | bits);
+		}
+
+		/* GPIO drive strength control */
+		if (strength >= 0) {
+			off = bank * 0x20 + (idx / 4) * 0x04;
+			mask = (0xf << ((idx % 4) * 4));
+			bits = (strength << ((idx % 4) * 4));
+			regmap_write_4(rm, ds_base + off, mask << 16 | bits);
+		}
+
+		/* GPIO Schmitt trigger. */
+		if (schmitt >= 0) {
+			off = bank * 0x10 + (idx / 8) * 0x04;
+			mask = (0x1 << (idx % 8));
+			bits = (schmitt << (idx % 8));
+			regmap_write_4(rm, smt_base + off, mask << 16 | bits);
+		}
+
+		splx(s);
+	}
+
+	free(pins, M_TEMP, len);
+	return 0;
+
+fail:
+	free(pins, M_TEMP, len);
+	return -1;
+}
 
 /* 
  * Rockchip RK3588
@@ -1147,11 +1478,11 @@ int
 rk3588_pinctrl(uint32_t phandle, void *cookie)
 {
 	struct rkpinctrl_softc *sc = cookie;
-	struct regmap *rm = sc->sc_grf;
+	struct regmap *rm = regmap_byphandle(sc->sc_grf);
 	uint32_t *pins;
 	int node, len, i;
 
-	KASSERT(sc->sc_grf);
+	KASSERT(rm);
 
 	node = OF_getnodebyphandle(phandle);
 	if (node == 0)

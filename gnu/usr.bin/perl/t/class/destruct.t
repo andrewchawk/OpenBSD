@@ -28,7 +28,7 @@ package DestructionNotify {
 {
     my $destroyed;
 
-    class Test1 {
+    class Testcase1 {
         field $x;
         method x { return $x; }
         ADJUST {
@@ -45,7 +45,7 @@ package DestructionNotify {
         }
     }
 
-    my $obj = Test1->new;
+    my $obj = Testcase1->new;
     ok(!$destroyed, 'Destruction notify not yet triggered');
 
     refcount_is $obj, 1, 'Object has one reference';
@@ -55,6 +55,25 @@ package DestructionNotify {
 
     undef $obj;
     is($destroyed, "zyx", 'Destruction notify triggered by object destruction in the correct order');
+}
+
+# GH22278
+{
+    my $observed;
+
+    class Testcase2 {
+        field $f1 :param :reader;
+        field $f2 :param :reader;
+        method DESTROY {
+            $observed = $f1;
+        }
+    }
+
+    my $e = eval { Testcase2->new( f1 => "field 1" ); 1 } ? undef : $@;
+    pass('Testcase2 constructor did not segfault');
+    like($e, qr/^Required parameter 'f2' is missing for "Testcase2" constructor at /,
+        'Constructor throws but does not crash');
+    is($observed, "field 1", 'Prior field is still initialised correctly');
 }
 
 done_testing;

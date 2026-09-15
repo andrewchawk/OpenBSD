@@ -1,4 +1,4 @@
-/*	$OpenBSD: hibernate.h,v 1.46 2024/06/04 20:31:35 krw Exp $	*/
+/*	$OpenBSD: hibernate.h,v 1.52 2026/09/06 18:26:41 mglocker Exp $	*/
 
 /*
  * Copyright (c) 2011 Ariane van der Steldt <ariane@stack.nl>
@@ -22,7 +22,6 @@
 #include <sys/types.h>
 #include <sys/tree.h>
 #include <lib/libz/zlib.h>
-#include <machine/vmparam.h>
 #include <crypto/sha2.h>
 
 #define HIB_PHYSSEG_MAX		22
@@ -116,11 +115,9 @@ union hibernate_info {
 void	*hib_alloc(struct hiballoc_arena*, size_t);
 void	 hib_free(struct hiballoc_arena*, void*);
 int	 hiballoc_init(struct hiballoc_arena*, void*, size_t len);
-void	 uvm_pmr_zero_everything(void);
 void	 uvm_pmr_dirty_everything(void);
 int	 uvm_pmr_alloc_pig(paddr_t*, psize_t, paddr_t);
 int	 uvm_pmr_alloc_piglet(vaddr_t*, paddr_t*, vsize_t, paddr_t);
-void	 uvm_pmr_free_piglet(vaddr_t, vsize_t);
 int	 uvm_page_rle(paddr_t);
 void	 uvmpd_hibernate(void);
 
@@ -153,10 +150,17 @@ void	hibernate_unpack_image(union hibernate_info *);
 void	hibernate_populate_resume_pt(union hibernate_info *, paddr_t, paddr_t);
 int	hibernate_alloc(void);
 void	hibernate_free(void);
+
+/* MD pmap setup/teardown for suspend-time HIBERNATE_HIBALLOC_PAGE access. */
+int	hibernate_pmap_setup_md(void);
+void	hibernate_pmap_teardown_md(void);
 void	hib_getentropy(char **, size_t *);
 
+int	hibernate_write(union hibernate_info *, daddr_t, vaddr_t, size_t, int);
 void	hibernate_sort_ranges(union hibernate_info *);
 void	hibernate_suspend_bufcache(void);
 void	hibernate_resume_bufcache(void);
+
+void	preallocate_hibernate_memory(void);
 
 #endif /* _SYS_HIBERNATE_H_ */

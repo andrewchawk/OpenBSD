@@ -1,4 +1,4 @@
-/*	$OpenBSD: idr.h,v 1.6 2023/01/01 01:34:58 jsg Exp $	*/
+/*	$OpenBSD: idr.h,v 1.10 2026/04/07 09:11:15 jsg Exp $	*/
 /*
  * Copyright (c) 2016 Mark Kettenis
  *
@@ -31,11 +31,19 @@ struct idr_entry {
 
 struct idr {
 	SPLAY_HEAD(idr_tree, idr_entry) tree;
+	unsigned long next;
 };
+
+#define DEFINE_IDR(name)					\
+	struct idr name = {					\
+		.tree = SPLAY_INITIALIZER(&name.idr.tree),	\
+		.next = 0					\
+	}
 
 void idr_init(struct idr *);
 void idr_preload(unsigned int);
 int idr_alloc(struct idr *, void *, int, int, gfp_t);
+int idr_alloc_cyclic(struct idr *, void *, int, int, gfp_t);
 void *idr_find(struct idr *, unsigned long);
 void *idr_replace(struct idr *, void *, unsigned long);
 void *idr_remove(struct idr *, unsigned long);
@@ -74,9 +82,8 @@ struct ida {
 
 void ida_init(struct ida *);
 void ida_destroy(struct ida *);
-int ida_simple_get(struct ida *, unsigned int, unsigned int, gfp_t);
-void ida_simple_remove(struct ida *, unsigned int);
 
+int ida_alloc_range(struct ida *, unsigned int, unsigned int, gfp_t);
 int ida_alloc_min(struct ida *, unsigned int, gfp_t);
 int ida_alloc_max(struct ida *, unsigned int, gfp_t);
 void ida_free(struct ida *, unsigned int);

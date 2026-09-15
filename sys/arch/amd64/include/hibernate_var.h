@@ -1,4 +1,4 @@
-/*	$OpenBSD: hibernate_var.h,v 1.12 2014/12/08 07:12:37 mlarkin Exp $	*/
+/*	$OpenBSD: hibernate_var.h,v 1.14 2025/09/13 13:43:47 mlarkin Exp $	*/
 
 /*
  * Copyright (c) 2011 Mike Larkin <mlarkin@openbsd.org>
@@ -58,6 +58,18 @@
 /* Use 4MB hibernation chunks */
 #define HIBERNATE_CHUNK_SIZE		0x400000
 
-#define HIBERNATE_CHUNK_TABLE_SIZE	0x100000
+#define HIBERNATE_CHUNK_TABLE_SIZE	0x200000
 
 #define HIBERNATE_STACK_OFFSET	0x0F00
+
+/*
+ * Minimum amount of memory for hibernate support. This is used in early boot
+ * when deciding if we can preallocate the piglet. If the machine does not
+ * have at least HIBERNATE_MIN_MEMORY RAM, we won't support hibernate. This
+ * avoids late allocation issues due to fragmented memory and failure to
+ * hibernate. We need to be able to allocate 16MB contiguous memory, aligned
+ * to 2MB.
+ *
+ * The default minimum required memory is 512MB (1ULL << 29).
+ */
+#define HIBERNATE_MIN_MEMORY	(1ULL << 29)

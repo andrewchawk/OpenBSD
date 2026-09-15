@@ -1,4 +1,4 @@
-/* $OpenBSD: s_socket.c,v 1.13 2021/12/06 11:06:58 tb Exp $ */
+/* $OpenBSD: s_socket.c,v 1.15 2026/05/10 03:26:07 kenjiro Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -70,8 +70,6 @@
 #include "apps.h"
 
 #include <openssl/ssl.h>
-
-#include "s_apps.h"
 
 static int init_server(int *sock, int port, int type);
 static int init_server_long(int *sock, int port, char *ip, int type);
@@ -262,15 +260,8 @@ do_accept(int acc_sock, int *sock)
 		h2 = gethostbyname(host);
 		if (h2 == NULL) {
 			BIO_printf(bio_err, "gethostbyname failure\n");
-			close(ret);
-			free(host);
-			return (0);
-		}
-		if (h2->h_addrtype != AF_INET) {
+		} else if (h2->h_addrtype != AF_INET) {
 			BIO_printf(bio_err, "gethostbyname addr is not AF_INET\n");
-			close(ret);
-			free(host);
-			return (0);
 		}
 	}
 

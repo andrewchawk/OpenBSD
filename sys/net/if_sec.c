@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_sec.c,v 1.11 2024/03/19 03:49:11 dlg Exp $ */
+/*	$OpenBSD: if_sec.c,v 1.14 2025/03/04 15:11:30 bluhm Exp $ */
 
 /*
  * Copyright (c) 2022 The University of Queensland
@@ -43,6 +43,7 @@
 
 #include <net/if.h>
 #include <net/if_var.h>
+#include <net/if_sec.h>
 #include <net/if_types.h>
 #include <net/toeplitz.h>
 
@@ -73,6 +74,7 @@ struct sec_softc {
 
 	struct task			sc_send;
 	int				sc_txprio;
+	int				sc_tunneldf;
 
 	unsigned int			sc_unit;
 	SMR_SLIST_ENTRY(sec_softc)	sc_entry;
@@ -127,6 +129,7 @@ sec_clone_create(struct if_clone *ifc, int unit)
 	sc = malloc(sizeof(*sc), M_DEVBUF, M_WAITOK|M_ZERO);
 
 	sc->sc_unit = unit;
+	sc->sc_tunneldf = IPSP_DF_OFF;
 
 	task_set(&sc->sc_send, sec_send, sc);
 
@@ -211,6 +214,13 @@ sec_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 
 		ifp->if_mtu = ifr->ifr_mtu;
+		break;
+
+	case SIOCSLIFPHYDF:
+		sc->sc_tunneldf = (ifr->ifr_df ? IPSP_DF_ON : IPSP_DF_OFF);
+		break;
+	case SIOCGLIFPHYDF:
+		ifr->ifr_df = (sc->sc_tunneldf == IPSP_DF_ON);
 		break;
 
 	default:
@@ -391,7 +401,8 @@ sec_send(void *arg)
 		m->m_pkthdr.ph_flowid = flowid;
 
 		error = ipsp_process_packet(m, tdb,
-		    m->m_pkthdr.ph_family, /* already tunnelled? */ 0);
+		    m->m_pkthdr.ph_family, /* already tunnelled? */ 0,
+		    sc->sc_tunneldf);
 		if (error != 0)
 			counters_inc(ifp->if_counters, ifc_oerrors);
 	}
@@ -438,7 +449,8 @@ sec_get(unsigned int unit)
 }
 
 void
-sec_input(struct sec_softc *sc, int af, int proto, struct mbuf *m)
+sec_input(struct sec_softc *sc, int af, int proto, struct mbuf *m,
+    struct netstack *ns)
 {
 	struct ip *iph;
 	int hlen;
@@ -476,7 +488,7 @@ sec_input(struct sec_softc *sc, int af, int proto, struct mbuf *m)
 
 	m->m_pkthdr.ph_family = af;
 
-	if_vinput(&sc->sc_if, m);
+	if_vinput(&sc->sc_if, m, ns);
 }
 
 void

@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.h,v 1.17 2024/03/24 10:53:27 job Exp $	*/
+/*	$OpenBSD: http.h,v 1.19 2026/07/26 14:46:32 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2012 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -97,21 +97,21 @@ struct http_method {
 	{ HTTP_METHOD_MOVE,		"MOVE" },	\
 	{ HTTP_METHOD_LOCK,		"LOCK" },	\
 	{ HTTP_METHOD_UNLOCK,		"UNLOCK" },	\
-	{ HTTP_METHOD_VERSION_CONTROL,	"VERSION-CONTROL" }, \
+	{ HTTP_METHOD_VERSION_CONTROL,	"VERSION-CONTROL" },\
 	{ HTTP_METHOD_REPORT,		"REPORT" },	\
 	{ HTTP_METHOD_CHECKOUT,		"CHECKOUT" },	\
 	{ HTTP_METHOD_CHECKIN,		"CHECKIN" },	\
 	{ HTTP_METHOD_UNCHECKOUT,	"UNCHECKOUT" },	\
-	{ HTTP_METHOD_MKWORKSPACE,	"MKWORKSPACE" }, \
+	{ HTTP_METHOD_MKWORKSPACE,	"MKWORKSPACE" },\
 	{ HTTP_METHOD_UPDATE,		"UPDATE" },	\
 	{ HTTP_METHOD_LABEL,		"LABEL" },	\
 	{ HTTP_METHOD_MERGE,		"MERGE" },	\
-	{ HTTP_METHOD_BASELINE_CONTROL,	"BASELINE-CONTROL" }, \
+	{ HTTP_METHOD_BASELINE_CONTROL,	"BASELINE-CONTROL" },\
 	{ HTTP_METHOD_MKACTIVITY,	"MKACTIVITY" },	\
 	{ HTTP_METHOD_ORDERPATCH,	"ORDERPATCH" },	\
 	{ HTTP_METHOD_ACL,		"ACL" },	\
-	{ HTTP_METHOD_MKREDIRECTREF,	"MKREDIRECTREF" }, \
-	{ HTTP_METHOD_UPDATEREDIRECTREF, "UPDATEREDIRECTREF" }, \
+	{ HTTP_METHOD_MKREDIRECTREF,	"MKREDIRECTREF" },\
+	{ HTTP_METHOD_UPDATEREDIRECTREF, "UPDATEREDIRECTREF" },\
 	{ HTTP_METHOD_SEARCH,		"SEARCH" },	\
 	{ HTTP_METHOD_PATCH,		"PATCH" },	\
 	{ HTTP_METHOD_NONE,		NULL }		\
@@ -179,7 +179,7 @@ struct http_error {
 	{ 422,	"Unprocessable Content" },		\
 	{ 423,	"Locked" },				\
 	{ 424,	"Failed Dependency" },			\
-	{ 425,	"Too Early" },			\
+	{ 425,	"Too Early" },				\
 	{ 426,	"Upgrade Required" },			\
 	/* 427 unassigned */				\
 	{ 428,	"Precondition Required" },		\
@@ -241,6 +241,7 @@ struct http_descriptor {
 	char			*http_host;
 	enum httpmethod		 http_method;
 	int			 http_chunked;
+	int			 http_cl;
 	char			*http_version;
 	unsigned int		 http_status;
 

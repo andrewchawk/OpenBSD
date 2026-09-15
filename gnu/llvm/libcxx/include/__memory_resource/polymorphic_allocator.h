@@ -11,12 +11,15 @@
 
 #include <__assert>
 #include <__config>
+#include <__cstddef/byte.h>
+#include <__cstddef/max_align_t.h>
+#include <__fwd/pair.h>
 #include <__memory_resource/memory_resource.h>
+#include <__new/exceptions.h>
+#include <__new/placement_new_delete.h>
 #include <__utility/exception_guard.h>
-#include <cstddef>
+#include <__utility/piecewise_construct.h>
 #include <limits>
-#include <new>
-#include <stdexcept>
 #include <tuple>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
@@ -26,7 +29,7 @@
 _LIBCPP_PUSH_MACROS
 #include <__undef_macros>
 
-#if _LIBCPP_STD_VER > 14
+#if _LIBCPP_STD_VER >= 17
 
 _LIBCPP_BEGIN_NAMESPACE_STD
 
@@ -39,7 +42,7 @@ template <class _ValueType
           = byte
 #  endif
           >
-class _LIBCPP_TEMPLATE_VIS polymorphic_allocator {
+class _LIBCPP_AVAILABILITY_PMR polymorphic_allocator {
 
 public:
   using value_type = _ValueType;
@@ -48,9 +51,11 @@ public:
 
   _LIBCPP_HIDE_FROM_ABI polymorphic_allocator() noexcept : __res_(std::pmr::get_default_resource()) {}
 
-  _LIBCPP_HIDE_FROM_ABI polymorphic_allocator(memory_resource* __r) noexcept : __res_(__r) {}
+  _LIBCPP_HIDE_FROM_ABI polymorphic_allocator(memory_resource* _LIBCPP_DIAGNOSE_NULLPTR __r) noexcept : __res_(__r) {
+    _LIBCPP_ASSERT_NON_NULL(__r, "Attempted to pass a nullptr resource to polymorphic_alloator");
+  }
 
-  polymorphic_allocator(const polymorphic_allocator&) = default;
+  _LIBCPP_HIDE_FROM_ABI polymorphic_allocator(const polymorphic_allocator&) = default;
 
   template <class _Tp>
   _LIBCPP_HIDE_FROM_ABI polymorphic_allocator(const polymorphic_allocator<_Tp>& __other) noexcept
@@ -60,43 +65,46 @@ public:
 
   // [mem.poly.allocator.mem]
 
-  _LIBCPP_NODISCARD_AFTER_CXX17 _LIBCPP_HIDE_FROM_ABI _ValueType* allocate(size_t __n) {
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI _ValueType* allocate(size_t __n) {
     if (__n > __max_size()) {
-      __throw_bad_array_new_length();
+      std::__throw_bad_array_new_length();
     }
     return static_cast<_ValueType*>(__res_->allocate(__n * sizeof(_ValueType), alignof(_ValueType)));
   }
 
   _LIBCPP_HIDE_FROM_ABI void deallocate(_ValueType* __p, size_t __n) {
-    _LIBCPP_ASSERT(__n <= __max_size(), "deallocate called for size which exceeds max_size()");
+    _LIBCPP_ASSERT_VALID_DEALLOCATION(
+        __n <= __max_size(),
+        "deallocate() called for a size which exceeds max_size(), leading to a memory leak "
+        "(the argument will overflow and result in too few objects being deleted)");
     __res_->deallocate(__p, __n * sizeof(_ValueType), alignof(_ValueType));
   }
 
 #  if _LIBCPP_STD_VER >= 20
 
-  [[nodiscard]] [[using __gnu__: __alloc_size__(2), __alloc_align__(3)]] void*
+  [[nodiscard]] [[using __gnu__: __alloc_size__(2), __alloc_align__(3)]] _LIBCPP_HIDE_FROM_ABI void*
   allocate_bytes(size_t __nbytes, size_t __alignment = alignof(max_align_t)) {
     return __res_->allocate(__nbytes, __alignment);
   }
 
-  void deallocate_bytes(void* __ptr, size_t __nbytes, size_t __alignment = alignof(max_align_t)) {
+  _LIBCPP_HIDE_FROM_ABI void deallocate_bytes(void* __ptr, size_t __nbytes, size_t __alignment = alignof(max_align_t)) {
     __res_->deallocate(__ptr, __nbytes, __alignment);
   }
 
   template <class _Type>
-  [[nodiscard]] _Type* allocate_object(size_t __n = 1) {
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI _Type* allocate_object(size_t __n = 1) {
     if (numeric_limits<size_t>::max() / sizeof(_Type) < __n)
       std::__throw_bad_array_new_length();
     return static_cast<_Type*>(allocate_bytes(__n * sizeof(_Type), alignof(_Type)));
   }
 
   template <class _Type>
-  void deallocate_object(_Type* __ptr, size_t __n = 1) {
+  _LIBCPP_HIDE_FROM_ABI void deallocate_object(_Type* __ptr, size_t __n = 1) {
     deallocate_bytes(__ptr, __n * sizeof(_Type), alignof(_Type));
   }
 
   template <class _Type, class... _CtorArgs>
-  [[nodiscard]] _Type* new_object(_CtorArgs&&... __ctor_args) {
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI _Type* new_object(_CtorArgs&&... __ctor_args) {
     _Type* __ptr = allocate_object<_Type>();
     auto __guard = std::__make_exception_guard([&] { deallocate_object(__ptr); });
     construct(__ptr, std::forward<_CtorArgs>(__ctor_args)...);
@@ -105,7 +113,7 @@ public:
   }
 
   template <class _Type>
-  void delete_object(_Type* __ptr) {
+  _LIBCPP_HIDE_FROM_ABI void delete_object(_Type* __ptr) {
     destroy(__ptr);
     deallocate_object(__ptr);
   }
@@ -128,10 +136,10 @@ public:
         piecewise_construct,
         __transform_tuple(typename __uses_alloc_ctor< _T1, polymorphic_allocator&, _Args1... >::type(),
                           std::move(__x),
-                          typename __make_tuple_indices<sizeof...(_Args1)>::type{}),
+                          make_index_sequence<sizeof...(_Args1)>()),
         __transform_tuple(typename __uses_alloc_ctor< _T2, polymorphic_allocator&, _Args2... >::type(),
                           std::move(__y),
-                          typename __make_tuple_indices<sizeof...(_Args2)>::type{}));
+                          make_index_sequence<sizeof...(_Args2)>()));
   }
 
   template <class _T1, class _T2>
@@ -165,29 +173,44 @@ public:
     __p->~_Tp();
   }
 
-  _LIBCPP_HIDE_FROM_ABI polymorphic_allocator select_on_container_copy_construction() const noexcept {
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI polymorphic_allocator select_on_container_copy_construction() const noexcept {
     return polymorphic_allocator();
   }
 
-  _LIBCPP_HIDE_FROM_ABI memory_resource* resource() const noexcept { return __res_; }
+  [[nodiscard, __gnu__::__returns_nonnull__]] _LIBCPP_HIDE_FROM_ABI memory_resource* resource() const noexcept {
+    return __res_;
+  }
+
+  _LIBCPP_HIDE_FROM_ABI friend bool
+  operator==(const polymorphic_allocator& __lhs, const polymorphic_allocator& __rhs) noexcept {
+    return *__lhs.resource() == *__rhs.resource();
+  }
+
+#  if _LIBCPP_STD_VER <= 17
+  // This overload is not specified, it was added due to LWG3683.
+  _LIBCPP_HIDE_FROM_ABI friend bool
+  operator!=(const polymorphic_allocator& __lhs, const polymorphic_allocator& __rhs) noexcept {
+    return *__lhs.resource() != *__rhs.resource();
+  }
+#  endif
 
 private:
   template <class... _Args, size_t... _Is>
   _LIBCPP_HIDE_FROM_ABI tuple<_Args&&...>
-  __transform_tuple(integral_constant<int, 0>, tuple<_Args...>&& __t, __tuple_indices<_Is...>) {
+  __transform_tuple(integral_constant<int, 0>, tuple<_Args...>&& __t, index_sequence<_Is...>) {
     return std::forward_as_tuple(std::get<_Is>(std::move(__t))...);
   }
 
   template <class... _Args, size_t... _Is>
   _LIBCPP_HIDE_FROM_ABI tuple<allocator_arg_t const&, polymorphic_allocator&, _Args&&...>
-  __transform_tuple(integral_constant<int, 1>, tuple<_Args...>&& __t, __tuple_indices<_Is...>) {
+  __transform_tuple(integral_constant<int, 1>, tuple<_Args...>&& __t, index_sequence<_Is...>) {
     using _Tup = tuple<allocator_arg_t const&, polymorphic_allocator&, _Args&&...>;
     return _Tup(allocator_arg, *this, std::get<_Is>(std::move(__t))...);
   }
 
   template <class... _Args, size_t... _Is>
   _LIBCPP_HIDE_FROM_ABI tuple<_Args&&..., polymorphic_allocator&>
-  __transform_tuple(integral_constant<int, 2>, tuple<_Args...>&& __t, __tuple_indices<_Is...>) {
+  __transform_tuple(integral_constant<int, 2>, tuple<_Args...>&& __t, index_sequence<_Is...>) {
     using _Tup = tuple<_Args&&..., polymorphic_allocator&>;
     return _Tup(std::get<_Is>(std::move(__t))..., *this);
   }
@@ -207,17 +230,21 @@ operator==(const polymorphic_allocator<_Tp>& __lhs, const polymorphic_allocator<
   return *__lhs.resource() == *__rhs.resource();
 }
 
+#  if _LIBCPP_STD_VER <= 17
+
 template <class _Tp, class _Up>
 inline _LIBCPP_HIDE_FROM_ABI bool
 operator!=(const polymorphic_allocator<_Tp>& __lhs, const polymorphic_allocator<_Up>& __rhs) noexcept {
   return !(__lhs == __rhs);
 }
 
+#  endif
+
 } // namespace pmr
 
 _LIBCPP_END_NAMESPACE_STD
 
-#endif // _LIBCPP_STD_VER > 14
+#endif // _LIBCPP_STD_VER >= 17
 
 _LIBCPP_POP_MACROS
 

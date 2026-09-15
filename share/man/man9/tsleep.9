@@ -1,4 +1,4 @@
-.\"	$OpenBSD: tsleep.9,v 1.16 2022/03/31 17:27:23 naddy Exp $
+.\"	$OpenBSD: tsleep.9,v 1.18 2026/04/22 10:04:41 tb Exp $
 .\"	$NetBSD: sleep.9,v 1.11 1999/03/24 06:15:12 mycroft Exp $
 .\"
 .\" Copyright (c) 1996 The NetBSD Foundation, Inc.
@@ -28,7 +28,7 @@
 .\" ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 .\" POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd $Mdocdate: March 31 2022 $
+.Dd $Mdocdate: April 22 2026 $
 .Dt TSLEEP 9
 .Os
 .Sh NAME
@@ -49,21 +49,21 @@
 .Fd #define MAXTSLP	(UINT64_MAX - 1)
 .Ft int
 .Fo tsleep
-.Fa "void *ident"
+.Fa "const volatile void *ident"
 .Fa "int priority"
 .Fa "const char *wmesg"
 .Fa "int timo"
 .Fc
 .Ft int
 .Fo tsleep_nsec
-.Fa "void *ident"
+.Fa "const volatile void *ident"
 .Fa "int priority"
 .Fa "const char *wmesg"
 .Fa "uint64_t nsecs"
 .Fc
 .Ft int
 .Fo msleep
-.Fa "void *ident"
+.Fa "const volatile void *ident"
 .Fa "struct mutex *mtx"
 .Fa "int priority"
 .Fa "const char *wmesg"
@@ -71,7 +71,7 @@
 .Fc
 .Ft int
 .Fo msleep_nsec
-.Fa "void *ident"
+.Fa "const volatile void *ident"
 .Fa "struct mutex *mtx"
 .Fa "int priority"
 .Fa "const char *wmesg"
@@ -79,7 +79,7 @@
 .Fc
 .Ft int
 .Fo rwsleep
-.Fa "void *ident"
+.Fa "const volatile void *ident"
 .Fa "struct rwlock *rwl"
 .Fa "int priority"
 .Fa "const char *wmesg"
@@ -87,18 +87,18 @@
 .Fc
 .Ft int
 .Fo rwsleep_nsec
-.Fa "void *ident"
+.Fa "const volatile void *ident"
 .Fa "struct rwlock *rwl"
 .Fa "int priority"
 .Fa "const char *wmesg"
 .Fa "uint64_t nsecs"
 .Fc
 .Ft void
-.Fn wakeup "void *ident"
+.Fn wakeup "const volatile void *ident"
 .Ft void
-.Fn wakeup_n "void *ident" "int count"
+.Fn wakeup_n "const volatile void *ident" "int count"
 .Ft void
-.Fn wakeup_one "void *ident"
+.Fn wakeup_one "const volatile void *ident"
 .Sh DESCRIPTION
 These functions implement voluntary context switching.
 .Fn tsleep ,
@@ -126,8 +126,8 @@ and
 .Fn wakeup_one
 functions are used to notify sleeping processes of possible changes to the
 condition that caused them to go to sleep.
-Typically, an awakened process will -- after it has acquired a context
-again -- retry the action that blocked its operation to see if the
+Typically, an awakened process will \(em after it has acquired a context
+again \(em retry the action that blocked its operation to see if the
 .Dq blocking
 condition has cleared.
 .Pp

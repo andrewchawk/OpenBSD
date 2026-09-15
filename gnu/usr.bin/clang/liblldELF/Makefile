@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.10 2023/11/11 18:35:39 robert Exp $
+# $OpenBSD: Makefile,v 1.12 2026/05/29 11:18:31 robert Exp $
 
 LIB=	lldELF
 NOPROFILE=
@@ -6,6 +6,9 @@ NOPROFILE=
 CPPFLAGS+=	-I${.OBJDIR}/../include/lld/ELF
 CPPFLAGS+=	-I${LLD_SRCS}/include
 CPPFLAGS+=	-I${LLD_SRCS}/ELF
+
+# Find GenVT.inc
+CPPFLAGS+=	-I${.OBJDIR}/../llvm-tblgen
 
 .include <bsd.own.mk>
 
@@ -15,6 +18,7 @@ SRCS=	AArch64.cpp \
 	ARM.cpp \
 	AVR.cpp \
 	Hexagon.cpp \
+	LoongArch.cpp \
 	Mips.cpp \
 	MipsArchTree.cpp \
 	MSP430.cpp \
@@ -22,12 +26,14 @@ SRCS=	AArch64.cpp \
 	PPC64.cpp \
 	RISCV.cpp \
 	SPARCV9.cpp \
+	SystemZ.cpp \
 	X86.cpp \
 	X86_64.cpp
 
 # ELF
 SRCS+=	AArch64ErrataFix.cpp \
 	ARMErrataFix.cpp \
+	BPSectionOrderer.cpp \
 	CallGraphSort.cpp \
 	DWARF.cpp \
 	Driver.cpp \

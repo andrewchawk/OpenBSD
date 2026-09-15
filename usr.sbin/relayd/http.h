@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.h,v 1.12 2021/03/24 20:59:53 benno Exp $	*/
+/*	$OpenBSD: http.h,v 1.15 2026/06/15 11:02:13 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2012 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -72,6 +72,9 @@ enum httpmethod {
 	/* WebDAV Search, RFC 5323 */
 	HTTP_METHOD_SEARCH,
 
+	/* WebDAV Calendaring Extensions, RFC 4791 */
+	HTTP_METHOD_MKCALENDAR,
+
 	/* PATCH, RFC 5789 */
 	HTTP_METHOD_PATCH,
 
@@ -99,22 +102,23 @@ struct http_method {
 	{ HTTP_METHOD_MOVE,		"MOVE" },	\
 	{ HTTP_METHOD_LOCK,		"LOCK" },	\
 	{ HTTP_METHOD_UNLOCK,		"UNLOCK" },	\
-	{ HTTP_METHOD_VERSION_CONTROL,	"VERSION-CONTROL" }, \
+	{ HTTP_METHOD_VERSION_CONTROL,	"VERSION-CONTROL" },\
 	{ HTTP_METHOD_REPORT,		"REPORT" },	\
 	{ HTTP_METHOD_CHECKOUT,		"CHECKOUT" },	\
 	{ HTTP_METHOD_CHECKIN,		"CHECKIN" },	\
 	{ HTTP_METHOD_UNCHECKOUT,	"UNCHECKOUT" },	\
-	{ HTTP_METHOD_MKWORKSPACE,	"MKWORKSPACE" }, \
+	{ HTTP_METHOD_MKWORKSPACE,	"MKWORKSPACE" },\
 	{ HTTP_METHOD_UPDATE,		"UPDATE" },	\
 	{ HTTP_METHOD_LABEL,		"LABEL" },	\
 	{ HTTP_METHOD_MERGE,		"MERGE" },	\
-	{ HTTP_METHOD_BASELINE_CONTROL,	"BASELINE-CONTROL" }, \
+	{ HTTP_METHOD_BASELINE_CONTROL,	"BASELINE-CONTROL" },\
 	{ HTTP_METHOD_MKACTIVITY,	"MKACTIVITY" },	\
 	{ HTTP_METHOD_ORDERPATCH,	"ORDERPATCH" },	\
 	{ HTTP_METHOD_ACL,		"ACL" },	\
-	{ HTTP_METHOD_MKREDIRECTREF,	"MKREDIRECTREF" }, \
-	{ HTTP_METHOD_UPDATEREDIRECTREF, "UPDATEREDIRECTREF" }, \
+	{ HTTP_METHOD_MKREDIRECTREF,	"MKREDIRECTREF" },\
+	{ HTTP_METHOD_UPDATEREDIRECTREF, "UPDATEREDIRECTREF" },\
 	{ HTTP_METHOD_SEARCH,		"SEARCH" },	\
+	{ HTTP_METHOD_MKCALENDAR,	"MKCALENDAR" },	\
 	{ HTTP_METHOD_PATCH,		"PATCH" },	\
 	{ HTTP_METHOD_NONE,		NULL }		\
 }
@@ -242,6 +246,7 @@ struct http_descriptor {
 	char			*http_host;
 	enum httpmethod		 http_method;
 	int			 http_chunked;
+	struct kv		*http_cl;
 	char			*http_version;
 	unsigned int		 http_status;
 

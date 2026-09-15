@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_parser.h,v 1.120 2024/07/14 19:51:08 sashan Exp $ */
+/*	$OpenBSD: pfctl_parser.h,v 1.124 2026/04/09 06:10:38 dlg Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -71,6 +71,23 @@
 
 struct pfr_buffer;	/* forward definition */
 
+struct pfctl_statelim {
+	struct pfioc_statelim		ioc;
+	RBT_ENTRY(pfctl_statelim)	id_entry;
+	RBT_ENTRY(pfctl_statelim)	nm_entry;
+};
+
+RBT_HEAD(pfctl_statelim_ids, pfctl_statelim);
+RBT_HEAD(pfctl_statelim_nms, pfctl_statelim);
+
+struct pfctl_sourcelim {
+	struct pfioc_sourcelim		ioc;
+	RBT_ENTRY(pfctl_sourcelim)	id_entry;
+	RBT_ENTRY(pfctl_sourcelim)	nm_entry;
+};
+
+RBT_HEAD(pfctl_sourcelim_ids, pfctl_sourcelim);
+RBT_HEAD(pfctl_sourcelim_nms, pfctl_sourcelim);
 
 struct pfctl {
 	int dev;
@@ -87,6 +104,11 @@ struct pfctl {
 	struct pf_anchor *anchor, *alast;
 	struct pfr_ktablehead pfr_ktlast;
 	const char *ruleset;
+
+	struct pfctl_statelim_ids statelim_ids;
+	struct pfctl_statelim_nms statelim_nms;
+	struct pfctl_sourcelim_ids sourcelim_ids;
+	struct pfctl_sourcelim_nms sourcelim_nms;
 
 	/* 'set foo' options */
 	u_int32_t	 timeout[PFTM_MAX];
@@ -142,7 +164,7 @@ struct node_os {
 };
 
 struct node_queue_bw {
-	u_int32_t	bw_absolute;
+	u_int64_t	bw_absolute;
 	u_int16_t	bw_percent;
 };
 
@@ -224,6 +246,17 @@ int     add_opt_table(struct pfctl *, struct pf_opt_tbl **, sa_family_t,
 
 void	pfctl_add_rule(struct pfctl *, struct pf_rule *);
 
+int	pfctl_add_statelim(struct pfctl *, struct pfctl_statelim *);
+struct pfctl_statelim *
+	pfctl_get_statelim_id(struct pfctl *, uint32_t);
+struct pfctl_statelim *
+	pfctl_get_statelim_nm(struct pfctl *, const char *);
+int	pfctl_add_sourcelim(struct pfctl *, struct pfctl_sourcelim *);
+struct pfctl_sourcelim *
+	pfctl_get_sourcelim_id(struct pfctl *, uint32_t);
+struct pfctl_sourcelim *
+	pfctl_get_sourcelim_nm(struct pfctl *, const char *);
+
 int	pfctl_set_timeout(struct pfctl *, const char *, int, int);
 int	pfctl_set_reassembly(struct pfctl *, int, int);
 int	pfctl_set_syncookies(struct pfctl *, u_int8_t,
@@ -245,7 +278,9 @@ struct pfctl_qsitem *	pfctl_find_queue(char *, struct pf_qihead *);
 
 void	print_pool(struct pf_pool *, u_int16_t, u_int16_t, sa_family_t, int, int);
 void	print_src_node(struct pf_src_node *, int);
-void	print_rule(struct pf_rule *, const char *, int);
+void	print_statelim(const struct pfioc_statelim *);
+void	print_sourcelim(const struct pfioc_sourcelim *);
+void	print_rule(struct pfctl *pf, struct pf_rule *, const char *, int);
 void	print_tabledef(const char *, int, int, struct node_tinithead *);
 void	print_status(struct pf_status *, struct pfctl_watermarks *, int);
 void	print_queuespec(struct pf_queuespec *);

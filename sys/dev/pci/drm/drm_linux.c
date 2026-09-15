@@ -1,4 +1,4 @@
-/*	$OpenBSD: drm_linux.c,v 1.115 2024/07/13 15:38:21 kettenis Exp $	*/
+/*	$OpenBSD: drm_linux.c,v 1.148 2026/09/15 01:24:06 jsg Exp $	*/
 /*
  * Copyright (c) 2013 Jonathan Gray <jsg@openbsd.org>
  * Copyright (c) 2015, 2016 Mark Kettenis <kettenis@openbsd.org>
@@ -29,6 +29,10 @@
 #include <sys/fcntl.h>
 
 #include <dev/pci/ppbreg.h>
+#include <dev/wscons/wsconsio.h>
+#include <dev/wscons/wsdisplayvar.h>
+
+#include <acpi/video.h>
 
 #include <linux/dma-buf.h>
 #include <linux/mod_devicetable.h>
@@ -45,17 +49,20 @@
 #include <linux/notifier.h>
 #include <linux/backlight.h>
 #include <linux/shrinker.h>
-#include <linux/fb.h>
 #include <linux/xarray.h>
 #include <linux/interval_tree.h>
 #include <linux/kthread.h>
 #include <linux/processor.h>
 #include <linux/sync_file.h>
 #include <linux/suspend.h>
+#include <linux/slab.h>
+#include <linux/seq_buf.h>
+#include <linux/platform_device.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_print.h>
+#include <drm/drm_drv.h>
 
 #if defined(__amd64__) || defined(__i386__)
 #include "bios.h"
@@ -120,7 +127,7 @@ __set_current_state(int state)
 	SCHED_LOCK();
 	unsleep(p);
 	p->p_stat = SONPROC;
-	atomic_clearbits_int(&p->p_flag, P_WSLEEP);
+	atomic_clearbits_int(&p->p_flag, P_INSCHED|P_SINTR);
 	SCHED_UNLOCK();
 }
 
@@ -134,15 +141,15 @@ long
 schedule_timeout(long timeout)
 {
 	unsigned long deadline;
-	int timo = 0;
+	uint64_t nsecs = INFSLP;
 
 	KASSERT(!cold);
 
-	if (timeout != MAX_SCHEDULE_TIMEOUT)
-		timo = timeout;
-	if (timeout != MAX_SCHEDULE_TIMEOUT)
+	if (timeout != MAX_SCHEDULE_TIMEOUT) {
 		deadline = jiffies + timeout;
-	sleep_finish(timo, timeout > 0);
+		nsecs = jiffies_to_nsecs(timeout);
+	}
+	sleep_finish(nsecs, timeout > 0);
 	if (timeout != MAX_SCHEDULE_TIMEOUT)
 		timeout = deadline - jiffies;
 
@@ -162,7 +169,7 @@ wake_up_process(struct proc *p)
 	int rv;
 
 	SCHED_LOCK();
-	rv = wakeup_proc(p, 0);
+	rv = wakeup_proc(p);
 	SCHED_UNLOCK();
 	return rv;
 }
@@ -175,6 +182,15 @@ autoremove_wake_function(struct wait_queue_entry *wqe, unsigned int mode,
 		wake_up_process(wqe->private);
 	list_del_init(&wqe->entry);
 	return 0;
+}
+
+int
+woken_wake_function(struct wait_queue_entry *wqe, unsigned int mode,
+    int sync, void *key)
+{
+	smp_mb();
+	wqe->flags |= WQ_FLAG_WOKEN;
+	return wake_up_process(wqe->private);
 }
 
 void
@@ -284,7 +300,7 @@ kthread_run(int (*func)(void *), void *data, const char *name)
 }
 
 struct kthread_worker *
-kthread_create_worker(unsigned int flags, const char *fmt, ...)
+kthread_run_worker(unsigned int flags, const char *fmt, ...)
 {
 	char name[MAXCOMLEN+1];
 	va_list ap;
@@ -554,8 +570,6 @@ alloc_pages(unsigned int gfp_mask, unsigned int order)
 	struct uvm_constraint_range *constraint = &no_constraint;
 	struct pglist mlist;
 
-	if (gfp_mask & M_CANFAIL)
-		flags |= UVM_PLA_FAILOK;
 	if (gfp_mask & M_ZERO)
 		flags |= UVM_PLA_ZERO;
 	if (gfp_mask & __GFP_DMA32)
@@ -685,7 +699,7 @@ vmap_pfn(unsigned long *pfns, unsigned int npfn, pgprot_t prot)
 	if (va == 0)
 		return NULL;
 	for (i = 0; i < npfn; i++) {
-		pa = round_page(pfns[i]) | prot;
+		pa = ptoa(pfns[i]) | prot;
 		pmap_enter(pmap_kernel(), va + (i * PAGE_SIZE), pa,
 		    PROT_READ | PROT_WRITE,
 		    PROT_READ | PROT_WRITE | PMAP_WIRED);
@@ -718,6 +732,20 @@ is_vmalloc_addr(const void *p)
 		return true;
 	else
 		return false;
+}
+
+void *
+vmemdup_array_user(const void *src, size_t n, size_t size)
+{
+	void *p = kvmalloc_array(n, size, GFP_KERNEL);
+	if (p == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	if (copyin(src, p, n * size) != 0) {
+		free(p, M_DRM, n * size);
+		return ERR_PTR(-EFAULT);
+	}
+	return (p);
 }
 
 void
@@ -767,8 +795,7 @@ RB_GENERATE(linux_root, rb_node, __entry, panic_cmp);
  * This is a fairly minimal implementation of the Linux "idr" API.  It
  * probably isn't very efficient, and definitely isn't RCU safe.  The
  * pre-load buffer is global instead of per-cpu; we rely on the kernel
- * lock to make this work.  We do randomize our IDs in order to make
- * them harder to guess.
+ * lock to make this work.
  */
 
 int idr_cmp(struct idr_entry *, struct idr_entry *);
@@ -781,6 +808,7 @@ void
 idr_init(struct idr *idr)
 {
 	SPLAY_INIT(&idr->tree);
+	idr->next = 0;
 }
 
 void
@@ -805,12 +833,12 @@ idr_preload(unsigned int gfp_mask)
 		idr_entry_cache = pool_get(&idr_pool, flags);
 }
 
+/* [start, end) */
 int
 idr_alloc(struct idr *idr, void *ptr, int start, int end, gfp_t gfp_mask)
 {
 	int flags = (gfp_mask & GFP_NOWAIT) ? PR_NOWAIT : PR_WAITOK;
 	struct idr_entry *id;
-	int begin;
 
 	KERNEL_ASSERT_LOCKED();
 
@@ -826,22 +854,53 @@ idr_alloc(struct idr *idr, void *ptr, int start, int end, gfp_t gfp_mask)
 	if (end <= 0)
 		end = INT_MAX;
 
-#ifdef notyet
-	id->id = begin = start + arc4random_uniform(end - start);
-#else
-	id->id = begin = start;
-#endif
+	id->id = start;
 	while (SPLAY_INSERT(idr_tree, &idr->tree, id)) {
-		if (id->id == end)
-			id->id = start;
-		else
-			id->id++;
-		if (id->id == begin) {
+		id->id++;
+		if (id->id == end) {
 			pool_put(&idr_pool, id);
 			return -ENOSPC;
 		}
 	}
 	id->ptr = ptr;
+	return id->id;
+}
+
+/* [start, end) */
+int
+idr_alloc_cyclic(struct idr *idr, void *ptr, int start, int end, gfp_t gfp_mask)
+{
+	int flags = (gfp_mask & GFP_NOWAIT) ? PR_NOWAIT : PR_WAITOK;
+	struct idr_entry *id;
+
+	KERNEL_ASSERT_LOCKED();
+
+	if (idr_entry_cache) {
+		id = idr_entry_cache;
+		idr_entry_cache = NULL;
+	} else {
+		id = pool_get(&idr_pool, flags);
+		if (id == NULL)
+			return -ENOMEM;
+	}
+
+	if (end <= 0)
+		end = INT_MAX;
+
+	id->id = idr->next;
+	while (SPLAY_INSERT(idr_tree, &idr->tree, id)) {
+		id->id++;
+		if (id->id == end) {
+			id->id = start;
+		} else if (id->id == idr->next) {
+			pool_put(&idr_pool, id);
+			return -ENOSPC;
+		}
+	}
+	id->ptr = ptr;
+	idr->next = id->id + 1;
+	if (idr->next == end)
+		idr->next = start;
 	return id->id;
 }
 
@@ -935,38 +994,42 @@ ida_init(struct ida *ida)
 void
 ida_destroy(struct ida *ida)
 {
+	int s = spltty();
 	idr_destroy(&ida->idr);
+	splx(s);
 }
 
+/* [start, end] */
 int
-ida_simple_get(struct ida *ida, unsigned int start, unsigned int end,
-    gfp_t gfp_mask)
+ida_alloc_range(struct ida *ida, unsigned int start, unsigned int end, gfp_t gfp)
 {
-	return idr_alloc(&ida->idr, NULL, start, end, gfp_mask);
-}
+	int r, s;
 
-void
-ida_simple_remove(struct ida *ida, unsigned int id)
-{
-	idr_remove(&ida->idr, id);
+	s = spltty();
+	r = idr_alloc(&ida->idr, NULL, start, end + 1, gfp);
+	splx(s);
+
+	return r;
 }
 
 int
 ida_alloc_min(struct ida *ida, unsigned int min, gfp_t gfp)
 {
-	return idr_alloc(&ida->idr, NULL, min, INT_MAX, gfp);
+	return ida_alloc_range(ida, min, INT_MAX, gfp);
 }
 
 int
 ida_alloc_max(struct ida *ida, unsigned int max, gfp_t gfp)
 {
-	return idr_alloc(&ida->idr, NULL, 0, max - 1, gfp);
+	return ida_alloc_range(ida, 0, max, gfp);
 }
 
 void
 ida_free(struct ida *ida, unsigned int id)
 {
+	int s = spltty();
 	idr_remove(&ida->idr, id);
+	splx(s);
 }
 
 int
@@ -982,18 +1045,12 @@ SPLAY_GENERATE(xarray_tree, xarray_entry, entry, xarray_cmp);
 void
 xa_init_flags(struct xarray *xa, gfp_t flags)
 {
-	static int initialized;
-
-	if (!initialized) {
-		pool_init(&xa_pool, sizeof(struct xarray_entry), 0, IPL_NONE, 0,
-		    "xapl", NULL);
-		initialized = 1;
-	}
 	SPLAY_INIT(&xa->xa_tree);
 	if (flags & XA_FLAGS_LOCK_IRQ)
 		mtx_init(&xa->xa_lock, IPL_TTY);
 	else
 		mtx_init(&xa->xa_lock, IPL_NONE);
+	xa->xa_flags = flags;
 }
 
 void
@@ -1007,13 +1064,17 @@ xa_destroy(struct xarray *xa)
 	}
 }
 
-/* Don't wrap ids. */
+/* [start, end] Don't wrap ids. */
 int
-__xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
+__xa_alloc(struct xarray *xa, u32 *id, void *entry, struct xarray_range xr,
+    gfp_t gfp)
 {
 	struct xarray_entry *xid;
-	int start = (xa->xa_flags & XA_FLAGS_ALLOC1) ? 1 : 0;
-	int begin;
+	uint32_t start = xr.start;
+	uint32_t end = xr.end;
+
+	if (start == 0 && (xa->xa_flags & XA_FLAGS_ALLOC1))
+		start = 1;
 
 	if (gfp & GFP_NOWAIT) {
 		xid = pool_get(&xa_pool, PR_NOWAIT);
@@ -1026,17 +1087,14 @@ __xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
 	if (xid == NULL)
 		return -ENOMEM;
 
-	if (limit <= 0)
-		limit = INT_MAX;
-
-	xid->id = begin = start;
+	xid->id = start;
 
 	while (SPLAY_INSERT(xarray_tree, &xa->xa_tree, xid)) {
-		if (xid->id == limit)
+		if (xid->id == end)
 			xid->id = start;
 		else
 			xid->id++;
-		if (xid->id == begin) {
+		if (xid->id == start) {
 			pool_put(&xa_pool, xid);
 			return -EBUSY;
 		}
@@ -1046,18 +1104,51 @@ __xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
 	return 0;
 }
 
-/*
- * Wrap ids and store next id.
- * We walk the entire tree so don't special case wrapping.
- * The only caller of this (i915_drm_client.c) doesn't use next id.
- */
+/* [start, end] Wrap ids and store next id. */
 int
-__xa_alloc_cyclic(struct xarray *xa, u32 *id, void *entry, int limit, u32 *next,
-    gfp_t gfp)
+__xa_alloc_cyclic(struct xarray *xa, u32 *id, void *entry,
+    struct xarray_range xr, u32 *next, gfp_t gfp)
 {
-	int r = __xa_alloc(xa, id, entry, limit, gfp);
-	*next = *id + 1;
-	return r;
+	struct xarray_entry *xid;
+	uint32_t start = xr.start;
+	uint32_t end = xr.end;
+
+	if (start == 0 && (xa->xa_flags & XA_FLAGS_ALLOC1))
+		start = 1;
+
+	if (gfp & GFP_NOWAIT) {
+		xid = pool_get(&xa_pool, PR_NOWAIT);
+	} else {
+		mtx_leave(&xa->xa_lock);
+		xid = pool_get(&xa_pool, PR_WAITOK);
+		mtx_enter(&xa->xa_lock);
+	}
+
+	if (xid == NULL)
+		return -ENOMEM;
+
+	if (*next < start)
+		xid->id = start;
+	else
+		xid->id = *next;
+
+	while (SPLAY_INSERT(xarray_tree, &xa->xa_tree, xid)) {
+		if (xid->id == end) {
+			xid->id = start;
+		} else if (xid->id == *next) {
+			pool_put(&xa_pool, xid);
+			return -EBUSY;
+		} else {
+			xid->id++;
+		}
+	}
+	xid->ptr = entry;
+	if (xid->id == end)
+		*next = start;
+	else
+		*next = xid->id + 1;
+	*id = xid->id;
+	return 0;
 }
 
 void *
@@ -1160,11 +1251,36 @@ sg_free_table(struct sg_table *table)
 	table->sgl = NULL;
 }
 
-size_t
-sg_copy_from_buffer(struct scatterlist *sgl, unsigned int nents,
-    const void *buf, size_t buflen)
+int
+sg_alloc_table_from_pages_segment(struct sg_table *table, struct vm_page **pages,
+    unsigned int npages, unsigned int off, unsigned long size,
+    unsigned int max_segs, gfp_t gfp_mask)
 {
-	panic("%s", __func__);
+	struct scatterlist *sg;
+	int r, i;
+	unsigned int len;
+
+	r = sg_alloc_table(table, npages, gfp_mask);
+	if (r != 0)
+		return r;
+
+	sg = table->sgl;
+	table->nents = 0;
+	len = PAGE_SIZE - off;
+	for (i = 0; i < npages; i++) {
+		if (i)
+			sg = sg_next(sg);
+		sg_set_page(sg, pages[i], len, off);
+		off = 0;
+		table->nents++;
+		size -= len;
+		if (size > PAGE_SIZE)
+			len = PAGE_SIZE;
+		else
+			len = size;
+	}
+
+	return 0;
 }
 
 int
@@ -1532,6 +1648,17 @@ acpi_target_system_state(void)
 	return acpi_softc->sc_state;
 }
 
+enum acpi_backlight_type
+acpi_video_get_backlight_type(void)
+{
+	struct wsdisplay_param dp;
+
+	dp.param = WSDISPLAYIO_PARAM_BRIGHTNESS;
+	if (ws_get_param && ws_get_param(&dp) == 0)
+		return acpi_backlight_video;
+	return acpi_backlight_native;
+}
+
 #endif
 
 SLIST_HEAD(,backlight_device) backlight_device_list =
@@ -1581,7 +1708,7 @@ backlight_enable(struct backlight_device *bd)
 	if (bd == NULL)
 		return 0;
 
-	bd->props.power = FB_BLANK_UNBLANK;
+	bd->props.power = BACKLIGHT_POWER_ON;
 
 	return bd->ops->update_status(bd);
 }
@@ -1592,7 +1719,7 @@ backlight_disable(struct backlight_device *bd)
 	if (bd == NULL)
 		return 0;
 
-	bd->props.power = FB_BLANK_POWERDOWN;
+	bd->props.power = BACKLIGHT_POWER_OFF;
 
 	return bd->ops->update_status(bd);
 }
@@ -1816,6 +1943,28 @@ dma_fence_is_signaled_locked(struct dma_fence *fence)
 	return false;
 }
 
+int
+dma_fence_get_status_locked(struct dma_fence *fence)
+{
+	if (dma_fence_is_signaled_locked(fence) == false)
+		return 0;
+	if (fence->error == 0)
+		return 1;
+	return fence->error;
+}
+
+int
+dma_fence_get_status(struct dma_fence *fence)
+{
+	int r;
+
+	mtx_enter(fence->lock);
+	r = dma_fence_get_status_locked(fence);
+	mtx_leave(fence->lock);
+
+	return r;
+}
+
 ktime_t
 dma_fence_timestamp(struct dma_fence *fence)
 {
@@ -1877,6 +2026,14 @@ dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
 	fence->error = 0;
 	kref_init(&fence->refcount);
 	INIT_LIST_HEAD(&fence->cb_list);
+}
+
+void
+dma_fence_init64(struct dma_fence *fence, const struct dma_fence_ops *ops,
+    struct mutex *lock, uint64_t context, uint64_t seqno)
+{
+	dma_fence_init(fence, ops, lock, context, seqno);
+	set_bit(DMA_FENCE_FLAG_SEQ64_BIT, &fence->flags);
 }
 
 int
@@ -2313,7 +2470,7 @@ dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
 
 	/* if prev is a chain */
 	if (to_dma_fence_chain(prev) != NULL) {
-		if (__dma_fence_is_later(seqno, prev->seqno, prev->ops)) {
+		if (__dma_fence_is_later(prev, seqno, prev->seqno)) {
 			chain->prev_seqno = prev->seqno;
 			context = prev->context;
 		} else {
@@ -2326,7 +2483,7 @@ dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
 		context = dma_fence_context_alloc(1);
 	}
 
-	dma_fence_init(&chain->base, &dma_fence_chain_ops, &chain->lock,
+	dma_fence_init64(&chain->base, &dma_fence_chain_ops, &chain->lock,
 	    context, seqno);
 }
 
@@ -2469,7 +2626,6 @@ const struct dma_fence_ops dma_fence_chain_ops = {
 	.enable_signaling = dma_fence_chain_enable_signaling,
 	.signaled = dma_fence_chain_signaled,
 	.release = dma_fence_chain_release,
-	.use_64bit_seqno = true,
 };
 
 bool
@@ -2853,6 +3009,8 @@ drm_linux_init(void)
 
 	pool_init(&idr_pool, sizeof(struct idr_entry), 0, IPL_TTY, 0,
 	    "idrpl", NULL);
+	pool_init(&xa_pool, sizeof(struct xarray_entry), 0, IPL_TTY, 0,
+	    "xapl", NULL);
 
 	kmap_atomic_va =
 	    (vaddr_t)km_alloc(PAGE_SIZE, &kv_any, &kp_none, &kd_waitok);
@@ -2868,6 +3026,7 @@ drm_linux_init(void)
 void
 drm_linux_exit(void)
 {
+	pool_destroy(&xa_pool);
 	pool_destroy(&idr_pool);
 
 	taskq_destroy(taskletq);
@@ -2887,7 +3046,7 @@ drm_linux_exit(void)
 
 /* size in MB is 1 << nsize */
 int
-pci_resize_resource(struct pci_dev *pdev, int bar, int nsize)
+pci_resize_resource(struct pci_dev *pdev, int bar, int nsize, int skip_bars)
 {
 	pcireg_t	reg;
 	uint32_t	offset, capid;
@@ -2933,33 +3092,48 @@ pci_resize_resource(struct pci_dev *pdev, int bar, int nsize)
 
 TAILQ_HEAD(, shrinker) shrinkers = TAILQ_HEAD_INITIALIZER(shrinkers);
 
-int
-register_shrinker(struct shrinker *shrinker, const char *format, ...)
+struct shrinker *
+shrinker_alloc(u_int flags, const char *format, ...)
+{
+	struct shrinker *s;
+
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
+	s->seeks = DEFAULT_SEEKS;
+	return s;
+}
+
+void
+shrinker_register(struct shrinker *shrinker)
 {
 	TAILQ_INSERT_TAIL(&shrinkers, shrinker, next);
-	return 0;
 }
 
 void
-unregister_shrinker(struct shrinker *shrinker)
+shrinker_free(struct shrinker *shrinker)
 {
 	TAILQ_REMOVE(&shrinkers, shrinker, next);
+	kfree(shrinker);
 }
 
-void
+unsigned long
 drmbackoff(long npages)
 {
 	struct shrink_control sc;
 	struct shrinker *shrinker;
-	u_long ret;
+	u_long ret, freed = 0;
 
 	shrinker = TAILQ_FIRST(&shrinkers);
 	while (shrinker && npages > 0) {
 		sc.nr_to_scan = npages;
 		ret = shrinker->scan_objects(shrinker, &sc);
+		if (ret == SHRINK_STOP)
+			break;
 		npages -= ret;
+		freed += ret;
 		shrinker = TAILQ_NEXT(shrinker, next);
 	}
+
+	return freed;
 }
 
 void *
@@ -3140,9 +3314,6 @@ fd_install(int fd, struct file *fp)
 	struct proc *p = curproc;
 	struct filedesc *fdp = p->p_fd;
 
-	if (fp->f_type != DTYPE_SYNC)
-		return;
-
 	fdplock(fdp);
 	/* all callers use get_unused_fd_flags(O_CLOEXEC) */
 	fdinsert(fdp, fd, UF_EXCLOSE, fp);
@@ -3152,9 +3323,6 @@ fd_install(int fd, struct file *fp)
 void
 fput(struct file *fp)
 {
-	if (fp->f_type != DTYPE_SYNC)
-		return;
-	
 	FRELE(fp, curproc);
 }
 
@@ -3233,13 +3401,6 @@ sync_file_create(struct dma_fence *fence)
 	return sf;
 }
 
-bool
-drm_firmware_drivers_only(void)
-{
-	return false;
-}
-
-
 void *
 memremap(phys_addr_t phys_addr, size_t size, int flags)
 {
@@ -3253,19 +3414,23 @@ memunmap(void *addr)
 	STUB();
 }
 
-#include <linux/platform_device.h>
+void
+kfree_const(const void *addr)
+{
+        kfree(addr);
+}
 
 bus_dma_tag_t
 dma_tag_lookup(struct device *dev)
 {
 	extern struct cfdriver drm_cd;
-	struct drm_device *drm;
+	struct drm_softc *sc;
 	int i;
 
 	for (i = 0; i < drm_cd.cd_ndevs; i++) {
-		drm = drm_cd.cd_devs[i];
-		if (drm && drm->dev == dev)
-			return drm->dmat;
+		sc = drm_cd.cd_devs[i];
+		if (sc && &sc->sc_dev == dev)
+			return sc->sc_drm->dmat;
 	}
 
 	return ((struct platform_device *)dev)->dmat;
@@ -3347,11 +3512,31 @@ dma_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
 	return map->dm_segs[0].ds_addr;
 }
 
+void
+dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+    enum dma_data_direction dir, u_long attr)
+{
+	STUB();
+}
+
+int
+dma_map_sgtable(struct device *dev, struct sg_table *sgt,
+    enum dma_data_direction dir, unsigned long attrs)
+{
+	return 0;
+}
+
+void
+dma_unmap_sgtable(struct device *dev, struct sg_table *sgt,
+    enum dma_data_direction dir, unsigned long attrs)
+{
+}
+
 #ifdef BUS_DMA_FIXED
 
 #include <linux/iommu.h>
 
-size_t
+ssize_t
 iommu_map_sgtable(struct iommu_domain *domain, u_long iova,
     struct sg_table *sgt, int prot)
 {
@@ -3499,12 +3684,55 @@ component_master_add_with_match(struct device *dev,
 	return 0;
 }
 
+void
+seq_buf_printf(struct seq_buf *s, const char *fmt, ...)
+{
+	int r;
+	va_list ap;
+	va_start(ap, fmt);
+	r = vsnprintf(s->buf + s->pos, s->size - s->pos, fmt, ap);
+	va_end(ap);
+
+	s->pos += r;
+	if (s->pos >= s->size) {
+		s->pos = s->size - 1;
+		s->overflowed = 1;
+	}
+}
+
+u64
+hrtimer_forward_now(struct timeout *to, ktime_t val)
+{
+	struct timespec now, ts;
+
+	getnanotime(&now);
+	NSEC_TO_TIMESPEC(ktime_to_ns(val), &ts);
+	timespecadd(&ts, &now, &ts);
+	timeout_abs_ts(to, &ts);
+
+	return 0;
+}
+
+int
+string_get_size(uint64_t size, uint64_t bsize, int units, char *buf, int blen)
+{
+	return snprintf(buf, blen, "%llu", size);
+}
+
 #ifdef __HAVE_FDT
 
-#include <linux/platform_device.h>
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/fdt.h>
+#include <dev/ofw/ofw_clock.h>
+#include <dev/ofw/ofw_misc.h>
+#include <dev/ofw/ofw_gpio.h>
 #include <machine/fdt.h>
+
+#include <linux/clk.h>
+#include <linux/of.h>
+#include <linux/gpio/consumer.h>
+
+struct bus_type platform_bus_type;
 
 LIST_HEAD(, platform_device) pdev_list = LIST_HEAD_INITIALIZER(pdev_list);
 
@@ -3559,9 +3787,6 @@ devm_platform_ioremap_resource_byname(struct platform_device *pdev,
 	return bus_space_vaddr(pdev->iot, ioh);
 }
 
-#include <dev/ofw/ofw_clock.h>
-#include <linux/clk.h>
-
 struct clk *
 devm_clk_get(struct device *dev, const char *name)
 {
@@ -3578,9 +3803,6 @@ clk_get_rate(struct clk *clk)
 {
 	return clk->freq;
 }
-
-#include <linux/gpio/consumer.h>
-#include <dev/ofw/ofw_gpio.h>
 
 struct gpio_desc {
 	uint32_t gpios[4];
@@ -3648,13 +3870,6 @@ devm_phy_optional_get(struct device *dev, const char *name)
 
 	return phy;
 }
-
-struct bus_type platform_bus_type;
-
-#include <dev/ofw/ofw_misc.h>
-
-#include <linux/of.h>
-#include <linux/platform_device.h>
 
 struct device_node *
 __of_devnode(void *arg)

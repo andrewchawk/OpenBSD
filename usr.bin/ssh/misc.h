@@ -1,4 +1,4 @@
-/* $OpenBSD: misc.h,v 1.109 2024/06/06 17:15:25 djm Exp $ */
+/* $OpenBSD: misc.h,v 1.117 2026/09/07 20:24:22 job Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -56,8 +56,11 @@ struct ForwardOptions {
 char	*chop(char *);
 void	 rtrim(char *);
 void	skip_space(char **);
+const char *strprefix(const char *, const char *, int);
 char	*strdelim(char **);
 char	*strdelimw(char **);
+void	 stringlist_append(char ***listp, const char *s);
+void	 stringlist_free(char **list);
 int	 set_nonblock(int);
 int	 unset_nonblock(int);
 void	 set_nodelay(int);
@@ -78,7 +81,9 @@ char	*colon(char *);
 int	 parse_user_host_path(const char *, char **, char **, char **);
 int	 parse_user_host_port(const char *, char **, char **, int *);
 int	 parse_uri(const char *, const char *, char **, char **, int *, char **);
+double	 convtime_double(const char *);
 int	 convtime(const char *);
+double	 convtime_double(const char *);
 const char *fmt_timeframe(time_t t);
 int	 tilde_expand(const char *, uid_t, char **);
 char	*tilde_expand_filename(const char *, uid_t);
@@ -107,8 +112,12 @@ int	 parse_pattern_interval(const char *, char **, int *);
 int	 path_absolute(const char *);
 int	 stdfd_devnull(int, int, int);
 int	 lib_contains_symbol(const char *, const char *);
+char	*get_homedir(void);
+int	 mkdir_path(const char *, mode_t);
 
 struct passwd *pwcopy(struct passwd *);
+void	 pwfree(struct passwd *); /* NB. only use with pwcopy */
+
 const char *ssh_gai_strerror(int);
 
 typedef void privdrop_fn(struct passwd *);
@@ -150,34 +159,34 @@ int	 tun_open(int, int, char **);
 #define PORT_STREAMLOCAL	-2
 
 /* Functions to extract or store big-endian words of various sizes */
-u_int64_t	get_u64(const void *)
+uint64_t	get_u64(const void *)
     __attribute__((__bounded__( __minbytes__, 1, 8)));
-u_int32_t	get_u32(const void *)
+uint32_t	get_u32(const void *)
     __attribute__((__bounded__( __minbytes__, 1, 4)));
-u_int16_t	get_u16(const void *)
+uint16_t	get_u16(const void *)
     __attribute__((__bounded__( __minbytes__, 1, 2)));
-void		put_u64(void *, u_int64_t)
+void		put_u64(void *, uint64_t)
     __attribute__((__bounded__( __minbytes__, 1, 8)));
-void		put_u32(void *, u_int32_t)
+void		put_u32(void *, uint32_t)
     __attribute__((__bounded__( __minbytes__, 1, 4)));
-void		put_u16(void *, u_int16_t)
+void		put_u16(void *, uint16_t)
     __attribute__((__bounded__( __minbytes__, 1, 2)));
 
 /* Little-endian store/load, used by umac.c */
-u_int32_t	get_u32_le(const void *)
+uint32_t	get_u32_le(const void *)
     __attribute__((__bounded__(__minbytes__, 1, 4)));
-void		put_u32_le(void *, u_int32_t)
+void		put_u32_le(void *, uint32_t)
     __attribute__((__bounded__(__minbytes__, 1, 4)));
 
 struct bwlimit {
 	size_t buflen;
-	u_int64_t rate;		/* desired rate in kbit/s */
-	u_int64_t thresh;	/* threshold after which we'll check timers */
-	u_int64_t lamt;		/* amount written in last timer interval */
+	uint64_t rate;		/* desired rate in kbit/s */
+	uint64_t thresh;	/* threshold after which we'll check timers */
+	uint64_t lamt;		/* amount written in last timer interval */
 	struct timeval bwstart, bwend;
 };
 
-void bandwidth_limit_init(struct bwlimit *, u_int64_t, size_t);
+void bandwidth_limit_init(struct bwlimit *, uint64_t, size_t);
 void bandwidth_limit(struct bwlimit *, size_t);
 
 int parse_ipqos(const char *);
@@ -228,6 +237,11 @@ int ptimeout_get_ms(struct timespec *pt);
 struct timespec *ptimeout_get_tsp(struct timespec *pt);
 int ptimeout_isset(struct timespec *pt);
 
+/* misc-agent.c */
+char	*agent_hostname_hash(void);
+int	 agent_listener(const char *, const char *, int *, char **);
+void	 agent_cleanup_stale(const char *, int);
+
 /* readpass.c */
 
 #define RP_ECHO			0x0001
@@ -254,5 +268,12 @@ int signal_is_crash(int);
 
 /* On OpenBSD time_t is int64_t which is long long. */
 #define SSH_TIME_T_MAX LLONG_MAX
+
+#define FD_CLOSEONEXEC(x) do { \
+	if (fcntl(x, F_SETFD, FD_CLOEXEC) == -1) \
+		fatal_f("fcntl(%d, F_SETFD, FD_CLOEXEC): %s", x, \
+		    strerror(errno)); \
+} while (0)
+
 
 #endif /* _MISC_H */

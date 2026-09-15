@@ -1,20 +1,12 @@
 #  You may distribute under the terms of either the GNU General Public License
 #  or the Artistic License (the same terms as Perl itself)
 #
-#  (C) Paul Evans, 2010-2020 -- leonerd@leonerd.org.uk
+#  (C) Paul Evans, 2010-2024 -- leonerd@leonerd.org.uk
 
-package IO::Socket::IP;
+package IO::Socket::IP 0.43;
 
-use v5;
-use strict;
+use v5.14;
 use warnings;
-
-# $VERSION needs to be set before  use base 'IO::Socket'
-#  - https://rt.cpan.org/Ticket/Display.html?id=92107
-BEGIN {
-   our $VERSION = '0.41_01';
-   $VERSION = eval $VERSION;
-}
 
 use base qw( IO::Socket );
 
@@ -72,26 +64,28 @@ C<IO::Socket::IP> - Family-neutral IP socket supporting both IPv4 and IPv6
 
 =head1 SYNOPSIS
 
- use IO::Socket::IP;
+=for highlighter language=perl
 
- my $sock = IO::Socket::IP->new(
-    PeerHost => "www.google.com",
-    PeerPort => "http",
-    Type     => SOCK_STREAM,
- ) or die "Cannot construct socket - $@";
+   use IO::Socket::IP;
 
- my $familyname = ( $sock->sockdomain == PF_INET6 ) ? "IPv6" :
-                  ( $sock->sockdomain == PF_INET  ) ? "IPv4" :
-                                                      "unknown";
+   my $sock = IO::Socket::IP->new(
+      PeerHost => "www.google.com",
+      PeerPort => "http",
+      Type     => SOCK_STREAM,
+   ) or die "Cannot construct socket - $IO::Socket::errstr";
 
- printf "Connected to google via %s\n", $familyname;
+   my $familyname = ( $sock->sockdomain == PF_INET6 ) ? "IPv6" :
+                    ( $sock->sockdomain == PF_INET  ) ? "IPv4" :
+                                                        "unknown";
+
+   printf "Connected to google via %s\n", $familyname;
 
 =head1 DESCRIPTION
 
 This module provides a protocol-independent way to use IPv4 and IPv6 sockets,
 intended as a replacement for L<IO::Socket::INET>. Most constructor arguments
 and methods are provided in a backward-compatible way. For a list of known
-differences, see the C<IO::Socket::INET> INCOMPATIBILITES section below.
+differences, see the C<IO::Socket::INET> INCOMPATIBILITIES section below.
 
 It uses the C<getaddrinfo(3)> function to convert hostnames and service names
 or port numbers into sets of possible addresses to connect to or listen on.
@@ -109,15 +103,15 @@ Changing C<IO::Socket>'s default behaviour means that calling the
 C<IO::Socket> constructor with either C<PF_INET> or C<PF_INET6> as the
 C<Domain> parameter will yield an C<IO::Socket::IP> object.
 
- use IO::Socket::IP -register;
+   use IO::Socket::IP -register;
 
- my $sock = IO::Socket->new(
-    Domain    => PF_INET6,
-    LocalHost => "::1",
-    Listen    => 1,
- ) or die "Cannot create socket - $@\n";
+   my $sock = IO::Socket->new(
+      Domain    => PF_INET6,
+      LocalHost => "::1",
+      Listen    => 1,
+   ) or die "Cannot create socket - $IO::Socket::errstr\n";
 
- print "Created a socket of type " . ref($sock) . "\n";
+   print "Created a socket of type " . ref($sock) . "\n";
 
 Note that C<-register> is a global setting that applies to the entire program;
 it cannot be applied only for certain callers, removed, or limited by lexical
@@ -155,9 +149,9 @@ sub import
          die "Cannot socket(PF_INET6) - $!";
 
       if( setsockopt $testsock, IPPROTO_IPV6, IPV6_V6ONLY, 0 ) {
-         if ($^O eq "dragonfly") {
+         if( $^O eq "dragonfly") {
             # dragonflybsd 6.4 lies about successfully turning this off
-            if (getsockopt $testsock, IPPROTO_IPV6, IPV6_V6ONLY) {
+            if( getsockopt $testsock, IPPROTO_IPV6, IPV6_V6ONLY ) {
                return $can_disable_v6only = 0;
             }
          }
@@ -287,10 +281,10 @@ common boolean options).
 
 For example, both options given below are equivalent to setting C<ReuseAddr>.
 
- Sockopts => [
-    [ SOL_SOCKET, SO_REUSEADDR ],
-    [ SOL_SOCKET, SO_REUSEADDR, pack( "i", 1 ) ],
- ]
+   Sockopts => [
+      [ SOL_SOCKET, SO_REUSEADDR ],
+      [ SOL_SOCKET, SO_REUSEADDR, pack( "i", 1 ) ],
+   ]
 
 =item V6Only => BOOL
 
@@ -307,12 +301,12 @@ Note that not all platforms support disabling this option. Some, at least
 OpenBSD and MirBSD, will fail with C<EINVAL> if you attempt to disable it.
 To determine whether it is possible to disable, you may use the class method
 
- if( IO::Socket::IP->CAN_DISABLE_V6ONLY ) {
-    ...
- }
- else {
-    ...
- }
+   if( IO::Socket::IP->CAN_DISABLE_V6ONLY ) {
+      ...
+   }
+   else {
+      ...
+   }
 
 If your platform does not support disabling this option but you still want to
 listen for both C<AF_INET> and C<AF_INET6> connections you will have to create
@@ -321,7 +315,7 @@ two listening sockets, one bound to each protocol.
 =item MultiHomed
 
 This C<IO::Socket::INET>-style argument is ignored, except if it is defined
-but false. See the C<IO::Socket::INET> INCOMPATIBILITES section below.
+but false. See the C<IO::Socket::INET> INCOMPATIBILITIES section below.
 
 However, the behaviour it enables is always performed by C<IO::Socket::IP>.
 
@@ -343,9 +337,9 @@ timeout will apply to each connection attempt individually, rather than to the
 operation as a whole. Further note that the timeout does not apply to the
 initial hostname resolve operation, if connecting by hostname.
 
-This behviour is copied inspired by C<IO::Socket::INET>; for more fine grained
-control over connection timeouts, consider performing a nonblocking connect
-directly.
+This behaviour is copied inspired by C<IO::Socket::INET>; for more fine
+grained control over connection timeouts, consider performing a nonblocking
+connect directly.
 
 =back
 
@@ -356,13 +350,13 @@ recognised are ignored.
 
 If neither C<Family> nor any hosts or addresses are passed, nor any
 C<*AddrInfo>, then the constructor has no information on which to decide a
-socket family to create. In this case, it performs a C<getaddinfo> call with
+socket family to create. In this case, it performs a C<getaddrinfo> call with
 the C<AI_ADDRCONFIG> flag, no host name, and a service name of C<"0">, and
 uses the family of the first returned result.
 
-If the constructor fails, it will set C<$@> to an appropriate error message;
-this may be from C<$!> or it may be some other string; not every failure
-necessarily has an associated C<errno> value.
+If the constructor fails, it will set C<$IO::Socket::errstr> and C<$@> to
+an appropriate error message; this may be from C<$!> or it may be some other
+string; not every failure necessarily has an associated C<errno> value.
 
 =head2 new (one arg)
 
@@ -500,7 +494,7 @@ sub _io_socket_ip__configure
       }
 
       if( $err ) {
-         $@ = "$err";
+         $IO::Socket::errstr = $@ = "$err";
          $! = EINVAL;
          return;
       }
@@ -527,7 +521,7 @@ sub _io_socket_ip__configure
       }
 
       if( $err ) {
-         $@ = "$err";
+         $IO::Socket::errstr = $@ = "$err";
          $! = EINVAL;
          return;
       }
@@ -605,7 +599,7 @@ sub _io_socket_ip__configure
       else {
          ( my $err, @infos ) = getaddrinfo( "", "0", \%hints );
          if( $err ) {
-            $@ = "$err";
+            $IO::Socket::errstr = $@ = "$err";
             $! = EINVAL;
             return;
          }
@@ -654,12 +648,14 @@ sub setup
 
       foreach my $sockopt ( @{ ${*$self}{io_socket_ip_sockopts} } ) {
          my ( $level, $optname, $value ) = @$sockopt;
-         $self->setsockopt( $level, $optname, $value ) or ( $@ = "$!", return undef );
+         $self->setsockopt( $level, $optname, $value ) or
+            ( $IO::Socket::errstr = $@ = "$!", return undef );
       }
 
       if( defined ${*$self}{io_socket_ip_v6only} and defined $AF_INET6 and $info->{family} == $AF_INET6 ) {
          my $v6only = ${*$self}{io_socket_ip_v6only};
-         $self->setsockopt( IPPROTO_IPV6, IPV6_V6ONLY, pack "i", $v6only ) or ( $@ = "$!", return undef );
+         $self->setsockopt( IPPROTO_IPV6, IPV6_V6ONLY, pack "i", $v6only ) or
+            ( $IO::Socket::errstr = $@ = "$!", return undef );
       }
 
       if( defined( my $addr = $info->{localaddr} ) ) {
@@ -668,7 +664,8 @@ sub setup
       }
 
       if( defined( my $listenqueue = ${*$self}{io_socket_ip_listenqueue} ) ) {
-         $self->listen( $listenqueue ) or ( $@ = "$!", return undef );
+         $self->listen( $listenqueue ) or
+            ( $IO::Socket::errstr = $@ = "$!", return undef );
       }
 
       if( defined( my $addr = $info->{peeraddr} ) ) {
@@ -698,7 +695,7 @@ sub setup
 
    # Pick the most appropriate error, stringified
    $! = ( grep defined, @{ ${*$self}{io_socket_ip_errors}} )[0];
-   $@ = "$!";
+   $IO::Socket::errstr = $@ = "$!";
    return undef;
 }
 
@@ -832,7 +829,7 @@ sub _unpack_sockaddr
 
 =head2 sockhost_service
 
-   ( $host, $service ) = $sock->sockhost_service( $numeric )
+   ( $host, $service ) = $sock->sockhost_service( $numeric );
 
 Returns the hostname and service name of the local address (that is, the
 socket address given by the C<sockname> method).
@@ -857,25 +854,25 @@ sub sockhost_service
 
 =head2 sockhost
 
-   $addr = $sock->sockhost
+   $addr = $sock->sockhost;
 
 Return the numeric form of the local address as a textual representation
 
 =head2 sockport
 
-   $port = $sock->sockport
+   $port = $sock->sockport;
 
 Return the numeric form of the local port number
 
 =head2 sockhostname
 
-   $host = $sock->sockhostname
+   $host = $sock->sockhostname;
 
 Return the resolved name of the local address
 
 =head2 sockservice
 
-   $service = $sock->sockservice
+   $service = $sock->sockservice;
 
 Return the resolved name of the local port number
 
@@ -889,7 +886,7 @@ sub sockservice  { my $self = shift; scalar +( $self->_get_host_service( $self->
 
 =head2 sockaddr
 
-   $addr = $sock->sockaddr
+   $addr = $sock->sockaddr;
 
 Return the local address as a binary octet string
 
@@ -899,7 +896,7 @@ sub sockaddr { my $self = shift; _unpack_sockaddr $self->sockname }
 
 =head2 peerhost_service
 
-   ( $host, $service ) = $sock->peerhost_service( $numeric )
+   ( $host, $service ) = $sock->peerhost_service( $numeric );
 
 Returns the hostname and service name of the peer address (that is, the
 socket address given by the C<peername> method), similar to the
@@ -922,25 +919,25 @@ sub peerhost_service
 
 =head2 peerhost
 
-   $addr = $sock->peerhost
+   $addr = $sock->peerhost;
 
 Return the numeric form of the peer address as a textual representation
 
 =head2 peerport
 
-   $port = $sock->peerport
+   $port = $sock->peerport;
 
 Return the numeric form of the peer port number
 
 =head2 peerhostname
 
-   $host = $sock->peerhostname
+   $host = $sock->peerhostname;
 
 Return the resolved name of the peer address
 
 =head2 peerservice
 
-   $service = $sock->peerservice
+   $service = $sock->peerservice;
 
 Return the resolved name of the peer port number
 
@@ -954,7 +951,7 @@ sub peerservice  { my $self = shift; scalar +( $self->_get_host_service( $self->
 
 =head2 peeraddr
 
-   $addr = $peer->peeraddr
+   $addr = $peer->peeraddr;
 
 Return the peer address as a binary octet string
 
@@ -1006,7 +1003,7 @@ BEGIN {
 
 =head2 as_inet
 
-   $inet = $sock->as_inet
+   $inet = $sock->as_inet;
 
 Returns a new L<IO::Socket::INET> instance wrapping the same filehandle. This
 may be useful in cases where it is required, for backward-compatibility, to
@@ -1062,28 +1059,28 @@ a lookup using the C<PeerAddrInfo> or C<LocalAddrInfo> arguments. This can be
 achieved by using L<Net::LibAsyncNS>, or the C<getaddrinfo(3)> function can be
 called in a child process.
 
- use IO::Socket::IP;
- use Errno qw( EINPROGRESS EWOULDBLOCK );
+   use IO::Socket::IP;
+   use Errno qw( EINPROGRESS EWOULDBLOCK );
 
- my @peeraddrinfo = ... # Caller must obtain the getaddinfo result here
+   my @peeraddrinfo = ... # Caller must obtain the getaddrinfo result here
 
- my $socket = IO::Socket::IP->new(
-    PeerAddrInfo => \@peeraddrinfo,
-    Blocking     => 0,
- ) or die "Cannot construct socket - $@";
+   my $socket = IO::Socket::IP->new(
+      PeerAddrInfo => \@peeraddrinfo,
+      Blocking     => 0,
+   ) or die "Cannot construct socket - $@";
 
- while( !$socket->connect and ( $! == EINPROGRESS || $! == EWOULDBLOCK ) ) {
-    my $wvec = '';
-    vec( $wvec, fileno $socket, 1 ) = 1;
-    my $evec = '';
-    vec( $evec, fileno $socket, 1 ) = 1;
+   while( !$socket->connect and ( $! == EINPROGRESS || $! == EWOULDBLOCK ) ) {
+      my $wvec = '';
+      vec( $wvec, fileno $socket, 1 ) = 1;
+      my $evec = '';
+      vec( $evec, fileno $socket, 1 ) = 1;
 
-    select( undef, $wvec, $evec, undef ) or die "Cannot select - $!";
- }
+      select( undef, $wvec, $evec, undef ) or die "Cannot select - $!";
+   }
 
- die "Cannot connect - $!" if $!;
+   die "Cannot connect - $!" if $!;
 
- ...
+   ...
 
 The example above uses C<select()>, but any similar mechanism should work
 analogously. C<IO::Socket::IP> takes care when creating new socket filehandles
@@ -1108,9 +1105,13 @@ of the following special forms then special parsing is applied.
 The value of the C<...Host> argument will be split to give both the hostname
 and port (or service name):
 
- hostname.example.org:http    # Host name
- 192.0.2.1:80                 # IPv4 address
- [2001:db8::1]:80             # IPv6 address
+=for highlighter
+
+   hostname.example.org:http    # Host name
+   192.0.2.1:80                 # IPv4 address
+   [2001:db8::1]:80             # IPv6 address
+
+=for highlighter language=perl
 
 In each case, the port or service name (e.g. C<80>) is passed as the
 C<LocalService> or C<PeerService> argument.
@@ -1119,7 +1120,7 @@ Either of C<LocalService> or C<PeerService> (or their C<...Port> synonyms) can
 be either a service name, a decimal number, or a string containing both a
 service name and number, in a form such as
 
- http(80)
+   http(80)
 
 In this case, the name (C<http>) will be tried first, but if the resolver does
 not understand it then the port number (C<80>) will be used instead.
@@ -1137,17 +1138,17 @@ Returns a 2-element list, containing either the split hostname and port
 description if it could be parsed, or the given address and C<undef> if it was
 not recognised.
 
- IO::Socket::IP->split_addr( "hostname:http" )
-                              # ( "hostname",  "http" )
+   IO::Socket::IP->split_addr( "hostname:http" );
+                                # ( "hostname",  "http" )
 
- IO::Socket::IP->split_addr( "192.0.2.1:80" )
-                              # ( "192.0.2.1", "80"   )
+   IO::Socket::IP->split_addr( "192.0.2.1:80" );
+                                # ( "192.0.2.1", "80"   )
 
- IO::Socket::IP->split_addr( "[2001:db8::1]:80" )
-                              # ( "2001:db8::1", "80" )
+   IO::Socket::IP->split_addr( "[2001:db8::1]:80" );
+                                # ( "2001:db8::1", "80" )
 
- IO::Socket::IP->split_addr( "something.else" )
-                              # ( "something.else", undef )
+   IO::Socket::IP->split_addr( "something.else" );
+                                # ( "something.else", undef )
 
 =cut
 
@@ -1178,7 +1179,7 @@ numeric address).
 This can be especially useful when combined with the C<sockhost_service> or
 C<peerhost_service> methods.
 
- say "Connected to ", IO::Socket::IP->join_addr( $sock->peerhost_service );
+   say "Connected to ", IO::Socket::IP->join_addr( $sock->peerhost_service );
 
 =cut
 
@@ -1224,7 +1225,7 @@ sub configure
    $self->configure( { %$arg, Family => Socket::AF_INET6() } );
 }
 
-=head1 C<IO::Socket::INET> INCOMPATIBILITES
+=head1 C<IO::Socket::INET> INCOMPATIBILITIES
 
 =over 4
 
@@ -1258,12 +1259,12 @@ and receive" behaviour of specifying this combination of options to C<::INET>
 when using C<::IP>, perform first a blocking connect, then afterwards turn the
 socket into nonblocking mode.
 
- my $sock = IO::Socket::IP->new(
-    PeerHost => $peer,
-    Timeout => 20,
- ) or die "Cannot connect - $@";
+   my $sock = IO::Socket::IP->new(
+      PeerHost => $peer,
+      Timeout => 20,
+   ) or die "Cannot connect - $@";
 
- $sock->blocking( 0 );
+   $sock->blocking( 0 );
 
 This code will behave identically under both C<IO::Socket::INET> and
 C<IO::Socket::IP>.

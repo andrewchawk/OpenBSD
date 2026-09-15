@@ -1,4 +1,4 @@
-/*	$OpenBSD: virtio.c,v 1.115 2024/07/10 09:27:33 dv Exp $	*/
+/*	$OpenBSD: virtio.c,v 1.149 2026/09/08 19:46:18 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -25,19 +25,14 @@
 #include <dev/pv/virtioreg.h>
 #include <dev/pci/virtio_pcireg.h>
 #include <dev/pv/vioblkreg.h>
-#include <dev/pv/vioscsireg.h>
 #include <dev/vmm/vmm.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
-#include <netinet/ip.h>
 
 #include <errno.h>
 #include <event.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -48,12 +43,31 @@
 #include "virtio.h"
 #include "vmd.h"
 
-extern struct vmd *env;
-extern char *__progname;
+#define VIRTIO_DEBUG	0
+#ifdef DPRINTF
+#undef DPRINTF
+#endif
+#if VIRTIO_DEBUG
+#define DPRINTF		log_debug
+#else
+#define DPRINTF(x...)	do {} while(0)
+#endif	/* VIRTIO_DEBUG */
 
-struct viornd_dev viornd;
-struct vioscsi_dev *vioscsi;
-struct vmmci_dev vmmci;
+extern struct vmd *env;
+
+struct virtio_dev viornd;
+struct virtio_dev *vioscsi = NULL;
+struct virtio_dev vmmci;
+
+/*
+ * Serializes synchronous PCI IO with a mutex. This will need to be
+ * revisited when vmd supports SMP to allow more than one VCPU to
+ * process synchronous PCI IO messages.
+ */
+pthread_mutex_t vcpu_sync_mtx;
+
+/* Guards the in-process entropy device state. */
+static pthread_mutex_t viornd_mtx;
 
 /* Devices emulated in subprocesses are inserted into this list. */
 SLIST_HEAD(virtio_dev_head, virtio_dev) virtio_devs;
@@ -69,10 +83,52 @@ SLIST_HEAD(virtio_dev_head, virtio_dev) virtio_devs;
 #define RXQ	0
 #define TXQ	1
 
+static void virtio_dev_init(struct vmd_vm *, struct virtio_dev *, uint8_t,
+    uint16_t, uint16_t, uint64_t);
 static int virtio_dev_launch(struct vmd_vm *, struct virtio_dev *);
 static void virtio_dispatch_dev(int, short, void *);
 static int handle_dev_msg(struct viodev_msg *, struct virtio_dev *);
 static int virtio_dev_closefds(struct virtio_dev *);
+static void virtio_pci_add_cap(uint8_t, uint8_t, uint8_t, uint32_t);
+static void vmmci_pipe_dispatch(int, short, void *);
+
+static int virtio_io_dispatch(int, uint16_t, uint32_t *, uint8_t *, void *,
+    uint8_t);
+static int virtio_io_isr(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
+static int virtio_io_notify(int, uint16_t, uint32_t *, uint8_t *, void *,
+    uint8_t);
+static int viornd_notifyq(struct virtio_dev *, uint16_t);
+
+static void vmmci_ack(struct virtio_dev *, unsigned int);
+
+#if VIRTIO_DEBUG
+static const char *
+virtio1_reg_name(uint16_t reg)
+{
+	switch (reg) {
+	case VIO1_PCI_DEVICE_FEATURE_SELECT: return "DEVICE_FEATURE_SELECT";
+	case VIO1_PCI_DEVICE_FEATURE: return "DEVICE_FEATURE";
+	case VIO1_PCI_DRIVER_FEATURE_SELECT: return "DRIVER_FEATURE_SELECT";
+	case VIO1_PCI_DRIVER_FEATURE: return "DRIVER_FEATURE";
+	case VIO1_PCI_CONFIG_MSIX_VECTOR: return "CONFIG_MSIX_VECTOR";
+	case VIO1_PCI_NUM_QUEUES: return "NUM_QUEUES";
+	case VIO1_PCI_DEVICE_STATUS: return "DEVICE_STATUS";
+	case VIO1_PCI_CONFIG_GENERATION: return "CONFIG_GENERATION";
+	case VIO1_PCI_QUEUE_SELECT: return "QUEUE_SELECT";
+	case VIO1_PCI_QUEUE_SIZE: return "QUEUE_SIZE";
+	case VIO1_PCI_QUEUE_MSIX_VECTOR: return "QUEUE_MSIX_VECTOR";
+	case VIO1_PCI_QUEUE_ENABLE: return "QUEUE_ENABLE";
+	case VIO1_PCI_QUEUE_NOTIFY_OFF: return "QUEUE_NOTIFY_OFF";
+	case VIO1_PCI_QUEUE_DESC: return "QUEUE_DESC";
+	case VIO1_PCI_QUEUE_DESC + 4: return "QUEUE_DESC (HIGH)";
+	case VIO1_PCI_QUEUE_AVAIL: return "QUEUE_AVAIL";
+	case VIO1_PCI_QUEUE_AVAIL + 4: return "QUEUE_AVAIL (HIGH)";
+	case VIO1_PCI_QUEUE_USED: return "QUEUE_USED";
+	case VIO1_PCI_QUEUE_USED + 4: return "QUEUE_USED (HIGH)";
+	default: return "UNKNOWN";
+	}
+}
+#endif	/* VIRTIO_DEBUG */
 
 const char *
 virtio_reg_name(uint8_t reg)
@@ -115,62 +171,156 @@ vring_size(uint32_t vq_size)
 
 /* Update queue select */
 void
-viornd_update_qs(void)
+virtio_update_qs(struct virtio_dev *dev)
 {
-	struct virtio_vq_info *vq_info;
+	struct virtio_vq_info *vq_info = NULL;
 
-	/* Invalid queue? */
-	if (viornd.cfg.queue_select > 0) {
-		viornd.cfg.queue_size = 0;
-		return;
+	if (dev->driver_feature & VIRTIO_F_VERSION_1) {
+		/* Invalid queue */
+		if (dev->pci_cfg.queue_select >= dev->num_queues) {
+			dev->pci_cfg.queue_size = 0;
+			dev->pci_cfg.queue_enable = 0;
+			return;
+		}
+		vq_info = &dev->vq[dev->pci_cfg.queue_select];
+		dev->pci_cfg.queue_size = vq_info->qs;
+		dev->pci_cfg.queue_desc = vq_info->q_gpa;
+		dev->pci_cfg.queue_avail = vq_info->q_gpa + vq_info->vq_availoffset;
+		dev->pci_cfg.queue_used = vq_info->q_gpa + vq_info->vq_usedoffset;
+		dev->pci_cfg.queue_enable = vq_info->vq_enabled;
+	} else {
+		/* Invalid queue? */
+		if (dev->cfg.queue_select >= dev->num_queues) {
+			dev->cfg.queue_size = 0;
+			return;
+		}
+		vq_info = &dev->vq[dev->cfg.queue_select];
+		dev->cfg.queue_pfn = vq_info->q_gpa >> 12;
+		dev->cfg.queue_size = vq_info->qs;
+	}
+}
+
+/* Update queue address. */
+void
+virtio_update_qa(struct virtio_dev *dev)
+{
+	struct virtio_vq_info *vq_info = NULL;
+	void *hva = NULL;
+	uint64_t availoff, usedoff, availsz, usedsz;
+
+	if (dev->driver_feature & VIRTIO_F_VERSION_1) {
+		if (dev->pci_cfg.queue_select >= dev->num_queues) {
+			log_warnx("%s: invalid queue index", __func__);
+			return;
+		}
+		vq_info = &dev->vq[dev->pci_cfg.queue_select];
+		vq_info->q_gpa = dev->pci_cfg.queue_desc;
+
+		/*
+		 * Queue size is adjustable by the guest in Virtio 1.x.
+		 * We validate the max size at time of write and not here.
+		 */
+		vq_info->qs = dev->pci_cfg.queue_size;
+		vq_info->mask = vq_info->qs - 1;
+
+		/*
+		 * Require the available (driver) and used (device) area to be
+		 * similar to Virtio 0.9 but support Virtio 1.x alignment.
+		 */
+		if (dev->pci_cfg.queue_avail < dev->pci_cfg.queue_desc ||
+		    dev->pci_cfg.queue_used < dev->pci_cfg.queue_desc) {
+			vq_info->vq_enabled = 0;
+			return;
+		}
+
+		availoff = dev->pci_cfg.queue_avail - dev->pci_cfg.queue_desc;
+		usedoff = dev->pci_cfg.queue_used - dev->pci_cfg.queue_desc;
+		if (availoff > UINT32_MAX || usedoff > UINT32_MAX ||
+		    (usedoff & 3) != 0) {
+			vq_info->vq_enabled = 0;
+			return;
+		}
+
+		availsz = sizeof(uint16_t) * (2 + vq_info->qs);
+		usedsz = (sizeof(uint16_t) * 2) +
+		    (sizeof(struct vring_used_elem) * vq_info->qs);
+		hva = hvaddr_mem(dev->pci_cfg.queue_desc + availoff, availsz);
+		if (hva == NULL) {
+			vq_info->vq_enabled = 0;
+			return;
+		}
+		hva = hvaddr_mem(dev->pci_cfg.queue_desc + usedoff, usedsz);
+		if (hva == NULL) {
+			vq_info->vq_enabled = 0;
+			return;
+		}
+
+		if (vq_info->qs > 0 && vq_info->qs % 2 == 0) {
+			vq_info->vq_availoffset = availoff;
+			vq_info->vq_usedoffset = usedoff;
+			vq_info->vq_enabled = (dev->pci_cfg.queue_enable == 1);
+		} else {
+			vq_info->vq_availoffset = 0;
+			vq_info->vq_usedoffset = 0;
+			vq_info->vq_enabled = 0;
+		}
+	} else {
+		/* Invalid queue? */
+		if (dev->cfg.queue_select >= dev->num_queues) {
+			log_warnx("%s: invalid queue index", __func__);
+			return;
+		}
+		vq_info = &dev->vq[dev->cfg.queue_select];
+		vq_info->q_gpa = (uint64_t)dev->cfg.queue_pfn *
+		    VIRTIO_PAGE_SIZE;
+
+		/* Queue size is immutable in Virtio 0.9. */
+		vq_info->vq_availoffset = sizeof(struct vring_desc) *
+		    vq_info->qs;
+		vq_info->vq_usedoffset = VIRTQUEUE_ALIGN(
+			sizeof(struct vring_desc) * vq_info->qs +
+			sizeof(uint16_t) * (2 + vq_info->qs));
 	}
 
-	vq_info = &viornd.vq[viornd.cfg.queue_select];
-
-	/* Update queue pfn/size based on queue select */
-	viornd.cfg.queue_pfn = vq_info->q_gpa >> 12;
-	viornd.cfg.queue_size = vq_info->qs;
+	/* Update any host va mappings. */
+	if (vq_info->q_gpa > 0) {
+		hva = hvaddr_mem(vq_info->q_gpa, vring_size(vq_info->qs));
+		if (hva == NULL)
+			fatalx("%s: failed to translate gpa to hva", __func__);
+		vq_info->q_hva = hva;
+	} else {
+		vq_info->q_hva = NULL;
+		vq_info->last_avail = 0;
+		vq_info->notified_avail = 0;
+	}
 }
 
-/* Update queue address */
-void
-viornd_update_qa(void)
-{
-	struct virtio_vq_info *vq_info;
-	void *hva = NULL;
-
-	/* Invalid queue? */
-	if (viornd.cfg.queue_select > 0)
-		return;
-
-	vq_info = &viornd.vq[viornd.cfg.queue_select];
-	vq_info->q_gpa = (uint64_t)viornd.cfg.queue_pfn * VIRTIO_PAGE_SIZE;
-
-	hva = hvaddr_mem(vq_info->q_gpa, vring_size(VIORND_QUEUE_SIZE));
-	if (hva == NULL)
-		fatalx("viornd_update_qa");
-	vq_info->q_hva = hva;
-}
-
-int
-viornd_notifyq(void)
+static int
+viornd_notifyq(struct virtio_dev *dev, uint16_t idx)
 {
 	size_t sz;
-	int dxx, ret;
+	int dxx, ret = 0;
 	uint16_t aidx, uidx;
 	char *vr, *rnd_data;
-	struct vring_desc *desc;
-	struct vring_avail *avail;
-	struct vring_used *used;
-	struct virtio_vq_info *vq_info;
+	struct vring_desc *desc = NULL;
+	struct vring_avail *avail = NULL;
+	struct vring_used *used = NULL;
+	struct virtio_vq_info *vq_info = NULL;
 
-	ret = 0;
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_ENTROPY)
+		fatalx("%s: device is not an entropy device", __func__);
 
-	/* Invalid queue? */
-	if (viornd.cfg.queue_notify > 0)
+	if (idx >= dev->num_queues) {
+		log_warnx("%s: invalid virtqueue index", __func__);
 		return (0);
+	}
+	vq_info = &dev->vq[idx];
 
-	vq_info = &viornd.vq[viornd.cfg.queue_notify];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
+
 	vr = vq_info->q_hva;
 	if (vr == NULL)
 		fatalx("%s: null vring", __func__);
@@ -179,118 +329,454 @@ viornd_notifyq(void)
 	avail = (struct vring_avail *)(vr + vq_info->vq_availoffset);
 	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
 
-	aidx = avail->idx & VIORND_QUEUE_MASK;
-	uidx = used->idx & VIORND_QUEUE_MASK;
+	aidx = avail->idx & vq_info->mask;
+	uidx = used->idx & vq_info->mask;
 
-	dxx = avail->ring[aidx] & VIORND_QUEUE_MASK;
+	dxx = avail->ring[aidx] & vq_info->mask;
 
 	sz = desc[dxx].len;
-	if (sz > MAXPHYS)
-		fatalx("viornd descriptor size too large (%zu)", sz);
+	if (sz > MAXPHYS) {
+		log_warnx("viornd descriptor size too large (%zu)", sz);
+		return (0);
+	}
 
 	rnd_data = malloc(sz);
-
-	if (rnd_data != NULL) {
-		arc4random_buf(rnd_data, sz);
-		if (write_mem(desc[dxx].addr, rnd_data, sz)) {
-			log_warnx("viornd: can't write random data @ "
-			    "0x%llx",
-			    desc[dxx].addr);
-		} else {
-			/* ret == 1 -> interrupt needed */
-			/* XXX check VIRTIO_F_NO_INTR */
-			ret = 1;
-			viornd.cfg.isr_status = 1;
-			used->ring[uidx].id = dxx;
-			used->ring[uidx].len = sz;
-			__sync_synchronize();
-			used->idx++;
-		}
-		free(rnd_data);
-	} else
+	if (rnd_data == NULL)
 		fatal("memory allocation error for viornd data");
+
+	arc4random_buf(rnd_data, sz);
+	if (write_mem(desc[dxx].addr, rnd_data, sz)) {
+		log_warnx("viornd: can't write random data @ 0x%llx",
+		    desc[dxx].addr);
+	} else {
+		/* ret == 1 -> interrupt needed */
+		/* XXX check VIRTIO_F_NO_INTR */
+		ret = 1;
+		viornd.isr = 1;
+		used->ring[uidx].id = dxx;
+		used->ring[uidx].len = sz;
+		__sync_synchronize();
+		used->idx++;
+	}
+	free(rnd_data);
 
 	return (ret);
 }
 
-int
-virtio_rnd_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
-    void *unused, uint8_t sz)
+static int
+virtio_io_dispatch(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
+    void *arg, uint8_t sz)
 {
-	*intr = 0xFF;
+	struct virtio_dev *dev = (struct virtio_dev *)arg;
+	int ret = 0;
+	uint8_t actual = (uint8_t)reg;
 
-	if (dir == 0) {
+	mutex_lock(&viornd_mtx);
+	switch (reg & 0xFF00) {
+	case VIO1_CFG_BAR_OFFSET:
+		*data = virtio_io_cfg(dev, dir, actual, *data, sz);
+		break;
+	case VIO1_DEV_BAR_OFFSET:
+		if (dir == VEI_DIR_IN) {
+			log_debug("%s: no device specific handler", __func__);
+			*data = (uint32_t)(-1);
+		}
+		break;
+	case VIO1_NOTIFY_BAR_OFFSET:
+		ret = virtio_io_notify(dir, actual, data, intr, arg, sz);
+		break;
+	case VIO1_ISR_BAR_OFFSET:
+		ret = virtio_io_isr(dir, actual, data, intr, arg, sz);
+		break;
+	default:
+		DPRINTF("%s: no handler for reg 0x%04x", __func__, reg);
+		if (dir == VEI_DIR_IN)
+			*data = (uint32_t)(-1);
+	}
+	mutex_unlock(&viornd_mtx);
+	return (ret);
+}
+
+/*
+ * virtio 1.x PCI config register io. If a register is read, returns the value.
+ * Otherwise returns 0.
+ */
+uint32_t
+virtio_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
+    uint8_t sz)
+{
+	struct virtio_pci_common_cfg *pci_cfg = &dev->pci_cfg;
+	uint32_t res = 0;
+	uint16_t i;
+
+	if (dir == VEI_DIR_OUT) {
 		switch (reg) {
-		case VIRTIO_CONFIG_DEVICE_FEATURES:
-		case VIRTIO_CONFIG_QUEUE_SIZE:
-		case VIRTIO_CONFIG_ISR_STATUS:
-			log_warnx("%s: illegal write %x to %s",
-			    __progname, *data, virtio_reg_name(reg));
+		case VIO1_PCI_DEVICE_FEATURE_SELECT:
+			if (sz != 4)
+				log_warnx("%s: unaligned write to device "
+				    "feature select (sz=%u)", __func__, sz);
+			else
+				pci_cfg->device_feature_select = data;
 			break;
-		case VIRTIO_CONFIG_GUEST_FEATURES:
-			viornd.cfg.guest_feature = *data;
+		case VIO1_PCI_DEVICE_FEATURE:
+			log_warnx("illegal write to device feature register");
 			break;
-		case VIRTIO_CONFIG_QUEUE_PFN:
-			viornd.cfg.queue_pfn = *data;
-			viornd_update_qa();
+		case VIO1_PCI_DRIVER_FEATURE_SELECT:
+			if (sz != 4)
+				log_warnx("%s: unaligned write to driver "
+				    "feature select register (sz=%u)", __func__,
+				    sz);
+			else
+				pci_cfg->driver_feature_select = data;
 			break;
-		case VIRTIO_CONFIG_QUEUE_SELECT:
-			viornd.cfg.queue_select = *data;
-			viornd_update_qs();
+		case VIO1_PCI_DRIVER_FEATURE:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to driver "
+				    "feature register (sz=%u)", __func__, sz);
+				break;
+			}
+			if (pci_cfg->driver_feature_select > 1) {
+				/* We only support a 64-bit feature space. */
+				DPRINTF("%s: ignoring driver feature write",
+				    __func__);
+				break;
+			}
+			pci_cfg->driver_feature = data;
+			if (pci_cfg->driver_feature_select == 0)
+				dev->driver_feature |= pci_cfg->driver_feature;
+			else
+				dev->driver_feature |=
+				    ((uint64_t)pci_cfg->driver_feature << 32);
+			dev->driver_feature &= dev->device_feature;
+			DPRINTF("%s: driver features 0x%llx", __func__,
+			    dev->driver_feature);
 			break;
-		case VIRTIO_CONFIG_QUEUE_NOTIFY:
-			viornd.cfg.queue_notify = *data;
-			if (viornd_notifyq())
-				*intr = 1;
+		case VIO1_PCI_CONFIG_MSIX_VECTOR:
+			/* Ignore until we support MSIX. */
 			break;
-		case VIRTIO_CONFIG_DEVICE_STATUS:
-			viornd.cfg.device_status = *data;
+		case VIO1_PCI_NUM_QUEUES:
+			log_warnx("illegal write to num queues register");
 			break;
+		case VIO1_PCI_DEVICE_STATUS:
+			if (sz != 1) {
+				log_warnx("%s: unaligned write to device "
+				    "status register (sz=%u)", __func__, sz);
+				break;
+			}
+			dev->status = data;
+			if (dev->status == 0) {
+				/* Reset device and virtqueues (if any). */
+				dev->driver_feature = 0;
+				dev->isr = 0;
+
+				pci_cfg->queue_select = 0;
+				virtio_update_qs(dev);
+
+				if (dev->num_queues > 0) {
+					/*
+					 * Reset virtqueues to initial state and
+					 * set to disabled status. Clear PCI
+					 * configuration registers.
+					 */
+					for (i = 0; i < dev->num_queues; i++)
+						virtio_vq_init(dev, i);
+				}
+			}
+
+			DPRINTF("%s: dev %u status [%s%s%s%s%s%s]", __func__,
+			    dev->pci_id,
+			    (data & VIRTIO_CONFIG_DEVICE_STATUS_ACK) ?
+			    "[ack]" : "",
+			    (data & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER) ?
+			    "[driver]" : "",
+			    (data & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK) ?
+			    "[driver ok]" : "",
+			    (data & VIRTIO_CONFIG_DEVICE_STATUS_FEATURES_OK) ?
+			    "[features ok]" : "",
+			    (data &
+				VIRTIO_CONFIG_DEVICE_STATUS_DEVICE_NEEDS_RESET)
+			    ? "[needs reset]" : "",
+			    (data & VIRTIO_CONFIG_DEVICE_STATUS_FAILED) ?
+			    "[failed]" : "");
+
+			break;
+		case VIO1_PCI_CONFIG_GENERATION:
+			log_warnx("illegal write to config generation "
+			    "register");
+			break;
+		case VIO1_PCI_QUEUE_SELECT:
+			pci_cfg->queue_select = data;
+			virtio_update_qs(dev);
+			break;
+		case VIO1_PCI_QUEUE_SIZE:
+			if (data <= VIRTIO_QUEUE_SIZE_MAX)
+				pci_cfg->queue_size = data;
+			else {
+				log_warnx("%s: clamping queue size", __func__);
+				pci_cfg->queue_size = VIRTIO_QUEUE_SIZE_MAX;
+			}
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_MSIX_VECTOR:
+			/* Ignore until we support MSI-X. */
+			break;
+		case VIO1_PCI_QUEUE_ENABLE:
+			pci_cfg->queue_enable = data;
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_NOTIFY_OFF:
+			log_warnx("illegal write to queue notify offset "
+			    "register");
+			break;
+		case VIO1_PCI_QUEUE_DESC:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to queue "
+				    "desc. register (sz=%u)", __func__, sz);
+				break;
+			}
+			pci_cfg->queue_desc &= 0xffffffff00000000;
+			pci_cfg->queue_desc |= (uint64_t)data;
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_DESC + 4:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to queue "
+				    "desc. register (sz=%u)", __func__, sz);
+				break;
+			}
+			pci_cfg->queue_desc &= 0x00000000ffffffff;
+			pci_cfg->queue_desc |= ((uint64_t)data << 32);
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_AVAIL:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to queue "
+				    "available register (sz=%u)", __func__, sz);
+				break;
+			}
+			pci_cfg->queue_avail &= 0xffffffff00000000;
+			pci_cfg->queue_avail |= (uint64_t)data;
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_AVAIL + 4:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to queue "
+				    "available register (sz=%u)", __func__, sz);
+				break;
+			}
+			pci_cfg->queue_avail &= 0x00000000ffffffff;
+			pci_cfg->queue_avail |= ((uint64_t)data << 32);
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_USED:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to queue used "
+				    "register (sz=%u)", __func__, sz);
+				break;
+			}
+			pci_cfg->queue_used &= 0xffffffff00000000;
+			pci_cfg->queue_used |= (uint64_t)data;
+			virtio_update_qa(dev);
+			break;
+		case VIO1_PCI_QUEUE_USED + 4:
+			if (sz != 4) {
+				log_warnx("%s: unaligned write to queue used "
+				    "register (sz=%u)", __func__, sz);
+				break;
+			}
+			pci_cfg->queue_used &= 0x00000000ffffffff;
+			pci_cfg->queue_used |= ((uint64_t)data << 32);
+			virtio_update_qa(dev);
+			break;
+		default:
+			log_warnx("%s: invalid register 0x%04x", __func__, reg);
 		}
 	} else {
 		switch (reg) {
-		case VIRTIO_CONFIG_DEVICE_FEATURES:
-			*data = viornd.cfg.device_feature;
+		case VIO1_PCI_DEVICE_FEATURE_SELECT:
+			res = pci_cfg->device_feature_select;
 			break;
-		case VIRTIO_CONFIG_GUEST_FEATURES:
-			*data = viornd.cfg.guest_feature;
+		case VIO1_PCI_DEVICE_FEATURE:
+			if (pci_cfg->device_feature_select == 0)
+				res = dev->device_feature & (uint32_t)(-1);
+			else if (pci_cfg->device_feature_select == 1)
+				res = dev->device_feature >> 32;
+			else {
+				DPRINTF("%s: ignoring device feature read",
+				    __func__);
+			}
 			break;
-		case VIRTIO_CONFIG_QUEUE_PFN:
-			*data = viornd.cfg.queue_pfn;
+		case VIO1_PCI_DRIVER_FEATURE_SELECT:
+			res = pci_cfg->driver_feature_select;
 			break;
-		case VIRTIO_CONFIG_QUEUE_SIZE:
-			*data = viornd.cfg.queue_size;
+		case VIO1_PCI_DRIVER_FEATURE:
+			if (pci_cfg->driver_feature_select == 0)
+				res = dev->driver_feature & (uint32_t)(-1);
+			else if (pci_cfg->driver_feature_select == 1)
+				res = dev->driver_feature >> 32;
+			else {
+				DPRINTF("%s: ignoring driver feature read",
+				    __func__);
+			}
 			break;
-		case VIRTIO_CONFIG_QUEUE_SELECT:
-			*data = viornd.cfg.queue_select;
+		case VIO1_PCI_CONFIG_MSIX_VECTOR:
+			res = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
 			break;
-		case VIRTIO_CONFIG_QUEUE_NOTIFY:
-			*data = viornd.cfg.queue_notify;
+		case VIO1_PCI_NUM_QUEUES:
+			res = dev->num_queues;
 			break;
-		case VIRTIO_CONFIG_DEVICE_STATUS:
-			*data = viornd.cfg.device_status;
+		case VIO1_PCI_DEVICE_STATUS:
+			res = dev->status;
 			break;
-		case VIRTIO_CONFIG_ISR_STATUS:
-			*data = viornd.cfg.isr_status;
-			viornd.cfg.isr_status = 0;
-			vcpu_deassert_irq(viornd.vm_id, 0, viornd.irq);
+		case VIO1_PCI_CONFIG_GENERATION:
+			res = pci_cfg->config_generation;
 			break;
+		case VIO1_PCI_QUEUE_SELECT:
+			res = pci_cfg->queue_select;
+			break;
+		case VIO1_PCI_QUEUE_SIZE:
+			res = pci_cfg->queue_size;
+			break;
+		case VIO1_PCI_QUEUE_MSIX_VECTOR:
+			res = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+			break;
+		case VIO1_PCI_QUEUE_ENABLE:
+			res = pci_cfg->queue_enable;
+			break;
+		case VIO1_PCI_QUEUE_NOTIFY_OFF:
+			res = pci_cfg->queue_notify_off;
+			break;
+		case VIO1_PCI_QUEUE_DESC:
+			res = (uint32_t)(0xFFFFFFFF & pci_cfg->queue_desc);
+			break;
+		case VIO1_PCI_QUEUE_DESC + 4:
+			res = (uint32_t)(pci_cfg->queue_desc >> 32);
+			break;
+		case VIO1_PCI_QUEUE_AVAIL:
+			res = (uint32_t)(0xFFFFFFFF & pci_cfg->queue_avail);
+			break;
+		case VIO1_PCI_QUEUE_AVAIL + 4:
+			res = (uint32_t)(pci_cfg->queue_avail >> 32);
+			break;
+		case VIO1_PCI_QUEUE_USED:
+			res = (uint32_t)(0xFFFFFFFF & pci_cfg->queue_used);
+			break;
+		case VIO1_PCI_QUEUE_USED + 4:
+			res = (uint32_t)(pci_cfg->queue_used >> 32);
+			break;
+		default:
+			log_warnx("%s: invalid register 0x%04x", __func__, reg);
 		}
 	}
+
+	DPRINTF("%s: dev=%u %s sz=%u dir=%s data=0x%04x", __func__, dev->pci_id,
+	    virtio1_reg_name(reg), sz, (dir == VEI_DIR_OUT) ? "w" : "r",
+	    (dir == VEI_DIR_OUT) ? data : res);
+
+	return (res);
+}
+
+static int
+virtio_io_isr(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
+    void *arg, uint8_t sz)
+{
+	struct virtio_dev *dev = (struct virtio_dev *)arg;
+	*intr = 0xFF;
+
+	DPRINTF("%s: dev=%u, reg=0x%04x, sz=%u, dir=%s", __func__,
+	    dev->pci_id, reg, sz,
+	    (dir == VEI_DIR_OUT) ? "write" : "read");
+
+	/* Limit to in-process devices. */
+	if (dev->device_id == PCI_PRODUCT_VIRTIO_BLOCK ||
+	    dev->device_id == PCI_PRODUCT_VIRTIO_NETWORK ||
+	    dev->device_id == PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: cannot use on multi-process virtio dev", __func__);
+
+	if (dir == VEI_DIR_IN) {
+		*data = dev->isr;
+		dev->isr = 0;
+		vcpu_deassert_irq(dev->vmm_id, 0, dev->irq);
+	}
+
 	return (0);
 }
 
-int
-vmmci_ctl(unsigned int cmd)
+static int
+virtio_io_notify(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
+    void *arg, uint8_t sz)
 {
-	struct timeval tv = { 0, 0 };
+	int raise_intr = 0;
+	struct virtio_dev *dev = (struct virtio_dev *)arg;
+	uint16_t vq_idx = (uint16_t)(0x0000ffff & *data);
 
-	if ((vmmci.cfg.device_status &
-	    VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK) == 0)
-		return (-1);
+	*intr = 0xFF;
 
-	if (cmd == vmmci.cmd)
+	DPRINTF("%s: reg=0x%04x, sz=%u, vq_idx=%u, dir=%s", __func__, reg, sz,
+	    vq_idx, (dir == VEI_DIR_OUT) ? "write" : "read");
+
+	/* Limit this handler to in-process devices */
+	if (dev->device_id == PCI_PRODUCT_VIRTIO_BLOCK ||
+	    dev->device_id == PCI_PRODUCT_VIRTIO_NETWORK ||
+	    dev->device_id == PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: cannot use on multi-process virtio dev", __func__);
+
+	if (vq_idx >= dev->num_queues) {
+		log_warnx("%s: invalid virtqueue index %u", __func__, vq_idx);
 		return (0);
+	}
+
+	if (dir == VEI_DIR_IN) {
+		/* Behavior is undefined. */
+		*data = 0;
+		return (0);
+	}
+
+	switch (dev->device_id) {
+	case PCI_PRODUCT_VIRTIO_ENTROPY:
+		raise_intr = viornd_notifyq(dev, vq_idx);
+		break;
+	case PCI_PRODUCT_VIRTIO_VMMCI:
+		/* Does not use a virtqueue. */
+		break;
+	default:
+		log_warnx("%s: invalid device type %u", __func__,
+		    dev->device_id);
+	}
+
+	if (raise_intr)
+		*intr = 1;
+
+	return (0);
+}
+
+/*
+ * vmmci_ctl
+ *
+ * Inject a command into the vmmci device, potentially delivering interrupt.
+ *
+ * Called by the vm process's event(3) loop.
+ */
+int
+vmmci_ctl(struct virtio_dev *dev, unsigned int cmd)
+{
+	int ret = 0;
+	struct timeval tv = { 0, 0 };
+	struct vmmci_dev *v = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_VMMCI)
+		fatalx("%s: device is not a vmmci device", __func__);
+	v = &dev->vmmci;
+
+	mutex_lock(&v->mutex);
+
+	if ((dev->status & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK) == 0) {
+		ret = -1;
+		goto unlock;
+	}
+
+	if (cmd == v->cmd)
+		goto unlock;
 
 	switch (cmd) {
 	case VMMCI_NONE:
@@ -298,7 +784,7 @@ vmmci_ctl(unsigned int cmd)
 	case VMMCI_SHUTDOWN:
 	case VMMCI_REBOOT:
 		/* Update command */
-		vmmci.cmd = cmd;
+		v->cmd = cmd;
 
 		/*
 		 * vmm VMs do not support powerdown, send a reboot request
@@ -308,36 +794,50 @@ vmmci_ctl(unsigned int cmd)
 			cmd = VMMCI_REBOOT;
 
 		/* Trigger interrupt */
-		vmmci.cfg.isr_status = VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
-		vcpu_assert_irq(vmmci.vm_id, 0, vmmci.irq);
+		dev->isr = VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+		vcpu_assert_irq(dev->vmm_id, 0, dev->irq);
 
 		/* Add ACK timeout */
-		tv.tv_sec = VMMCI_TIMEOUT;
-		evtimer_add(&vmmci.timeout, &tv);
+		tv.tv_sec = VMMCI_TIMEOUT_SHORT;
+		evtimer_add(&v->timeout, &tv);
 		break;
 	case VMMCI_SYNCRTC:
 		if (vmmci.cfg.guest_feature & VMMCI_F_SYNCRTC) {
 			/* RTC updated, request guest VM resync of its RTC */
-			vmmci.cmd = cmd;
+			v->cmd = cmd;
 
-			vmmci.cfg.isr_status = VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
-			vcpu_assert_irq(vmmci.vm_id, 0, vmmci.irq);
+			dev->isr = VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+			vcpu_assert_irq(dev->vmm_id, 0, dev->irq);
 		} else {
 			log_debug("%s: RTC sync skipped (guest does not "
-			    "support RTC sync)\n", __func__);
+			    "support RTC sync)", __func__);
 		}
 		break;
 	default:
 		fatalx("invalid vmmci command: %d", cmd);
 	}
 
-	return (0);
+unlock:
+	mutex_unlock(&v->mutex);
+
+	return (ret);
 }
 
-void
-vmmci_ack(unsigned int cmd)
+/*
+ * vmmci_ack
+ *
+ * Process a write to the command register.
+ *
+ * Called by the vcpu thread. Must be called with the mutex held.
+ */
+static void
+vmmci_ack(struct virtio_dev *dev, unsigned int cmd)
 {
-	struct timeval	 tv = { 0, 0 };
+	struct vmmci_dev *v = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_VMMCI)
+		fatalx("%s: device is not a vmmci device", __func__);
+	v = &dev->vmmci;
 
 	switch (cmd) {
 	case VMMCI_NONE:
@@ -349,11 +849,10 @@ vmmci_ack(unsigned int cmd)
 		 * timeout to give the VM a chance to reboot before the
 		 * timer is expired.
 		 */
-		if (vmmci.cmd == 0) {
+		if (v->cmd == 0) {
 			log_debug("%s: vm %u requested shutdown", __func__,
-			    vmmci.vm_id);
-			tv.tv_sec = VMMCI_TIMEOUT;
-			evtimer_add(&vmmci.timeout, &tv);
+			    dev->vmm_id);
+			vm_pipe_send(&v->dev_pipe, VMMCI_SET_TIMEOUT_SHORT);
 			return;
 		}
 		/* FALLTHROUGH */
@@ -365,18 +864,16 @@ vmmci_ack(unsigned int cmd)
 		 * rc.shutdown on the VM), so increase the timeout before
 		 * killing it forcefully.
 		 */
-		if (cmd == vmmci.cmd &&
-		    evtimer_pending(&vmmci.timeout, NULL)) {
+		if (cmd == v->cmd) {
 			log_debug("%s: vm %u acknowledged shutdown request",
-			    __func__, vmmci.vm_id);
-			tv.tv_sec = VMMCI_SHUTDOWN_TIMEOUT;
-			evtimer_add(&vmmci.timeout, &tv);
+			    __func__, dev->vmm_id);
+			vm_pipe_send(&v->dev_pipe, VMMCI_SET_TIMEOUT_LONG);
 		}
 		break;
 	case VMMCI_SYNCRTC:
 		log_debug("%s: vm %u acknowledged RTC sync request",
-		    __func__, vmmci.vm_id);
-		vmmci.cmd = VMMCI_NONE;
+		    __func__, dev->vmm_id);
+		v->cmd = VMMCI_NONE;
 		break;
 	default:
 		log_warnx("%s: illegal request %u", __func__, cmd);
@@ -387,204 +884,238 @@ vmmci_ack(unsigned int cmd)
 void
 vmmci_timeout(int fd, short type, void *arg)
 {
-	log_debug("%s: vm %u shutdown", __progname, vmmci.vm_id);
-	vm_shutdown(vmmci.cmd == VMMCI_REBOOT ? VMMCI_REBOOT : VMMCI_SHUTDOWN);
+	struct virtio_dev *dev = (struct virtio_dev *)arg;
+	struct vmmci_dev *v = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_VMMCI)
+		fatalx("%s: device is not a vmmci device", __func__);
+	v = &dev->vmmci;
+
+	log_debug("vm %u shutdown", dev->vmm_id);
+	vm_shutdown(v->cmd == VMMCI_REBOOT ? VMMCI_REBOOT : VMMCI_SHUTDOWN);
 }
 
 int
 vmmci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
-    void *unused, uint8_t sz)
+    void *arg, uint8_t sz)
 {
+	struct virtio_dev	*dev = (struct virtio_dev *)arg;
+	struct vmmci_dev	*v = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_VMMCI)
+		fatalx("%s: device is not a vmmci device (%u)",
+		    __func__, dev->device_id);
+	v = &dev->vmmci;
+
 	*intr = 0xFF;
 
+	mutex_lock(&v->mutex);
 	if (dir == 0) {
 		switch (reg) {
 		case VIRTIO_CONFIG_DEVICE_FEATURES:
 		case VIRTIO_CONFIG_QUEUE_SIZE:
 		case VIRTIO_CONFIG_ISR_STATUS:
-			log_warnx("%s: illegal write %x to %s",
-			    __progname, *data, virtio_reg_name(reg));
+			log_warnx("illegal write %x to %s", *data,
+			    virtio_reg_name(reg));
 			break;
 		case VIRTIO_CONFIG_GUEST_FEATURES:
-			vmmci.cfg.guest_feature = *data;
+			dev->cfg.guest_feature = *data;
 			break;
 		case VIRTIO_CONFIG_QUEUE_PFN:
-			vmmci.cfg.queue_pfn = *data;
+			dev->cfg.queue_pfn = *data;
 			break;
 		case VIRTIO_CONFIG_QUEUE_SELECT:
-			vmmci.cfg.queue_select = *data;
+			dev->cfg.queue_select = *data;
 			break;
 		case VIRTIO_CONFIG_QUEUE_NOTIFY:
-			vmmci.cfg.queue_notify = *data;
+			dev->cfg.queue_notify = *data;
 			break;
 		case VIRTIO_CONFIG_DEVICE_STATUS:
-			vmmci.cfg.device_status = *data;
+			dev->status = *data;
 			break;
 		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI:
-			vmmci_ack(*data);
+			vmmci_ack(dev, *data);
 			break;
 		}
 	} else {
 		switch (reg) {
 		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI:
-			*data = vmmci.cmd;
+			*data = v->cmd;
 			break;
 		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 4:
 			/* Update time once when reading the first register */
-			gettimeofday(&vmmci.time, NULL);
-			*data = (uint64_t)vmmci.time.tv_sec;
+			gettimeofday(&v->time, NULL);
+			*data = (uint64_t)v->time.tv_sec;
 			break;
 		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 8:
-			*data = (uint64_t)vmmci.time.tv_sec << 32;
+			*data = (uint64_t)v->time.tv_sec << 32;
 			break;
 		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 12:
-			*data = (uint64_t)vmmci.time.tv_usec;
+			*data = (uint64_t)v->time.tv_usec;
 			break;
 		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 16:
-			*data = (uint64_t)vmmci.time.tv_usec << 32;
+			*data = (uint64_t)v->time.tv_usec << 32;
 			break;
 		case VIRTIO_CONFIG_DEVICE_FEATURES:
-			*data = vmmci.cfg.device_feature;
+			*data = dev->cfg.device_feature;
 			break;
 		case VIRTIO_CONFIG_GUEST_FEATURES:
-			*data = vmmci.cfg.guest_feature;
+			*data = dev->cfg.guest_feature;
 			break;
 		case VIRTIO_CONFIG_QUEUE_PFN:
-			*data = vmmci.cfg.queue_pfn;
+			*data = dev->cfg.queue_pfn;
 			break;
 		case VIRTIO_CONFIG_QUEUE_SIZE:
-			*data = vmmci.cfg.queue_size;
+			*data = dev->cfg.queue_size;
 			break;
 		case VIRTIO_CONFIG_QUEUE_SELECT:
-			*data = vmmci.cfg.queue_select;
+			*data = dev->cfg.queue_select;
 			break;
 		case VIRTIO_CONFIG_QUEUE_NOTIFY:
-			*data = vmmci.cfg.queue_notify;
+			*data = dev->cfg.queue_notify;
 			break;
 		case VIRTIO_CONFIG_DEVICE_STATUS:
-			*data = vmmci.cfg.device_status;
+			*data = dev->status;
 			break;
 		case VIRTIO_CONFIG_ISR_STATUS:
-			*data = vmmci.cfg.isr_status;
-			vmmci.cfg.isr_status = 0;
-			vcpu_deassert_irq(vmmci.vm_id, 0, vmmci.irq);
+			*data = dev->isr;
+			dev->isr = 0;
+			vcpu_deassert_irq(dev->vmm_id, 0, dev->irq);
 			break;
 		}
 	}
+	mutex_unlock(&v->mutex);
+
 	return (0);
 }
 
-int
-virtio_get_base(int fd, char *path, size_t npath, int type, const char *dpath)
+enum vm_disk_fmt
+virtio_get_disktype(int fd)
 {
-	switch (type) {
-	case VMDF_RAW:
-		return 0;
-	case VMDF_QCOW2:
-		return virtio_qcow2_get_base(fd, path, npath, dpath);
-	}
-	log_warnx("%s: invalid disk format", __func__);
-	return -1;
+	char	 buf[sizeof(VM_MAGIC_QCOW) - 1];
+	ssize_t	 len;
+
+	len = pread(fd, buf, sizeof(buf), 0);
+	if (len >= (ssize_t)sizeof(buf) &&
+	    memcmp(buf, VM_MAGIC_QCOW, sizeof(buf)) == 0)
+		return (VMDF_QCOW2);
+
+	return (VMDF_RAW);
 }
 
-void
+static void
+vmmci_pipe_dispatch(int fd, short event, void *arg)
+{
+	struct virtio_dev	*dev = (struct virtio_dev *)arg;
+	struct vmmci_dev 	*v = &dev->vmmci;
+	struct timeval		 tv = { 0, 0 };
+	enum pipe_msg_type	 msg;
+
+	msg = vm_pipe_recv(&v->dev_pipe);
+	switch (msg) {
+	case VMMCI_SET_TIMEOUT_SHORT:
+		tv.tv_sec = VMMCI_TIMEOUT_SHORT;
+		evtimer_add(&v->timeout, &tv);
+		break;
+	case VMMCI_SET_TIMEOUT_LONG:
+		tv.tv_sec = VMMCI_TIMEOUT_LONG;
+		evtimer_add(&v->timeout, &tv);
+		break;
+	default:
+		log_warnx("%s: invalid pipe message type %d", __func__, msg);
+	}
+}
+
+/*
+ * Initialize virtio devices, launching subprocesses if needed.
+ *
+ * Returns 0 on success, 1 on failure.
+ */
+int
 virtio_init(struct vmd_vm *vm, int child_cdrom,
     int child_disks[][VM_MAX_BASE_PER_DISK], int *child_taps)
 {
 	struct vmop_create_params *vmc = &vm->vm_params;
-	struct vm_create_params *vcp = &vmc->vmc_params;
 	struct virtio_dev *dev;
-	uint8_t id;
-	uint8_t i, j;
-
-	/* Virtio entropy device */
-	if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
-	    PCI_PRODUCT_QUMRANET_VIO_RNG, PCI_CLASS_SYSTEM,
-	    PCI_SUBCLASS_SYSTEM_MISC,
-	    PCI_VENDOR_OPENBSD,
-	    PCI_PRODUCT_VIRTIO_ENTROPY, 1, NULL)) {
-		log_warnx("%s: can't add PCI virtio rng device",
-		    __progname);
-		return;
-	}
-
-	if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_rnd_io, NULL)) {
-		log_warnx("%s: can't add bar for virtio rng device",
-		    __progname);
-		return;
-	}
-
-	memset(&viornd, 0, sizeof(viornd));
-	viornd.vq[0].qs = VIORND_QUEUE_SIZE;
-	viornd.vq[0].vq_availoffset = sizeof(struct vring_desc) *
-	    VIORND_QUEUE_SIZE;
-	viornd.vq[0].vq_usedoffset = VIRTQUEUE_ALIGN(
-	    sizeof(struct vring_desc) * VIORND_QUEUE_SIZE
-	    + sizeof(uint16_t) * (2 + VIORND_QUEUE_SIZE));
-	viornd.pci_id = id;
-	viornd.irq = pci_get_dev_irq(id);
-	viornd.vm_id = vcp->vcp_id;
+	uint8_t id, i, j;
+	int bar_id, ret = 0;
 
 	SLIST_INIT(&virtio_devs);
 
+	if (pthread_mutex_init(&vcpu_sync_mtx, NULL) != 0)
+		fatalx("%s: could not initialize sync io mutex", __func__);
+
+	ret = pthread_mutex_init(&viornd_mtx, NULL);
+	if (ret) {
+		errno = ret;
+		log_warn("could not initialize entropy device mutex");
+		return (1);
+	}
+
+	/* Virtio 1.x Entropy Device */
+	if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
+	    PCI_PRODUCT_QUMRANET_VIO1_RNG, PCI_CLASS_SYSTEM,
+	    PCI_SUBCLASS_SYSTEM_MISC, PCI_VENDOR_OPENBSD,
+	    PCI_PRODUCT_VIRTIO_ENTROPY, 1, 1, NULL)) {
+		log_warnx("can't add PCI virtio rng device");
+		return (1);
+	}
+	virtio_dev_init(vm, &viornd, id, VIORND_QUEUE_SIZE_DEFAULT,
+	    VIRTIO_RND_QUEUES, VIRTIO_F_VERSION_1);
+
+	bar_id = pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_io_dispatch,
+	    &viornd);
+	if (bar_id == -1 || bar_id > 0xff) {
+		log_warnx("can't add bar for virtio rng device");
+		return (1);
+	}
+	virtio_pci_add_cap(id, VIRTIO_PCI_CAP_COMMON_CFG, bar_id, 0);
+	virtio_pci_add_cap(id, VIRTIO_PCI_CAP_ISR_CFG, bar_id, 0);
+	virtio_pci_add_cap(id, VIRTIO_PCI_CAP_NOTIFY_CFG, bar_id, 0);
+
+	/* Virtio 1.x Network Devices */
 	if (vmc->vmc_nnics > 0) {
 		for (i = 0; i < vmc->vmc_nnics; i++) {
-			dev = calloc(1, sizeof(struct virtio_dev));
+			dev = malloc(sizeof(struct virtio_dev));
 			if (dev == NULL) {
-				log_warn("%s: calloc failure allocating vionet",
-				    __progname);
-				return;
+				log_warn("calloc failure allocating vionet");
+				return (1);
 			}
-			/* Virtio network */
-			dev->dev_type = VMD_DEVTYPE_NET;
-
 			if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
-				PCI_PRODUCT_QUMRANET_VIO_NET, PCI_CLASS_SYSTEM,
+				PCI_PRODUCT_QUMRANET_VIO1_NET, PCI_CLASS_SYSTEM,
 				PCI_SUBCLASS_SYSTEM_MISC, PCI_VENDOR_OPENBSD,
-				PCI_PRODUCT_VIRTIO_NETWORK, 1, NULL)) {
-				log_warnx("%s: can't add PCI virtio net device",
-				    __progname);
-				return;
+				PCI_PRODUCT_VIRTIO_NETWORK, 1, 1, NULL)) {
+				log_warnx("can't add PCI virtio net device");
+				free(dev);
+				return (1);
 			}
-			dev->pci_id = id;
-			dev->sync_fd = -1;
-			dev->async_fd = -1;
-			dev->vm_id = vcp->vcp_id;
-			dev->vm_vmid = vm->vm_vmid;
-			dev->irq = pci_get_dev_irq(id);
+			virtio_dev_init(vm, dev, id, VIONET_QUEUE_SIZE_DEFAULT,
+			    VIRTIO_NET_QUEUES,
+			    (VIRTIO_NET_F_MAC | VIRTIO_F_VERSION_1));
 
-			/* The vionet pci bar function is called by the vcpu. */
 			if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_pci_io,
-			    dev)) {
-				log_warnx("%s: can't add bar for virtio net "
-				    "device", __progname);
-				return;
+			    dev) == -1) {
+				log_warnx("can't add bar for virtio net "
+				    "device");
+				free(dev);
+				return (1);
 			}
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_COMMON_CFG,
+			    bar_id, 0);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_DEVICE_CFG,
+			    bar_id, 8);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_ISR_CFG, bar_id,
+			    0);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_NOTIFY_CFG,
+			    bar_id, 0);
 
-			dev->vionet.vq[RXQ].qs = VIONET_QUEUE_SIZE;
-			dev->vionet.vq[RXQ].vq_availoffset =
-			    sizeof(struct vring_desc) * VIONET_QUEUE_SIZE;
-			dev->vionet.vq[RXQ].vq_usedoffset = VIRTQUEUE_ALIGN(
-				sizeof(struct vring_desc) * VIONET_QUEUE_SIZE
-				+ sizeof(uint16_t) * (2 + VIONET_QUEUE_SIZE));
-			dev->vionet.vq[RXQ].last_avail = 0;
-			dev->vionet.vq[RXQ].notified_avail = 0;
-
-			dev->vionet.vq[TXQ].qs = VIONET_QUEUE_SIZE;
-			dev->vionet.vq[TXQ].vq_availoffset =
-			    sizeof(struct vring_desc) * VIONET_QUEUE_SIZE;
-			dev->vionet.vq[TXQ].vq_usedoffset = VIRTQUEUE_ALIGN(
-				sizeof(struct vring_desc) * VIONET_QUEUE_SIZE
-				+ sizeof(uint16_t) * (2 + VIONET_QUEUE_SIZE));
-			dev->vionet.vq[TXQ].last_avail = 0;
-			dev->vionet.vq[TXQ].notified_avail = 0;
-
+			/* Device specific initialization. */
+			dev->dev_type = VMD_DEVTYPE_NET;
+			dev->vmm_id = vm->vm_vmmid;
 			dev->vionet.data_fd = child_taps[i];
 
 			/* MAC address has been assigned by the parent */
 			memcpy(&dev->vionet.mac, &vmc->vmc_macs[i], 6);
-			dev->vionet.cfg.device_feature = VIRTIO_NET_F_MAC;
-
 			dev->vionet.lockedmac =
 			    vmc->vmc_ifflags[i] & VMIFF_LOCKED ? 1 : 0;
 			dev->vionet.local =
@@ -595,7 +1126,7 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 			    &env->vmd_cfg.cfg_localprefix,
 			    sizeof(dev->vionet.local_prefix));
 			log_debug("%s: vm \"%s\" vio%u lladdr %s%s%s%s",
-			    __func__, vcp->vcp_name, i,
+			    __func__, vm->vm_params.vmc_name, i,
 			    ether_ntoa((void *)dev->vionet.mac),
 			    dev->vionet.lockedmac ? ", locked" : "",
 			    dev->vionet.local ? ", local" : "",
@@ -607,51 +1138,50 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 		}
 	}
 
+	/* Virtio 1.x Block Devices */
 	if (vmc->vmc_ndisks > 0) {
 		for (i = 0; i < vmc->vmc_ndisks; i++) {
-			dev = calloc(1, sizeof(struct virtio_dev));
+			dev = malloc(sizeof(struct virtio_dev));
 			if (dev == NULL) {
-				log_warn("%s: calloc failure allocating vioblk",
-				    __progname);
-				return;
+				log_warn("%s: failure allocating vioblk",
+				    __func__);
+				return (1);
 			}
-
-			/* One vioblk device for each disk defined in vcp */
-			dev->dev_type = VMD_DEVTYPE_DISK;
-
 			if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
-			    PCI_PRODUCT_QUMRANET_VIO_BLOCK,
+			    PCI_PRODUCT_QUMRANET_VIO1_BLOCK,
 			    PCI_CLASS_MASS_STORAGE,
-			    PCI_SUBCLASS_MASS_STORAGE_SCSI,
-			    PCI_VENDOR_OPENBSD,
-			    PCI_PRODUCT_VIRTIO_BLOCK, 1, NULL)) {
-				log_warnx("%s: can't add PCI virtio block "
-				    "device", __progname);
-				return;
+			    PCI_SUBCLASS_MASS_STORAGE_SCSI, PCI_VENDOR_OPENBSD,
+			    PCI_PRODUCT_VIRTIO_BLOCK, 1, 1, NULL)) {
+				log_warnx("can't add PCI virtio block "
+				    "device");
+				free(dev);
+				return (1);
 			}
-			dev->pci_id = id;
-			dev->sync_fd = -1;
-			dev->async_fd = -1;
-			dev->vm_id = vcp->vcp_id;
-			dev->vm_vmid = vm->vm_vmid;
-			dev->irq = pci_get_dev_irq(id);
+			virtio_dev_init(vm, dev, id, VIOBLK_QUEUE_SIZE_DEFAULT,
+			    VIRTIO_BLK_QUEUES,
+			    (VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX));
 
-			if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_pci_io,
-			    &dev->vioblk)) {
-				log_warnx("%s: can't add bar for virtio block "
-				    "device", __progname);
-				return;
+			bar_id = pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_pci_io,
+			    dev);
+			if (bar_id == -1 || bar_id > 0xff) {
+				log_warnx("can't add bar for virtio block "
+				    "device");
+				free(dev);
+				return (1);
 			}
-			dev->vioblk.vq[0].qs = VIOBLK_QUEUE_SIZE;
-			dev->vioblk.vq[0].vq_availoffset =
-			    sizeof(struct vring_desc) * VIOBLK_QUEUE_SIZE;
-			dev->vioblk.vq[0].vq_usedoffset = VIRTQUEUE_ALIGN(
-			    sizeof(struct vring_desc) * VIOBLK_QUEUE_SIZE
-			    + sizeof(uint16_t) * (2 + VIOBLK_QUEUE_SIZE));
-			dev->vioblk.vq[0].last_avail = 0;
-			dev->vioblk.cfg.device_feature =
-			    VIRTIO_BLK_F_SEG_MAX;
-			dev->vioblk.seg_max = VIOBLK_SEG_MAX;
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_COMMON_CFG,
+			    bar_id, 0);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_DEVICE_CFG,
+			    bar_id, 24);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_ISR_CFG, bar_id,
+			    0);
+			virtio_pci_add_cap(id, VIRTIO_PCI_CAP_NOTIFY_CFG,
+			    bar_id, 0);
+
+			/* Device specific initialization. */
+			dev->dev_type = VMD_DEVTYPE_DISK;
+			dev->vmm_id = vm->vm_vmmid;
+			dev->vioblk.seg_max = VIOBLK_SEG_MAX_DEFAULT;
 
 			/*
 			 * Initialize disk fds to an invalid fd (-1), then
@@ -668,90 +1198,80 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 		}
 	}
 
+	/* Virtio 1.x SCSI CD-ROM */
+	if (strlen(vmc->vmc_cdrom)) {
+		dev = malloc(sizeof(struct virtio_dev));
+		if (dev == NULL) {
+			log_warn("calloc failure allocating vioscsi");
+			return (1);
+		}
+		if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
+		    PCI_PRODUCT_QUMRANET_VIO1_SCSI, PCI_CLASS_MASS_STORAGE,
+		    PCI_SUBCLASS_MASS_STORAGE_SCSI, PCI_VENDOR_OPENBSD,
+		    PCI_PRODUCT_VIRTIO_SCSI, 1, 1, NULL)) {
+			log_warnx("can't add PCI vioscsi device");
+			free(dev);
+			return (1);
+		}
+		virtio_dev_init(vm, dev, id, VIOSCSI_QUEUE_SIZE_DEFAULT,
+		    VIRTIO_SCSI_QUEUES, VIRTIO_F_VERSION_1);
+		if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_pci_io, dev)
+		    == -1) {
+			log_warnx("can't add bar for vioscsi device");
+			free(dev);
+			return (1);
+		}
+		virtio_pci_add_cap(id, VIRTIO_PCI_CAP_COMMON_CFG, bar_id, 0);
+		virtio_pci_add_cap(id, VIRTIO_PCI_CAP_DEVICE_CFG, bar_id, 36);
+		virtio_pci_add_cap(id, VIRTIO_PCI_CAP_ISR_CFG, bar_id, 0);
+		virtio_pci_add_cap(id, VIRTIO_PCI_CAP_NOTIFY_CFG, bar_id, 0);
+
+		/* Device specific initialization. */
+		dev->dev_type = VMD_DEVTYPE_SCSI;
+		dev->vmm_id = vm->vm_vmmid;
+		dev->vioscsi.cdrom_fd = child_cdrom;
+		dev->vioscsi.locked = 0;
+		dev->vioscsi.lba = 0;
+		dev->vioscsi.max_xfer = VIOSCSI_BLOCK_SIZE_CDROM;
+		SLIST_INSERT_HEAD(&virtio_devs, dev, dev_next);
+	}
+
 	/*
 	 * Launch virtio devices that support subprocess execution.
 	 */
 	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
-		if (virtio_dev_launch(vm, dev) != 0)
-			fatalx("failed to launch virtio device");
+		if (virtio_dev_launch(vm, dev) != 0) {
+			log_warnx("failed to launch virtio device");
+			return (1);
+		}
 	}
 
-	/* vioscsi cdrom */
-	if (strlen(vmc->vmc_cdrom)) {
-		vioscsi = calloc(1, sizeof(struct vioscsi_dev));
-		if (vioscsi == NULL) {
-			log_warn("%s: calloc failure allocating vioscsi",
-			    __progname);
-			return;
-		}
-
-		if (pci_add_device(&id, PCI_VENDOR_QUMRANET,
-		    PCI_PRODUCT_QUMRANET_VIO_SCSI,
-		    PCI_CLASS_MASS_STORAGE,
-		    PCI_SUBCLASS_MASS_STORAGE_SCSI,
-		    PCI_VENDOR_OPENBSD,
-		    PCI_PRODUCT_VIRTIO_SCSI, 1, NULL)) {
-			log_warnx("%s: can't add PCI vioscsi device",
-			    __progname);
-			return;
-		}
-
-		if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, vioscsi_io, vioscsi)) {
-			log_warnx("%s: can't add bar for vioscsi device",
-			    __progname);
-			return;
-		}
-
-		for (i = 0; i < VIRTIO_MAX_QUEUES; i++) {
-			vioscsi->vq[i].qs = VIOSCSI_QUEUE_SIZE;
-			vioscsi->vq[i].vq_availoffset =
-			    sizeof(struct vring_desc) * VIOSCSI_QUEUE_SIZE;
-			vioscsi->vq[i].vq_usedoffset = VIRTQUEUE_ALIGN(
-			    sizeof(struct vring_desc) * VIOSCSI_QUEUE_SIZE
-			    + sizeof(uint16_t) * (2 + VIOSCSI_QUEUE_SIZE));
-			vioscsi->vq[i].last_avail = 0;
-		}
-		if (virtio_raw_init(&vioscsi->file, &vioscsi->sz, &child_cdrom,
-		    1) == -1) {
-			log_warnx("%s: unable to determine iso format",
-			    __func__);
-			return;
-		}
-		vioscsi->locked = 0;
-		vioscsi->lba = 0;
-		vioscsi->n_blocks = vioscsi->sz / VIOSCSI_BLOCK_SIZE_CDROM;
-		vioscsi->max_xfer = VIOSCSI_BLOCK_SIZE_CDROM;
-		vioscsi->pci_id = id;
-		vioscsi->vm_id = vcp->vcp_id;
-		vioscsi->irq = pci_get_dev_irq(id);
+	/* Virtio 0.9 VMM Control Interface */
+	dev = &vmmci;
+	if (pci_add_device(&id, PCI_VENDOR_OPENBSD, PCI_PRODUCT_OPENBSD_CONTROL,
+	    PCI_CLASS_COMMUNICATIONS, PCI_SUBCLASS_COMMUNICATIONS_MISC,
+	    PCI_VENDOR_OPENBSD, PCI_PRODUCT_VIRTIO_VMMCI, 0, 1, NULL)) {
+		log_warnx("can't add PCI vmm control device");
+		return (1);
+	}
+	virtio_dev_init(vm, dev, id, 0, 0,
+	    VMMCI_F_TIMESYNC | VMMCI_F_ACK | VMMCI_F_SYNCRTC);
+	if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, vmmci_io, dev) == -1) {
+		log_warnx("can't add bar for vmm control device");
+		return (1);
 	}
 
-	/* virtio control device */
-	if (pci_add_device(&id, PCI_VENDOR_OPENBSD,
-	    PCI_PRODUCT_OPENBSD_CONTROL,
-	    PCI_CLASS_COMMUNICATIONS,
-	    PCI_SUBCLASS_COMMUNICATIONS_MISC,
-	    PCI_VENDOR_OPENBSD,
-	    PCI_PRODUCT_VIRTIO_VMMCI, 1, NULL)) {
-		log_warnx("%s: can't add PCI vmm control device",
-		    __progname);
-		return;
+	ret = pthread_mutex_init(&dev->vmmci.mutex, NULL);
+	if (ret) {
+		errno = ret;
+		log_warn("could not initialize vmmci mutex");
+		return (1);
 	}
+	evtimer_set(&dev->vmmci.timeout, vmmci_timeout, dev);
+	vm_pipe_init2(&dev->vmmci.dev_pipe, vmmci_pipe_dispatch, dev);
+	event_add(&dev->vmmci.dev_pipe.read_ev, NULL);
 
-	if (pci_add_bar(id, PCI_MAPREG_TYPE_IO, vmmci_io, NULL)) {
-		log_warnx("%s: can't add bar for vmm control device",
-		    __progname);
-		return;
-	}
-
-	memset(&vmmci, 0, sizeof(vmmci));
-	vmmci.cfg.device_feature = VMMCI_F_TIMESYNC | VMMCI_F_ACK |
-	    VMMCI_F_SYNCRTC;
-	vmmci.vm_id = vcp->vcp_id;
-	vmmci.irq = pci_get_dev_irq(id);
-	vmmci.pci_id = id;
-
-	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
+	return (0);
 }
 
 /*
@@ -810,7 +1330,7 @@ virtio_shutdown(struct vmd_vm *vm)
 
 	/* Ensure that our disks are synced. */
 	if (vioscsi != NULL)
-		vioscsi->file.close(vioscsi->file.p, 0);
+		vioscsi->vioscsi.file.close(vioscsi->vioscsi.file.p, 0);
 
 	/*
 	 * Broadcast shutdown to child devices. We need to do this
@@ -825,8 +1345,8 @@ virtio_shutdown(struct vmd_vm *vm)
 		if (ret == -1)
 			fatalx("%s: failed to send shutdown to device",
 			    __func__);
-		if (imsg_flush(ibuf) == -1)
-			fatalx("%s: imsg_flush", __func__);
+		if (imsgbuf_flush(ibuf) == -1)
+			fatalx("%s: imsgbuf_flush", __func__);
 	}
 
 	/*
@@ -846,421 +1366,6 @@ virtio_shutdown(struct vmd_vm *vm)
 			log_warnx("%s: unexpected pid %d", __func__, pid);
 		free(dev);
 	}
-}
-
-int
-vmmci_restore(int fd, uint32_t vm_id)
-{
-	log_debug("%s: receiving vmmci", __func__);
-	if (atomicio(read, fd, &vmmci, sizeof(vmmci)) != sizeof(vmmci)) {
-		log_warnx("%s: error reading vmmci from fd", __func__);
-		return (-1);
-	}
-
-	if (pci_set_bar_fn(vmmci.pci_id, 0, vmmci_io, NULL)) {
-		log_warnx("%s: can't set bar fn for vmm control device",
-		    __progname);
-		return (-1);
-	}
-	vmmci.vm_id = vm_id;
-	vmmci.irq = pci_get_dev_irq(vmmci.pci_id);
-	memset(&vmmci.timeout, 0, sizeof(struct event));
-	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
-	return (0);
-}
-
-int
-viornd_restore(int fd, struct vmd_vm *vm)
-{
-	void *hva = NULL;
-
-	log_debug("%s: receiving viornd", __func__);
-	if (atomicio(read, fd, &viornd, sizeof(viornd)) != sizeof(viornd)) {
-		log_warnx("%s: error reading viornd from fd", __func__);
-		return (-1);
-	}
-	if (pci_set_bar_fn(viornd.pci_id, 0, virtio_rnd_io, NULL)) {
-		log_warnx("%s: can't set bar fn for virtio rng device",
-		    __progname);
-		return (-1);
-	}
-	viornd.vm_id = vm->vm_params.vmc_params.vcp_id;
-	viornd.irq = pci_get_dev_irq(viornd.pci_id);
-
-	hva = hvaddr_mem(viornd.vq[0].q_gpa, vring_size(VIORND_QUEUE_SIZE));
-	if (hva == NULL)
-		fatal("failed to restore viornd virtqueue");
-	viornd.vq[0].q_hva = hva;
-
-	return (0);
-}
-
-int
-vionet_restore(int fd, struct vmd_vm *vm, int *child_taps)
-{
-	struct vmop_create_params *vmc = &vm->vm_params;
-	struct vm_create_params *vcp = &vmc->vmc_params;
-	struct virtio_dev *dev;
-	uint8_t i;
-
-	if (vmc->vmc_nnics == 0)
-		return (0);
-
-	for (i = 0; i < vmc->vmc_nnics; i++) {
-		dev = calloc(1, sizeof(struct virtio_dev));
-		if (dev == NULL) {
-			log_warn("%s: calloc failure allocating vionet",
-			    __progname);
-			return (-1);
-		}
-
-		log_debug("%s: receiving virtio network device", __func__);
-		if (atomicio(read, fd, dev, sizeof(struct virtio_dev))
-		    != sizeof(struct virtio_dev)) {
-			log_warnx("%s: error reading vionet from fd",
-			    __func__);
-			return (-1);
-		}
-
-		/* Virtio network */
-		if (dev->dev_type != VMD_DEVTYPE_NET) {
-			log_warnx("%s: invalid device type", __func__);
-			return (-1);
-		}
-
-		dev->sync_fd = -1;
-		dev->async_fd = -1;
-		dev->vm_id = vcp->vcp_id;
-		dev->vm_vmid = vm->vm_vmid;
-		dev->irq = pci_get_dev_irq(dev->pci_id);
-
-		if (pci_set_bar_fn(dev->pci_id, 0, virtio_pci_io, dev)) {
-			log_warnx("%s: can't set bar fn for virtio net "
-			    "device", __progname);
-			return (-1);
-		}
-
-		dev->vionet.data_fd = child_taps[i];
-		dev->vionet.idx = i;
-
-		SLIST_INSERT_HEAD(&virtio_devs, dev, dev_next);
-	}
-
-	return (0);
-}
-
-int
-vioblk_restore(int fd, struct vmd_vm *vm,
-    int child_disks[][VM_MAX_BASE_PER_DISK])
-{
-	struct vmop_create_params *vmc = &vm->vm_params;
-	struct virtio_dev *dev;
-	uint8_t i, j;
-
-	if (vmc->vmc_ndisks == 0)
-		return (0);
-
-	for (i = 0; i < vmc->vmc_ndisks; i++) {
-		dev = calloc(1, sizeof(struct virtio_dev));
-		if (dev == NULL) {
-			log_warn("%s: calloc failure allocating vioblks",
-			    __progname);
-			return (-1);
-		}
-
-		log_debug("%s: receiving vioblk", __func__);
-		if (atomicio(read, fd, dev, sizeof(struct virtio_dev))
-		    != sizeof(struct virtio_dev)) {
-			log_warnx("%s: error reading vioblk from fd", __func__);
-			return (-1);
-		}
-		if (dev->dev_type != VMD_DEVTYPE_DISK) {
-			log_warnx("%s: invalid device type", __func__);
-			return (-1);
-		}
-
-		dev->sync_fd = -1;
-		dev->async_fd = -1;
-
-		if (pci_set_bar_fn(dev->pci_id, 0, virtio_pci_io, dev)) {
-			log_warnx("%s: can't set bar fn for virtio block "
-			    "device", __progname);
-			return (-1);
-		}
-		dev->vm_id = vmc->vmc_params.vcp_id;
-		dev->irq = pci_get_dev_irq(dev->pci_id);
-
-		memset(&dev->vioblk.disk_fd, -1, sizeof(dev->vioblk.disk_fd));
-		dev->vioblk.ndisk_fd = vmc->vmc_diskbases[i];
-		for (j = 0; j < dev->vioblk.ndisk_fd; j++)
-			dev->vioblk.disk_fd[j] = child_disks[i][j];
-
-		dev->vioblk.idx = i;
-		SLIST_INSERT_HEAD(&virtio_devs, dev, dev_next);
-	}
-	return (0);
-}
-
-int
-vioscsi_restore(int fd, struct vmd_vm *vm, int child_cdrom)
-{
-	void *hva = NULL;
-	unsigned int i;
-
-	if (!strlen(vm->vm_params.vmc_cdrom))
-		return (0);
-
-	vioscsi = calloc(1, sizeof(struct vioscsi_dev));
-	if (vioscsi == NULL) {
-		log_warn("%s: calloc failure allocating vioscsi", __progname);
-		return (-1);
-	}
-
-	log_debug("%s: receiving vioscsi", __func__);
-
-	if (atomicio(read, fd, vioscsi, sizeof(struct vioscsi_dev)) !=
-	    sizeof(struct vioscsi_dev)) {
-		log_warnx("%s: error reading vioscsi from fd", __func__);
-		return (-1);
-	}
-
-	if (pci_set_bar_fn(vioscsi->pci_id, 0, vioscsi_io, vioscsi)) {
-		log_warnx("%s: can't set bar fn for vmm control device",
-		    __progname);
-		return (-1);
-	}
-
-	vioscsi->vm_id = vm->vm_params.vmc_params.vcp_id;
-	vioscsi->irq = pci_get_dev_irq(vioscsi->pci_id);
-
-	/* vioscsi uses 3 virtqueues. */
-	for (i = 0; i < 3; i++) {
-		hva = hvaddr_mem(vioscsi->vq[i].q_gpa,
-		    vring_size(VIOSCSI_QUEUE_SIZE));
-		if (hva == NULL)
-			fatal("failed to restore vioscsi virtqueue");
-		vioscsi->vq[i].q_hva = hva;
-	}
-
-	return (0);
-}
-
-int
-virtio_restore(int fd, struct vmd_vm *vm, int child_cdrom,
-    int child_disks[][VM_MAX_BASE_PER_DISK], int *child_taps)
-{
-	struct virtio_dev *dev;
-	int ret;
-
-	SLIST_INIT(&virtio_devs);
-
-	if ((ret = viornd_restore(fd, vm)) == -1)
-		return (ret);
-
-	if ((ret = vioblk_restore(fd, vm, child_disks)) == -1)
-		return (ret);
-
-	if ((ret = vioscsi_restore(fd, vm, child_cdrom)) == -1)
-		return (ret);
-
-	if ((ret = vionet_restore(fd, vm, child_taps)) == -1)
-		return (ret);
-
-	if ((ret = vmmci_restore(fd, vm->vm_params.vmc_params.vcp_id)) == -1)
-		return (ret);
-
-	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
-		if (virtio_dev_launch(vm, dev) != 0)
-			fatalx("%s: failed to restore virtio dev", __func__);
-	}
-
-	return (0);
-}
-
-int
-viornd_dump(int fd)
-{
-	log_debug("%s: sending viornd", __func__);
-
-	viornd.vq[0].q_hva = NULL;
-
-	if (atomicio(vwrite, fd, &viornd, sizeof(viornd)) != sizeof(viornd)) {
-		log_warnx("%s: error writing viornd to fd", __func__);
-		return (-1);
-	}
-	return (0);
-}
-
-int
-vmmci_dump(int fd)
-{
-	log_debug("%s: sending vmmci", __func__);
-
-	if (atomicio(vwrite, fd, &vmmci, sizeof(vmmci)) != sizeof(vmmci)) {
-		log_warnx("%s: error writing vmmci to fd", __func__);
-		return (-1);
-	}
-	return (0);
-}
-
-int
-vionet_dump(int fd)
-{
-	struct virtio_dev	*dev, temp;
-	struct viodev_msg	 msg;
-	struct imsg		 imsg;
-	struct imsgbuf		*ibuf = NULL;
-	size_t			 sz;
-	int			 ret;
-
-	log_debug("%s: dumping vionet", __func__);
-
-	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
-		if (dev->dev_type != VMD_DEVTYPE_NET)
-			continue;
-
-		memset(&msg, 0, sizeof(msg));
-		memset(&imsg, 0, sizeof(imsg));
-
-		ibuf = &dev->sync_iev.ibuf;
-		msg.type = VIODEV_MSG_DUMP;
-
-		ret = imsg_compose(ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
-		    sizeof(msg));
-		if (ret == -1) {
-			log_warnx("%s: failed requesting dump of vionet[%d]",
-			    __func__, dev->vionet.idx);
-			return (-1);
-		}
-		if (imsg_flush(ibuf) == -1) {
-			log_warnx("%s: imsg_flush", __func__);
-			return (-1);
-		}
-
-		sz = atomicio(read, dev->sync_fd, &temp, sizeof(temp));
-		if (sz != sizeof(temp)) {
-			log_warnx("%s: failed to dump vionet[%d]", __func__,
-			    dev->vionet.idx);
-			return (-1);
-		}
-
-		/* Clear volatile state. Will reinitialize on restore. */
-		temp.vionet.vq[RXQ].q_hva = NULL;
-		temp.vionet.vq[TXQ].q_hva = NULL;
-		temp.async_fd = -1;
-		temp.sync_fd = -1;
-		memset(&temp.async_iev, 0, sizeof(temp.async_iev));
-		memset(&temp.sync_iev, 0, sizeof(temp.sync_iev));
-
-		if (atomicio(vwrite, fd, &temp, sizeof(temp)) != sizeof(temp)) {
-			log_warnx("%s: error writing vionet to fd", __func__);
-			return (-1);
-		}
-	}
-
-	return (0);
-}
-
-int
-vioblk_dump(int fd)
-{
-	struct virtio_dev	*dev, temp;
-	struct viodev_msg	 msg;
-	struct imsg		 imsg;
-	struct imsgbuf		*ibuf = NULL;
-	size_t			 sz;
-	int			 ret;
-
-	log_debug("%s: dumping vioblk", __func__);
-
-	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
-		if (dev->dev_type != VMD_DEVTYPE_DISK)
-			continue;
-
-		memset(&msg, 0, sizeof(msg));
-		memset(&imsg, 0, sizeof(imsg));
-
-		ibuf = &dev->sync_iev.ibuf;
-		msg.type = VIODEV_MSG_DUMP;
-
-		ret = imsg_compose(ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
-		    sizeof(msg));
-		if (ret == -1) {
-			log_warnx("%s: failed requesting dump of vioblk[%d]",
-			    __func__, dev->vioblk.idx);
-			return (-1);
-		}
-		if (imsg_flush(ibuf) == -1) {
-			log_warnx("%s: imsg_flush", __func__);
-			return (-1);
-		}
-
-
-		sz = atomicio(read, dev->sync_fd, &temp, sizeof(temp));
-		if (sz != sizeof(temp)) {
-			log_warnx("%s: failed to dump vioblk[%d]", __func__,
-			    dev->vioblk.idx);
-			return (-1);
-		}
-
-		/* Clear volatile state. Will reinitialize on restore. */
-		temp.vioblk.vq[0].q_hva = NULL;
-		temp.async_fd = -1;
-		temp.sync_fd = -1;
-		memset(&temp.async_iev, 0, sizeof(temp.async_iev));
-		memset(&temp.sync_iev, 0, sizeof(temp.sync_iev));
-
-		if (atomicio(vwrite, fd, &temp, sizeof(temp)) != sizeof(temp)) {
-			log_warnx("%s: error writing vioblk to fd", __func__);
-			return (-1);
-		}
-	}
-
-	return (0);
-}
-
-int
-vioscsi_dump(int fd)
-{
-	unsigned int i;
-
-	if (vioscsi == NULL)
-		return (0);
-
-	log_debug("%s: sending vioscsi", __func__);
-
-	for (i = 0; i < 3; i++)
-		vioscsi->vq[i].q_hva = NULL;
-
-	if (atomicio(vwrite, fd, vioscsi, sizeof(struct vioscsi_dev)) !=
-	    sizeof(struct vioscsi_dev)) {
-		log_warnx("%s: error writing vioscsi to fd", __func__);
-		return (-1);
-	}
-	return (0);
-}
-
-int
-virtio_dump(int fd)
-{
-	int ret;
-
-	if ((ret = viornd_dump(fd)) == -1)
-		return ret;
-
-	if ((ret = vioblk_dump(fd)) == -1)
-		return ret;
-
-	if ((ret = vioscsi_dump(fd)) == -1)
-		return ret;
-
-	if ((ret = vionet_dump(fd)) == -1)
-		return ret;
-
-	if ((ret = vmmci_dump(fd)) == -1)
-		return ret;
-
-	return (0);
 }
 
 void virtio_broadcast_imsg(struct vmd_vm *vm, uint16_t type, void *data,
@@ -1293,6 +1398,126 @@ virtio_start(struct vmd_vm *vm)
 }
 
 /*
+ * Initialize a new virtio device structure.
+ */
+static void
+virtio_dev_init(struct vmd_vm *vm, struct virtio_dev *dev, uint8_t pci_id,
+    uint16_t queue_size, uint16_t num_queues, uint64_t features)
+{
+	size_t i;
+	uint16_t device_id;
+
+	if (num_queues > 0 && num_queues > VIRTIO_MAX_QUEUES)
+		fatalx("%s: num_queues too large", __func__);
+
+	device_id = pci_get_subsys_id(pci_id);
+	if (!device_id)
+		fatalx("%s: invalid pci device id %u", __func__, pci_id);
+
+	memset(dev, 0, sizeof(*dev));
+
+	dev->pci_id = pci_id;
+	dev->device_id = device_id;
+	dev->irq = pci_get_dev_irq(pci_id);
+	dev->isr = 0;
+	dev->vm_id = vm->vm_vmid;
+	dev->vmm_id = vm->vm_vmmid;
+
+	dev->device_feature = features;
+
+	dev->pci_cfg.config_generation = 0;
+	dev->cfg.device_feature = features;
+
+	dev->num_queues = num_queues;
+	dev->queue_size = queue_size;
+	dev->cfg.queue_size = queue_size;
+
+	dev->async_fd = -1;
+	dev->sync_fd = -1;
+
+	if (num_queues > 0) {
+		for (i = 0; i < num_queues; i++)
+			virtio_vq_init(dev, i);
+	}
+}
+
+void
+virtio_vq_init(struct virtio_dev *dev, size_t idx)
+{
+	struct virtio_vq_info *vq_info = NULL;
+	int v1 = (dev->device_feature & VIRTIO_F_VERSION_1) ? 1 : 0;
+
+	if (idx >= dev->num_queues)
+		fatalx("%s: invalid virtqueue index", __func__);
+	vq_info = &dev->vq[idx];
+
+	vq_info->q_gpa = 0;
+	vq_info->qs = dev->queue_size;
+	vq_info->mask = dev->queue_size - 1;
+
+	if (v1) {
+		vq_info->vq_enabled = 0;
+		vq_info->vq_availoffset = 0;
+		vq_info->vq_usedoffset = 0;
+	} else {
+		/* Always enable on pre-1.0 virtio devices. */
+		vq_info->vq_enabled = 1;
+		vq_info->vq_availoffset =
+		    sizeof(struct vring_desc) * vq_info->qs;
+		vq_info->vq_usedoffset = VIRTQUEUE_ALIGN(
+		    sizeof(struct vring_desc) * vq_info->qs +
+		    sizeof(uint16_t) * (2 + vq_info->qs));
+	}
+
+	vq_info->last_avail = 0;
+	vq_info->notified_avail = 0;
+}
+
+
+static void
+virtio_pci_add_cap(uint8_t pci_id, uint8_t cfg_type, uint8_t bar_id,
+    uint32_t dev_cfg_len)
+{
+	struct virtio_pci_common_cap cap;
+
+	memset(&cap, 0, sizeof(cap));
+
+	cap.virtio.cap_vndr = PCI_CAP_VENDSPEC;
+	cap.virtio.cap_len = sizeof(struct virtio_pci_cap);
+	cap.virtio.bar = bar_id;
+	cap.virtio.cfg_type = cfg_type;
+
+	switch (cfg_type) {
+	case VIRTIO_PCI_CAP_COMMON_CFG:
+		cap.virtio.offset = VIO1_CFG_BAR_OFFSET;
+		cap.virtio.length = sizeof(struct virtio_pci_common_cfg);
+		break;
+	case VIRTIO_PCI_CAP_DEVICE_CFG:
+		/* XXX maybe inspect the virtio device and lookup the len. */
+		cap.virtio.offset = VIO1_DEV_BAR_OFFSET;
+		cap.virtio.length = dev_cfg_len;
+		break;
+	case VIRTIO_PCI_CAP_ISR_CFG:
+		cap.virtio.offset = VIO1_ISR_BAR_OFFSET;
+		cap.virtio.length = sizeof(uint8_t);
+		break;
+	case VIRTIO_PCI_CAP_NOTIFY_CFG:
+		cap.virtio.offset = VIO1_NOTIFY_BAR_OFFSET;
+		cap.virtio.length = sizeof(uint16_t);
+		cap.notify.notify_off_multiplier = 0;
+		break;
+	default:
+		fatalx("%s: invalid pci capability config type %u", __func__,
+		    cfg_type);
+	}
+
+	if (pci_add_capability(pci_id, &cap.pci) == -1) {
+		fatalx("%s: can't add capability for virtio pci device %u",
+		    __func__, pci_id);
+	}
+}
+
+/*
  * Fork+exec a child virtio device. Returns 0 on success.
  */
 static int
@@ -1301,20 +1526,24 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 	char *nargv[12], num[32], vmm_fd[32], vm_name[VM_NAME_MAX], t[2];
 	pid_t dev_pid;
 	int sync_fds[2], async_fds[2], ret = 0;
-	size_t sz = 0;
+	size_t i, sz = 0;
 	struct viodev_msg msg;
-	struct virtio_dev *dev_entry;
+	struct virtio_dev *dev_entry, dev_copy;
 	struct imsg imsg;
 	struct imsgev *iev = &dev->sync_iev;
+	struct vmd_vm vm_copy;
 
 	switch (dev->dev_type) {
 	case VMD_DEVTYPE_NET:
-		log_debug("%s: launching vionet%d",
-		    vm->vm_params.vmc_params.vcp_name, dev->vionet.idx);
+		log_debug("%s: launching vionet%d", vm->vm_params.vmc_name,
+		    dev->vionet.idx);
 		break;
 	case VMD_DEVTYPE_DISK:
-		log_debug("%s: launching vioblk%d",
-		    vm->vm_params.vmc_params.vcp_name, dev->vioblk.idx);
+		log_debug("%s: launching vioblk%d", vm->vm_params.vmc_name,
+		    dev->vioblk.idx);
+		break;
+	case VMD_DEVTYPE_SCSI:
+		log_debug("%s: launching vioscsi", vm->vm_params.vmc_name);
 		break;
 		/* NOTREACHED */
 	default:
@@ -1357,8 +1586,12 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		/* 1. Send over our configured device. */
 		log_debug("%s: sending '%c' type device struct", __func__,
 			dev->dev_type);
-		sz = atomicio(vwrite, sync_fds[0], dev, sizeof(*dev));
-		if (sz != sizeof(*dev)) {
+		memcpy(&dev_copy, dev, sizeof(dev_copy));
+		bzero(&dev_copy.async_iev, sizeof(dev_copy.async_iev));
+		bzero(&dev_copy.sync_iev, sizeof(dev_copy.sync_iev));
+		bzero(&dev_copy.dev_next, sizeof(dev_copy.dev_next));
+		sz = atomicio(vwrite, sync_fds[0], &dev_copy, sizeof(dev_copy));
+		if (sz != sizeof(dev_copy)) {
 			log_warnx("%s: failed to send device", __func__);
 			ret = EIO;
 			goto err;
@@ -1373,9 +1606,20 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 
 		/* 2. Send over details on the VM (including memory fds). */
 		log_debug("%s: sending vm message for '%s'", __func__,
-			vm->vm_params.vmc_params.vcp_name);
-		sz = atomicio(vwrite, sync_fds[0], vm, sizeof(*vm));
-		if (sz != sizeof(*vm)) {
+			vm->vm_params.vmc_name);
+		memcpy(&vm_copy, vm, sizeof(vm_copy));
+		vm_copy.vm_kernel_path = NULL;
+		bzero(&vm_copy.vm_entry, sizeof(vm_copy.vm_entry));
+		bzero(&vm_copy.vm_iev, sizeof(vm_copy.vm_iev));
+		for (i = 0; i < nitems(vm_copy.vm_ifs); i++) {
+			vm_copy.vm_ifs[i].vif_name = NULL;
+			vm_copy.vm_ifs[i].vif_switch = NULL;
+			vm_copy.vm_ifs[i].vif_group = NULL;
+			bzero(&vm_copy.vm_ifs[i].vif_entry,
+			    sizeof(vm_copy.vm_ifs[i].vif_entry));
+		}
+		sz = atomicio(vwrite, sync_fds[0], &vm_copy, sizeof(vm_copy));
+		if (sz != sizeof(vm_copy)) {
 			log_warnx("%s: failed to send vm details", __func__);
 			ret = EIO;
 			goto err;
@@ -1386,10 +1630,12 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		 * communication will be synchronous. We expect the child to
 		 * report itself "ready" to confirm the launch was a success.
 		 */
-		imsg_init(&iev->ibuf, sync_fds[0]);
-		do
-			ret = imsg_read(&iev->ibuf);
-		while (ret == -1 && errno == EAGAIN);
+		if (imsgbuf_init(&iev->ibuf, sync_fds[0]) == -1) {
+			log_warn("%s: failed to init imsgbuf", __func__);
+			goto err;
+		}
+		imsgbuf_allow_fdpass(&iev->ibuf);
+		ret = imsgbuf_read_one(&iev->ibuf, &imsg);
 		if (ret == 0 || ret == -1) {
 			log_warnx("%s: failed to receive ready message from "
 			    "'%c' type device", __func__, dev->dev_type);
@@ -1398,14 +1644,7 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		}
 		ret = 0;
 
-		log_debug("%s: receiving reply", __func__);
-		if (imsg_get(&iev->ibuf, &imsg) < 1) {
-			log_warnx("%s: imsg_get", __func__);
-			ret = EIO;
-			goto err;
-		}
-		IMSG_SIZE_CHECK(&imsg, &msg);
-		memcpy(&msg, imsg.data, sizeof(msg));
+		viodev_msg_read(&imsg, &msg);
 		imsg_free(&imsg);
 
 		if (msg.type != VIODEV_MSG_READY) {
@@ -1433,7 +1672,7 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 		close_fd(vm->vm_tty);
 		vm->vm_tty = -1;
 
-		if (vm->vm_cdrom != -1) {
+		if (vm->vm_cdrom != -1 && dev->dev_type != VMD_DEVTYPE_SCSI) {
 			close_fd(vm->vm_cdrom);
 			vm->vm_cdrom = -1;
 		}
@@ -1446,40 +1685,39 @@ virtio_dev_launch(struct vmd_vm *vm, struct virtio_dev *dev)
 				fatalx("unable to close other virtio devs");
 		}
 
-		memset(&nargv, 0, sizeof(nargv));
 		memset(num, 0, sizeof(num));
 		snprintf(num, sizeof(num), "%d", sync_fds[1]);
 		memset(vmm_fd, 0, sizeof(vmm_fd));
-		snprintf(vmm_fd, sizeof(vmm_fd), "%d", env->vmd_fd);
+		snprintf(vmm_fd, sizeof(vmm_fd), "%d", env->vmd_vmm_fd);
 		memset(vm_name, 0, sizeof(vm_name));
 		snprintf(vm_name, sizeof(vm_name), "%s",
-		    vm->vm_params.vmc_params.vcp_name);
+		    vm->vm_params.vmc_name);
 
 		t[0] = dev->dev_type;
 		t[1] = '\0';
 
-		nargv[0] = env->argv0;
-		nargv[1] = "-X";
-		nargv[2] = num;
-		nargv[3] = "-t";
-		nargv[4] = t;
-		nargv[5] = "-i";
-		nargv[6] = vmm_fd;
-		nargv[7] = "-p";
-		nargv[8] = vm_name;
-		nargv[9] = "-n";
-		nargv[10] = NULL;
-
-		if (env->vmd_verbose == 1) {
-			nargv[10] = VMD_VERBOSE_1;
-			nargv[11] = NULL;
-		} else if (env->vmd_verbose > 1) {
-			nargv[10] = VMD_VERBOSE_2;
-			nargv[11] = NULL;
-		}
+		i = 0;
+		nargv[i++] = env->vmd_execpath;
+		nargv[i++] = "-X";
+		nargv[i++] = num;
+		nargv[i++] = "-t";
+		nargv[i++] = t;
+		nargv[i++] = "-i";
+		nargv[i++] = vmm_fd;
+		nargv[i++] = "-p";
+		nargv[i++] = vm_name;
+		if (env->vmd_debug)
+			nargv[i++] = "-d";
+		if (env->vmd_verbose == 1)
+			nargv[i++] = "-v";
+		else if (env->vmd_verbose > 1)
+			nargv[i++] = "-vv";
+		nargv[i++] = NULL;
+		if (i > sizeof(nargv) / sizeof(nargv[0]))
+			fatalx("%s: nargv overflow", __func__);
 
 		/* Control resumes in vmd.c:main(). */
-		execvp(nargv[0], nargv);
+		execv(nargv[0], nargv);
 
 		ret = errno;
 		log_warn("%s: failed to exec device", __func__);
@@ -1510,7 +1748,9 @@ vm_device_pipe(struct virtio_dev *dev, void (*cb)(int, short, void *),
 	log_debug("%s: initializing '%c' device pipe (fd=%d)", __func__,
 	    dev->dev_type, fd);
 
-	imsg_init(&iev->ibuf, fd);
+	if (imsgbuf_init(&iev->ibuf, fd) == -1)
+		fatal("imsgbuf_init");
+	imsgbuf_allow_fdpass(&iev->ibuf);
 	iev->handler = cb;
 	iev->data = dev;
 	iev->events = EV_READ;
@@ -1527,11 +1767,12 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
 	struct viodev_msg	 msg;
-	ssize_t			 n = 0;
+	int			 n;
+	uint32_t		 type;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: pipe dead (EV_READ)", __func__);
@@ -1542,32 +1783,32 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_loopexit(NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+		switch (type) {
 		case IMSG_DEVOP_MSG:
-			IMSG_SIZE_CHECK(&imsg, &msg);
-			memcpy(&msg, imsg.data, sizeof(msg));
+			viodev_msg_read(&imsg, &msg);
 			handle_dev_msg(&msg, dev);
 			break;
 		default:
-			log_warnx("%s: got non devop imsg %d", __func__,
-			    imsg.hdr.type);
+			log_warnx("%s: got non devop imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -1579,15 +1820,14 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 static int
 handle_dev_msg(struct viodev_msg *msg, struct virtio_dev *gdev)
 {
-	uint32_t vm_id = gdev->vm_id;
-	int irq = gdev->irq;
+	uint32_t vmm_id = gdev->vmm_id;
 
 	switch (msg->type) {
 	case VIODEV_MSG_KICK:
 		if (msg->state == INTR_STATE_ASSERT)
-			vcpu_assert_irq(vm_id, msg->vcpu, irq);
+			vcpu_assert_irq(vmm_id, msg->vcpu, msg->irq);
 		else if (msg->state == INTR_STATE_DEASSERT)
-			vcpu_deassert_irq(vm_id, msg->vcpu, irq);
+			vcpu_deassert_irq(vmm_id, msg->vcpu, msg->irq);
 		break;
 	case VIODEV_MSG_READY:
 		log_debug("%s: device reports ready", __func__);
@@ -1624,8 +1864,9 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 	struct imsgbuf *ibuf = &dev->sync_iev.ibuf;
 	struct imsg imsg;
 	struct viodev_msg msg;
-	ssize_t n;
 	int ret = 0;
+
+	mutex_lock(&vcpu_sync_mtx);
 
 	memset(&msg, 0, sizeof(msg));
 	msg.reg = reg;
@@ -1647,11 +1888,12 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 		if (ret == -1) {
 			log_warn("%s: failed to send async io event to virtio"
 			    " device", __func__);
-			return (ret);
+			goto out;
 		}
-		if (imsg_flush(ibuf) == -1) {
-			log_warnx("%s: imsg_flush (write)", __func__);
-			return (-1);
+		if (imsgbuf_flush(ibuf) == -1) {
+			log_warnx("%s: imsgbuf_flush (write)", __func__);
+			ret = -1;
+			goto out;
 		}
 	} else {
 		/*
@@ -1662,56 +1904,48 @@ virtio_pci_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
 		if (ret == -1) {
 			log_warnx("%s: failed to send sync io event to virtio"
 			    " device", __func__);
-			return (ret);
+			goto out;
 		}
-		if (imsg_flush(ibuf) == -1) {
-			log_warnx("%s: imsg_flush (read)", __func__);
-			return (-1);
+		if (imsgbuf_flush(ibuf) == -1) {
+			log_warnx("%s: imsgbuf_flush (read)", __func__);
+			ret = -1;
+			goto out;
 		}
 
 		/* Read our reply. */
-		do
-			n = imsg_read(ibuf);
-		while (n == -1 && errno == EAGAIN);
-		if (n == 0 || n == -1) {
-			log_warn("%s: imsg_read (n=%ld)", __func__, n);
-			return (-1);
+		ret = imsgbuf_read_one(ibuf, &imsg);
+		if (ret == 0 || ret == -1) {
+			log_warn("%s: imsgbuf_read (n=%d)", __func__, ret);
+			ret = -1;
+			goto out;
 		}
-		if ((n = imsg_get(ibuf, &imsg)) == -1) {
-			log_warn("%s: imsg_get (n=%ld)", __func__, n);
-			return (-1);
-		}
-		if (n == 0) {
-			log_warnx("%s: invalid imsg", __func__);
-			return (-1);
-		}
-
-		IMSG_SIZE_CHECK(&imsg, &msg);
-		memcpy(&msg, imsg.data, sizeof(msg));
+		viodev_msg_read(&imsg, &msg);
 		imsg_free(&imsg);
 
 		if (msg.type == VIODEV_MSG_IO_READ && msg.data_valid) {
-#if DEBUG
-			log_debug("%s: got sync read response (reg=%s)",
-			    __func__, virtio_reg_name(msg.reg));
-#endif /* DEBUG */
+			DPRINTF("%s: got sync read response (reg=%s)", __func__,
+			    virtio_reg_name(msg.reg));
 			*data = msg.data;
 			/*
 			 * It's possible we're asked to {de,}assert after the
 			 * device performs a register read.
 			 */
 			if (msg.state == INTR_STATE_ASSERT)
-				vcpu_assert_irq(dev->vm_id, msg.vcpu, msg.irq);
+				vcpu_assert_irq(dev->vmm_id, msg.vcpu, msg.irq);
 			else if (msg.state == INTR_STATE_DEASSERT)
-				vcpu_deassert_irq(dev->vm_id, msg.vcpu, msg.irq);
+				vcpu_deassert_irq(dev->vmm_id, msg.vcpu, msg.irq);
 		} else {
 			log_warnx("%s: expected IO_READ, got %d", __func__,
 			    msg.type);
-			return (-1);
+			ret = -1;
+			goto out;
 		}
 	}
 
-	return (0);
+	ret = 0;
+out:
+	mutex_unlock(&vcpu_sync_mtx);
+	return (ret);
 }
 
 void
@@ -1769,6 +2003,10 @@ virtio_dev_closefds(struct virtio_dev *dev)
 			close_fd(dev->vionet.data_fd);
 			dev->vionet.data_fd = -1;
 			break;
+		case VMD_DEVTYPE_SCSI:
+			close_fd(dev->vioscsi.cdrom_fd);
+			dev->vioscsi.cdrom_fd = -1;
+			break;
 	default:
 		log_warnx("%s: invalid device type", __func__);
 		return (-1);
@@ -1780,4 +2018,18 @@ virtio_dev_closefds(struct virtio_dev *dev)
 	dev->sync_fd = -1;
 
 	return (0);
+}
+
+void
+viodev_msg_read(struct imsg *imsg, struct viodev_msg *msg)
+{
+	if (imsg_get_data(imsg, msg, sizeof(*msg)))
+		fatal("%s", __func__);
+}
+
+void
+vionet_hostmac_read(struct imsg *imsg, struct vionet_dev *dev)
+{
+	if (imsg_get_data(imsg, dev->hostmac, sizeof(dev->hostmac)))
+		fatal("%s", __func__);
 }

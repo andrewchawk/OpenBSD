@@ -1,4 +1,4 @@
-/*	$OpenBSD: tmpfs_mem.c,v 1.8 2015/12/11 22:34:34 beck Exp $	*/
+/*	$OpenBSD: tmpfs_mem.c,v 1.11 2025/11/21 09:49:33 mvs Exp $	*/
 /*	$NetBSD: tmpfs_mem.c,v 1.4 2011/05/24 01:09:47 rmind Exp $	*/
 
 /*
@@ -46,6 +46,9 @@
 extern struct pool	tmpfs_dirent_pool;
 extern struct pool	tmpfs_node_pool;
 
+uint64_t tmpfs_bytes_limit;
+uint64_t tmpfs_bytes_used = 0;
+
 void
 tmpfs_mntmem_init(struct tmpfs_mount *mp, uint64_t memlimit)
 {
@@ -63,83 +66,68 @@ tmpfs_mntmem_destroy(struct tmpfs_mount *mp)
 	/* mutex_destroy(&mp->tm_acc_lock); */
 }
 
-/*
- * tmpfs_mem_info: return the number of available memory pages.
- *
- * => If 'total' is true, then return _total_ amount of pages.
- * => If false, then return the amount of _free_ memory pages.
- *
- * Remember to remove TMPFS_PAGES_RESERVED from the returned value to avoid
- * excessive memory usage.
- */
-size_t
-tmpfs_mem_info(int total)
-{
-	int size = 0;
-
-	/* XXX: unlocked */
-	size += uvmexp.swpages;
-	if (!total) {
-		size -= uvmexp.swpgonly;
-	}
-
-	size += uvmexp.free;
-	/* size += uvmexp.filepages; */
-	if (size > uvmexp.wired) {
-		size -= uvmexp.wired;
-	} else {
-		size = 0;
-	}
-
-	KASSERT(size >= 0);
-
-	return (size_t)size;
-}
-
 uint64_t
-tmpfs_bytes_max(struct tmpfs_mount *mp)
+tmpfs_pages_total(struct tmpfs_mount *mp)
 {
-	size_t freepages = tmpfs_mem_info(0);
-	uint64_t avail_mem;
+	uint64_t total;
 
-	if (freepages < TMPFS_PAGES_RESERVED) {
-		freepages = 0;
-	} else {
-		freepages -= TMPFS_PAGES_RESERVED;
+	if (mp->tm_mem_limit)
+		total = mp->tm_mem_limit;
+	else {
+		total = tmpfs_bytes_limit - tmpfs_bytes_used +
+		    mp->tm_bytes_used;
 	}
-	avail_mem = round_page(mp->tm_bytes_used) + (freepages << PAGE_SHIFT);
-	return MIN(mp->tm_mem_limit, avail_mem);
+
+	return (total >> PAGE_SHIFT);
 }
 
 uint64_t
 tmpfs_pages_avail(struct tmpfs_mount *mp)
 {
+	uint64_t free;
 
-	return (tmpfs_bytes_max(mp) - mp->tm_bytes_used) >> PAGE_SHIFT;
+	rw_assert_anylock(&mp->tm_acc_lock);
+
+	if (mp->tm_mem_limit)
+		free = mp->tm_mem_limit - mp->tm_bytes_used;
+	else
+		free = tmpfs_bytes_limit - tmpfs_bytes_used;
+
+	return (free >> PAGE_SHIFT);
 }
 
 int
 tmpfs_mem_incr(struct tmpfs_mount *mp, size_t sz)
 {
-	uint64_t lim;
+	int ret = 0;
 
 	rw_enter_write(&mp->tm_acc_lock);
-	lim = tmpfs_bytes_max(mp);
-	if (mp->tm_bytes_used + sz >= lim) {
-		rw_exit_write(&mp->tm_acc_lock);
-		return 0;
+
+	if (mp->tm_mem_limit) {
+		if ((mp->tm_mem_limit - mp->tm_bytes_used) < sz)
+			goto out;
+	} else {
+		if ((tmpfs_bytes_limit - tmpfs_bytes_used) < sz)
+			goto out;
+		tmpfs_bytes_used += sz;
 	}
+
 	mp->tm_bytes_used += sz;
+
+	ret = 1;
+out:
 	rw_exit_write(&mp->tm_acc_lock);
-	return 1;
+
+	return ret;
 }
 
 void
 tmpfs_mem_decr(struct tmpfs_mount *mp, size_t sz)
 {
-
 	rw_enter_write(&mp->tm_acc_lock);
 	KASSERT(mp->tm_bytes_used >= sz);
+	if (mp->tm_mem_limit == 0)
+		tmpfs_bytes_used -= sz;
 	mp->tm_bytes_used -= sz;
 	rw_exit_write(&mp->tm_acc_lock);
 }
@@ -172,6 +160,7 @@ tmpfs_node_get(struct tmpfs_mount *mp)
 		return NULL;
 	}
 	if (!tmpfs_mem_incr(mp, sizeof(struct tmpfs_node))) {
+		mp->tm_nodes_cnt--;
 		return NULL;
 	}
 	return pool_get(&tmpfs_node_pool, PR_WAITOK);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cl_read.c,v 1.23 2021/09/02 11:19:02 schwarze Exp $	*/
+/*	$OpenBSD: cl_read.c,v 1.24 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -174,7 +174,7 @@ tty_retry:
 			break;
 		}
 	}
-	
+
 	/*
 	 * The user can enter a key in the editor to quote a character.  If we
 	 * get here and the next key is supposed to be quoted, do what we can.
@@ -269,7 +269,7 @@ err:		if (errno == EINTR)
 	return (rval);
 }
 
-/* 
+/*
  * cl_resize --
  *	Reset the options for a resize event.
  */

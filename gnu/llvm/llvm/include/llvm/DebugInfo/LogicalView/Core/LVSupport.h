@@ -13,53 +13,58 @@
 #ifndef LLVM_DEBUGINFO_LOGICALVIEW_CORE_LVSUPPORT_H
 #define LLVM_DEBUGINFO_LOGICALVIEW_CORE_LVSUPPORT_H
 
-#include "llvm/ADT/SmallBitVector.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/DebugInfo/LogicalView/Core/LVStringPool.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include <bitset>
 #include <cctype>
 #include <map>
 #include <sstream>
+#include <type_traits>
 
 namespace llvm {
 namespace logicalview {
 
 // Returns the unique string pool instance.
-LVStringPool &getStringPool();
+LLVM_ABI LVStringPool &getStringPool();
 
-template <typename T>
-using TypeIsValid = std::bool_constant<std::is_pointer<T>::value>;
-
-// Utility class to help memory management and perform an automatic cleaning.
-template <typename T, unsigned N = 8>
-class LVAutoSmallVector : public SmallVector<T, N> {
-  static_assert(TypeIsValid<T>::value, "T must be a pointer type");
-
-public:
-  using iterator = typename SmallVector<T, N>::iterator;
-  LVAutoSmallVector() : SmallVector<T, N>::SmallVector() {}
-
-  ~LVAutoSmallVector() {
-    // Destroy the constructed elements in the vector.
-    for (auto *Item : *this)
-      delete Item;
-  }
-};
+using LVStringRefs = std::vector<StringRef>;
+using LVLexicalComponent = std::tuple<StringRef, StringRef>;
+using LVLexicalIndex =
+    std::tuple<LVStringRefs::size_type, LVStringRefs::size_type>;
 
 // Used to record specific characteristics about the objects.
 template <typename T> class LVProperties {
-  SmallBitVector Bits = SmallBitVector(static_cast<unsigned>(T::LastEntry) + 1);
+  static constexpr unsigned N_PROPS = static_cast<unsigned>(T::LastEntry);
+  // Use uint32_t as the underlying type if the `T` enum has at most 32
+  // enumerators; otherwise, fallback to the generic `std::bitset` case.
+  std::conditional_t<(N_PROPS > 32), std::bitset<N_PROPS>, uint32_t> Bits{};
 
 public:
   LVProperties() = default;
 
-  void set(T Idx) { Bits[static_cast<unsigned>(Idx)] = 1; }
-  void reset(T Idx) { Bits[static_cast<unsigned>(Idx)] = 0; }
-  bool get(T Idx) const { return Bits[static_cast<unsigned>(Idx)]; }
+  void set(T Idx) {
+    if constexpr (std::is_same_v<decltype(Bits), uint32_t>)
+      Bits |= 1 << static_cast<unsigned>(Idx);
+    else
+      Bits.set(static_cast<unsigned>(Idx));
+  }
+  void reset(T Idx) {
+    if constexpr (std::is_same_v<decltype(Bits), uint32_t>)
+      Bits &= ~(1 << static_cast<unsigned>(Idx));
+    else
+      Bits.reset(static_cast<unsigned>(Idx));
+  }
+  bool get(T Idx) const {
+    if constexpr (std::is_same_v<decltype(Bits), uint32_t>)
+      return Bits & (1 << static_cast<unsigned>(Idx));
+    else
+      return Bits[static_cast<unsigned>(Idx)];
+  }
 };
 
 // Generate get, set and reset 'bool' functions for LVProperties instances.
@@ -125,7 +130,7 @@ inline std::string hexString(uint64_t Value, size_t Width = HEX_WIDTH) {
   std::string String;
   raw_string_ostream Stream(String);
   Stream << hexValue(Value, Width, false);
-  return Stream.str();
+  return String;
 }
 
 // Get a hexadecimal string representation for the given value.
@@ -147,25 +152,10 @@ std::string formatAttributes(const StringRef First, Args... Others) {
   return Stream.str();
 }
 
-// Add an item to a map with second being a list.
-template <typename MapType, typename ListType, typename KeyType,
-          typename ValueType>
+// Add an item to a map with second being a small vector.
+template <typename MapType, typename KeyType, typename ValueType>
 void addItem(MapType *Map, KeyType Key, ValueType Value) {
-  ListType *List = nullptr;
-  typename MapType::const_iterator Iter = Map->find(Key);
-  if (Iter != Map->end())
-    List = Iter->second;
-  else {
-    List = new ListType();
-    Map->emplace(Key, List);
-  }
-  List->push_back(Value);
-}
-
-// Delete the map contained list.
-template <typename MapType> void deleteList(MapType &Map) {
-  for (typename MapType::const_reference Entry : Map)
-    delete Entry.second;
+  (*Map)[Key].push_back(Value);
 }
 
 // Double map data structure.
@@ -174,32 +164,25 @@ class LVDoubleMap {
   static_assert(std::is_pointer<ValueType>::value,
                 "ValueType must be a pointer.");
   using LVSecondMapType = std::map<SecondKeyType, ValueType>;
-  using LVFirstMapType = std::map<FirstKeyType, LVSecondMapType *>;
+  using LVFirstMapType =
+      std::map<FirstKeyType, std::unique_ptr<LVSecondMapType>>;
   using LVAuxMapType = std::map<SecondKeyType, FirstKeyType>;
   using LVValueTypes = std::vector<ValueType>;
   LVFirstMapType FirstMap;
   LVAuxMapType AuxMap;
 
 public:
-  LVDoubleMap() = default;
-  ~LVDoubleMap() {
-    for (auto &Entry : FirstMap)
-      delete Entry.second;
-  }
-
   void add(FirstKeyType FirstKey, SecondKeyType SecondKey, ValueType Value) {
-    LVSecondMapType *SecondMap = nullptr;
     typename LVFirstMapType::iterator FirstIter = FirstMap.find(FirstKey);
     if (FirstIter == FirstMap.end()) {
-      SecondMap = new LVSecondMapType();
-      FirstMap.emplace(FirstKey, SecondMap);
+      auto SecondMapSP = std::make_unique<LVSecondMapType>();
+      SecondMapSP->emplace(SecondKey, Value);
+      FirstMap.emplace(FirstKey, std::move(SecondMapSP));
     } else {
-      SecondMap = FirstIter->second;
+      LVSecondMapType *SecondMap = FirstIter->second.get();
+      if (SecondMap->find(SecondKey) == SecondMap->end())
+        SecondMap->emplace(SecondKey, Value);
     }
-
-    assert(SecondMap && "SecondMap is null.");
-    if (SecondMap && SecondMap->find(SecondKey) == SecondMap->end())
-      SecondMap->emplace(SecondKey, Value);
 
     typename LVAuxMapType::iterator AuxIter = AuxMap.find(SecondKey);
     if (AuxIter == AuxMap.end()) {
@@ -212,8 +195,7 @@ public:
     if (FirstIter == FirstMap.end())
       return nullptr;
 
-    LVSecondMapType *SecondMap = FirstIter->second;
-    return SecondMap;
+    return FirstIter->second.get();
   }
 
   ValueType find(FirstKeyType FirstKey, SecondKeyType SecondKey) const {
@@ -239,8 +221,8 @@ public:
     if (FirstMap.empty())
       return Values;
     for (typename LVFirstMapType::const_reference FirstEntry : FirstMap) {
-      LVSecondMapType *SecondMap = FirstEntry.second;
-      for (typename LVSecondMapType::const_reference SecondEntry : *SecondMap)
+      LVSecondMapType &SecondMap = *FirstEntry.second;
+      for (typename LVSecondMapType::const_reference SecondEntry : SecondMap)
         Values.push_back(SecondEntry.second);
     }
     return Values;
@@ -248,8 +230,8 @@ public:
 };
 
 // Unified and flattened pathnames.
-std::string transformPath(StringRef Path);
-std::string flattenedFilePath(StringRef Path);
+LLVM_ABI std::string transformPath(StringRef Path);
+LLVM_ABI std::string flattenedFilePath(StringRef Path);
 
 inline std::string formattedKind(StringRef Kind) {
   return (Twine("{") + Twine(Kind) + Twine("}")).str();
@@ -262,6 +244,15 @@ inline std::string formattedName(StringRef Name) {
 inline std::string formattedNames(StringRef Name1, StringRef Name2) {
   return (Twine("'") + Twine(Name1) + Twine(Name2) + Twine("'")).str();
 }
+
+// The given string represents a symbol or type name with optional enclosing
+// scopes, such as: name, name<..>, scope::name, scope::..::name, etc.
+// The string can have multiple references to template instantiations.
+// It returns the inner most component.
+LLVM_ABI LVLexicalComponent getInnerComponent(StringRef Name);
+LLVM_ABI LVStringRefs getAllLexicalComponents(StringRef Name);
+LLVM_ABI std::string getScopedName(const LVStringRefs &Components,
+                                   StringRef BaseName = {});
 
 // These are the values assigned to the debug location record IDs.
 // See DebugInfo/CodeView/CodeViewSymbols.def.

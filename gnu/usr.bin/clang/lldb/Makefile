@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.17 2024/07/13 07:25:38 asou Exp $
+# $OpenBSD: Makefile,v 1.19 2026/05/29 11:18:32 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -23,7 +23,9 @@ CPPFLAGS+=	-I${.OBJDIR}/../include
 
 LLVM_LIBDEPS=	clangAST \
 		clangASTMatchers \
+		clangAPINotes \
 		clangAnalysis \
+		clangAnalysisLifetimeSafety \
 		clangBasic \
 		clangBasicTargets \
 		clangCodeGen \
@@ -31,6 +33,7 @@ LLVM_LIBDEPS=	clangAST \
 		clangEdit \
 		clangFrontend \
 		clangLex \
+		clangOptions \
 		clangParse \
 		clangRewrite \
 		clangRewriteFrontend \
@@ -63,16 +66,19 @@ LLVM_LIBDEPS=	clangAST \
 		lldbPluginObjectFile \
 		lldbPluginPlatform \
 		lldbPluginProcess \
+		lldbPluginRegisterTypeBuilder \
 		lldbPluginScriptInterpreter \
 		lldbPluginStructuredData \
 		lldbPluginSymbolFile \
+		lldbPluginSymbolLocator \
 		lldbPluginSymbolVendor \
 		lldbPluginSystemRuntime \
 		lldbPluginTypeSystem \
 		lldbPluginUnwindAssembly \
 		lldbSymbol \
 		lldbTarget \
-		lldbUtility
+		lldbUtility \
+		lldbValueObject
 
 Driver.o: Options.inc
 

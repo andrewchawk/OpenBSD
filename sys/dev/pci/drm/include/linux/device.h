@@ -14,11 +14,9 @@
 #include <linux/kobject.h>
 #include <linux/ratelimit.h> /* dev_printk.h -> ratelimit.h */
 #include <linux/module.h> /* via device/driver.h */
+#include <linux/device/bus.h>
 
 struct device_node;
-
-struct bus_type {
-};
 
 struct device_driver {
 	struct device *dev;
@@ -33,6 +31,8 @@ struct device_attribute {
 	struct device_attribute dev_attr_##_name
 #define DEVICE_ATTR_RO(_name) \
 	struct device_attribute dev_attr_##_name
+#define DEVICE_ATTR_RW(_name) \
+	struct device_attribute dev_attr_##_name
 
 #define device_create_file(a, b)	0
 #define device_remove_file(a, b)
@@ -42,8 +42,14 @@ void	dev_set_drvdata(struct device *, void *);
 
 #define dev_pm_set_driver_flags(x, y)
 
-#define devm_kzalloc(x, y, z)	kzalloc(y, z)
-#define devm_kfree(x, y)	kfree(y)
+#define devm_kzalloc(dev, size, flags)		kzalloc(size, flags)
+#define devm_kcalloc(dev, n, size, flags)	kcalloc(n, size, flags)
+#define devm_kfree(dev, p)			kfree(p)
+
+/* XXX run callback on detach/shutdown */
+#define devm_add_action(x, y, z)		0
+#define devm_add_action_or_reset(x, y, z)	0
+#define devm_remove_action(x, y, z)
 
 static inline int
 devm_device_add_group(struct device *dev, const struct attribute_group *g)
@@ -70,8 +76,7 @@ devm_device_add_group(struct device *dev, const struct attribute_group *g)
 	printf("drm:pid%d:%s *EMERGENCY* " fmt, curproc->p_p->ps_pid,	\
 	    __func__ , ## arg)
 #define dev_printk(level, dev, fmt, arg...)				\
-	printf("drm:pid%d:%s *PRINTK* " fmt, curproc->p_p->ps_pid,	\
-	    __func__ , ## arg)
+	printf(fmt, ## arg)
 
 #define dev_warn_ratelimited(dev, fmt, arg...)				\
 	printf("drm:pid%d:%s *WARNING* " fmt, curproc->p_p->ps_pid,	\
@@ -83,15 +88,29 @@ devm_device_add_group(struct device *dev, const struct attribute_group *g)
 	printf("drm:pid%d:%s *ERROR* " fmt, curproc->p_p->ps_pid,	\
 	    __func__ , ## arg)
 
-#define dev_warn_once(dev, fmt, arg...)				\
-	printf("drm:pid%d:%s *WARNING* " fmt, curproc->p_p->ps_pid,	\
-	    __func__ , ## arg)
+#define dev_warn_once(dev, fmt, arg...)					\
+({									\
+	static int _warned;						\
+	if (!_warned) {							\
+		printf("drm:pid%d:%s *WARNING* " fmt, curproc->p_p->ps_pid,	\
+		    __func__ , ## arg);					\
+		_warned = 1;						\
+	}								\
+})
+
 #define dev_WARN_ONCE(dev, cond, fmt, arg...)					\
 	WARN_ONCE(cond, "drm:pid%d:%s *WARNING* " fmt, curproc->p_p->ps_pid,	\
 	    __func__ , ## arg)
-#define dev_err_once(dev, fmt, arg...)				\
-	printf("drm:pid%d:%s *ERROR* " fmt, curproc->p_p->ps_pid,	\
-	    __func__ , ## arg)
+
+#define dev_err_once(dev, fmt, arg...)					\
+({									\
+	static int _warned;						\
+	if (!_warned) {							\
+		printf("drm:pid%d:%s *ERROR* " fmt, curproc->p_p->ps_pid,	\
+		    __func__ , ## arg);					\
+		_warned = 1;						\
+	}								\
+})
 	
 #define dev_err_probe(dev, err, fmt, arg...)				\
 	printf("drm:pid%d:%s *ERROR* " fmt, curproc->p_p->ps_pid,	\
@@ -100,8 +119,16 @@ devm_device_add_group(struct device *dev, const struct attribute_group *g)
 #ifdef DRMDEBUG
 #define dev_info(dev, fmt, arg...)				\
 	printf("drm: " fmt, ## arg)
+
 #define dev_info_once(dev, fmt, arg...)				\
-	printf("drm: " fmt, ## arg)
+({								\
+	static int _warned;					\
+	if (!_warned) {						\
+		printf("drm: " fmt, ## arg);			\
+		_warned = 1;					\
+	}							\
+})
+
 #define dev_dbg(dev, fmt, arg...)				\
 	printf("drm:pid%d:%s *DEBUG* " fmt, curproc->p_p->ps_pid,	\
 	    __func__ , ## arg)
@@ -154,6 +181,22 @@ dev_driver_string(struct device *dev)
 
 static inline void
 device_set_wakeup_path(struct device *dev)
+{
+}
+
+static inline void *
+devres_open_group(struct device *dev, void *ident, gfp_t gfp)
+{
+	return (void *)1;
+}
+
+static inline void
+devres_close_group(struct device *dev, void *ident)
+{
+}
+
+static inline void
+devres_release_group(struct device *dev, void *ident)
 {
 }
 

@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.6 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.8 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMAMDGPUUtils
 NOPROFILE=
@@ -8,7 +8,7 @@ CPPFLAGS+=	-I${.OBJDIR}/../include/llvm/AMDGPU \
 
 SRCS+=	AMDGPUAsmUtils.cpp \
 	AMDGPUBaseInfo.cpp \
-	AMDGPUMemoryUtils.cpp \
+	AMDGPUDelayedMCExpr.cpp \
 	AMDGPUPALMetadata.cpp \
 	AMDKernelCodeTUtils.cpp
 

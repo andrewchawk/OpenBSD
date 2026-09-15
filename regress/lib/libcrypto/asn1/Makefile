@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.28 2024/02/29 20:03:47 tb Exp $
+#	$OpenBSD: Makefile,v 1.30 2026/01/04 09:51:42 tb Exp $
 
 PROGS = \
 	asn1api \

@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.87 2024/07/03 08:39:43 job Exp $ */
+/*	$OpenBSD: util.c,v 1.104 2026/08/04 08:11:05 job Exp $ */
 
 /*
  * Copyright (c) 2006 Claudio Jeker <claudio@openbsd.org>
@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -30,23 +31,6 @@
 
 #include "bgpd.h"
 #include "rde.h"
-#include "log.h"
-
-char *
-ibuf_get_string(struct ibuf *buf, size_t len)
-{
-	char *str;
-
-	if (ibuf_size(buf) < len) {
-		errno = EBADMSG;
-		return (NULL);
-	}
-	str = strndup(ibuf_data(buf), len);
-	if (str == NULL)
-		return (NULL);
-	ibuf_skip(buf, len);
-	return (str);
-}
 
 const char *
 log_addr(const struct bgpd_addr *addr)
@@ -65,8 +49,77 @@ log_addr(const struct bgpd_addr *addr)
 		snprintf(buf, sizeof(buf), "%s %s", log_rd(addr->rd),
 		    log_sockaddr(sa, len));
 		return (buf);
+	case AID_EVPN:
+		return log_evpnaddr(addr, sa, len);
+		break;
 	}
 	return ("???");
+}
+
+static const char *
+log_mac(const uint8_t mac[ETHER_ADDR_LEN])
+{
+	static char buf[18];
+
+	snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0],
+	    mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+	return (buf);
+}
+
+static const uint8_t zero_esi[ESI_ADDR_LEN];
+
+static const char *
+log_esi(const uint8_t esi[ESI_ADDR_LEN])
+{
+	static char buf[30];
+
+	if (memcmp(esi, zero_esi, sizeof(zero_esi)) == 0)
+		return ("");
+
+	snprintf(buf, sizeof(buf),
+	    "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", esi[0],
+	    esi[1], esi[2], esi[3], esi[4], esi[5], esi[6], esi[7], esi[8],
+	    esi[9]);
+
+	return (buf);
+}
+
+const char *
+log_evpnaddr(const struct bgpd_addr *addr, struct sockaddr *sa,
+    socklen_t salen)
+{
+	static char	buf[138];
+	uint32_t	vni;
+	uint8_t		len;
+
+	switch (addr->evpn.type) {
+	case EVPN_ROUTE_TYPE_2:
+		vni = addr->labelstack[0];
+		vni = vni << 8 | addr->labelstack[1];
+		vni = vni << 8 | addr->labelstack[2];
+		snprintf(buf, sizeof(buf), "[2]:[%s]:[%s]:[%d]:[48]:[%s]",
+		    log_rd(addr->rd), log_esi(addr->evpn.esi), vni,
+		    log_mac(addr->evpn.mac));
+		if (sa != NULL) {
+			len = strlen(buf);
+			snprintf(buf+len, sizeof(buf)-len, ":[%d]:[%s]",
+			    sa->sa_family == AF_INET ? 32 : 128,
+			    log_sockaddr(sa, salen));
+		}
+		break;
+	case EVPN_ROUTE_TYPE_3:
+		if (sa != NULL) {
+			snprintf(buf, sizeof(buf), "[3]:[%s]:[%d]:[%s]",
+			    log_rd(addr->rd),
+			    sa->sa_family == AF_INET ? 32 : 128,
+			    log_sockaddr(sa, salen));
+		}
+		break;
+	default:
+		break;
+	}
+	return (buf);
 }
 
 const char *
@@ -161,14 +214,16 @@ const struct ext_comm_pairs iana_ext_comms[] = IANA_EXT_COMMUNITIES;
 const char *
 log_ext_subtype(int type, uint8_t subtype)
 {
-	static char etype[6];
+	static char etype[16];
 	const struct ext_comm_pairs *cp;
 
 	for (cp = iana_ext_comms; cp->subname != NULL; cp++) {
 		if ((type == cp->type || type == -1) && subtype == cp->subtype)
 			return (cp->subname);
 	}
-	snprintf(etype, sizeof(etype), "[%u]", subtype);
+	if (type == -1)
+		return ("???");
+	snprintf(etype, sizeof(etype), "[%hhx:%hhx]", (uint8_t)type, subtype);
 	return (etype);
 }
 
@@ -196,13 +251,8 @@ const char *
 log_roa(struct roa *roa)
 {
 	static char buf[256];
-	char maxbuf[32];
-#if defined(__GNUC__) && __GNUC__ < 4
-	struct bgpd_addr addr = { .aid = roa->aid };
-	addr.v6 = roa->prefix.inet6;
-#else
 	struct bgpd_addr addr = { .aid = roa->aid, .v6 = roa->prefix.inet6 };
-#endif
+	char maxbuf[32];
 
 	maxbuf[0] = '\0';
 	if (roa->prefixlen != roa->maxlen)
@@ -223,7 +273,7 @@ log_aspa(struct aspa_set *aspa)
 	uint32_t i;
 
 	/* include enough space for header and trailer */
-	if ((uint64_t)aspa->num > (SIZE_MAX / sizeof(asbuf) - 72))
+	if (aspa->num > MAX_ASPA_SPAS_COUNT)
 		goto fail;
 	needed = aspa->num * sizeof(asbuf) + 72;
 	if (needed > len) {
@@ -270,6 +320,8 @@ log_aspath_error(int error)
 		return "invalid encoding";
 	case AS_ERR_SOFT:
 		return "soft failure";
+	case AS_ERR_MAX:
+		return "too large";
 	default:
 		snprintf(buf, sizeof(buf), "unknown %d", error);
 		return buf;
@@ -302,6 +354,16 @@ log_rtr_error(enum rtr_error err)
 		return "Duplicate Announcement Received";
 	case UNEXP_PROTOCOL_VERS:
 		return "Unexpected Protocol Version";
+	case ASPA_LIST_ERR:
+		return "ASPA Provider List Error";
+	case TRANSPORT_ERR:
+		return "Transport Error";
+	case ORDERING_ERR:
+		return "Ordering Error";
+	case CACHE_RESTART:
+		return "Cache Restart";
+	case CACHE_SHUTDOWN:
+		return "Cache Shutdown";
 	default:
 		snprintf(buf, sizeof(buf), "unknown %u", err);
 		return buf;
@@ -337,6 +399,10 @@ log_capability(uint8_t capa)
 		return "Multiprotocol Extensions";
 	case CAPA_REFRESH:
 		return "Route Refresh";
+	case CAPA_EXT_NEXTHOP:
+		return "Extended Nexthop Encoding";
+	case CAPA_EXT_MSG:
+		return "Extended Message";
 	case CAPA_ROLE:
 		return "BGP Role";
 	case CAPA_RESTART:
@@ -514,11 +580,12 @@ aspath_extract(const void *seg, int pos)
  * Verify that the aspath is correctly encoded.
  */
 int
-aspath_verify(struct ibuf *in, int as4byte, int noset)
+aspath_verify(struct ibuf *in, int as4byte, int permit_set)
 {
 	struct ibuf	 buf;
 	int		 pos, error = 0;
 	uint8_t		 seg_len, seg_type;
+	unsigned int	 count = 0;
 
 	ibuf_from_ibuf(&buf, in);
 	if (ibuf_size(&buf) & 1) {
@@ -551,7 +618,7 @@ aspath_verify(struct ibuf *in, int as4byte, int noset)
 		 * If AS_SET filtering (RFC6472) is on, error out on AS_SET
 		 * as well.
 		 */
-		if (noset && seg_type == AS_SET)
+		if (!permit_set && seg_type == AS_SET)
 			error = AS_ERR_SOFT;
 		if (seg_type != AS_SET && seg_type != AS_SEQUENCE &&
 		    seg_type != AS_CONFED_SEQUENCE &&
@@ -579,8 +646,13 @@ aspath_verify(struct ibuf *in, int as4byte, int noset)
 			}
 			if (as == 0)
 				error = AS_ERR_SOFT;
+
+			count++;
 		}
 	}
+
+	if (count > MAX_ASPATH_COUNT)
+		error = AS_ERR_MAX;
 
  done:
 	return (error);	/* aspath is valid but probably not loop free */
@@ -828,6 +900,108 @@ nlri_get_vpn6(struct ibuf *buf, struct bgpd_addr *prefix,
 	return (0);
 }
 
+int
+nlri_get_evpn(struct ibuf *buf, struct bgpd_addr *prefix,
+    uint8_t *prefixlen)
+{
+	struct ibuf	evpnbuf;
+	uint8_t		nlrilen, type, pfxlen = 0, maclen = 0;
+
+	if (ibuf_get_n8(buf, &type) == -1)
+		return (-1);
+	if (ibuf_get_n8(buf, &nlrilen) == -1)
+		return (-1);
+
+	memset(prefix, 0, sizeof(struct bgpd_addr));
+	prefix->aid = AID_EVPN;
+
+	switch (type) {
+	case EVPN_ROUTE_TYPE_2:
+		if (ibuf_get_ibuf(buf, nlrilen, &evpnbuf) == -1)
+			return (-1);
+		prefix->evpn.type = EVPN_ROUTE_TYPE_2;
+		/* RD */
+		if (ibuf_get_h64(&evpnbuf, &prefix->rd) == -1)
+			return (-1);
+		/* ESI */
+		if (ibuf_get(&evpnbuf, &prefix->evpn.esi,
+		    sizeof(prefix->evpn.esi)) == -1)
+			return (-1);
+		/* Ethernet Tag */
+		if (ibuf_get_h32(&evpnbuf, &prefix->evpn.ethtag) == -1)
+			return (-1);
+		/* MAC length */
+		if (ibuf_get_n8(&evpnbuf, &maclen) == -1)
+			return (-1);
+		if (maclen != 48)
+			return (-1);
+		/* MAC address */
+		if (ibuf_get(&evpnbuf, &prefix->evpn.mac,
+		    sizeof(prefix->evpn.mac)) == -1)
+			return (-1);
+		/* Prefix length */
+		if (ibuf_get_n8(&evpnbuf, &pfxlen) == -1)
+			return (-1);
+		/* Destination */
+		if (pfxlen == 0) {
+			/* nothing */
+		} else if (pfxlen == 32) {
+			prefix->evpn.aid = AID_INET;
+			if (ibuf_get(&evpnbuf, &prefix->evpn.v4,
+			    sizeof(prefix->evpn.v4)) == -1)
+				return (-1);
+		} else if (pfxlen == 128) {
+			prefix->evpn.aid = AID_INET6;
+			if (ibuf_get(&evpnbuf, &prefix->evpn.v6,
+			    sizeof(prefix->evpn.v6)) == -1)
+				return (-1);
+		} else
+			return (-1);
+		/* VNI */
+		if (ibuf_size(&evpnbuf) != 3 && ibuf_size(&evpnbuf) != 6)
+			return (-1);
+		prefix->labellen = ibuf_size(&evpnbuf);
+		if (ibuf_get(&evpnbuf, prefix->labelstack,
+		    prefix->labellen) == -1)
+			return (-1);
+		break;
+	case EVPN_ROUTE_TYPE_3:
+		if (ibuf_get_ibuf(buf, nlrilen, &evpnbuf) == -1)
+			return (-1);
+		prefix->evpn.type = EVPN_ROUTE_TYPE_3;
+		/* RD */
+		if (ibuf_get_h64(&evpnbuf, &prefix->rd) == -1)
+			return (-1);
+		/* Ethernet Tag */
+		if (ibuf_get_h32(&evpnbuf, &prefix->evpn.ethtag) == -1)
+			return (-1);
+		/* Prefix length */
+		if (ibuf_get_n8(&evpnbuf, &pfxlen) == -1)
+			return (-1);
+		/* Destination */
+		if (pfxlen == 32) {
+			prefix->evpn.aid = AID_INET;
+			if (ibuf_get(&evpnbuf, &prefix->evpn.v4,
+			    sizeof(prefix->evpn.v4)) == -1)
+				return (-1);
+		} else if (pfxlen == 128) {
+			prefix->evpn.aid = AID_INET6;
+			if (ibuf_get(&evpnbuf, &prefix->evpn.v6,
+			    sizeof(prefix->evpn.v6)) == -1)
+				return (-1);
+		} else
+			return (-1);
+		if (ibuf_size(&evpnbuf) != 0)
+			return (-1);
+		break;
+	default:
+		return (-1);
+	}
+
+	*prefixlen = pfxlen;
+	return (0);
+}
+
 static in_addr_t
 prefixlen2mask(uint8_t prefixlen)
 {
@@ -977,7 +1151,7 @@ aid2afi(uint8_t aid, uint16_t *afi, uint8_t *safi)
 int
 afi2aid(uint16_t afi, uint8_t safi, uint8_t *aid)
 {
-	uint8_t i;
+	u_int i;
 
 	for (i = AID_MIN; i < AID_MAX; i++)
 		if (aid_vals[i].afi == afi && aid_vals[i].safi == safi) {
@@ -999,7 +1173,7 @@ aid2af(uint8_t aid)
 int
 af2aid(sa_family_t af, uint8_t safi, uint8_t *aid)
 {
-	uint8_t i;
+	u_int i;
 
 	if (safi == 0) /* default to unicast subclass */
 		safi = SAFI_UNICAST;
@@ -1011,6 +1185,26 @@ af2aid(sa_family_t af, uint8_t safi, uint8_t *aid)
 		}
 
 	return (-1);
+}
+
+static socklen_t
+addr2sa_in6(struct sockaddr_in6 *sin6, struct in6_addr in6, uint16_t port,
+    uint32_t scope_id)
+{
+	sin6->sin6_family = AF_INET6;
+	memcpy(&sin6->sin6_addr, &in6, sizeof(sin6->sin6_addr));
+	sin6->sin6_port = htons(port);
+	sin6->sin6_scope_id = scope_id;
+	return (sizeof(struct sockaddr_in6));
+}
+
+static socklen_t
+addr2sa_in(struct sockaddr_in *sin, struct in_addr in, uint16_t port)
+{
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = in.s_addr;
+	sin->sin_port = htons(port);
+	return (sizeof(struct sockaddr_in));
 }
 
 /*
@@ -1031,22 +1225,26 @@ addr2sa(const struct bgpd_addr *addr, uint16_t port, socklen_t *len)
 	switch (addr->aid) {
 	case AID_INET:
 	case AID_VPN_IPv4:
-		sa_in->sin_family = AF_INET;
-		sa_in->sin_addr.s_addr = addr->v4.s_addr;
-		sa_in->sin_port = htons(port);
-		*len = sizeof(struct sockaddr_in);
+		*len = addr2sa_in(sa_in, addr->v4, port);
 		break;
 	case AID_INET6:
 	case AID_VPN_IPv6:
-		sa_in6->sin6_family = AF_INET6;
-		memcpy(&sa_in6->sin6_addr, &addr->v6,
-		    sizeof(sa_in6->sin6_addr));
-		sa_in6->sin6_port = htons(port);
-		sa_in6->sin6_scope_id = addr->scope_id;
-		*len = sizeof(struct sockaddr_in6);
+		*len = addr2sa_in6(sa_in6, addr->v6, port, addr->scope_id);
+		break;
+	case AID_EVPN:
+		if (addr->evpn.aid == AID_INET)
+			*len = addr2sa_in(sa_in, addr->evpn.v4, port);
+		else if (addr->evpn.aid == AID_INET6)
+			*len = addr2sa_in6(sa_in6, addr->evpn.v6, port,
+			    addr->scope_id);
+		else {
+			*len = 0;
+			return (NULL);
+		}
 		break;
 	case AID_FLOWSPECv4:
 	case AID_FLOWSPECv6:
+	default:
 		return (NULL);
 	}
 
@@ -1116,4 +1314,54 @@ get_baudrate(unsigned long long baudrate, char *unit)
 		    baudrate, unit);
 
 	return (bbuf);
+}
+
+/* internal functions needed for bucket sizing, stolen from omalloc.c */
+
+/* using built-in function version */
+__attribute__((const)) static inline unsigned int
+lb(unsigned int x)
+{
+	/* I need an extension just for integer-length (: */
+	return (sizeof(x) * CHAR_BIT - 1) - __builtin_clz(x);
+}
+
+/*
+ * https://pvk.ca/Blog/2015/06/27/linear-log-bucketing-fast-versatile-simple/
+ * via Tony Finch
+ */
+static inline unsigned int
+bin_of(unsigned int size, unsigned int linear, unsigned int subbin)
+{
+	unsigned int mask, rounded, rounded_size;
+	unsigned int n_bits, shift;
+
+	n_bits = lb(size | (1U << linear));
+	shift = n_bits - subbin;
+	mask = (1U << shift) - 1;
+	rounded = size + mask; /* XXX: overflow. */
+
+	rounded_size = rounded & ~mask;
+	return rounded_size;
+}
+
+unsigned int
+bin_of_attrs(unsigned int count)
+{
+	/* 4, 8, 12, ... 60, 64, 72, 80, ... */
+	return bin_of(count, 5, 3);
+}
+
+unsigned int
+bin_of_communities(unsigned int count)
+{
+	/* 8, 16, 24, ... 56, 64, 80, 96, ... */
+	return bin_of(count, 5, 2);
+}
+
+unsigned int
+bin_of_adjout_prefixes(unsigned int count)
+{
+	/* 1, 2, 3, 4, 6, 8, 12, 16, 24, ... */
+	return bin_of(count, 1, 1);
 }

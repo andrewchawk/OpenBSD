@@ -1,7 +1,8 @@
-/* $OpenBSD: term_ps.c,v 1.56 2020/09/06 14:44:19 schwarze Exp $ */
+/* $OpenBSD: term_ps.c,v 1.61 2026/01/07 08:22:24 schwarze Exp $ */
 /*
+ * Copyright (c) 2014-2017, 2020, 2025, 2026
+ *               Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
- * Copyright (c) 2014,2015,2016,2017,2020 Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2017 Marc Espie <espie@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -91,7 +92,7 @@ struct	termp_ps {
 
 static	int		  ps_hspan(const struct termp *,
 				const struct roffsu *);
-static	size_t		  ps_width(const struct termp *, int);
+static	size_t		  ps_getwidth(const struct termp *, int);
 static	void		  ps_advance(struct termp *, size_t);
 static	void		  ps_begin(struct termp *);
 static	void		  ps_closepage(struct termp *);
@@ -106,7 +107,7 @@ static	void		  ps_printf(struct termp *, const char *, ...)
 				__attribute__((__format__ (__printf__, 2, 3)));
 static	void		  ps_putchar(struct termp *, char);
 static	void		  ps_setfont(struct termp *, enum termfont);
-static	void		  ps_setwidth(struct termp *, int, int);
+static	void		  ps_setwidth(struct termp *, int, size_t);
 static	struct termp	 *pspdf_alloc(const struct manoutput *, enum termtype);
 static	void		  pdf_obj(struct termp *, size_t);
 
@@ -545,7 +546,7 @@ pspdf_alloc(const struct manoutput *outopts, enum termtype type)
 	p->hspan = ps_hspan;
 	p->letter = ps_letter;
 	p->setwidth = ps_setwidth;
-	p->width = ps_width;
+	p->getwidth = ps_getwidth;
 
 	/* Default to US letter (millimetres). */
 
@@ -614,12 +615,12 @@ pspdf_alloc(const struct manoutput *outopts, enum termtype type)
 	p->ps->left = marginx;
 	p->ps->lineheight = lineheight;
 
-	p->defrmargin = pagex - (marginx * 2);
+	p->maxrmargin = p->defrmargin = pagex - (marginx * 2);
 	return p;
 }
 
 static void
-ps_setwidth(struct termp *p, int iop, int width)
+ps_setwidth(struct termp *p, int iop, size_t width)
 {
 	size_t	 lastwidth;
 
@@ -627,8 +628,8 @@ ps_setwidth(struct termp *p, int iop, int width)
 	if (iop > 0)
 		p->ps->width += width;
 	else if (iop == 0)
-		p->ps->width = width ? (size_t)width : p->ps->lastwidth;
-	else if (p->ps->width > (size_t)width)
+		p->ps->width = width ? width : p->ps->lastwidth;
+	else if (p->ps->width > width)
 		p->ps->width -= width;
 	else
 		p->ps->width = 0;
@@ -1207,6 +1208,7 @@ ps_advance(struct termp *p, size_t len)
 	ps_plast(p);
 	ps_pclose(p);
 	p->ps->pscol += len;
+	p->viscol += len;
 }
 
 static void
@@ -1217,6 +1219,8 @@ ps_endline(struct termp *p)
 
 	ps_plast(p);
 	ps_pclose(p);
+	p->viscol = 0;
+	p->minbl = 0;
 
 	/*
 	 * If we're in the margin, don't try to recalculate our current
@@ -1278,7 +1282,7 @@ ps_setfont(struct termp *p, enum termfont f)
 }
 
 static size_t
-ps_width(const struct termp *p, int c)
+ps_getwidth(const struct termp *p, int c)
 {
 
 	if (c <= 32 || c - 32 >= MAXCHAR)
@@ -1307,7 +1311,7 @@ ps_hspan(const struct termp *p, const struct roffsu *su)
 		 * scaling unit so that output is the same regardless
 		 * the media.
 		 */
-		r = PNT2AFM(p, su->scale * 72.0 / 240.0);
+		r = PNT2AFM(p, su->scale * 72.0 / 10.0);
 		break;
 	case SCALE_CM:
 		r = PNT2AFM(p, su->scale * 72.0 / 2.54);
@@ -1340,8 +1344,7 @@ ps_hspan(const struct termp *p, const struct roffsu *su)
 		r = su->scale;
 		break;
 	}
-
-	return r * 24.0;
+	return r;
 }
 
 static void

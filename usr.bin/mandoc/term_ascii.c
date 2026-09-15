@@ -1,7 +1,8 @@
-/* $OpenBSD: term_ascii.c,v 1.55 2023/11/13 19:13:00 schwarze Exp $ */
+/* $OpenBSD: term_ascii.c,v 1.59 2026/01/07 08:22:24 schwarze Exp $ */
 /*
+ * Copyright (c) 2014, 2015, 2017-2020, 2025, 2026
+ *               Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
- * Copyright (c) 2014,2015,2017,2018,2020 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -39,18 +40,18 @@
 static	struct termp	 *ascii_init(enum termenc, const struct manoutput *);
 static	int		  ascii_hspan(const struct termp *,
 				const struct roffsu *);
-static	size_t		  ascii_width(const struct termp *, int);
+static	size_t		  ascii_getwidth(const struct termp *, int);
 static	void		  ascii_advance(struct termp *, size_t);
 static	void		  ascii_begin(struct termp *);
 static	void		  ascii_end(struct termp *);
 static	void		  ascii_endline(struct termp *);
 static	void		  ascii_letter(struct termp *, int);
-static	void		  ascii_setwidth(struct termp *, int, int);
+static	void		  ascii_setwidth(struct termp *, int, size_t);
 
 static	void		  locale_advance(struct termp *, size_t);
 static	void		  locale_endline(struct termp *);
 static	void		  locale_letter(struct termp *, int);
-static	size_t		  locale_width(const struct termp *, int);
+static	size_t		  locale_getwidth(const struct termp *, int);
 
 
 static struct termp *
@@ -65,7 +66,6 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 
 	p->line = 1;
 	p->defindent = 5;
-	p->defrmargin = p->lastrmargin = 78;
 	p->fontq = mandoc_reallocarray(NULL,
 	     (p->fontsz = 8), sizeof(*p->fontq));
 	p->fontq[0] = p->fontl = TERMFONT_NONE;
@@ -74,13 +74,12 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 	p->end = ascii_end;
 	p->hspan = ascii_hspan;
 	p->type = TERMTYPE_CHAR;
-
 	p->enc = TERMENC_ASCII;
 	p->advance = ascii_advance;
 	p->endline = ascii_endline;
 	p->letter = ascii_letter;
 	p->setwidth = ascii_setwidth;
-	p->width = ascii_width;
+	p->getwidth = ascii_getwidth;
 
 	if (enc != TERMENC_ASCII) {
 
@@ -109,16 +108,14 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 			p->advance = locale_advance;
 			p->endline = locale_endline;
 			p->letter = locale_letter;
-			p->width = locale_width;
+			p->getwidth = locale_getwidth;
 		}
 	}
+	p->defrmargin = term_len(p, outopts->width ? outopts->width : 78);
+	p->lastrmargin = p->maxrmargin = p->defrmargin;
 
-	if (outopts->mdoc)
-		p->mdocstyle = 1;
 	if (outopts->indent)
 		p->defindent = outopts->indent;
-	if (outopts->width)
-		p->defrmargin = outopts->width;
 	if (outopts->synopsisonly)
 		p->synopsisonly = 1;
 
@@ -130,109 +127,113 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 void *
 ascii_alloc(const struct manoutput *outopts)
 {
-
 	return ascii_init(TERMENC_ASCII, outopts);
 }
 
 void *
 utf8_alloc(const struct manoutput *outopts)
 {
-
 	return ascii_init(TERMENC_UTF8, outopts);
 }
 
 void *
 locale_alloc(const struct manoutput *outopts)
 {
-
 	return ascii_init(TERMENC_LOCALE, outopts);
 }
 
 static void
-ascii_setwidth(struct termp *p, int iop, int width)
+ascii_setwidth(struct termp *p, int iop, size_t width)
 {
-
-	width /= 24;
-	p->tcol->rmargin = p->defrmargin;
+	p->tcol->rmargin = p->maxrmargin;
 	if (iop > 0)
-		p->defrmargin += width;
+		p->maxrmargin += width;
 	else if (iop == 0)
-		p->defrmargin = width ? (size_t)width : p->lastrmargin;
-	else if (p->defrmargin > (size_t)width)
-		p->defrmargin -= width;
+		p->maxrmargin = width ? width : p->lastrmargin;
+	else if (p->maxrmargin > width)
+		p->maxrmargin -= width;
 	else
-		p->defrmargin = 0;
-	if (p->defrmargin > 1000)
-		p->defrmargin = 1000;
+		p->maxrmargin = 0;
+	if (p->maxrmargin > term_len(p, 1000))
+		p->maxrmargin = term_len(p, 1000);
 	p->lastrmargin = p->tcol->rmargin;
-	p->tcol->rmargin = p->maxrmargin = p->defrmargin;
+	p->tcol->rmargin = p->maxrmargin;
 }
 
 void
 terminal_sepline(void *arg)
 {
 	struct termp	*p;
-	size_t		 i;
+	size_t		 i;	/* Printed width in basic units. */
+	size_t		 sz;	/* Width of a dash in basic units. */
 
 	p = (struct termp *)arg;
 	(*p->endline)(p);
-	for (i = 0; i < p->defrmargin; i++)
+	sz = (*p->getwidth)(p, '-');
+	for (i = 0; i < p->defrmargin; i += sz)
 		(*p->letter)(p, '-');
 	(*p->endline)(p);
 	(*p->endline)(p);
 }
 
 static size_t
-ascii_width(const struct termp *p, int c)
+ascii_getwidth(const struct termp *p, int c)
 {
-	return c != ASCII_BREAK && c != ASCII_NBRZW && c != ASCII_TABREF;
+	switch (c) {
+	case ASCII_BREAK:
+	case ASCII_NBRZW:
+	case ASCII_TABREF:
+		return 0;
+	default:
+		return 24;
+	}
 }
 
 void
 ascii_free(void *arg)
 {
-
 	term_free((struct termp *)arg);
 }
 
 static void
 ascii_letter(struct termp *p, int c)
 {
-
 	putchar(c);
 }
 
 static void
 ascii_begin(struct termp *p)
 {
-
 	(*p->headf)(p, p->argf);
 }
 
 static void
 ascii_end(struct termp *p)
 {
-
 	(*p->footf)(p, p->argf);
 }
 
 static void
 ascii_endline(struct termp *p)
 {
-
 	p->line++;
 	if ((int)p->tcol->offset > p->ti)
 		p->tcol->offset -= p->ti;
 	else
 		p->tcol->offset = 0;
 	p->ti = 0;
+	p->minbl = 0;
+	p->viscol = 0;
 	putchar('\n');
 }
 
 static void
 ascii_advance(struct termp *p, size_t len)
 {
-	size_t		i;
+	size_t		 dst;	/* Destination column in basic units. */
+	size_t		 sz;	/* Width of a space in basic units. */
+
+	sz = (*p->getwidth)(p, ' ');
 
 	/*
 	 * XXX We used to have "assert(len < UINT16_MAX)" here.
@@ -240,10 +241,14 @@ ascii_advance(struct termp *p, size_t len)
 	 * can trigger that by merely providing large input.
 	 * For now, simply truncate.
 	 */
-	if (len > 256)
-		len = 256;
-	for (i = 0; i < len; i++)
+	if (len > 256 * sz)
+		len = 256 * sz;
+
+	dst = p->viscol + len;
+	while (p->viscol + sz / 2 < dst) {
 		putchar(' ');
+		p->viscol += sz;
+	}
 }
 
 static int
@@ -361,7 +366,7 @@ ascii_uc2str(int uc)
 }
 
 static size_t
-locale_width(const struct termp *p, int c)
+locale_getwidth(const struct termp *p, int c)
 {
 	int		rc;
 
@@ -370,13 +375,16 @@ locale_width(const struct termp *p, int c)
 	rc = wcwidth(c);
 	if (rc < 0)
 		rc = 0;
-	return rc;
+	return rc * 24;
 }
 
 static void
 locale_advance(struct termp *p, size_t len)
 {
-	size_t		i;
+	size_t		 dst;	/* Destination column in basic units. */
+	size_t		 sz;	/* Width of a space in basic units. */
+
+	sz = (*p->getwidth)(p, ' ');
 
 	/*
 	 * XXX We used to have "assert(len < UINT16_MAX)" here.
@@ -384,28 +392,32 @@ locale_advance(struct termp *p, size_t len)
 	 * can trigger that by merely providing large input.
 	 * For now, simply truncate.
 	 */
-	if (len > 256)
-		len = 256;
-	for (i = 0; i < len; i++)
+	if (len > 256 * sz)
+		len = 256 * sz;
+
+	dst = p->viscol + len;
+	while (p->viscol + sz / 2 < dst) {
 		putwchar(L' ');
+		p->viscol += sz;
+	}
 }
 
 static void
 locale_endline(struct termp *p)
 {
-
 	p->line++;
 	if ((int)p->tcol->offset > p->ti)
 		p->tcol->offset -= p->ti;
 	else 
 		p->tcol->offset = 0;
 	p->ti = 0;
+	p->minbl = 0;
+	p->viscol = 0;
 	putwchar(L'\n');
 }
 
 static void
 locale_letter(struct termp *p, int c)
 {
-
 	putwchar(c);
 }

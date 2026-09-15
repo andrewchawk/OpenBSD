@@ -1,4 +1,4 @@
-/*	$OpenBSD: agentx_control.c,v 1.7 2024/01/17 10:01:24 claudio Exp $	*/
+/*	$OpenBSD: agentx_control.c,v 1.12 2026/08/12 19:29:34 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2020 Martijn van Duren <martijn@openbsd.org>
@@ -38,6 +38,7 @@
 #include <imsg.h>
 
 #include "relayd.h"
+#include "log.h"
 
 #define RELAYD_MIB	"1.3.6.1.4.1.30155.3"
 #define SNMP_ELEMENT(x...)	do {				\
@@ -191,7 +192,7 @@ void agentxctl_table(struct agentx_varbind *);
 void	 agentx_sock(int, short, void *);
 #if 0
 int	 snmp_element(const char *, enum snmp_type, void *, int64_t,
-	    struct agentx_pdu *);
+    struct agentx_pdu *);
 int	 snmp_string2oid(const char *, struct snmp_oid *);
 #endif
 
@@ -227,8 +228,8 @@ agentx_init(struct relayd *nenv)
 	if ((sas = agentx_session(sa, NULL, 0, "relayd", 0)) == NULL)
 		fatal("%s: agentx session alloc", __func__);
 	if ((sac = agentx_context(sas,
-		env->sc_conf.agentx_context[0] == '\0' ? NULL :
-		env->sc_conf.agentx_context)) == NULL)
+	    env->sc_conf.agentx_context[0] == '\0' ? NULL :
+	    env->sc_conf.agentx_context)) == NULL)
 		fatal("%s: agentx context alloc", __func__);
 	sar = agentx_region(sac, AGENTX_OID(RELAYDINFO), 0);
 	if (sar == NULL)
@@ -236,19 +237,19 @@ agentx_init(struct relayd *nenv)
 	if ((relaydRedirectIdx = agentx_index_integer_dynamic(sar,
 	    AGENTX_OID(RELAYDREDIRECTINDEX))) == NULL ||
 	    (relaydRelayIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDRELAYINDEX))) == NULL ||
+	     AGENTX_OID(RELAYDRELAYINDEX))) == NULL ||
 	    (relaydRouterIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDROUTERINDEX))) == NULL ||
+	     AGENTX_OID(RELAYDROUTERINDEX))) == NULL ||
 	    (relaydNetRouteIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDNETROUTEINDEX))) == NULL ||
+	     AGENTX_OID(RELAYDNETROUTEINDEX))) == NULL ||
 	    (relaydHostIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDHOSTINDEX))) == NULL ||
+	     AGENTX_OID(RELAYDHOSTINDEX))) == NULL ||
 	    (relaydSessionIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDSESSIONINDEX))) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONINDEX))) == NULL ||
 	    (relaydSessionRelayIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDSESSIONRELAYINDEX))) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONRELAYINDEX))) == NULL ||
 	    (relaydTableIdx = agentx_index_integer_dynamic(sar,
-	    AGENTX_OID(RELAYDTABLEINDEX))) == NULL)
+	     AGENTX_OID(RELAYDTABLEINDEX))) == NULL)
 		fatal("%s: agentx index alloc", __func__);
 	session_idxs[0] = relaydSessionRelayIdx;
 	session_idxs[1] = relaydSessionIdx;
@@ -256,179 +257,181 @@ agentx_init(struct relayd *nenv)
 	    AGENTX_OID(RELAYDREDIRECTINDEX), &relaydRedirectIdx, 1, 0,
 	    agentxctl_redirect)) == NULL ||
 	    (relaydRedirectStatus = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTSTATUS), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTSTATUS), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectName = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTNAME), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTNAME), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectCnt = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTCNT), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTCNT), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectAvg = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTAVG), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTAVG), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectLast = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTLAST), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTLAST), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectAvgHour = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTAVGHOUR), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTAVGHOUR), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectLastHour = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTLASTHOUR), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTLASTHOUR), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectAvgDay = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTAVGDAY), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTAVGDAY), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRedirectLastDay = agentx_object(sar,
-	    AGENTX_OID(RELAYDREDIRECTLASTDAY), &relaydRedirectIdx, 1, 0,
-	    agentxctl_redirect)) == NULL ||
+	     AGENTX_OID(RELAYDREDIRECTLASTDAY), &relaydRedirectIdx, 1, 0,
+	     agentxctl_redirect)) == NULL ||
 	    (relaydRelayIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYINDEX), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYINDEX), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayStatus = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYSTATUS), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYSTATUS), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayName = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYNAME), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYNAME), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayCnt = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYCNT), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYCNT), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayAvg = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYAVG), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYAVG), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayLast = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYLAST), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYLAST), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayAvgHour = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYAVGHOUR), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYAVGHOUR), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayLastHour = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYLASTHOUR), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYLASTHOUR), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayAvgDay = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYAVGDAY), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYAVGDAY), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRelayLastDay = agentx_object(sar,
-	    AGENTX_OID(RELAYDRELAYLASTDAY), &relaydRelayIdx, 1, 0,
-	    agentxctl_relay)) == NULL ||
+	     AGENTX_OID(RELAYDRELAYLASTDAY), &relaydRelayIdx, 1, 0,
+	     agentxctl_relay)) == NULL ||
 	    (relaydRouterIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDROUTERINDEX), &relaydRouterIdx, 1, 0,
-	    agentxctl_router)) == NULL ||
+	     AGENTX_OID(RELAYDROUTERINDEX), &relaydRouterIdx, 1, 0,
+	     agentxctl_router)) == NULL ||
 	    (relaydRouterTableIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDROUTERTABLEINDEX), &relaydRouterIdx, 1, 0,
-	    agentxctl_router)) == NULL ||
+	     AGENTX_OID(RELAYDROUTERTABLEINDEX), &relaydRouterIdx, 1, 0,
+	     agentxctl_router)) == NULL ||
 	    (relaydRouterStatus = agentx_object(sar,
-	    AGENTX_OID(RELAYDROUTERSTATUS), &relaydRouterIdx, 1, 0,
-	    agentxctl_router)) == NULL ||
+	     AGENTX_OID(RELAYDROUTERSTATUS), &relaydRouterIdx, 1, 0,
+	     agentxctl_router)) == NULL ||
 	    (relaydRouterName = agentx_object(sar,
-	    AGENTX_OID(RELAYDROUTERNAME), &relaydRouterIdx, 1, 0,
-	    agentxctl_router)) == NULL ||
+	     AGENTX_OID(RELAYDROUTERNAME), &relaydRouterIdx, 1, 0,
+	     agentxctl_router)) == NULL ||
 	    (relaydRouterLabel = agentx_object(sar,
-	    AGENTX_OID(RELAYDROUTERLABEL), &relaydRouterIdx, 1, 0,
-	    agentxctl_router)) == NULL ||
+	     AGENTX_OID(RELAYDROUTERLABEL), &relaydRouterIdx, 1, 0,
+	     agentxctl_router)) == NULL ||
 	    (relaydRouterRtable = agentx_object(sar,
-	    AGENTX_OID(RELAYDROUTERRTABLE), &relaydRouterIdx, 1, 0,
-	    agentxctl_router)) == NULL ||
+	     AGENTX_OID(RELAYDROUTERRTABLE), &relaydRouterIdx, 1, 0,
+	     agentxctl_router)) == NULL ||
 	    (relaydNetRouteIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDNETROUTEINDEX), &relaydNetRouteIdx, 1, 0,
-	    agentxctl_netroute)) == NULL ||
+	     AGENTX_OID(RELAYDNETROUTEINDEX), &relaydNetRouteIdx, 1, 0,
+	     agentxctl_netroute)) == NULL ||
 	    (relaydNetRouteAddr = agentx_object(sar,
-	    AGENTX_OID(RELAYDNETROUTEADDR), &relaydNetRouteIdx, 1, 0,
-	    agentxctl_netroute)) == NULL ||
+	     AGENTX_OID(RELAYDNETROUTEADDR), &relaydNetRouteIdx, 1, 0,
+	     agentxctl_netroute)) == NULL ||
 	    (relaydNetRouteAddrType = agentx_object(sar,
-	    AGENTX_OID(RELAYDNETROUTEADDRTYPE), &relaydNetRouteIdx, 1, 0,
-	    agentxctl_netroute)) == NULL ||
+	     AGENTX_OID(RELAYDNETROUTEADDRTYPE), &relaydNetRouteIdx, 1, 0,
+	     agentxctl_netroute)) == NULL ||
 	    (relaydNetRoutePrefixLen = agentx_object(sar,
-	    AGENTX_OID(RELAYDNETROUTEPREFIXLEN), &relaydNetRouteIdx, 1, 0,
-	    agentxctl_netroute)) == NULL ||
+	     AGENTX_OID(RELAYDNETROUTEPREFIXLEN), &relaydNetRouteIdx, 1, 0,
+	     agentxctl_netroute)) == NULL ||
 	    (relaydNetRouteRouterIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDNETROUTEROUTERINDEX), &relaydNetRouteIdx, 1, 0,
-	    agentxctl_netroute)) == NULL ||
+	     AGENTX_OID(RELAYDNETROUTEROUTERINDEX), &relaydNetRouteIdx, 1, 0,
+	     agentxctl_netroute)) == NULL ||
 	    (relaydHostIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTINDEX), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTINDEX), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostParentIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTPARENTINDEX), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTPARENTINDEX), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostTableIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTTABLEINDEX), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTTABLEINDEX), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostName = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTNAME), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTNAME), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostAddress = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTADDRESS), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTADDRESS), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostAddressType = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTADDRESSTYPE), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTADDRESSTYPE), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostStatus = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTSTATUS), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTSTATUS), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostCheckCnt = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTCHECKCNT), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTCHECKCNT), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostUpCnt = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTUPCNT), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTUPCNT), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydHostErrno = agentx_object(sar,
-	    AGENTX_OID(RELAYDHOSTERRNO), &relaydHostIdx, 1, 0,
-	    agentxctl_host)) == NULL ||
+	     AGENTX_OID(RELAYDHOSTERRNO), &relaydHostIdx, 1, 0,
+	     agentxctl_host)) == NULL ||
 	    (relaydSessionIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONINDEX), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONINDEX), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionRelayIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONRELAYINDEX), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONRELAYINDEX), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionInAddr = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONINADDR), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONINADDR), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionInAddrType = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONINADDRTYPE), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONINADDRTYPE), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionOutAddr = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONOUTADDR), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONOUTADDR), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionOutAddrType = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONOUTADDRTYPE), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONOUTADDRTYPE), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionPortIn = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONPORTIN), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONPORTIN), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionPortOut = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONPORTOUT), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONPORTOUT), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionAge = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONAGE), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONAGE), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionIdle = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONIDLE), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONIDLE), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionStatus = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONSTATUS), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONSTATUS), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydSessionPid = agentx_object(sar,
-	    AGENTX_OID(RELAYDSESSIONPID), session_idxs, 2, 0,
-	    agentxctl_session)) == NULL ||
+	     AGENTX_OID(RELAYDSESSIONPID), session_idxs, 2, 0,
+	     agentxctl_session)) == NULL ||
 	    (relaydTableIndex = agentx_object(sar,
-	    AGENTX_OID(RELAYDTABLEINDEX), &relaydTableIdx, 1, 0,
-	    agentxctl_table)) == NULL ||
+	     AGENTX_OID(RELAYDTABLEINDEX), &relaydTableIdx, 1, 0,
+	     agentxctl_table)) == NULL ||
 	    (relaydTableName = agentx_object(sar,
-	    AGENTX_OID(RELAYDTABLENAME), &relaydTableIdx, 1, 0,
-	    agentxctl_table)) == NULL ||
+	     AGENTX_OID(RELAYDTABLENAME), &relaydTableIdx, 1, 0,
+	     agentxctl_table)) == NULL ||
 	    (relaydTableStatus = agentx_object(sar,
-	    AGENTX_OID(RELAYDTABLESTATUS), &relaydTableIdx, 1, 0,
-	    agentxctl_table)) == NULL)
+	     AGENTX_OID(RELAYDTABLESTATUS), &relaydTableIdx, 1, 0,
+	     agentxctl_table)) == NULL)
 		fatal("%s: agentx object alloc", __func__);
 }
 
 void
 agentx_nofd(struct agentx *usa, void *cookie, int close)
 {
-	if (!close)
-		proc_compose(env->sc_ps, PROC_PARENT, IMSG_AGENTXSOCK, NULL, 0);
-	else {
+	if (!close) {
+		if (proc_compose(env->sc_ps, PROC_PARENT, IMSG_AGENTXSOCK,
+		    NULL, 0) == -1)
+			log_warn("%s: proc_compose", __func__);
+	} else {
 		sa = NULL;
 		agentx_init(env);
 		event_del(&(env->sc_agentxev));
@@ -455,14 +458,16 @@ agentx_setsock(struct relayd *lenv, enum privsep_procid id)
 		s = -1;
 	}
  done:
-	proc_compose_imsg(lenv->sc_ps, id, -1, IMSG_AGENTXSOCK, -1, s, NULL, 0);
+	if (proc_compose_imsg(lenv->sc_ps, id, -1, IMSG_AGENTXSOCK, -1, s,
+	    NULL, 0) == -1)
+		log_warn("%s: proc_compose_imsg", __func__);
 }
 
 void
 agentx_getsock(struct imsg *imsg)
 {
 	struct timeval		 tv = AGENTX_RECONNECT_TIMEOUT;
-	int 			 fd;
+	int			 fd;
 
 	fd = imsg_get_fd(imsg);
 	if (fd == -1)
@@ -484,7 +489,9 @@ void
 agentx_sock(int fd, short event, void *arg)
 {
 	if (event & EV_TIMEOUT) {
-		proc_compose(env->sc_ps, PROC_PARENT, IMSG_AGENTXSOCK, NULL, 0);
+		if (proc_compose(env->sc_ps, PROC_PARENT, IMSG_AGENTXSOCK,
+		    NULL, 0) == -1)
+			log_warn("%s: proc_compose", __func__);
 		return;
 	}
 	if (event & EV_WRITE) {
@@ -541,7 +548,6 @@ agentxctl_rdr_byidx(uint32_t instanceidx, enum agentx_request_type type)
 	return NULL;
 }
 
-
 void
 agentxctl_redirect(struct agentx_varbind *sav)
 {
@@ -562,8 +568,6 @@ agentxctl_redirect(struct agentx_varbind *sav)
 			agentx_varbind_integer(sav, 1);
 		else if (rdr->conf.flags & F_DOWN)
 			agentx_varbind_integer(sav, 2);
-		else if (rdr->conf.flags & F_BACKUP)
-			agentx_varbind_integer(sav, 3);
 		else
 			agentx_varbind_integer(sav, 0);
 	} else if (agentx_varbind_get_object(sav) == relaydRedirectName)
@@ -992,7 +996,6 @@ agentxctl_table(struct agentx_varbind *sav)
 		else
 			agentx_varbind_integer(sav, 0);
 	}
-
 }
 #if 0
 
@@ -1004,7 +1007,7 @@ snmp_element(const char *oidstr, enum snmp_type type, void *buf, int64_t val,
 	u_int64_t		 l;
 	struct snmp_oid		 oid;
 
-	DPRINTF("%s: oid %s type %d buf %p val %lld", __func__,
+	log_debug("%s: oid %s type %d buf %p val %lld", __func__,
 	    oidstr, type, buf, val);
 
 	if (snmp_string2oid(oidstr, &oid) == -1)

@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.15 2023/11/11 18:35:38 robert Exp $
+# $OpenBSD: Makefile,v 1.17 2026/05/29 11:18:31 robert Exp $
 
 LIB=	LLVMTransformUtils
 NOPROFILE=
@@ -23,9 +23,14 @@ SRCS+=	AddDiscriminators.cpp \
 	CodeExtractor.cpp \
 	CodeLayout.cpp \
 	CodeMoverUtils.cpp \
+	ControlFlowUtils.cpp \
 	CtorUtils.cpp \
+	CountVisits.cpp \
 	Debugify.cpp \
+	DebugSSAUpdater.cpp \
+	DeclareRuntimeLibcalls.cpp \
 	DemoteRegToStack.cpp \
+	DXILUpgrade.cpp \
 	EntryExitInstrumenter.cpp \
 	EscapeEnumerator.cpp \
 	Evaluator.cpp \
@@ -39,10 +44,13 @@ SRCS+=	AddDiscriminators.cpp \
 	InlineFunction.cpp \
 	InjectTLIMappings.cpp \
 	InstructionNamer.cpp \
+	Instrumentation.cpp \
 	IntegerDivision.cpp \
+	IRNormalizer.cpp \
 	LCSSA.cpp \
 	LibCallsShrinkWrap.cpp \
 	TransformUtilsLocal.cpp \
+	LoopConstrainer.cpp \
 	LoopPeel.cpp \
 	LoopRotationUtils.cpp \
 	LoopSimplify.cpp \
@@ -57,6 +65,7 @@ SRCS+=	AddDiscriminators.cpp \
 	LowerInvoke.cpp \
 	LowerMemIntrinsics.cpp \
 	LowerSwitch.cpp \
+	LowerVectorIntrinsics.cpp \
 	MatrixUtils.cpp \
 	MemoryOpRemark.cpp \
 	MemoryTaggingSupport.cpp \
@@ -64,8 +73,10 @@ SRCS+=	AddDiscriminators.cpp \
 	MetaRenamer.cpp \
 	MisExpect.cpp \
 	ModuleUtils.cpp \
+	MoveAutoInit.cpp \
 	NameAnonGlobals.cpp \
 	PredicateInfo.cpp \
+	ProfileVerify.cpp \
 	PromoteMemoryToRegister.cpp \
 	RelLookupTableConverter.cpp \
 	ScalarEvolutionExpander.cpp \
@@ -81,6 +92,7 @@ SRCS+=	AddDiscriminators.cpp \
 	SimplifyLibCalls.cpp \
 	SizeOpts.cpp \
 	SplitModule.cpp \
+	SplitModuleByCategory.cpp \
 	StripNonLineTableDebugInfo.cpp \
 	SymbolRewriter.cpp \
 	UnifyFunctionExitNodes.cpp \

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vionet.c,v 1.16 2024/07/12 14:34:08 jan Exp $	*/
+/*	$OpenBSD: vionet.c,v 1.33 2026/08/30 23:23:18 jsg Exp $	*/
 
 /*
  * Copyright (c) 2023 Dave Voutila <dv@openbsd.org>
@@ -16,7 +16,6 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-#include <sys/socket.h>
 #include <sys/types.h>
 
 #include <dev/pci/virtio_pcireg.h>
@@ -39,11 +38,22 @@
 #include "virtio.h"
 #include "vmd.h"
 
+#define VIONET_DEBUG	0
+#ifdef DPRINTF
+#undef DPRINTF
+#endif
+#if VIONET_DEBUG
+#define DPRINTF		log_debug
+#else
+#define DPRINTF(x...)	do {} while(0)
+#endif	/* VIONET_DEBUG */
+
+#define VIRTIO_NET_CONFIG_MAC		 0 /*  8 bit x 6 byte */
+
 #define VIRTIO_NET_F_MAC	(1 << 5)
 #define RXQ	0
 #define TXQ	1
 
-extern char *__progname;
 extern struct vmd_vm *current_vm;
 
 struct packet {
@@ -53,17 +63,20 @@ struct packet {
 
 static void *rx_run_loop(void *);
 static void *tx_run_loop(void *);
-static int vionet_rx(struct vionet_dev *, int);
+static int vionet_rx(struct virtio_dev *, int);
 static ssize_t vionet_rx_copy(struct vionet_dev *, int, const struct iovec *,
     int, size_t);
 static ssize_t vionet_rx_zerocopy(struct vionet_dev *, int,
     const struct iovec *, int);
 static void vionet_rx_event(int, short, void *);
-static uint32_t handle_io_read(struct viodev_msg *, struct virtio_dev *,
-    int8_t *);
-static void handle_io_write(struct viodev_msg *, struct virtio_dev *);
+static uint32_t vionet_read(struct virtio_dev *, struct viodev_msg *, int *);
+static void vionet_write(struct virtio_dev *, struct viodev_msg *);
+static uint32_t vionet_cfg_read(struct virtio_dev *, struct viodev_msg *);
+static void vionet_cfg_write(struct virtio_dev *, struct viodev_msg *);
+
 static int vionet_tx(struct virtio_dev *);
-static void vionet_notifyq(struct virtio_dev *);
+static void vionet_notifyq(struct virtio_dev *, uint16_t);
+static uint32_t vionet_dev_read(struct virtio_dev *, struct viodev_msg *);
 static void dev_dispatch_vm(int, short, void *);
 static void handle_sync_io(int, short, void *);
 static void read_pipe_main(int, short, void *);
@@ -86,10 +99,9 @@ struct vm_dev_pipe pipe_tx;
 int pipe_inject[2];
 #define READ	0
 #define WRITE	1
-struct iovec iov_rx[VIONET_QUEUE_SIZE];
-struct iovec iov_tx[VIONET_QUEUE_SIZE];
+struct iovec iov_rx[VIRTIO_QUEUE_SIZE_MAX];
+struct iovec iov_tx[VIRTIO_QUEUE_SIZE_MAX];
 pthread_rwlock_t lock = NULL;		/* Guards device config state. */
-int resetting = 0;	/* Transient reset state used to coordinate reset. */
 int rx_enabled = 0;	/* 1: we expect to read the tap, 0: wait for notify. */
 
 __dead void
@@ -99,7 +111,6 @@ vionet_main(int fd, int fd_vmm)
 	struct vionet_dev	*vionet = NULL;
 	struct viodev_msg 	 msg;
 	struct vmd_vm	 	 vm;
-	struct vm_create_params	*vcp;
 	ssize_t			 sz;
 	int			 ret;
 
@@ -141,10 +152,9 @@ vionet_main(int fd, int fd_vmm)
 		log_warnx("failed to receive vm details");
 		goto fail;
 	}
-	vcp = &vm.vm_params.vmc_params;
 	current_vm = &vm;
-	setproctitle("%s/vionet%d", vcp->vcp_name, vionet->idx);
-	log_procinit("vm/%s/vionet%d", vcp->vcp_name, vionet->idx);
+	setproctitle("%s/vionet%d", vm.vm_params.vmc_name, vionet->idx);
+	log_procinit("vm/%s/vionet%d", vm.vm_params.vmc_name, vionet->idx);
 
 	/* Now that we have our vm information, we can remap memory. */
 	ret = remap_guest_mem(&vm, fd_vmm);
@@ -159,34 +169,6 @@ vionet_main(int fd, int fd_vmm)
 	close_fd(fd_vmm);
 	if (pledge("stdio", NULL) == -1)
 		fatal("pledge2");
-
-	/* If we're restoring hardware, re-initialize virtqueue hva's. */
-	if (vm.vm_state & VM_STATE_RECEIVED) {
-		struct virtio_vq_info *vq_info;
-		void *hva = NULL;
-
-		vq_info = &dev.vionet.vq[TXQ];
-		if (vq_info->q_gpa != 0) {
-			log_debug("%s: restoring TX virtqueue for gpa 0x%llx",
-			    __func__, vq_info->q_gpa);
-			hva = hvaddr_mem(vq_info->q_gpa,
-			    vring_size(VIONET_QUEUE_SIZE));
-			if (hva == NULL)
-				fatalx("%s: hva == NULL", __func__);
-			vq_info->q_hva = hva;
-		}
-
-		vq_info = &dev.vionet.vq[RXQ];
-		if (vq_info->q_gpa != 0) {
-			log_debug("%s: restoring RX virtqueue for gpa 0x%llx",
-			    __func__, vq_info->q_gpa);
-			hva = hvaddr_mem(vq_info->q_gpa,
-			    vring_size(VIONET_QUEUE_SIZE));
-			if (hva == NULL)
-				fatalx("%s: hva == NULL", __func__);
-			vq_info->q_hva = hva;
-		}
-	}
 
 	/* Initialize our packet injection pipe. */
 	if (pipe2(pipe_inject, O_NONBLOCK) == -1) {
@@ -242,14 +224,19 @@ vionet_main(int fd, int fd_vmm)
 	/* Configure our sync channel event handler. */
 	log_debug("%s: wiring in sync channel handler (fd=%d)", __func__,
 		dev.sync_fd);
-	imsg_init(&dev.sync_iev.ibuf, dev.sync_fd);
+	if (imsgbuf_init(&dev.sync_iev.ibuf, dev.sync_fd) == -1) {
+		log_warnx("imsgbuf_init");
+		goto fail;
+	}
+	imsgbuf_allow_fdpass(&dev.sync_iev.ibuf);
 	dev.sync_iev.handler = handle_sync_io;
 	dev.sync_iev.data = &dev;
 	dev.sync_iev.events = EV_READ;
 	imsg_event_add2(&dev.sync_iev, ev_base_main);
 
 	/* Send a ready message over the sync channel. */
-	log_debug("%s: telling vm %s device is ready", __func__, vcp->vcp_name);
+	log_debug("%s: telling vm %s device is ready", __func__,
+	    vm.vm_params.vmc_name);
 	memset(&msg, 0, sizeof(msg));
 	msg.type = VIODEV_MSG_READY;
 	imsg_compose_event2(&dev.sync_iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
@@ -298,7 +285,7 @@ fail:
 	msg.data = ret;
 	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 	    sizeof(msg));
-	imsg_flush(&dev.sync_iev.ibuf);
+	imsgbuf_flush(&dev.sync_iev.ibuf);
 
 	close_fd(dev.sync_fd);
 	close_fd(dev.async_fd);
@@ -312,56 +299,6 @@ fail:
 }
 
 /*
- * Update the gpa and hva of the virtqueue.
- */
-static void
-vionet_update_qa(struct vionet_dev *dev)
-{
-	struct virtio_vq_info *vq_info;
-	void *hva = NULL;
-
-	/* Invalid queue? */
-	if (dev->cfg.queue_select > 1)
-		return;
-
-	vq_info = &dev->vq[dev->cfg.queue_select];
-	vq_info->q_gpa = (uint64_t)dev->cfg.queue_pfn * VIRTIO_PAGE_SIZE;
-	dev->cfg.queue_pfn = vq_info->q_gpa >> 12;
-
-	if (vq_info->q_gpa == 0)
-		vq_info->q_hva = NULL;
-
-	hva = hvaddr_mem(vq_info->q_gpa, vring_size(VIONET_QUEUE_SIZE));
-	if (hva == NULL)
-		fatalx("%s: hva == NULL", __func__);
-
-	vq_info->q_hva = hva;
-}
-
-/*
- * Update the queue size.
- */
-static void
-vionet_update_qs(struct vionet_dev *dev)
-{
-	struct virtio_vq_info *vq_info;
-
-	/* Invalid queue? */
-	if (dev->cfg.queue_select > 1) {
-		log_warnx("%s: !!! invalid queue selector %d", __func__,
-		    dev->cfg.queue_select);
-		dev->cfg.queue_size = 0;
-		return;
-	}
-
-	vq_info = &dev->vq[dev->cfg.queue_select];
-
-	/* Update queue pfn/size based on queue select */
-	dev->cfg.queue_pfn = vq_info->q_gpa >> 12;
-	dev->cfg.queue_size = vq_info->qs;
-}
-
-/*
  * vionet_rx
  *
  * Pull packet from the provided fd and fill the receive-side virtqueue. We
@@ -371,21 +308,23 @@ vionet_update_qs(struct vionet_dev *dev)
  * or 0 if no notification is needed.
  */
 static int
-vionet_rx(struct vionet_dev *dev, int fd)
+vionet_rx(struct virtio_dev *dev, int fd)
 {
 	uint16_t idx, hdr_idx;
 	char *vr = NULL;
 	size_t chain_len = 0, iov_cnt;
+	struct vionet_dev *vionet = &dev->vionet;
 	struct vring_desc *desc, *table;
 	struct vring_avail *avail;
 	struct vring_used *used;
+	struct virtio_net_hdr *hdr = NULL;
 	struct virtio_vq_info *vq_info;
 	struct iovec *iov;
 	int notify = 0;
 	ssize_t sz;
 	uint8_t status = 0;
 
-	status = dev->cfg.device_status & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK;
+	status = dev->status & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK;
 	if (status != VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK) {
 		log_warnx("%s: driver not ready", __func__);
 		return (0);
@@ -404,8 +343,8 @@ vionet_rx(struct vionet_dev *dev, int fd)
 	used->flags |= VRING_USED_F_NO_NOTIFY;
 
 	while (idx != avail->idx) {
-		hdr_idx = avail->ring[idx & VIONET_QUEUE_MASK];
-		desc = &table[hdr_idx & VIONET_QUEUE_MASK];
+		hdr_idx = avail->ring[idx & vq_info->mask];
+		desc = &table[hdr_idx & vq_info->mask];
 		if (!DESC_WRITABLE(desc)) {
 			log_warnx("%s: invalid descriptor state", __func__);
 			goto reset;
@@ -432,7 +371,8 @@ vionet_rx(struct vionet_dev *dev, int fd)
 		iov->iov_base = hvaddr_mem(desc->addr, iov->iov_len);
 		if (iov->iov_base == NULL)
 			goto reset;
-		memset(iov->iov_base, 0, sizeof(struct virtio_net_hdr));
+		hdr = iov->iov_base;
+		memset(hdr, 0, sizeof(struct virtio_net_hdr));
 
 		/* Tweak the iovec to account for the virtio_net_hdr. */
 		iov->iov_len -= sizeof(struct virtio_net_hdr);
@@ -447,7 +387,7 @@ vionet_rx(struct vionet_dev *dev, int fd)
 		 * and lengths.
 		 */
 		while (desc->flags & VRING_DESC_F_NEXT) {
-			desc = &table[desc->next & VIONET_QUEUE_MASK];
+			desc = &table[desc->next & vq_info->mask];
 			if (!DESC_WRITABLE(desc)) {
 				log_warnx("%s: invalid descriptor state",
 				    __func__);
@@ -477,15 +417,17 @@ vionet_rx(struct vionet_dev *dev, int fd)
 			goto reset;
 		}
 
+		hdr->num_buffers = iov_cnt;
+
 		/*
 		 * If we're enforcing hardware address or handling an injected
 		 * packet, we need to use a copy-based approach.
 		 */
-		if (dev->lockedmac || fd != dev->data_fd)
-			sz = vionet_rx_copy(dev, fd, iov_rx, iov_cnt,
+		if (vionet->lockedmac || fd != vionet->data_fd)
+			sz = vionet_rx_copy(vionet, fd, iov_rx, iov_cnt,
 			    chain_len);
 		else
-			sz = vionet_rx_zerocopy(dev, fd, iov_rx, iov_cnt);
+			sz = vionet_rx_zerocopy(vionet, fd, iov_rx, iov_cnt);
 		if (sz == -1)
 			goto reset;
 		if (sz == 0)	/* No packets, so bail out for now. */
@@ -498,8 +440,8 @@ vionet_rx(struct vionet_dev *dev, int fd)
 		sz += sizeof(struct virtio_net_hdr);
 
 		/* Mark our buffers as used. */
-		used->ring[used->idx & VIONET_QUEUE_MASK].id = hdr_idx;
-		used->ring[used->idx & VIONET_QUEUE_MASK].len = sz;
+		used->ring[used->idx & vq_info->mask].id = hdr_idx;
+		used->ring[used->idx & vq_info->mask].len = sz;
 		__sync_synchronize();
 		used->idx++;
 		idx++;
@@ -523,7 +465,7 @@ reset:
  * characteristics, and copy into the provided buffers in the iovec array.
  *
  * It's assumed that the provided iovec array contains validated host virtual
- * address translations and not guest physical addreses.
+ * address translations and not guest physical addresses.
  *
  * Returns number of bytes copied on success, 0 if packet is dropped, and
  * -1 on an error.
@@ -655,14 +597,16 @@ static void
 vionet_rx_event(int fd, short event, void *arg)
 {
 	struct virtio_dev	*dev = (struct virtio_dev *)arg;
-	struct vionet_dev	*vionet = &dev->vionet;
-	int			 ret = 0;
+	struct vionet_dev	*vionet = (struct vionet_dev *)&dev->vionet;
+	int			 raise_irq = 0, ret = 0;
+	uint32_t		 generation = 0;
 
 	if (!(event & EV_READ))
 		fatalx("%s: invalid event type", __func__);
 
 	pthread_rwlock_rdlock(&lock);
-	ret = vionet_rx(vionet, fd);
+	generation = vionet->reset_generation;
+	ret = vionet_rx(dev, fd);
 	pthread_rwlock_unlock(&lock);
 
 	if (ret == 0) {
@@ -671,26 +615,28 @@ vionet_rx_event(int fd, short event, void *arg)
 	}
 
 	pthread_rwlock_wrlock(&lock);
-	if (ret == 1) {
-		/* Notify the driver. */
-		vionet->cfg.isr_status |= 1;
-	} else {
-		/* Need a reset. Something went wrong. */
-		log_warnx("%s: requesting device reset", __func__);
-		vionet->cfg.device_status |= DEVICE_NEEDS_RESET;
-		vionet->cfg.isr_status |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+	if (generation == vionet->reset_generation) {
+		if (ret == 1) {
+			/* Notify the driver. */
+			dev->isr |= 1;
+		} else {
+			/* Need a reset. Something went wrong. */
+			log_warnx("%s: requesting device reset", __func__);
+			dev->status |= DEVICE_NEEDS_RESET;
+			dev->isr |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+		}
+		raise_irq = 1;
 	}
 	pthread_rwlock_unlock(&lock);
 
-	vm_pipe_send(&pipe_main, VIRTIO_RAISE_IRQ);
+	if (raise_irq)
+		vm_pipe_send(&pipe_main, VIRTIO_RAISE_IRQ);
 }
 
 static void
-vionet_notifyq(struct virtio_dev *dev)
+vionet_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 {
-	struct vionet_dev	*vionet = &dev->vionet;
-
-	switch (vionet->cfg.queue_notify) {
+	switch (vq_idx) {
 	case RXQ:
 		rx_enabled = 1;
 		vm_pipe_send(&pipe_rx, VIRTIO_NOTIFY);
@@ -704,7 +650,7 @@ vionet_notifyq(struct virtio_dev *dev)
 		 * well as any bogus queue IDs.
 		 */
 		log_debug("%s: notify for unimplemented queue ID %d",
-		    __func__, vionet->cfg.queue_notify);
+		    __func__, dev->cfg.queue_notify);
 		break;
 	}
 }
@@ -727,14 +673,13 @@ vionet_tx(struct virtio_dev *dev)
 	struct packet pkt;
 	uint8_t status = 0;
 
-	status = vionet->cfg.device_status
-	    & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK;
+	status = dev->status & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK;
 	if (status != VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK) {
 		log_warnx("%s: driver not ready", __func__);
 		return (0);
 	}
 
-	vq_info = &vionet->vq[TXQ];
+	vq_info = &dev->vq[TXQ];
 	idx = vq_info->last_avail;
 	vr = vq_info->q_hva;
 	if (vr == NULL)
@@ -746,8 +691,8 @@ vionet_tx(struct virtio_dev *dev)
 	used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
 
 	while (idx != avail->idx) {
-		hdr_idx = avail->ring[idx & VIONET_QUEUE_MASK];
-		desc = &table[hdr_idx & VIONET_QUEUE_MASK];
+		hdr_idx = avail->ring[idx & vq_info->mask];
+		desc = &table[hdr_idx & vq_info->mask];
 		if (DESC_WRITABLE(desc)) {
 			log_warnx("%s: invalid descriptor state", __func__);
 			goto reset;
@@ -758,22 +703,24 @@ vionet_tx(struct virtio_dev *dev)
 		chain_len = 0;
 
 		/*
-		 * As a legacy device, we most likely will receive a lead
-		 * descriptor sized to the virtio_net_hdr. However, the framing
-		 * is not guaranteed, so check for packet data.
+		 * We do not negotiate VIRTIO_NET_F_HASH_REPORT so we
+		 * assume the header length is fixed.
 		 */
-		iov->iov_len = desc->len;
-		if (iov->iov_len < sizeof(struct virtio_net_hdr)) {
+		if (desc->len < sizeof(struct virtio_net_hdr)) {
 			log_warnx("%s: invalid descriptor length", __func__);
 			goto reset;
-		} else if (iov->iov_len > sizeof(struct virtio_net_hdr)) {
+		}
+		iov->iov_len = desc->len;
+
+		if (iov->iov_len > sizeof(struct virtio_net_hdr)) {
 			/* Chop off the virtio header, leaving packet data. */
 			iov->iov_len -= sizeof(struct virtio_net_hdr);
-			chain_len += iov->iov_len;
 			iov->iov_base = hvaddr_mem(desc->addr +
 			    sizeof(struct virtio_net_hdr), iov->iov_len);
 			if (iov->iov_base == NULL)
 				goto reset;
+
+			chain_len += iov->iov_len;
 			iov_cnt++;
 		}
 
@@ -781,7 +728,7 @@ vionet_tx(struct virtio_dev *dev)
 		 * Walk the chain and collect remaining addresses and lengths.
 		 */
 		while (desc->flags & VRING_DESC_F_NEXT) {
-			desc = &table[desc->next & VIONET_QUEUE_MASK];
+			desc = &table[desc->next & vq_info->mask];
 			if (DESC_WRITABLE(desc)) {
 				log_warnx("%s: invalid descriptor state",
 				    __func__);
@@ -851,8 +798,8 @@ vionet_tx(struct virtio_dev *dev)
 		}
 		chain_len += sizeof(struct virtio_net_hdr);
 drop:
-		used->ring[used->idx & VIONET_QUEUE_MASK].id = hdr_idx;
-		used->ring[used->idx & VIONET_QUEUE_MASK].len = chain_len;
+		used->ring[used->idx & vq_info->mask].id = hdr_idx;
+		used->ring[used->idx & vq_info->mask].len = chain_len;
 		__sync_synchronize();
 		used->idx++;
 		idx++;
@@ -873,15 +820,12 @@ drop:
 				    __func__);
 				free(pkt.buf);
 			}
-			log_debug("%s: injected dhcp reply with %ld bytes",
-			    __func__, sz);
 		}
 	}
 
 	if (idx != vq_info->last_avail &&
 	    !(avail->flags & VRING_AVAIL_F_NO_INTERRUPT))
 		notify = 1;
-
 
 	vq_info->last_avail = idx;
 	return (notify);
@@ -897,15 +841,15 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	struct imsgev		*iev = &dev->async_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg	 	 imsg;
-	ssize_t			 n = 0;
-	int			 verbose;
+	int			 n, verbose;
+	uint32_t		 type;
 
 	if (dev == NULL)
 		fatalx("%s: missing vionet pointer", __func__);
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: pipe dead (EV_READ)", __func__);
@@ -916,28 +860,28 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_base_loopexit(ev_base_main, NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+		switch (type) {
 		case IMSG_DEVOP_HOSTMAC:
-			IMSG_SIZE_CHECK(&imsg, vionet->hostmac);
-			memcpy(vionet->hostmac, imsg.data,
-			    sizeof(vionet->hostmac));
+			vionet_hostmac_read(&imsg, vionet);
 			log_debug("%s: set hostmac", __func__);
 			break;
 		case IMSG_VMDOP_PAUSE_VM:
@@ -950,8 +894,8 @@ dev_dispatch_vm(int fd, short event, void *arg)
 				vm_pipe_send(&pipe_rx, VIRTIO_THREAD_START);
 			break;
 		case IMSG_CTL_VERBOSE:
-			IMSG_SIZE_CHECK(&imsg, &verbose);
-			memcpy(&verbose, imsg.data, sizeof(verbose));
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)))
+				fatal("%s", __func__);
 			log_setverbose(verbose);
 			break;
 		}
@@ -972,12 +916,11 @@ handle_sync_io(int fd, short event, void *arg)
 	struct imsgbuf *ibuf = &iev->ibuf;
 	struct viodev_msg msg;
 	struct imsg imsg;
-	ssize_t n;
-	int8_t intr = INTR_STATE_NOOP;
+	int n, deassert = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: pipe dead (EV_READ)", __func__);
@@ -988,48 +931,41 @@ handle_sync_io(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_base_loopexit(ev_base_main, NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatalx("%s: imsg_get (n=%ld)", __func__, n);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
-		/* Unpack our message. They ALL should be dev messeges! */
-		IMSG_SIZE_CHECK(&imsg, &msg);
-		memcpy(&msg, imsg.data, sizeof(msg));
+		/* Unpack our message. They ALL should be dev messages! */
+		viodev_msg_read(&imsg, &msg);
 		imsg_free(&imsg);
 
 		switch (msg.type) {
-		case VIODEV_MSG_DUMP:
-			/* Dump device */
-			n = atomicio(vwrite, dev->sync_fd, dev, sizeof(*dev));
-			if (n != sizeof(*dev)) {
-				log_warnx("%s: failed to dump vionet device",
-				    __func__);
-				break;
-			}
 		case VIODEV_MSG_IO_READ:
 			/* Read IO: make sure to send a reply */
-			msg.data = handle_io_read(&msg, dev, &intr);
+			msg.data = vionet_read(dev, &msg, &deassert);
 			msg.data_valid = 1;
-			msg.state = intr;
+			if (deassert)
+				msg.state = INTR_STATE_DEASSERT;
 			imsg_compose_event2(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 			    sizeof(msg), ev_base_main);
 			break;
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed */
-			handle_io_write(&msg, dev);
+			vionet_write(dev, &msg);
 			break;
 		case VIODEV_MSG_SHUTDOWN:
 			event_del(&dev->sync_iev.ev);
@@ -1042,50 +978,289 @@ handle_sync_io(int fd, short event, void *arg)
 	imsg_event_add2(iev, ev_base_main);
 }
 
-static void
-handle_io_write(struct viodev_msg *msg, struct virtio_dev *dev)
+static uint32_t
+vionet_cfg_read(struct virtio_dev *dev, struct viodev_msg *msg)
 {
-	struct vionet_dev	*vionet = &dev->vionet;
-	uint32_t		 data = msg->data;
-	int			 pause_devices = 0;
+	struct virtio_pci_common_cfg *pci_cfg = &dev->pci_cfg;
+	uint32_t data = 0;
+	uint16_t reg = msg->reg & 0x00FF;
 
-	pthread_rwlock_wrlock(&lock);
-
-	switch (msg->reg) {
-	case VIRTIO_CONFIG_DEVICE_FEATURES:
-	case VIRTIO_CONFIG_QUEUE_SIZE:
-	case VIRTIO_CONFIG_ISR_STATUS:
-		log_warnx("%s: illegal write %x to %s", __progname, data,
-		    virtio_reg_name(msg->reg));
+	pthread_rwlock_rdlock(&lock);
+	switch (reg) {
+	case VIO1_PCI_DEVICE_FEATURE_SELECT:
+		data = pci_cfg->device_feature_select;
 		break;
-	case VIRTIO_CONFIG_GUEST_FEATURES:
-		vionet->cfg.guest_feature = data;
-		break;
-	case VIRTIO_CONFIG_QUEUE_PFN:
-		vionet->cfg.queue_pfn = data;
-		vionet_update_qa(vionet);
-		break;
-	case VIRTIO_CONFIG_QUEUE_SELECT:
-		vionet->cfg.queue_select = data;
-		vionet_update_qs(vionet);
-		break;
-	case VIRTIO_CONFIG_QUEUE_NOTIFY:
-		vionet->cfg.queue_notify = data;
-		vionet_notifyq(dev);
-		break;
-	case VIRTIO_CONFIG_DEVICE_STATUS:
-		if (data == 0) {
-			resetting = 2;	/* Wait on two acks: rx & tx */
-			pause_devices = 1;
-		} else {
-			// XXX is this correct?
-			vionet->cfg.device_status = data;
+	case VIO1_PCI_DEVICE_FEATURE:
+		if (pci_cfg->device_feature_select == 0)
+			data = dev->device_feature & (uint32_t)(-1);
+		else if (pci_cfg->device_feature_select == 1)
+			data = dev->device_feature >> 32;
+		else {
+			DPRINTF("%s: ignoring device feature read",
+			    __func__);
 		}
 		break;
+	case VIO1_PCI_DRIVER_FEATURE_SELECT:
+		data = pci_cfg->driver_feature_select;
+		break;
+	case VIO1_PCI_DRIVER_FEATURE:
+		if (pci_cfg->driver_feature_select == 0)
+			data = dev->driver_feature & (uint32_t)(-1);
+		else if (pci_cfg->driver_feature_select == 1)
+			data = dev->driver_feature >> 32;
+		else {
+			DPRINTF("%s: ignoring driver feature read",
+			    __func__);
+		}
+		break;
+	case VIO1_PCI_CONFIG_MSIX_VECTOR:
+		data = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+		break;
+	case VIO1_PCI_NUM_QUEUES:
+		data = dev->num_queues;
+		break;
+	case VIO1_PCI_DEVICE_STATUS:
+		data = dev->status;
+		break;
+	case VIO1_PCI_CONFIG_GENERATION:
+		data = pci_cfg->config_generation;
+		break;
+	case VIO1_PCI_QUEUE_SELECT:
+		data = pci_cfg->queue_select;
+		break;
+	case VIO1_PCI_QUEUE_SIZE:
+		data = pci_cfg->queue_size;
+		break;
+	case VIO1_PCI_QUEUE_MSIX_VECTOR:
+		data = VIRTIO_MSI_NO_VECTOR;	/* Unsupported */
+		break;
+	case VIO1_PCI_QUEUE_ENABLE:
+		data = pci_cfg->queue_enable;
+		break;
+	case VIO1_PCI_QUEUE_NOTIFY_OFF:
+		data = pci_cfg->queue_notify_off;
+		break;
+	case VIO1_PCI_QUEUE_DESC:
+		data = (uint32_t)(0xFFFFFFFF & pci_cfg->queue_desc);
+		break;
+	case VIO1_PCI_QUEUE_DESC + 4:
+		data = (uint32_t)(pci_cfg->queue_desc >> 32);
+		break;
+	case VIO1_PCI_QUEUE_AVAIL:
+		data = (uint32_t)(0xFFFFFFFF & pci_cfg->queue_avail);
+		break;
+	case VIO1_PCI_QUEUE_AVAIL + 4:
+		data = (uint32_t)(pci_cfg->queue_avail >> 32);
+		break;
+	case VIO1_PCI_QUEUE_USED:
+		data = (uint32_t)(0xFFFFFFFF & pci_cfg->queue_used);
+		break;
+	case VIO1_PCI_QUEUE_USED + 4:
+		data = (uint32_t)(pci_cfg->queue_used >> 32);
+		break;
+	default:
+		log_warnx("%s: invalid register 0x%04x", __func__, reg);
 	}
-
 	pthread_rwlock_unlock(&lock);
-	if (pause_devices) {
+
+	return (data);
+}
+
+static void
+vionet_cfg_write(struct virtio_dev *dev, struct viodev_msg *msg)
+{
+	struct virtio_pci_common_cfg *pci_cfg = &dev->pci_cfg;
+	struct vionet_dev *vionet = (struct vionet_dev *)&dev->vionet;
+	uint32_t data = msg->data;
+	uint16_t reg = msg->reg & 0xFF;
+	uint8_t sz = msg->io_sz;
+	int pausing = 0;
+
+	DPRINTF("%s: write reg=%d data=0x%x", __func__, msg->reg, data);
+
+	pthread_rwlock_wrlock(&lock);
+	switch (reg) {
+	case VIO1_PCI_DEVICE_FEATURE_SELECT:
+		if (sz != 4)
+			log_warnx("%s: unaligned write to device "
+			    "feature select (sz=%u)", __func__, sz);
+		else
+			pci_cfg->device_feature_select = data;
+		break;
+	case VIO1_PCI_DEVICE_FEATURE:
+		log_warnx("illegal write to device feature register");
+		break;
+	case VIO1_PCI_DRIVER_FEATURE_SELECT:
+		if (sz != 4)
+			log_warnx("%s: unaligned write to driver "
+			    "feature select register (sz=%u)", __func__,
+			    sz);
+		else
+			pci_cfg->driver_feature_select = data;
+		break;
+	case VIO1_PCI_DRIVER_FEATURE:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to driver "
+			    "feature register (sz=%u)", __func__, sz);
+			break;
+		}
+		if (pci_cfg->driver_feature_select > 1) {
+			/* We only support a 64-bit feature space. */
+			DPRINTF("%s: ignoring driver feature write",
+			    __func__);
+			break;
+		}
+		pci_cfg->driver_feature = data;
+		if (pci_cfg->driver_feature_select == 0)
+			dev->driver_feature |= pci_cfg->driver_feature;
+		else
+			dev->driver_feature |=
+			    ((uint64_t)pci_cfg->driver_feature << 32);
+		dev->driver_feature &= dev->device_feature;
+		DPRINTF("%s: driver features 0x%llx", __func__,
+		    dev->driver_feature);
+		break;
+	case VIO1_PCI_CONFIG_MSIX_VECTOR:
+		/* Ignore until we support MSIX. */
+		break;
+	case VIO1_PCI_NUM_QUEUES:
+		log_warnx("illegal write to num queues register");
+		break;
+	case VIO1_PCI_DEVICE_STATUS:
+		if (sz != 1) {
+			log_warnx("%s: unaligned write to device "
+			    "status register (sz=%u)", __func__, sz);
+			break;
+		}
+		dev->status = data;
+		if (dev->status == 0) {
+			/* vionet has special handling being multi-threaded. */
+			pausing = 1;
+			vionet->reset_generation++;
+
+			/*
+			 * Don't allow zero. It's a special case in
+			 * read_pipe_tx().
+			 */
+			if (vionet->reset_generation == 0)
+				vionet->reset_generation = 1;
+
+			/* Reset device and virtqueues. */
+			dev->driver_feature = 0;
+			dev->isr = 0;
+			pci_cfg->queue_select = 0;	/* Technically RXQ. */
+			virtio_update_qs(dev);
+			virtio_vq_init(dev, RXQ);
+			virtio_vq_init(dev, TXQ);
+		}
+		DPRINTF("%s: dev %u status [%s%s%s%s%s%s]", __func__,
+		    dev->pci_id,
+		    (data & VIRTIO_CONFIG_DEVICE_STATUS_ACK) ?
+		    "[ack]" : "",
+		    (data & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER) ?
+		    "[driver]" : "",
+		    (data & VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK) ?
+		    "[driver ok]" : "",
+		    (data & VIRTIO_CONFIG_DEVICE_STATUS_FEATURES_OK) ?
+		    "[features ok]" : "",
+		    (data & VIRTIO_CONFIG_DEVICE_STATUS_DEVICE_NEEDS_RESET)
+		    ? "[needs reset]" : "",
+		    (data & VIRTIO_CONFIG_DEVICE_STATUS_FAILED) ?
+		    "[failed]" : "");
+		break;
+	case VIO1_PCI_CONFIG_GENERATION:
+		log_warnx("illegal write to config generation register");
+		break;
+	case VIO1_PCI_QUEUE_SELECT:
+		pci_cfg->queue_select = data;
+		virtio_update_qs(dev);
+		break;
+	case VIO1_PCI_QUEUE_SIZE:
+		if (data <= VIRTIO_QUEUE_SIZE_MAX)
+			pci_cfg->queue_size = data;
+		else {
+			log_warnx("%s: clamping queue size", __func__);
+			pci_cfg->queue_size = VIRTIO_QUEUE_SIZE_MAX;
+		}
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_MSIX_VECTOR:
+		/* Ignore until we support MSI-X. */
+		break;
+	case VIO1_PCI_QUEUE_ENABLE:
+		pci_cfg->queue_enable = data;
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_NOTIFY_OFF:
+		log_warnx("illegal write to queue notify offset register");
+		break;
+	case VIO1_PCI_QUEUE_DESC:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to queue "
+			    "desc. register (sz=%u)", __func__, sz);
+			break;
+		}
+		pci_cfg->queue_desc &= 0xffffffff00000000;
+		pci_cfg->queue_desc |= (uint64_t)data;
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_DESC + 4:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to queue "
+			    "desc. register (sz=%u)", __func__, sz);
+			break;
+		}
+		pci_cfg->queue_desc &= 0x00000000ffffffff;
+		pci_cfg->queue_desc |= ((uint64_t)data << 32);
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_AVAIL:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to queue "
+			    "available register (sz=%u)", __func__, sz);
+			break;
+		}
+		pci_cfg->queue_avail &= 0xffffffff00000000;
+		pci_cfg->queue_avail |= (uint64_t)data;
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_AVAIL + 4:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to queue "
+			    "available register (sz=%u)", __func__, sz);
+			break;
+		}
+		pci_cfg->queue_avail &= 0x00000000ffffffff;
+		pci_cfg->queue_avail |= ((uint64_t)data << 32);
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_USED:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to queue used "
+			    "register (sz=%u)", __func__, sz);
+			break;
+		}
+		pci_cfg->queue_used &= 0xffffffff00000000;
+		pci_cfg->queue_used |= (uint64_t)data;
+		virtio_update_qa(dev);
+		break;
+	case VIO1_PCI_QUEUE_USED + 4:
+		if (sz != 4) {
+			log_warnx("%s: unaligned write to queue used "
+			    "register (sz=%u)", __func__, sz);
+			break;
+		}
+		pci_cfg->queue_used &= 0x00000000ffffffff;
+		pci_cfg->queue_used |= ((uint64_t)data << 32);
+		virtio_update_qa(dev);
+		break;
+	default:
+		log_warnx("%s: invalid register 0x%04x", __func__, reg);
+	}
+	pthread_rwlock_unlock(&lock);
+
+	if (pausing) {
+		/* Pause tx and rx processing. */
 		rx_enabled = 0;
 		vionet_deassert_pic_irq(dev);
 		vm_pipe_send(&pipe_rx, VIRTIO_THREAD_PAUSE);
@@ -1094,57 +1269,79 @@ handle_io_write(struct viodev_msg *msg, struct virtio_dev *dev)
 }
 
 static uint32_t
-handle_io_read(struct viodev_msg *msg, struct virtio_dev *dev, int8_t *intr)
+vionet_read(struct virtio_dev *dev, struct viodev_msg *msg, int *deassert)
 {
-	struct vionet_dev *vionet = &dev->vionet;
-	uint32_t data;
+	uint32_t data = 0;
+	uint16_t reg = msg->reg;
 
-	pthread_rwlock_rdlock(&lock);
-
-	switch (msg->reg) {
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI:
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 1:
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 2:
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 3:
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 4:
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 5:
-		data = vionet->mac[msg->reg -
-		    VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI];
+	switch (reg & 0xFF00) {
+	case VIO1_CFG_BAR_OFFSET:
+		data = vionet_cfg_read(dev, msg);
 		break;
-	case VIRTIO_CONFIG_DEVICE_FEATURES:
-		data = vionet->cfg.device_feature;
+	case VIO1_DEV_BAR_OFFSET:
+		data = vionet_dev_read(dev, msg);
 		break;
-	case VIRTIO_CONFIG_GUEST_FEATURES:
-		data = vionet->cfg.guest_feature;
+	case VIO1_NOTIFY_BAR_OFFSET:
+		/* Reads of notify register return all 1's. */
+		data = (uint32_t)(-1);
 		break;
-	case VIRTIO_CONFIG_QUEUE_PFN:
-		data = vionet->cfg.queue_pfn;
-		break;
-	case VIRTIO_CONFIG_QUEUE_SIZE:
-		data = vionet->cfg.queue_size;
-		break;
-	case VIRTIO_CONFIG_QUEUE_SELECT:
-		data = vionet->cfg.queue_select;
-		break;
-	case VIRTIO_CONFIG_QUEUE_NOTIFY:
-		data = vionet->cfg.queue_notify;
-		break;
-	case VIRTIO_CONFIG_DEVICE_STATUS:
-		data = vionet->cfg.device_status;
-		break;
-	case VIRTIO_CONFIG_ISR_STATUS:
-		pthread_rwlock_unlock(&lock);
+	case VIO1_ISR_BAR_OFFSET:
 		pthread_rwlock_wrlock(&lock);
-		data = vionet->cfg.isr_status;
-		vionet->cfg.isr_status = 0;
-		if (intr != NULL)
-			*intr = INTR_STATE_DEASSERT;
+		data = dev->isr;
+		dev->isr = 0;
+		*deassert = 1;
+		pthread_rwlock_unlock(&lock);
 		break;
 	default:
-		data = 0xFFFFFFFF;
+		log_debug("%s: no handler for reg 0x%04x", __func__, reg);
 	}
 
-	pthread_rwlock_unlock(&lock);
+	return (data);
+}
+
+static void
+vionet_write(struct virtio_dev *dev, struct viodev_msg *msg)
+{
+	uint16_t reg = msg->reg;
+
+	switch (reg & 0xFF00) {
+	case VIO1_CFG_BAR_OFFSET:
+		(void)vionet_cfg_write(dev, msg);
+		break;
+	case VIO1_DEV_BAR_OFFSET:
+		/* Ignore all writes to device configuration registers. */
+		break;
+	case VIO1_NOTIFY_BAR_OFFSET:
+		vionet_notifyq(dev, (uint16_t)(msg->data));
+		break;
+	case VIO1_ISR_BAR_OFFSET:
+		/* ignore writes to ISR. */
+		break;
+	default:
+		log_debug("%s: no handler for reg 0x%04x", __func__, reg);
+	}
+}
+
+static uint32_t
+vionet_dev_read(struct virtio_dev *dev, struct viodev_msg *msg)
+{
+	struct vionet_dev *vionet = (struct vionet_dev *)&dev->vionet;
+	uint32_t data = 0;
+	uint16_t reg = msg->reg & 0xFF;
+
+	switch (reg) {
+	case VIRTIO_NET_CONFIG_MAC:
+	case VIRTIO_NET_CONFIG_MAC + 1:
+	case VIRTIO_NET_CONFIG_MAC + 2:
+	case VIRTIO_NET_CONFIG_MAC + 3:
+	case VIRTIO_NET_CONFIG_MAC + 4:
+	case VIRTIO_NET_CONFIG_MAC + 5:
+		data = (uint8_t)vionet->mac[reg - VIRTIO_NET_CONFIG_MAC];
+		break;
+	default:
+		log_warnx("%s: invalid register 0x%04x", __func__, reg);
+	}
+
 	return (data);
 }
 
@@ -1233,7 +1430,6 @@ read_pipe_rx(int fd, short event, void *arg)
 	case VIRTIO_THREAD_PAUSE:
 		event_del(&ev_tap);
 		event_del(&ev_inject);
-		vm_pipe_send(&pipe_main, VIRTIO_THREAD_ACK);
 		break;
 	case VIRTIO_THREAD_STOP:
 		event_del(&ev_tap);
@@ -1252,9 +1448,10 @@ static void
 read_pipe_tx(int fd, short event, void *arg)
 {
 	struct virtio_dev	*dev = (struct virtio_dev*)arg;
-	struct vionet_dev	*vionet = &dev->vionet;
+	struct vionet_dev	*vionet = (struct vionet_dev*)&dev->vionet;
 	enum pipe_msg_type	 msg;
-	int			 ret = 0;
+	int			 raise_irq = 0, ret = 0;
+	uint32_t		 generation = 0;
 
 	if (!(event & EV_READ))
 		fatalx("%s: invalid event type", __func__);
@@ -1264,6 +1461,7 @@ read_pipe_tx(int fd, short event, void *arg)
 	switch (msg) {
 	case VIRTIO_NOTIFY:
 		pthread_rwlock_rdlock(&lock);
+		generation = vionet->reset_generation;
 		ret = vionet_tx(dev);
 		pthread_rwlock_unlock(&lock);
 		break;
@@ -1271,11 +1469,7 @@ read_pipe_tx(int fd, short event, void *arg)
 		/* Ignore Start messages. */
 		break;
 	case VIRTIO_THREAD_PAUSE:
-		/*
-		 * Nothing to do when pausing on the tx side, but ACK so main
-		 * thread knows we're not transmitting.
-		 */
-		vm_pipe_send(&pipe_main, VIRTIO_THREAD_ACK);
+		/* Nothing to do when pausing on the tx side. */
 		break;
 	case VIRTIO_THREAD_STOP:
 		event_base_loopexit(ev_base_tx, NULL);
@@ -1290,18 +1484,22 @@ read_pipe_tx(int fd, short event, void *arg)
 	}
 
 	pthread_rwlock_wrlock(&lock);
-	if (ret == 1) {
-		/* Notify the driver. */
-		vionet->cfg.isr_status |= 1;
-	} else {
-		/* Need a reset. Something went wrong. */
-		log_warnx("%s: requesting device reset", __func__);
-		vionet->cfg.device_status |= DEVICE_NEEDS_RESET;
-		vionet->cfg.isr_status |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+	if (generation == vionet->reset_generation) {
+		if (ret == 1) {
+			/* Notify the driver. */
+			dev->isr |= 1;
+		} else {
+			/* Need a reset. Something went wrong. */
+			log_warnx("%s: requesting device reset", __func__);
+			dev->status |= DEVICE_NEEDS_RESET;
+			dev->isr |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
+		}
+		raise_irq = 1;
 	}
 	pthread_rwlock_unlock(&lock);
 
-	vm_pipe_send(&pipe_main, VIRTIO_RAISE_IRQ);
+	if (raise_irq)
+		vm_pipe_send(&pipe_main, VIRTIO_RAISE_IRQ);
 }
 
 /*
@@ -1311,7 +1509,6 @@ static void
 read_pipe_main(int fd, short event, void *arg)
 {
 	struct virtio_dev	*dev = (struct virtio_dev*)arg;
-	struct vionet_dev	*vionet = &dev->vionet;
 	enum pipe_msg_type	 msg;
 
 	if (!(event & EV_READ))
@@ -1321,29 +1518,6 @@ read_pipe_main(int fd, short event, void *arg)
 	switch (msg) {
 	case VIRTIO_RAISE_IRQ:
 		vionet_assert_pic_irq(dev);
-		break;
-	case VIRTIO_THREAD_ACK:
-		resetting--;
-		if (resetting == 0) {
-			log_debug("%s: resetting virtio network device %d",
-			    __func__, vionet->idx);
-
-			pthread_rwlock_wrlock(&lock);
-			vionet->cfg.device_status = 0;
-			vionet->cfg.guest_feature = 0;
-			vionet->cfg.queue_pfn = 0;
-			vionet_update_qa(vionet);
-			vionet->cfg.queue_size = 0;
-			vionet_update_qs(vionet);
-			vionet->cfg.queue_select = 0;
-			vionet->cfg.queue_notify = 0;
-			vionet->cfg.isr_status = 0;
-			vionet->vq[RXQ].last_avail = 0;
-			vionet->vq[RXQ].notified_avail = 0;
-			vionet->vq[TXQ].last_avail = 0;
-			vionet->vq[TXQ].notified_avail = 0;
-			pthread_rwlock_unlock(&lock);
-		}
 		break;
 	default:
 		fatalx("%s: invalid channel msg: %d", __func__, msg);
@@ -1362,7 +1536,7 @@ vionet_assert_pic_irq(struct virtio_dev *dev)
 
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;
-	msg.vcpu = 0; // XXX
+	msg.vcpu = 0; /* XXX: smp */
 	msg.type = VIODEV_MSG_KICK;
 	msg.state = INTR_STATE_ASSERT;
 
@@ -1384,7 +1558,7 @@ vionet_deassert_pic_irq(struct virtio_dev *dev)
 
 	memset(&msg, 0, sizeof(msg));
 	msg.irq = dev->irq;
-	msg.vcpu = 0; // XXX
+	msg.vcpu = 0; /* XXX: smp */
 	msg.type = VIODEV_MSG_KICK;
 	msg.state = INTR_STATE_DEASSERT;
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.80 2024/06/20 10:46:11 aoyama Exp $ */
+/*	$OpenBSD: cpu.h,v 1.85 2026/07/15 18:44:08 miod Exp $ */
 /*
  * Copyright (c) 1996 Nivas Madhur
  * Copyright (c) 1992, 1993
@@ -54,6 +54,12 @@
 	{ "cputype", CTLTYPE_INT }, \
 }
 
+/*
+ * Values for the machdep.cputype sysctl.
+ */
+#define CPU_88100	0x00
+#define CPU_88110	0x01
+
 #ifdef _KERNEL
 
 #include <machine/atomic.h>
@@ -67,15 +73,9 @@
 #include <uvm/uvm_percpu.h>
 
 #if defined(MULTIPROCESSOR)
-#if !defined(MAX_CPUS) || MAX_CPUS > 4
-#undef	MAX_CPUS
 #define	MAX_CPUS	4
-#endif
 #else
-#if !defined(MAX_CPUS)
-#undef	MAX_CPUS
 #define	MAX_CPUS	1
-#endif
 #endif
 
 #ifndef _LOCORE
@@ -89,7 +89,7 @@
 struct pmap;
 
 struct cpu_info {
-	u_int		 ci_flags;
+	volatile u_int	 ci_flags;
 #define	CIF_ALIVE		0x01		/* cpu initialized */
 #define	CIF_PRIMARY		0x02		/* primary cpu */
 
@@ -139,14 +139,12 @@ struct cpu_info {
 #define	ci_ipi_arg2	 ci_cpudep1
 #define	ci_h_sxip	 ci_cpudep2		/* trapframe values */
 #define	ci_h_epsr	 ci_cpudep3		/* for hardclock */
-#define	ci_s_sxip	 ci_cpudep4		/* and softclock */
-#define	ci_s_epsr	 ci_cpudep5
 
 	struct schedstate_percpu
 			 ci_schedstate;		/* scheduling state */
 	int		 ci_want_resched;	/* need_resched() invoked */
 
-	u_int		 ci_intrdepth;		/* interrupt depth */
+	u_int		 ci_idepth;		/* interrupt depth */
 
 	int		 ci_ddb_state;		/* ddb status */
 #define	CI_DDB_RUNNING	0
@@ -268,7 +266,7 @@ struct clockframe {
 #define	CLKF_USERMODE(framep)	(((framep)->tf.tf_epsr & PSR_MODE) == 0)
 #define	CLKF_PC(framep)		((framep)->tf.tf_sxip & XIP_ADDR)
 #define	CLKF_INTR(framep) \
-	(((struct cpu_info *)(framep)->tf.tf_cpu)->ci_intrdepth > 1)
+	(((struct cpu_info *)(framep)->tf.tf_cpu)->ci_idepth > 1)
 
 #define	aston(p)		((p)->p_md.md_astpending = 1)
 

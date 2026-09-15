@@ -9,15 +9,15 @@ BEGIN {
     }
 }
 
-use Getopt::Long;
+use Getopt::Long::Parser;
 my $want_version="2.24";
 die("Getopt::Long version $want_version required--this is only version ".
-    $Getopt::Long::VERSION)
-  unless $Getopt::Long::VERSION ge $want_version;
+    $Getopt::Long::Parser::VERSION)
+  unless $Getopt::Long::Parser::VERSION ge $want_version;
 print "1..14\n";
 
 @ARGV = qw(-Foo -baR --foo bar);
-my $p = new Getopt::Long::Parser (config => ["no_ignore_case"]);
+my $p = Getopt::Long::Parser->new(config => ["no_ignore_case"]);
 undef $opt_baR;
 undef $opt_bar;
 print "ok 1\n" if $p->getoptions ("foo", "Foo=s");

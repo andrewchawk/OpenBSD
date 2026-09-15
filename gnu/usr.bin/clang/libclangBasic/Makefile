@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.12 2024/02/08 20:28:54 miod Exp $
+# $OpenBSD: Makefile,v 1.14 2026/05/29 11:18:31 robert Exp $
 
 LIB=	clangBasic
 NOPIC=
@@ -10,7 +10,8 @@ CPPFLAGS+=	-I${CLANG_SRCS}/lib/Basic/Targets
 
 .include <bsd.own.mk>
 
-SRCS=	Attributes.cpp \
+SRCS=	ASTSourceDescriptor.cpp \
+	Attributes.cpp \
 	Builtins.cpp \
 	CLWarnings.cpp \
 	CharInfo.cpp \
@@ -30,17 +31,22 @@ SRCS=	Attributes.cpp \
 	MakeSupport.cpp \
 	Module.cpp \
 	ObjCRuntime.cpp \
+	OffloadArch.cpp \
 	OpenCLOptions.cpp \
 	OpenMPKinds.cpp \
 	OperatorPrecedence.cpp \
+	ParsedAttrInfo.cpp \
 	ProfileList.cpp \
 	NoSanitizeList.cpp \
 	SanitizerSpecialCaseList.cpp \
 	Sanitizers.cpp \
 	Sarif.cpp \
+	SimpleTypoCorrection.cpp \
 	SourceLocation.cpp \
 	SourceManager.cpp \
+	SourceMgrAdapter.cpp \
 	Stack.cpp \
+	StackExhaustionHandler.cpp \
 	TargetID.cpp \
 	TargetInfo.cpp \
 	Targets.cpp \
@@ -62,14 +68,12 @@ SRCS+=	AArch64.cpp \
 	DirectX.cpp \
 	Hexagon.cpp \
 	Lanai.cpp \
-	Le64.cpp \
 	LoongArch.cpp \
 	M68k.cpp \
 	MSP430.cpp \
 	Mips.cpp \
 	NVPTX.cpp \
 	OSTargets.cpp \
-	PNaCl.cpp \
 	PPC.cpp \
 	RISCV.cpp \
 	SPIR.cpp \
@@ -79,7 +83,8 @@ SRCS+=	AArch64.cpp \
 	VE.cpp \
 	WebAssembly.cpp \
 	X86.cpp \
-	XCore.cpp
+	XCore.cpp \
+	Xtensa.cpp
 
 .PATH:	${.CURDIR}/../../../llvm/clang/lib/Basic
 .PATH:	${.CURDIR}/../../../llvm/clang/lib/Basic/Targets

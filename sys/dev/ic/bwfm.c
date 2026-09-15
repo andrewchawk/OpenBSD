@@ -1,4 +1,4 @@
-/* $OpenBSD: bwfm.c,v 1.111 2024/02/19 21:23:02 stsp Exp $ */
+/* $OpenBSD: bwfm.c,v 1.113 2025/08/21 17:03:58 mbuhl Exp $ */
 /*
  * Copyright (c) 2010-2016 Broadcom Corporation
  * Copyright (c) 2016,2017 Patrick Wildt <patrick@blueri.se>
@@ -494,6 +494,7 @@ bwfm_init(struct ifnet *ifp)
 		BWFM_EVENT(BWFM_E_LINK);
 		BWFM_EVENT(BWFM_E_AUTH);
 		BWFM_EVENT(BWFM_E_ASSOC);
+		BWFM_EVENT(BWFM_E_EAPOL_MSG);
 		BWFM_EVENT(BWFM_E_DEAUTH);
 		BWFM_EVENT(BWFM_E_DISASSOC);
 		BWFM_EVENT(BWFM_E_ESCAN_RESULT);
@@ -503,6 +504,7 @@ bwfm_init(struct ifnet *ifp)
 		BWFM_EVENT(BWFM_E_AUTH_IND);
 		BWFM_EVENT(BWFM_E_ASSOC_IND);
 		BWFM_EVENT(BWFM_E_REASSOC_IND);
+		BWFM_EVENT(BWFM_E_EAPOL_MSG);
 		BWFM_EVENT(BWFM_E_DEAUTH_IND);
 		BWFM_EVENT(BWFM_E_DISASSOC_IND);
 		BWFM_EVENT(BWFM_E_ESCAN_RESULT);
@@ -2352,7 +2354,7 @@ bwfm_rx(struct bwfm_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 	/* Remaining data is an ethernet packet, so align. */
 	if ((mtod(m, paddr_t) & 0x3) != ETHER_ALIGN) {
 		struct mbuf *m0;
-		m0 = m_dup_pkt(m, ETHER_ALIGN, M_WAITOK);
+		m0 = m_dup_pkt(m, ETHER_ALIGN, M_DONTWAIT);
 		m_freem(m);
 		if (m0 == NULL) {
 			ifp->if_ierrors++;
@@ -2551,8 +2553,41 @@ void
 bwfm_rx_event(struct bwfm_softc *sc, struct mbuf *m)
 {
 	int s;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct bwfm_event *e = mtod(m, void *);
 
 	s = splnet();
+	switch (ntohl(e->msg.event_type)) {
+	case BWFM_E_AUTH:
+		if (ntohl(e->msg.status) == BWFM_E_STATUS_SUCCESS &&
+		    ic->ic_state == IEEE80211_S_AUTH) {
+			ieee80211_new_state(ic, IEEE80211_S_ASSOC, -1);
+			break;
+		}
+		goto enqueue;
+	case BWFM_E_ASSOC:
+		if (ntohl(e->msg.status) == BWFM_E_STATUS_SUCCESS &&
+		    ic->ic_state == IEEE80211_S_ASSOC) {
+			ieee80211_new_state(ic, IEEE80211_S_RUN, -1);
+		} else if (ntohl(e->msg.status) != BWFM_E_STATUS_UNSOLICITED) {
+			goto enqueue;
+		}
+		break;
+	case BWFM_E_LINK:
+		if (ntohl(e->msg.status) == BWFM_E_STATUS_SUCCESS &&
+		    ntohl(e->msg.reason) == 0)
+			break;
+		goto enqueue;
+	case BWFM_E_EAPOL_MSG:
+		break;
+	default:
+		goto enqueue;
+	}
+
+	m_freem(m);
+	splx(s);
+	return;
+enqueue:
 	ml_enqueue(&sc->sc_evml, m);
 	splx(s);
 
@@ -2631,17 +2666,13 @@ bwfm_rx_event_cb(struct bwfm_softc *sc, struct mbuf *m)
 		break;
 		}
 	case BWFM_E_AUTH:
-		if (ntohl(e->msg.status) == BWFM_E_STATUS_SUCCESS &&
+		if (ntohl(e->msg.status) != BWFM_E_STATUS_SUCCESS &&
 		    ic->ic_state == IEEE80211_S_AUTH)
-			ieee80211_new_state(ic, IEEE80211_S_ASSOC, -1);
-		else
 			ieee80211_begin_scan(ifp);
 		break;
 	case BWFM_E_ASSOC:
-		if (ntohl(e->msg.status) == BWFM_E_STATUS_SUCCESS &&
+		if (ntohl(e->msg.status) != BWFM_E_STATUS_SUCCESS &&
 		    ic->ic_state == IEEE80211_S_ASSOC)
-			ieee80211_new_state(ic, IEEE80211_S_RUN, -1);
-		else if (ntohl(e->msg.status) != BWFM_E_STATUS_UNSOLICITED)
 			ieee80211_begin_scan(ifp);
 		break;
 	case BWFM_E_DEAUTH:
@@ -2650,9 +2681,6 @@ bwfm_rx_event_cb(struct bwfm_softc *sc, struct mbuf *m)
 			ieee80211_begin_scan(ifp);
 		break;
 	case BWFM_E_LINK:
-		if (ntohl(e->msg.status) == BWFM_E_STATUS_SUCCESS &&
-		    ntohl(e->msg.reason) == 0)
-			break;
 		/* Link status has changed */
 		if (ic->ic_state > IEEE80211_S_SCAN)
 			ieee80211_begin_scan(ifp);

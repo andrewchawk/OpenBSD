@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwxvar.h,v 1.26 2024/05/28 08:34:52 stsp Exp $	*/
+/*	$OpenBSD: qwxvar.h,v 1.39 2026/07/18 09:47:52 stsp Exp $	*/
 
 /*
  * Copyright (c) 2018-2019 The Linux Foundation.
@@ -266,9 +266,7 @@ struct ath11k_hw_ops {
 			       struct hal_tcl_data_cmd *tcl_cmd);
 #endif
 	int (*rx_desc_get_first_msdu)(struct hal_rx_desc *desc);
-#if notyet
-	bool (*rx_desc_get_last_msdu)(struct hal_rx_desc *desc);
-#endif
+	int (*rx_desc_get_last_msdu)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_l3_pad_bytes)(struct hal_rx_desc *desc);
 	uint8_t *(*rx_desc_get_hdr_status)(struct hal_rx_desc *desc);
 	int (*rx_desc_encrypt_valid)(struct hal_rx_desc *desc);
@@ -279,20 +277,18 @@ struct ath11k_hw_ops {
 	bool (*rx_desc_get_ldpc_support)(struct hal_rx_desc *desc);
 	bool (*rx_desc_get_mpdu_seq_ctl_vld)(struct hal_rx_desc *desc);
 	bool (*rx_desc_get_mpdu_fc_valid)(struct hal_rx_desc *desc);
-	uint16_t (*rx_desc_get_mpdu_start_seq_no)(struct hal_rx_desc *desc);
 #endif
+	uint16_t (*rx_desc_get_mpdu_start_seq_no)(struct hal_rx_desc *desc);
 	uint16_t (*rx_desc_get_msdu_len)(struct hal_rx_desc *desc);
-#ifdef notyet
 	uint8_t (*rx_desc_get_msdu_sgi)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_msdu_rate_mcs)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_msdu_rx_bw)(struct hal_rx_desc *desc);
-#endif
 	uint32_t (*rx_desc_get_msdu_freq)(struct hal_rx_desc *desc);
-#ifdef notyet
 	uint8_t (*rx_desc_get_msdu_pkt_type)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_msdu_nss)(struct hal_rx_desc *desc);
 	uint8_t (*rx_desc_get_mpdu_tid)(struct hal_rx_desc *desc);
 	uint16_t (*rx_desc_get_mpdu_peer_id)(struct hal_rx_desc *desc);
+#if 0
 	void (*rx_desc_copy_attn_end_tlv)(struct hal_rx_desc *fdesc,
 					  struct hal_rx_desc *ldesc);
 	uint32_t (*rx_desc_get_mpdu_start_tag)(struct hal_rx_desc *desc);
@@ -416,6 +412,8 @@ enum ath11k_dev_flags {
 	ATH11K_FLAG_FIXED_MEM_RGN,
 	ATH11K_FLAG_DEVICE_INIT_DONE,
 	ATH11K_FLAG_MULTI_MSI_VECTORS,
+
+	QWX_FLAG_ROAMING,
 };
 
 enum ath11k_scan_state {
@@ -1012,7 +1010,7 @@ struct qwx_hp_update_timer {
 
 struct dp_rx_tid {
 	uint8_t tid;
-	struct qwx_dmamem *mem;
+	const struct qwx_dmamem *mem;
 	uint32_t *vaddr;
 	uint64_t paddr;
 	uint32_t size;
@@ -1131,6 +1129,17 @@ struct qwx_dp {
 #endif
 	struct qwx_hp_update_timer reo_cmd_timer;
 	struct qwx_hp_update_timer tx_ring_timer[DP_TCL_NUM_RING_MAX];
+
+	/*
+	 * Cache of DMA memory regions used for Rx aggregation.
+	 * We used to free these DMA allocations in interrupt context but
+	 * destroying DMA memory in interrupt context is not allowed.
+	 *
+	 * This array contains enough entries for client station mode.
+	 * It will need to grow in order to support multiple clients if
+	 * support for HostAP mode gets added to the driver.
+	 */
+	struct qwx_dmamem *rx_tid_mem[HAL_DESC_REO_NON_QOS_TID + 1];
 };
 
 #define ATH11K_SHADOW_DP_TIMER_INTERVAL 20
@@ -1659,11 +1668,8 @@ struct qwx_vif {
 	uint8_t hal_addr_search_flags;
 	uint8_t search_type;
 
-	struct qwx_softc *sc;
-
 	uint16_t tx_seq_no;
 	struct wmi_wmm_params_all_arg wmm_params;
-	TAILQ_ENTRY(qwx_vif) entry;
 	union {
 		struct {
 			uint32_t uapsd;
@@ -1711,8 +1717,6 @@ struct qwx_vif {
 	struct qwx_txmgmt_queue txmgmt;
 };
 
-TAILQ_HEAD(qwx_vif_list, qwx_vif);
-
 struct qwx_survey_info {
 	int8_t noise;
 	uint64_t time;
@@ -1737,15 +1741,35 @@ struct qwx_ext_irq_grp {
 
 struct qwx_rx_radiotap_header {
 	struct ieee80211_radiotap_header wr_ihdr;
+	uint64_t	wr_tsft;
+	uint8_t		wr_flags;
+	uint8_t		wr_rate;
+	uint16_t	wr_chan_freq;
+	uint16_t	wr_chan_flags;
+	int8_t		wr_dbm_antsignal;
+	int8_t		wr_dbm_antnoise;
 } __packed;
 
-#define IWX_RX_RADIOTAP_PRESENT	0 /* TODO add more information */
+#define QWX_RX_RADIOTAP_PRESENT						\
+	((1 << IEEE80211_RADIOTAP_TSFT) |				\
+	 (1 << IEEE80211_RADIOTAP_FLAGS) |				\
+	 (1 << IEEE80211_RADIOTAP_RATE) |				\
+	 (1 << IEEE80211_RADIOTAP_CHANNEL) |				\
+	 (1 << IEEE80211_RADIOTAP_DBM_ANTSIGNAL) |			\
+	 (1 << IEEE80211_RADIOTAP_DBM_ANTNOISE))
 
 struct qwx_tx_radiotap_header {
 	struct ieee80211_radiotap_header wt_ihdr;
+	uint8_t		wt_flags;
+	uint8_t		wt_rate;
+	uint16_t	wt_chan_freq;
+	uint16_t	wt_chan_flags;
 } __packed;
 
-#define IWX_TX_RADIOTAP_PRESENT	0 /* TODO add more information */
+#define QWX_TX_RADIOTAP_PRESENT						\
+	((1 << IEEE80211_RADIOTAP_FLAGS) |				\
+	 (1 << IEEE80211_RADIOTAP_RATE) |				\
+	 (1 << IEEE80211_RADIOTAP_CHANNEL))
 
 struct qwx_setkey_task_arg {
 	struct ieee80211_node *ni;
@@ -1753,6 +1777,49 @@ struct qwx_setkey_task_arg {
 	int cmd;
 #define QWX_ADD_KEY	1
 #define QWX_DEL_KEY	2
+};
+
+struct ath11k_peer {
+	TAILQ_ENTRY(ath11k_peer) entry;
+#if 0
+	struct ieee80211_sta *sta;
+#endif
+	int vdev_id;
+	uint8_t addr[IEEE80211_ADDR_LEN];
+	int peer_id;
+	uint16_t ast_hash;
+	uint8_t pdev_id;
+	uint16_t hw_peer_id;
+#if 0
+	/* protected by ab->data_lock */
+	struct ieee80211_key_conf *keys[WMI_MAX_KEY_INDEX + 1];
+#endif
+	struct dp_rx_tid rx_tid[IEEE80211_NUM_TID + 1];
+#if 0
+	/* peer id based rhashtable list pointer */
+	struct rhash_head rhash_id;
+	/* peer addr based rhashtable list pointer */
+	struct rhash_head rhash_addr;
+
+	/* Info used in MMIC verification of
+	 * RX fragments
+	 */
+	struct crypto_shash *tfm_mmic;
+	u8 mcast_keyidx;
+	u8 ucast_keyidx;
+#endif
+	uint16_t sec_type;
+	uint16_t sec_type_grp;
+#if 0
+	bool is_authorized;
+	bool dp_setup_done;
+#endif
+};
+TAILQ_HEAD(qwx_peer_list, ath11k_peer);
+
+struct qwx_ba_task_data {
+	uint32_t		start_tidmask;
+	uint32_t		stop_tidmask;
 };
 
 struct qwx_softc {
@@ -1772,6 +1839,8 @@ struct qwx_softc {
 	enum ieee80211_state	ns_nstate;
 	int			ns_arg;
 
+	int			deauth_sent;
+
 	/* Task for setting encryption keys and its arguments. */
 	struct task		setkey_task;
 	/*
@@ -1789,6 +1858,14 @@ struct qwx_softc {
 	int install_key_done;
 	int install_key_status;
 
+	/* Task for firmware BlockAck setup/teardown and its arguments. */
+	struct task		ba_task;
+	struct qwx_ba_task_data	ba_rx;
+
+	/* Task for firmware country code updates. */
+	uint8_t new_alpha2[3];
+	struct task set_cc_task;
+
 	enum ath11k_11d_state	state_11d;
 	int			completed_11d_scan;
 	uint32_t		vdev_id_11d_scan;
@@ -1805,6 +1882,10 @@ struct qwx_softc {
 	} scan;
 	u_int			scan_channel;
 	struct qwx_survey_info	survey[IEEE80211_CHAN_MAX];
+	struct task		bgscan_task;
+	struct task		bgscan_done_task;
+	struct ieee80211_node_switch_bss_arg *bgscan_unref_arg;
+	size_t bgscan_unref_arg_size;
 
 	int			attached;
 	struct {
@@ -1850,11 +1931,13 @@ struct qwx_softc {
 	int				num_started_vdevs;
 	uint32_t			allocated_vdev_map;
 	uint32_t			free_vdev_map;
+	struct qwx_peer_list		peers;
 	int				num_peers;
 	int				peer_mapped;
 	int				peer_delete_done;
 	int				vdev_setup_done;
 	int				peer_assoc_done;
+	int				bss_peer_id;
 
 	struct qwx_dbring_cap	*db_caps;
 	uint32_t		 num_db_cap;
@@ -1865,7 +1948,7 @@ struct qwx_softc {
 
 	uint32_t pktlog_defs_checksum;
 
-	struct qwx_vif_list vif_list;
+	struct qwx_vif	sc_vif;
 	struct qwx_pdev pdevs[MAX_RADIOS];
 	struct {
 		enum WMI_HOST_WLAN_BAND supported_bands;
@@ -1934,7 +2017,9 @@ int	qwx_ext_intr(void *);
 int	qwx_dp_service_srng(struct qwx_softc *, int);
 
 int	qwx_init_hw_params(struct qwx_softc *);
-int	qwx_attach(struct qwx_softc *);
+int	qwx_vif_alloc(struct qwx_softc *);
+void	qwx_vif_free(struct qwx_softc *);
+void	qwx_attach(struct qwx_softc *);
 void	qwx_detach(struct qwx_softc *);
 int	qwx_activate(struct device *, int);
 
@@ -1948,50 +2033,19 @@ int	qwx_media_change(struct ifnet *);
 void	qwx_init_task(void *);
 int	qwx_newstate(struct ieee80211com *, enum ieee80211_state, int);
 void	qwx_newstate_task(void *);
-
-struct ath11k_peer {
-#if 0
-	struct list_head list;
-	struct ieee80211_sta *sta;
-#endif
-	int vdev_id;
-#if 0
-	u8 addr[ETH_ALEN];
-#endif
-	int peer_id;
-	uint16_t ast_hash;
-	uint8_t pdev_id;
-	uint16_t hw_peer_id;
-#if 0
-	/* protected by ab->data_lock */
-	struct ieee80211_key_conf *keys[WMI_MAX_KEY_INDEX + 1];
-#endif
-	struct dp_rx_tid rx_tid[IEEE80211_NUM_TID + 1];
-#if 0
-	/* peer id based rhashtable list pointer */
-	struct rhash_head rhash_id;
-	/* peer addr based rhashtable list pointer */
-	struct rhash_head rhash_addr;
-
-	/* Info used in MMIC verification of
-	 * RX fragments
-	 */
-	struct crypto_shash *tfm_mmic;
-	u8 mcast_keyidx;
-	u8 ucast_keyidx;
-	u16 sec_type;
-	u16 sec_type_grp;
-	bool is_authorized;
-	bool dp_setup_done;
-#endif
-};
+int	qwx_bgscan(struct ieee80211com *);
+void	qwx_bgscan_done(struct ieee80211com *,
+	    struct ieee80211_node_switch_bss_arg *, size_t);
+void	qwx_updatechan(struct ieee80211com *);
 
 struct qwx_node {
 	struct ieee80211_node ni;
-	struct ath11k_peer peer;
+	int peer_id;
 	unsigned int flags;
 #define QWX_NODE_FLAG_HAVE_PAIRWISE_KEY	0x01
 #define QWX_NODE_FLAG_HAVE_GROUP_KEY	0x02
+	uint32_t phymode;
+	enum wmi_peer_chwidth chwidth;
 };
 
 struct ieee80211_node *qwx_node_alloc(struct ieee80211com *);
@@ -1999,6 +2053,12 @@ int	qwx_set_key(struct ieee80211com *, struct ieee80211_node *,
     struct ieee80211_key *);
 void	qwx_delete_key(struct ieee80211com *, struct ieee80211_node *,
     struct ieee80211_key *);
+int	qwx_ampdu_rx_start(struct ieee80211com *, struct ieee80211_node *,
+	    uint8_t);
+void	qwx_ampdu_rx_stop(struct ieee80211com *, struct ieee80211_node *,
+	    uint8_t);
+int	qwx_ampdu_tx_start(struct ieee80211com *, struct ieee80211_node *,
+	    uint8_t);
 
 void	qwx_qrtr_recv_msg(struct qwx_softc *, struct mbuf *);
 

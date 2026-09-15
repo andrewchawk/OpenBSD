@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.10 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.12 2026/05/29 11:18:30 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -20,10 +20,12 @@ DEFS=	Attributes.inc \
 	IntrinsicsR600.h \
 	IntrinsicsRISCV.h \
 	IntrinsicsS390.h \
+	IntrinsicsSPIRV.h \
 	IntrinsicsWebAssembly.h \
 	IntrinsicsX86.h \
 	IntrinsicsXCore.h \
-	IntrinsicsVE.h
+	IntrinsicsVE.h \
+	RuntimeLibcalls.inc
 
 INCDIR=	/usr/include/llvm/IR
 
@@ -128,6 +130,12 @@ IntrinsicsS390.h: ${LLVM_SRCS}/include/llvm/IR/Intrinsics.td
 		-I${LLVM_SRCS}/include \
 		-o ${.TARGET} ${.ALLSRC}
 
+IntrinsicsSPIRV.h: ${LLVM_SRCS}/include/llvm/IR/Intrinsics.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-intrinsic-enums -intrinsic-prefix=spv \
+		-I${LLVM_SRCS}/include/llvm/IR -I${LLVM_SRCS}/lib/Target \
+		-I${LLVM_SRCS}/include \
+		-o ${.TARGET} ${.ALLSRC}
+
 IntrinsicsWebAssembly.h: ${LLVM_SRCS}/include/llvm/IR/Intrinsics.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-intrinsic-enums -intrinsic-prefix=wasm \
 		-I${LLVM_SRCS}/include/llvm/IR -I${LLVM_SRCS}/lib/Target \
@@ -148,6 +156,12 @@ IntrinsicsXCore.h: ${LLVM_SRCS}/include/llvm/IR/Intrinsics.td
 
 IntrinsicsVE.h: ${LLVM_SRCS}/include/llvm/IR/Intrinsics.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-intrinsic-enums -intrinsic-prefix=ve \
+		-I${LLVM_SRCS}/include/llvm/IR -I${LLVM_SRCS}/lib/Target \
+		-I${LLVM_SRCS}/include \
+		-o ${.TARGET} ${.ALLSRC}
+
+RuntimeLibcalls.inc: ${LLVM_SRCS}/include/llvm/IR/RuntimeLibcalls.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-runtime-libcalls \
 		-I${LLVM_SRCS}/include/llvm/IR -I${LLVM_SRCS}/lib/Target \
 		-I${LLVM_SRCS}/include \
 		-o ${.TARGET} ${.ALLSRC}

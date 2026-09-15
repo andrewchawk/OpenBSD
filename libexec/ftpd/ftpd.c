@@ -1,4 +1,4 @@
-/*	$OpenBSD: ftpd.c,v 1.234 2024/05/09 08:35:03 florian Exp $	*/
+/*	$OpenBSD: ftpd.c,v 1.236 2026/04/17 20:17:53 millert Exp $	*/
 /*	$NetBSD: ftpd.c,v 1.15 1995/06/03 22:46:47 mycroft Exp $	*/
 
 /*
@@ -387,7 +387,6 @@ main(int argc, char *argv[])
 		    FTPD_PRIVSEP_USER);
 		exit(1);
 	}
-	endpwent();
 
 	if (daemon_mode) {
 		int *fds, fd;
@@ -1559,11 +1558,12 @@ send_data(FILE *instr, FILE *outstr, off_t blksize, off_t filesize, int isreg)
 					munmap(buf, fsize);
 					goto got_oob;
 				}
-				len -= cnt;
-				bp += cnt;
-				if (cnt > 0)
+				if (cnt > 0) {
+					len -= cnt;
+					bp += cnt;
 					byte_count += cnt;
-			} while(cnt > 0 && len > 0);
+				}
+			} while (cnt > 0 && len > 0);
 
 			transflag = 0;
 			munmap(buf, fsize);

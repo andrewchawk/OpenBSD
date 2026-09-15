@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysv_msg.c,v 1.41 2023/04/11 00:45:09 jsg Exp $	*/
+/*	$OpenBSD: sysv_msg.c,v 1.51 2026/07/12 22:06:01 kirill Exp $	*/
 /*	$NetBSD: sysv_msg.c,v 1.19 1996/02/09 19:00:18 christos Exp $	*/
 /*
  * Copyright (c) 2009 Bret S. Lambert <blambert@openbsd.org>
@@ -56,11 +56,19 @@ void msg_free(struct msg *);
 void msg_enqueue(struct que *, struct msg *, struct proc *);
 void msg_dequeue(struct que *, struct msg *, struct proc *);
 struct msg *msg_lookup(struct que *, int);
-int msg_copyin(struct msg *, const char *, size_t, struct proc *);
-int msg_copyout(struct msg *, char *, size_t *, struct proc *);
+int msg_copyin(struct msg *, const char *, size_t);
+int msg_copyout(struct msg *, char *, size_t *, int);
 
 struct	pool sysvmsgpl;
-struct	msginfo msginfo;
+
+const struct msginfo msginfo = {
+	.msgmax = MSGMAX,
+	.msgmni = MSGMNI,
+	.msgmnb = MSGMNB,
+	.msgtql = MSGTQL,
+	.msgssz = MSGSSZ,
+	.msgseg = MSGSEG,
+};
 
 TAILQ_HEAD(, que) msg_queues;
 
@@ -72,13 +80,6 @@ int maxmsgs;
 void
 msginit(void)
 {
-	msginfo.msgmax = MSGMAX;
-	msginfo.msgmni = MSGMNI;
-	msginfo.msgmnb = MSGMNB;
-	msginfo.msgtql = MSGTQL;
-	msginfo.msgssz = MSGSSZ;
-	msginfo.msgseg = MSGSEG;
-
 	pool_init(&sysvmsgpl, sizeof(struct msg), 0, IPL_NONE, PR_WAITOK,
 	    "sysvmsgpl", NULL);
 
@@ -280,7 +281,7 @@ sys_msgsnd(struct proc *p, void *v, register_t *retval)
 	}
 
 	/* msg_copyin frees msg on error */
-	if ((error = msg_copyin(msg, (const char *)SCARG(uap, msgp), msgsz, p)))
+	if ((error = msg_copyin(msg, (const char *)SCARG(uap, msgp), msgsz)))
 		goto out;
 
 	msg_enqueue(que, msg, p);
@@ -326,27 +327,47 @@ sys_msgrcv(struct proc *p, void *v, register_t *retval)
 
 	QREF(que);
 
+again:
 	/* msg_lookup handles matching; sleeping gets handled here */
 	while ((msg = msg_lookup(que, msgtyp)) == NULL) {
 
 		if (SCARG(uap, msgflg) & IPC_NOWAIT) {
 			error = ENOMSG;
-			goto out;
+			goto rele;
 		}
 
 		que->que_flags |= MSGQ_READERS;
 		if ((error = tsleep_nsec(que, PZERO|PCATCH, "msgwait", INFSLP)))
-			goto out;
+			goto rele;
 
 		/* make sure the queue still alive */
 		if (que->que_flags & MSGQ_DYING) {
 			error = EIDRM;
-			goto out;
+			goto rele;
 		}
 	}
 
+	/* acquired message could be delivering by concurrent thread */
+	if (que->que_flags & MSGQ_RCVWAIT) {
+		que->que_flags |= MSGQ_RCVWAITING;
+		error = tsleep_nsec(&que->que_flags, PZERO | PCATCH,
+		    "msgrcv", INFSLP);
+		if (error)
+			goto rele;
+
+		/* make sure the queue still alive */
+		if (que->que_flags & MSGQ_DYING) {
+			error = EIDRM;
+			goto rele;
+		}
+
+		goto again;
+	}
+
+	que->que_flags |= MSGQ_RCVWAIT;
+
 	/* if msg_copyout fails, keep the message around so it isn't lost */
-	if ((error = msg_copyout(msg, msgp, &msgsz, p)))
+	if ((error = msg_copyout(msg, msgp, &msgsz, SCARG(uap, msgflg))))
 		goto out;
 
 	msg_dequeue(que, msg, p);
@@ -365,6 +386,16 @@ sys_msgrcv(struct proc *p, void *v, register_t *retval)
 
 	*retval = msgsz;
 out:
+	que->que_flags &= ~MSGQ_RCVWAIT;
+
+	if (que->que_flags & MSGQ_RCVWAITING) {
+		que->que_flags &= ~MSGQ_RCVWAITING;
+		if (que->que_flags & MSGQ_DYING)
+			wakeup(&que->que_flags);
+		else
+			wakeup_one(&que->que_flags);
+	}
+rele:
 	QRELE(que);
 
 	return (error);
@@ -378,12 +409,12 @@ struct que *
 que_create(key_t key, struct ucred *cred, int mode)
 {
 	struct que *que, *que2;
-	int nextix = 1;
+	int nextix = 0;
 
 	que = malloc(sizeof(*que), M_TEMP, M_WAIT|M_ZERO);
 
 	/* if malloc slept, a queue with the same key may have been created */
-	if (que_key_lookup(key)) {
+	if (num_ques >= msginfo.msgmni || que_key_lookup(key)) {
 		free(que, M_TEMP, sizeof *que);
 		return (NULL);
 	}
@@ -565,7 +596,7 @@ msg_dequeue(struct que *que, struct msg *msg, struct proc *p)
  */
 
 int
-msg_copyin(struct msg *msg, const char *ubuf, size_t len, struct proc *p)
+msg_copyin(struct msg *msg, const char *ubuf, size_t len)
 {
 	struct mbuf **mm, *m;
 	size_t xfer;
@@ -574,7 +605,8 @@ msg_copyin(struct msg *msg, const char *ubuf, size_t len, struct proc *p)
 	if (msg == NULL)
 		panic ("msg NULL");
 
-	if ((error = copyin(ubuf, &msg->msg_type, sizeof(long)))) {
+	/* msg->msg_type size is not included to `len' */
+	if ((error = copyin(ubuf, &msg->msg_type, sizeof(msg->msg_type)))) {
 		msg_free(msg);
 		return (error);
 	}
@@ -584,18 +616,18 @@ msg_copyin(struct msg *msg, const char *ubuf, size_t len, struct proc *p)
 		return (EINVAL);
 	}
 
-	ubuf += sizeof(long);
+	ubuf += sizeof(msg->msg_type);
 
 	msg->msg_len = 0;
 	mm = &msg->msg_data;
 
 	while (msg->msg_len < len) {
 		m = m_get(M_WAIT, MT_DATA);
-		if (len >= MINCLSIZE) {
+		if ((xfer = len - msg->msg_len) >= MINCLSIZE) {
 			MCLGET(m, M_WAIT);
-			xfer = min(len, MCLBYTES);
+			xfer = min(xfer, MCLBYTES);
 		} else {
-			xfer = min(len, MLEN);
+			xfer = min(xfer, MLEN);
 		}
 		m->m_len = xfer;
 		msg->msg_len += xfer;
@@ -615,10 +647,10 @@ msg_copyin(struct msg *msg, const char *ubuf, size_t len, struct proc *p)
 }
 
 int
-msg_copyout(struct msg *msg, char *ubuf, size_t *len, struct proc *p)
+msg_copyout(struct msg *msg, char *ubuf, size_t *len, int msgflg)
 {
 	struct mbuf *m;
-	size_t xfer;
+	size_t total, done, xfer;
 	int error;
 
 #ifdef DIAGNOSTIC
@@ -626,19 +658,24 @@ msg_copyout(struct msg *msg, char *ubuf, size_t *len, struct proc *p)
 		panic("SysV message longer than MSGMAX");
 #endif
 
-	/* silently truncate messages too large for user buffer */
-	xfer = min(*len, msg->msg_len);
+	if ((total = min(*len, msg->msg_len)) < msg->msg_len) {
+		if ((msgflg & MSG_NOERROR) == 0)
+			return (E2BIG);
+	}
 
-	if ((error = copyout(&msg->msg_type, ubuf, sizeof(long))))
+	if ((error = copyout(&msg->msg_type, ubuf, sizeof(msg->msg_type))))
 		return (error);
 
-	ubuf += sizeof(long);
-	*len = xfer;
+	ubuf += sizeof(msg->msg_type);
+	*len = total;
 
-	for (m = msg->msg_data; m; m = m->m_next) {
-		if ((error = copyout(mtod(m, void *), ubuf, m->m_len)))
+	for (done = 0, m = msg->msg_data; m; m = m->m_next) {
+		if ((xfer = min(m->m_len, total - done)) == 0)
+			break;
+		if ((error = copyout(mtod(m, void *), ubuf, xfer)))
 			return (error);
-		ubuf += m->m_len;
+		ubuf += xfer;
+		done += xfer;
 	}
 
 	return (0);
@@ -649,7 +686,7 @@ sysctl_sysvmsg(int *name, u_int namelen, void *where, size_t *sizep)
 {
 	struct msg_sysctl_info *info;
 	struct que *que;
-	size_t infolen, infolen0;
+	size_t infolen;
 	int error;
 
 	switch (*name) {
@@ -666,10 +703,10 @@ sysctl_sysvmsg(int *name, u_int namelen, void *where, size_t *sizep)
 		 * message queues; for now, emulate this behavior
 		 * until a more thorough fix can be made.
 		 */
-		infolen0 = sizeof(msginfo) +
+		infolen = sizeof(msginfo) +
 		    msginfo.msgmni * sizeof(struct msqid_ds);
 		if (where == NULL) {
-			*sizep = infolen0;
+			*sizep = infolen;
 			return (0);
 		}
 
@@ -682,20 +719,14 @@ sysctl_sysvmsg(int *name, u_int namelen, void *where, size_t *sizep)
 		 */
 		if (*sizep == sizeof(struct msginfo))
 			return (copyout(&msginfo, where, sizeof(msginfo)));
-
-		info = malloc(infolen0, M_TEMP, M_WAIT|M_ZERO);
-
-		/* if the malloc slept, this may have changed */
-		infolen = sizeof(msginfo) +
-		    msginfo.msgmni * sizeof(struct msqid_ds);
-
-		if (*sizep < infolen) {
-			free(info, M_TEMP, infolen0);
+		if (*sizep < infolen)
 			return (ENOMEM);
-		}
+
+		info = malloc(infolen, M_TEMP, M_WAIT|M_ZERO);
 
 		memcpy(&info->msginfo, &msginfo, sizeof(struct msginfo));
 
+		KERNEL_LOCK();
 		/*
 		 * Special case #3: the previous array-based implementation
 		 * exported the array indices and userland has come to rely
@@ -704,10 +735,11 @@ sysctl_sysvmsg(int *name, u_int namelen, void *where, size_t *sizep)
 		TAILQ_FOREACH(que, &msg_queues, que_next)
 			memcpy(&info->msgids[que->que_ix], &que->msqid_ds,
 			    sizeof(struct msqid_ds));
+		KERNEL_UNLOCK();
 
 		error = copyout(info, where, infolen);
 
-		free(info, M_TEMP, infolen0);
+		free(info, M_TEMP, infolen);
 
 		return (error);
 

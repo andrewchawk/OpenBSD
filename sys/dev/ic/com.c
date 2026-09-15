@@ -1,4 +1,4 @@
-/*	$OpenBSD: com.c,v 1.179 2024/05/13 01:15:50 jsg Exp $	*/
+/*	$OpenBSD: com.c,v 1.184 2026/08/31 15:40:34 deraadt Exp $	*/
 /*	$NetBSD: com.c,v 1.82.4.1 1996/06/02 09:08:00 mrg Exp $	*/
 
 /*
@@ -80,7 +80,6 @@
 #include <machine/bus.h>
 #include <machine/intr.h>
 
-#define	COM_CONSOLE
 #include <dev/cons.h>
 
 #include <dev/ic/comreg.h>
@@ -96,11 +95,10 @@ void	compwroff(struct com_softc *);
 void	cominit(bus_space_tag_t, bus_space_handle_t, int, int);
 
 struct cfdriver com_cd = {
-	NULL, "com", DV_TTY
+	NULL, "com", DV_TTY, CD_COCOVM
 };
 
 int	comdefaultrate = TTYDEF_SPEED;
-#ifdef COM_CONSOLE
 int	comconsfreq;
 int	comconsrate = TTYDEF_SPEED;
 bus_addr_t comconsaddr = 0;
@@ -109,7 +107,6 @@ bus_space_tag_t comconsiot;
 bus_space_handle_t comconsioh;
 int	comconsunit;
 tcflag_t comconscflag = TTYDEF_CFLAG;
-#endif
 
 int	commajor;
 
@@ -140,7 +137,6 @@ comspeed(long freq, long speed)
 #undef	divrnd
 }
 
-#ifdef COM_CONSOLE
 int
 comprobe1(bus_space_tag_t iot, bus_space_handle_t ioh)
 {
@@ -161,7 +157,6 @@ comprobe1(bus_space_tag_t iot, bus_space_handle_t ioh)
 
 	return 1;
 }
-#endif
 
 int
 com_detach(struct device *self, int flags)
@@ -260,13 +255,10 @@ comopen(dev_t dev, int flag, int mode, struct proc *p)
 		ttychars(tp);
 		tp->t_iflag = TTYDEF_IFLAG;
 		tp->t_oflag = TTYDEF_OFLAG;
-#ifdef COM_CONSOLE
 		if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
 			tp->t_cflag = comconscflag;
 			tp->t_ispeed = tp->t_ospeed = comconsrate;
-		} else
-#endif
-		{
+		} else {
 			tp->t_cflag = TTYDEF_CFLAG;
 			tp->t_ispeed = tp->t_ospeed = comdefaultrate;
 		}
@@ -306,6 +298,9 @@ comopen(dev_t dev, int flag, int mode, struct proc *p)
 				break;
 			case COM_UART_XR17V35X:
 				com_write_reg(sc, UART_EXAR_SLEEP, 0);
+				break;
+			case COM_UART_PXA2X0:
+				com_write_reg(sc, com_ier, IER_EUART);
 				break;
 			}
 		}
@@ -363,6 +358,8 @@ comopen(dev_t dev, int flag, int mode, struct proc *p)
 			SET(sc->sc_mcr, MCR_IENABLE);
 		com_write_reg(sc, com_mcr, sc->sc_mcr);
 		sc->sc_ier = IER_ERXRDY | IER_ERLS | IER_EMSC;
+		if (sc->sc_uarttype == COM_UART_PXA2X0)
+			sc->sc_ier |= IER_EUART | IER_ERXTOUT;
 		com_write_reg(sc, com_ier, sc->sc_ier);
 
 		sc->sc_msr = com_read_reg(sc, com_msr);
@@ -425,11 +422,9 @@ comclose(dev_t dev, int flag, int mode, struct proc *p)
 	struct tty *tp = sc->sc_tty;
 	int s;
 
-#ifdef COM_CONSOLE
 	/* XXX This is for cons.c. */
 	if (!ISSET(tp->t_state, TS_ISOPEN))
 		return 0;
-#endif
 
 	if(sc->sc_swflags & COM_SW_DEAD)
 		return 0;
@@ -450,13 +445,11 @@ comclose(dev_t dev, int flag, int mode, struct proc *p)
 	splx(s);
 	ttyclose(tp);
 
-#ifdef COM_CONSOLE
 #ifdef notyet /* XXXX */
 	if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
 		ttyfree(tp);
-		sc->sc_tty = 0;
+		sc->sc_tty = NULL;
 	}
-#endif
 #endif
 	return 0;
 }
@@ -465,16 +458,25 @@ void
 compwroff(struct com_softc *sc)
 {
 	struct tty *tp = sc->sc_tty;
+	u_int8_t ier;
+	int timo;
 
 	CLR(sc->sc_lcr, LCR_SBREAK);
 	com_write_reg(sc, com_lcr, sc->sc_lcr);
-	com_write_reg(sc, com_ier, 0);
+	ier = 0;
+	if (sc->sc_uarttype == COM_UART_PXA2X0)
+		ier |= IER_EUART;
+	com_write_reg(sc, com_ier, ier);
 	if (ISSET(tp->t_cflag, HUPCL) &&
 	    !ISSET(sc->sc_swflags, COM_SW_SOFTCAR)) {
 		/* XXX perhaps only clear DTR */
 		sc->sc_mcr = 0;
 		com_write_reg(sc, com_mcr, sc->sc_mcr);
 	}
+
+	timo = 10000;
+	while (!ISSET(com_read_reg(sc, com_lsr), LSR_TSRE) && --timo)
+		delay(1);
 
 	/*
 	 * Turn FIFO off; enter sleep mode if possible.
@@ -502,6 +504,9 @@ compwroff(struct com_softc *sc)
 		case COM_UART_XR17V35X:
 			com_write_reg(sc, UART_EXAR_SLEEP, 0xff);
 			break;
+		case COM_UART_PXA2X0:
+			com_write_reg(sc, com_ier, 0);
+			break;
 		}
 	}
 }
@@ -513,11 +518,9 @@ com_resume(struct com_softc *sc)
 	int ospeed;
 
 	if (!tp || !ISSET(tp->t_state, TS_ISOPEN)) {
-#ifdef COM_CONSOLE
 		if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE))
 			cominit(comconsiot, comconsioh, comconsrate,
 			    comconsfreq);
-#endif
 		return;
 	}
 
@@ -539,6 +542,9 @@ com_resume(struct com_softc *sc)
 			break;
 		case COM_UART_XR17V35X:
 			com_write_reg(sc, UART_EXAR_SLEEP, 0);
+			break;
+		case COM_UART_PXA2X0:
+			com_write_reg(sc, com_ier, IER_EUART);
 			break;
 		}
 	}
@@ -1072,7 +1078,7 @@ comintr(void *arg)
 			do {
 				data = com_read_reg(sc, com_data);
 				if (ISSET(lsr, LSR_BI)) {
-#if defined(COM_CONSOLE) && defined(DDB)
+#if defined(DDB)
 					if (ISSET(sc->sc_hwflags,
 					    COM_HW_CONSOLE)) {
 						if (db_console)
@@ -1097,7 +1103,7 @@ comintr(void *arg)
 						    sc->sc_mcr);
 					}
 				}
-#if defined(COM_CONSOLE) && defined(DDB)
+#if defined(DDB)
 			next:
 #endif
 				lsr = com_read_reg(sc, com_lsr);
@@ -1159,7 +1165,6 @@ cominit(bus_space_tag_t iot, bus_space_handle_t ioh, int rate, int frequency)
 	splx(s);
 }
 
-#ifdef COM_CONSOLE
 void  
 comcnprobe(struct consdev *cp)
 {
@@ -1276,12 +1281,10 @@ void
 comcnpollc(dev_t dev, int on)
 {
 }
-#endif	/* COM_CONSOLE */
 
 void	com_enable_debugport(struct com_softc *);
 void	com_fifo_probe(struct com_softc *);
 
-#ifdef COM_CONSOLE
 void
 com_enable_debugport(struct com_softc *sc)
 {
@@ -1294,7 +1297,6 @@ com_enable_debugport(struct com_softc *sc)
 
 	splx(s);
 }
-#endif	/* COM_CONSOLE */
 
 void
 com_attach_subr(struct com_softc *sc)
@@ -1302,19 +1304,26 @@ com_attach_subr(struct com_softc *sc)
 	int probe = 0;
 	u_int8_t lcr, fifo;
 	u_int32_t cpr;
+	int timo;
 
 	sc->sc_ier = 0;
+	if (sc->sc_uarttype == COM_UART_PXA2X0)
+		sc->sc_ier |= IER_EUART;
 	/* disable interrupts */
 	com_write_reg(sc, com_ier, sc->sc_ier);
 
-#ifdef COM_CONSOLE
 	if (sc->sc_iot == comconsiot && sc->sc_iobase == comconsaddr) {
 		comconsattached = 1;
-		delay(10000);			/* wait for output to finish */
 		SET(sc->sc_hwflags, COM_HW_CONSOLE);
 		SET(sc->sc_swflags, COM_SW_SOFTCAR);
 	}
-#endif
+
+	if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
+		/* wait for output to finish */
+		timo = 10000;
+		while (!ISSET(com_read_reg(sc, com_lsr), LSR_TSRE) && --timo)
+			delay(1);
+	}
 
 	/*
 	 * Probe for all known forms of UART.
@@ -1502,19 +1511,30 @@ com_attach_subr(struct com_softc *sc)
 			sc->sc_fifolen = 1;
 		}
 		break;
+	case COM_UART_PXA2X0:
+		printf(": pxa2x0, 32 byte fifo\n");
+		SET(sc->sc_hwflags, COM_HW_FIFO);
+		sc->sc_fifolen = 32;
+		break;
 	default:
 		panic("comattach: bad fifo type");
 	}
 
-#ifdef COM_CONSOLE
-	if (!ISSET(sc->sc_hwflags, COM_HW_CONSOLE))
-#endif
+	if (!ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
 		if (sc->sc_fifolen < 256)
 			com_fifo_probe(sc);
+	}
 
 	if (sc->sc_fifolen == 0) {
 		CLR(sc->sc_hwflags, COM_HW_FIFO);
 		sc->sc_fifolen = 1;
+	}
+
+	if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
+		/* wait for output to finish */
+		timo = 10000;
+		while (!ISSET(com_read_reg(sc, com_lsr), LSR_TSRE) && --timo)
+			delay(1);
 	}
 
 	/* clear and disable fifo */
@@ -1529,7 +1549,6 @@ com_attach_subr(struct com_softc *sc)
 	sc->sc_mcr = 0;
 	com_write_reg(sc, com_mcr, sc->sc_mcr);
 
-#ifdef COM_CONSOLE
 	if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
 		int maj;
 
@@ -1543,7 +1562,6 @@ com_attach_subr(struct com_softc *sc)
 
 		printf("%s: console\n", sc->sc_dev.dv_xname);
 	}
-#endif
 
 	timeout_set(&sc->sc_diag_tmo, comdiag, sc);
 	timeout_set(&sc->sc_dtr_tmo, com_raisedtr, sc);
@@ -1559,10 +1577,8 @@ com_attach_subr(struct com_softc *sc)
 	if (!sc->enable)
 		sc->enabled = 1;
 
-#ifdef COM_CONSOLE
 	if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE))
 		com_enable_debugport(sc);
-#endif
 }
 
 void
@@ -1575,6 +1591,8 @@ com_fifo_probe(struct com_softc *sc)
 		return;
 
 	ier = 0;
+	if (sc->sc_uarttype == COM_UART_PXA2X0)
+		ier |= IER_EUART;
 	com_write_reg(sc, com_ier, ier);
 	com_write_reg(sc, com_lcr, LCR_DLAB);
 	com_write_reg(sc, com_dlbl, 3);
@@ -1639,8 +1657,6 @@ com_write_reg(struct com_softc *sc, bus_size_t reg, uint8_t value)
 		bus_space_write_1(sc->sc_iot, sc->sc_ioh, reg, value);
 }
 
-#ifdef COM_CONSOLE
-
 u_char comcons_reg_width;
 u_char comcons_reg_shift;
 
@@ -1665,5 +1681,3 @@ comcn_write_reg(bus_size_t reg, uint8_t value)
 	else
 		bus_space_write_1(comconsiot, comconsioh, reg, value);
 }
-
-#endif

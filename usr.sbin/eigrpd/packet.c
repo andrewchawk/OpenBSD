@@ -1,4 +1,4 @@
-/*	$OpenBSD: packet.c,v 1.23 2023/12/14 10:02:27 claudio Exp $ */
+/*	$OpenBSD: packet.c,v 1.26 2026/08/06 13:06:23 claudio Exp $ */
 
 /*
  * Copyright (c) 2015 Renato Westphal <renato@openbsd.org>
@@ -175,7 +175,7 @@ send_packet(struct eigrp_iface *ei, struct nbr *nbr, uint32_t flags,
 		rtp_ack_stop_timer(nbr);
 	}
 
-	ibuf_from_ibuf(buf, &ebuf);
+	ibuf_from_ibuf(&ebuf, buf);
 	if (ibuf_get(&ebuf, &eigrp_hdr, sizeof(eigrp_hdr)) == -1)
 		fatalx("send_packet: get hdr failed");
 
@@ -355,7 +355,8 @@ recv_packet_eigrp(int af, union eigrpd_addr *src, union eigrpd_addr *dest,
 		}
 
 		memcpy(&tlv, buf, sizeof(tlv));
-		if (ntohs(tlv.length) > len) {
+		if (ntohs(tlv.length) < sizeof(tlv) ||
+		    ntohs(tlv.length) > len) {
 			log_debug("%s: malformed packet (bad length)",
 			    __func__);
 			goto error;
@@ -522,7 +523,7 @@ recv_packet(int fd, short event, void *bula)
 	len = (uint16_t)r;
 
 	sa2addr((struct sockaddr *)&from, &af, &src);
-	if (bad_addr(af, &src)) {
+	if (bad_addr(af, &src, 0)) {
 		log_debug("%s: invalid source address: %s", __func__,
 		    log_addr(af, &src));
 		return;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_trace.c,v 1.45 2024/06/07 10:14:29 jsg Exp $	*/
+/*	$OpenBSD: db_trace.c,v 1.50 2025/08/03 11:17:08 sashan Exp $	*/
 /*	$NetBSD: db_trace.c,v 1.18 1996/05/03 19:42:01 christos Exp $	*/
 
 /*
@@ -155,7 +155,7 @@ db_stack_trace_print(db_expr_t addr, int have_addr, db_expr_t count,
 	lastframe = 0;
 	while (count && frame != 0) {
 		int		narg;
-		char *		name;
+		const char *	name;
 		db_expr_t	offset;
 		Elf_Sym		*sym;
 
@@ -297,30 +297,43 @@ stacktrace_save_utrace(struct stacktrace *st)
 	if (pcb == NULL)
 		return;
 
+	lastframe = NULL;
 	frame = __builtin_frame_address(0);
 	KASSERT(INKERNEL(frame));
-	f = *frame;
 
-	while (st->st_count < STACKTRACE_MAX) {
-		if (f.f_retaddr != 0 && !INKERNEL(f.f_retaddr))
-			st->st_pc[st->st_count++] = f.f_retaddr;
-
+	curcpu()->ci_inatomic++;
+	/*
+	 * skip kernel frames
+	 */
+	while (frame != NULL && lastframe < frame &&
+	    frame <= (struct callframe *)pcb->pcb_kstack) {
 		lastframe = frame;
-		frame = f.f_frame;
-
-		if (frame == NULL)
-			break;
-		if (INKERNEL(f.f_retaddr)) {
-			if (frame <= lastframe)
-				break;
-			f = *frame;
-			continue;
-		}
-		if (!INKERNEL(lastframe) && frame <= lastframe)
-			break;
-		if (copyin(frame, &f, sizeof(f)) != 0)
-			break;
+		frame = frame->f_frame;
 	}
+
+	/*
+	 * start saving userland frames
+	 */
+	if (lastframe != NULL)
+		st->st_pc[st->st_count++] = lastframe->f_retaddr;
+
+	while (frame != NULL && st->st_count < STACKTRACE_MAX) {
+		if (copyin(frame, &f, sizeof(f)) != 0) {
+			/*
+			 * If the frame pointer read from the previous frame
+			 * is invalid, assume the return address we read
+			 * from that frame is invalid as well.
+			 */
+			if (st->st_count == 0)
+				st->st_pc[0] = 0;
+			else
+				st->st_count--;
+			break;
+		}
+		st->st_pc[st->st_count++] = f.f_retaddr;
+		frame = f.f_frame;
+	}
+	curcpu()->ci_inatomic--;
 }
 
 vaddr_t

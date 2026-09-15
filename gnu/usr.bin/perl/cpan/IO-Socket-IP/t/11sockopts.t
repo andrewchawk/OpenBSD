@@ -1,18 +1,18 @@
 #!/usr/bin/perl
 
-use v5;
-use strict;
+use v5.14;
 use warnings;
 
-use Test::More;
+use Test2::V0;
 
 use IO::Socket::IP;
 
 use Errno qw( EACCES );
 use Socket qw( SOL_SOCKET SO_REUSEADDR SO_REUSEPORT SO_BROADCAST );
 
-TODO: {
-   local $TODO = "SO_REUSEADDR doesn't appear to work on cygwin smokers" if $^O eq "cygwin";
+{
+   my $todo;
+   $todo = todo "SO_REUSEADDR doesn't appear to work on cygwin smokers" if $^O eq "cygwin";
    # I honestly have no idea why this fails, and people don't seem to be able
    # to reproduce it on a development box. I'll mark it TODO for now until we
    # can gain any more insight into it.
@@ -22,7 +22,7 @@ TODO: {
       Type      => SOCK_STREAM,
       Listen    => 1,
       ReuseAddr => 1,
-   ) or die "Cannot socket() - $@";
+   ) or die "Cannot socket() - $IO::Socket::errstr";
 
    ok( $sock->getsockopt( SOL_SOCKET, SO_REUSEADDR ), 'SO_REUSEADDR set' );
 
@@ -33,7 +33,7 @@ TODO: {
       Sockopts  => [
          [ SOL_SOCKET, SO_REUSEADDR ],
       ],
-   ) or die "Cannot socket() - $@";
+   ) or die "Cannot socket() - $IO::Socket::errstr";
 
    ok( $sock->getsockopt( SOL_SOCKET, SO_REUSEADDR ), 'SO_REUSEADDR set via Sockopts' );
 }
@@ -51,7 +51,7 @@ SKIP: {
       Type      => SOCK_STREAM,
       Listen    => 1,
       ReusePort => 1,
-   ) or die "Cannot socket() - $@";
+   ) or die "Cannot socket() - $IO::Socket::errstr";
 
    ok( $sock->getsockopt( SOL_SOCKET, SO_REUSEPORT ), 'SO_REUSEPORT set' );
 }
@@ -65,7 +65,7 @@ SKIP: {
       Broadcast => 1,
    );
    skip "Privileges required to set broadcast on datagram socket", 1 if !$sock and $! == EACCES;
-   die "Cannot socket() - $@" unless $sock;
+   die "Cannot socket() - $IO::Socket::errstr" unless $sock;
 
    ok( $sock->getsockopt( SOL_SOCKET, SO_BROADCAST ), 'SO_BROADCAST set' );
 }

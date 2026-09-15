@@ -1,4 +1,4 @@
-/*	$OpenBSD: rkclock.c,v 1.90 2024/07/15 09:54:38 patrick Exp $	*/
+/*	$OpenBSD: rkclock.c,v 1.99 2026/05/05 10:23:27 kettenis Exp $	*/
 /*
  * Copyright (c) 2017, 2018 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -170,6 +170,14 @@
 #define RK3399_PMUCRU_PPLL_CON(i)	(0x0000 + (i) * 4)
 #define RK3399_PMUCRU_CLKSEL_CON(i)	(0x0080 + (i) * 4)
 
+/* RK3528 registers */
+#define RK3528_CRU_PLL_CON(i)		(0x00000 + (i) * 4)
+#define RK3528_CRU_CLKSEL_CON(i)	(0x00300 + (i) * 4)
+#define RK3528_CRU_GATE_CON(i)		(0x00800 + (i) * 4)
+#define RK3528_CRU_SOFTRST_CON(i)	(0x00a00 + (i) * 4)
+#define RK3528_PCIE_CRU_PLL_CON(i)	(0x20000 + (i) * 4)
+#define RK3528_PCIE_CLKSEL_CON(i)	(0x20300 + (i) * 4)
+
 /* RK3568 registers */
 #define RK3568_CRU_APLL_CON(i)		(0x0000 + (i) * 4)
 #define RK3568_CRU_DPLL_CON(i)		(0x0020 + (i) * 4)
@@ -187,6 +195,22 @@
 #define RK3568_PMUCRU_MODE_CON		0x0080
 #define RK3568_PMUCRU_CLKSEL_CON(i)	(0x0100 + (i) * 4)
 #define RK3568_PMUCRU_GATE_CON(i)	(0x0180 + (i) * 4)
+
+/* RK3576 registers */
+#define RK3576_CRU_AUPLL_CON(i)		(0x00180 + (i) * 4)
+#define RK3576_CRU_CPLL_CON(i)		(0x001a0 + (i) * 4)
+#define RK3576_CRU_GPLL_CON(i)		(0x001c0 + (i) * 4)
+#define RK3576_CRU_MODE_CON		0x00280
+#define RK3576_CRU_CLKSEL_CON(i)	(0x00300 + (i) * 4)
+#define RK3576_CRU_GATE_CON(i)		(0x00800 + (i) * 4)
+#define RK3576_CRU_SOFTRST_CON(i)	(0x00a00 + (i) * 4)
+#define RK3576_PHPTOPCRU_PPLL_CON(i)	(0x08200 + (i) * 4)
+#define RK3576_PHPTOPCRU_CLKSEL_CON(i)	(0x08300 + (i) * 4)
+#define RK3576_PHPTOPCRU_GATE_CON(i)	(0x08800 + (i) * 4)
+#define RK3576_PHPTOPCRU_SOFTRST_CON(i)	(0x08a00 + (i) * 4)
+#define RK3576_SECURECRU_CLKSEL_CON(i)	(0x10300 + (i) * 4)
+#define RK3576_SECURECRU_GATE_CON(i)	(0x10800 + (i) * 4)
+#define RK3576_SECURECRU_SOFTRST_CON(i)	(0x10a00 + (i) * 4)
 
 /* RK3588 registers */
 #define RK3588_CRU_AUPLL_CON(i)		(0x00180 + (i) * 4)
@@ -299,6 +323,13 @@ int	rk3399_pmu_set_frequency(void *, uint32_t *, uint32_t);
 void	rk3399_pmu_enable(void *, uint32_t *, int);
 void	rk3399_pmu_reset(void *, uint32_t *, int);
 
+void	rk3528_init(struct rkclock_softc *);
+uint32_t rk3528_get_frequency(void *, uint32_t *);
+int	rk3528_set_frequency(void *, uint32_t *, uint32_t);
+int	rk3528_set_parent(void *, uint32_t *, uint32_t *);
+void	rk3528_enable(void *, uint32_t *, int);
+void	rk3528_reset(void *, uint32_t *, int);
+
 void	rk3568_init(struct rkclock_softc *);
 uint32_t rk3568_get_frequency(void *, uint32_t *);
 int	rk3568_set_frequency(void *, uint32_t *, uint32_t);
@@ -312,7 +343,16 @@ int	rk3568_pmu_set_frequency(void *, uint32_t *, uint32_t);
 void	rk3568_pmu_enable(void *, uint32_t *, int);
 void	rk3568_pmu_reset(void *, uint32_t *, int);
 
+void	rk3576_init(struct rkclock_softc *);
+uint32_t rk3576_get_frequency(void *, uint32_t *);
+int	rk3576_set_frequency(void *, uint32_t *, uint32_t);
+int	rk3576_set_parent(void *, uint32_t *, uint32_t *);
+void	rk3576_enable(void *, uint32_t *, int);
+void	rk3576_reset(void *, uint32_t *, int);
+
 void	rk3588_init(struct rkclock_softc *);
+int	rk3588_set_pll(struct rkclock_softc *, bus_size_t, uint32_t);
+uint32_t rk3588_get_pll(struct rkclock_softc *, bus_size_t);
 uint32_t rk3588_get_frequency(void *, uint32_t *);
 int	rk3588_set_frequency(void *, uint32_t *, uint32_t);
 void	rk3588_enable(void *, uint32_t *, int);
@@ -362,6 +402,12 @@ const struct rkclock_compat rkclock_compat[] = {
 		rk3399_pmu_reset
 	},
 	{
+		"rockchip,rk3528-cru", NULL, 1, rk3528_init,
+		rk3528_enable, rk3528_get_frequency,
+		rk3528_set_frequency, rk3528_set_parent,
+		rk3528_reset
+	},
+	{
 		"rockchip,rk3568-cru", "CRU", 1, rk3568_init,
 		rk3568_enable, rk3568_get_frequency,
 		rk3568_set_frequency, rk3568_set_parent,
@@ -372,6 +418,12 @@ const struct rkclock_compat rkclock_compat[] = {
 		rk3568_pmu_enable, rk3568_pmu_get_frequency,
 		rk3568_pmu_set_frequency, NULL,
 		rk3568_pmu_reset
+	},
+	{
+		"rockchip,rk3576-cru", NULL, 1, rk3576_init,
+		rk3576_enable, rk3576_get_frequency,
+		rk3576_set_frequency, rk3576_set_parent,
+		rk3576_reset
 	},
 	{
 		"rockchip,rk3588-cru", NULL, 1, rk3588_init,
@@ -2998,22 +3050,22 @@ rk3399_enable(void *cookie, uint32_t *cells, int on)
 
 	switch (idx) {
 	case RK3399_CLK_USB2PHY0_REF:
-		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(6), (5 << 0) << 16);
+		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(6), (1 << 5) << 16);
 		break;
 	case RK3399_CLK_USB2PHY1_REF:
-		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(6), (6 << 0) << 16);
+		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(6), (1 << 6) << 16);
 		break;
 	case RK3399_CLK_UPHY0_TCPDPHY_REF:
-		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (4 << 0) << 16);
+		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (1 << 4) << 16);
 		break;
 	case RK3399_CLK_UPHY0_TCPDCORE:
-		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (5 << 0) << 16);
+		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (1 << 5) << 16);
 		break;
 	case RK3399_CLK_UPHY1_TCPDPHY_REF:
-		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (6 << 0) << 16);
+		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (1 << 6) << 16);
 		break;
 	case RK3399_CLK_UPHY1_TCPDCORE:
-		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (7 << 0) << 16);
+		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(13), (1 << 7) << 16);
 		break;
 	case RK3399_ACLK_GMAC:
 		HWRITE4(sc, RK3399_CRU_CLKGATE_CON(32), (1 << 0) << 16);
@@ -3138,6 +3190,216 @@ rk3399_pmu_reset(void *cookie, uint32_t *cells, int on)
 	uint32_t idx = cells[0];
 
 	printf("%s: 0x%08x\n", __func__, idx);
+}
+
+/* 
+ * Rockchip RK3528 
+ */
+
+const struct rkclock rk3528_clocks[] = {
+	{
+		RK3528_CLK_MATRIX_50M_SRC, RK3528_CRU_CLKSEL_CON(0),
+		0, DIV(6, 2),
+		{ RK3528_PLL_CPLL }
+	},
+	{
+		RK3528_CLK_MATRIX_100M_SRC, RK3528_CRU_CLKSEL_CON(0),
+		0, DIV(11, 7),
+		{ RK3528_PLL_CPLL }
+	},
+	{
+		RK3528_CLK_MATRIX_200M_SRC, RK3528_CRU_CLKSEL_CON(1),
+		0, DIV(9, 5),
+		{ RK3528_PLL_GPLL }
+	},
+	{
+		RK3528_CLK_PWM0, RK3528_CRU_CLKSEL_CON(44),
+		SEL(7, 6), 0,
+		{ RK3528_CLK_MATRIX_100M_SRC, RK3528_CLK_MATRIX_50M_SRC,
+		  RK3528_XIN24M }
+	},
+	{
+		RK3528_CLK_PWM1, RK3528_CRU_CLKSEL_CON(44),
+		SEL(9, 8), 0,
+		{ RK3528_CLK_MATRIX_100M_SRC, RK3528_CLK_MATRIX_50M_SRC,
+		  RK3528_XIN24M }
+	},
+	{
+		RK3528_CLK_PPLL_100M_MATRIX, RK3528_PCIE_CLKSEL_CON(1),
+		0, DIV(6, 2),
+		{ RK3528_PLL_PPLL }
+	},
+	{
+		RK3528_CLK_REF_PCIE_INNER_PHY, RK3528_PCIE_CLKSEL_CON(1),
+		SEL(13, 13), 0,
+		{ RK3528_CLK_PPLL_100M_MATRIX, RK3528_XIN24M }
+	},
+	{
+		RK3528_CLK_PPLL_125M_MATRIX, RK3528_CRU_CLKSEL_CON(60),
+		0, DIV(14, 10),
+		{ RK3528_PLL_PPLL }
+	},
+	{
+		RK3528_CCLK_SRC_EMMC, RK3528_CRU_CLKSEL_CON(62),
+		SEL(7, 6), DIV(5, 0),
+		{ RK3528_PLL_GPLL, RK3528_PLL_CPLL, RK3528_XIN24M }
+	},
+	{
+		RK3528_BCLK_EMMC, RK3528_CRU_CLKSEL_CON(62),
+		SEL(9, 8), 0,
+		{ RK3528_CLK_MATRIX_200M_SRC, RK3528_CLK_MATRIX_100M_SRC,
+		  RK3528_CLK_MATRIX_50M_SRC, RK3528_XIN24M }
+	},
+	{
+		RK3528_TCLK_EMMC, 0, 0, 0,
+		{ RK3528_XIN24M }
+	},
+	{
+		RK3528_CLK_GMAC1_SRC_VPU, 0, 0, 0,
+		{ RK3528_CLK_PPLL_125M_MATRIX }
+	},
+	{
+		RK3528_CLK_I2C1, RK3528_CRU_CLKSEL_CON(79),
+		SEL(10, 9), 0,
+		{ RK3528_CLK_MATRIX_200M_SRC, RK3528_CLK_MATRIX_100M_SRC,
+		  RK3528_CLK_MATRIX_50M_SRC, RK3528_XIN24M }
+	},
+	{
+		RK3528_CCLK_SRC_SDMMC0, RK3528_CRU_CLKSEL_CON(85),
+		SEL(7, 6), DIV(5, 0),
+		{ RK3528_PLL_GPLL, RK3528_PLL_CPLL, RK3528_XIN24M }
+	},
+	{
+		/* Sentinel */
+	}
+};
+
+void
+rk3528_init(struct rkclock_softc *sc)
+{
+	int i;
+
+	/* The code below assumes all clocks are enabled.  Check this!. */
+	for (i = 0; i <= 46; i++) {
+		if (HREAD4(sc, RK3528_CRU_GATE_CON(i)) != 0x00000000) {
+			printf("CRU_GATE_CON%d: 0x%08x\n", i,
+			    HREAD4(sc, RK3528_CRU_GATE_CON(i)));
+		}
+	}
+
+	sc->sc_clocks = rk3528_clocks;
+}
+
+uint32_t
+rk3528_get_frequency(void *cookie, uint32_t *cells)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+
+	switch (idx) {
+	case RK3528_PLL_CPLL:
+		return rk3328_get_pll(sc, RK3528_CRU_PLL_CON(8));
+	case RK3528_PLL_GPLL:
+		return rk3328_get_pll(sc, RK3528_CRU_PLL_CON(24));
+	case RK3528_PLL_PPLL:
+		return rk3328_get_pll(sc, RK3528_PCIE_CRU_PLL_CON(32));
+	case RK3528_XIN24M:
+		return 24000000;
+	default:
+		break;
+	}
+
+	return rkclock_get_frequency(sc, idx);
+}
+
+int
+rk3528_set_frequency(void *cookie, uint32_t *cells, uint32_t freq)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+
+	return rkclock_set_frequency(sc, idx, freq);
+}
+
+int
+rk3528_set_parent(void *cookie, uint32_t *cells, uint32_t *pcells)
+{
+	struct rkclock_softc *sc = cookie;
+
+	return rkclock_set_parent(sc, cells[0], pcells[1]);
+}
+
+void
+rk3528_enable(void *cookie, uint32_t *cells, int on)
+{
+	uint32_t idx = cells[0];
+
+	/* All clocks are enabled upon hardware reset. */
+	if (!on) {
+		printf("%s: 0x%08x\n", __func__, idx);
+		return;
+	}
+}
+
+void
+rk3528_reset(void *cookie, uint32_t *cells, int on)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+	uint32_t bit, mask, reg;
+
+	switch (idx) {
+	case RK3528_SRST_C_EMMC:
+		reg = RK3528_CRU_SOFTRST_CON(25);
+		bit = 15;
+		break;
+	case RK3528_SRST_H_EMMC:
+		reg = RK3528_CRU_SOFTRST_CON(26);
+		bit = 0;
+		break;
+	case RK3528_SRST_A_EMMC:
+		reg = RK3528_CRU_SOFTRST_CON(26);
+		bit = 1;
+		break;
+	case RK3528_SRST_B_EMMC:
+		reg = RK3528_CRU_SOFTRST_CON(26);
+		bit = 2;
+		break;
+	case RK3528_SRST_T_EMMC:
+		reg = RK3528_CRU_SOFTRST_CON(26);
+		bit = 3;
+		break;
+	case RK3528_SRST_A_MAC:
+		reg = RK3528_CRU_SOFTRST_CON(28);
+		bit = 5;
+		break;
+	case RK3528_SRST_P_PCIE:
+		reg = RK3528_CRU_SOFTRST_CON(30);
+		bit = 1;
+		break;
+	case RK3528_SRST_PCIE_PIPE_PHY:
+		reg = RK3528_CRU_SOFTRST_CON(30);
+		bit = 2;
+		break;
+	case RK3528_SRST_PCIE_POWER_UP:
+		reg = RK3528_CRU_SOFTRST_CON(30);
+		bit = 3;
+		break;
+	case RK3528_SRST_P_PCIE_PHY:
+		reg = RK3528_CRU_SOFTRST_CON(30);
+		bit = 6;
+		break;
+	case RK3528_SRST_H_SDMMC0:
+		reg = RK3528_CRU_SOFTRST_CON(42);
+		bit = 9;
+		break;
+	default:
+		printf("%s: 0x%08x\n", __func__, idx);
+		return;
+	}
+
+	mask = (1 << bit);
+	HWRITE4(sc, reg, mask << 16 | (on ? mask : 0));
 }
 
 /* 
@@ -3913,6 +4175,347 @@ rk3568_pmu_reset(void *cookie, uint32_t *cells, int on)
 }
 
 /* 
+ * Rockchip RK3576
+ */
+
+const struct rkclock rk3576_clocks[] = {
+	{
+		RK3576_CLK_CPLL_DIV20, RK3576_CRU_CLKSEL_CON(0),
+		SEL(5, 5), DIV(4, 0), { RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_CPLL_DIV10, RK3576_CRU_CLKSEL_CON(0),
+		SEL(11, 11), DIV(10, 6), { RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_GPLL_DIV8, RK3576_CRU_CLKSEL_CON(1),
+		SEL(5, 5), DIV(4, 0), { RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_GPLL_DIV6, RK3576_CRU_CLKSEL_CON(1),
+		SEL(11, 11), DIV(10, 6), { RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_CPLL_DIV4, RK3576_CRU_CLKSEL_CON(2),
+		SEL(5, 5), DIV(4, 0), { RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_CPLL_DIV2, RK3576_CRU_CLKSEL_CON(4),
+		SEL(11, 11), DIV(10, 6), { RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_GMAC0_125M_SRC, RK3576_CRU_CLKSEL_CON(30),
+		0, DIV(14, 10),	{ RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CLK_I2C1, RK3576_CRU_CLKSEL_CON(57),
+		SEL(1, 0), 0,
+		{ RK3576_CLK_GPLL_DIV6, RK3576_CLK_CPLL_DIV10,
+		  RK3576_CLK_CPLL_DIV20, RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_I2C2, RK3576_CRU_CLKSEL_CON(57),
+		SEL(3, 2), 0,
+		{ RK3576_CLK_GPLL_DIV6, RK3576_CLK_CPLL_DIV10,
+		  RK3576_CLK_CPLL_DIV20, RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_I2C5, RK3576_CRU_CLKSEL_CON(57),
+		SEL(9, 8), 0,
+		{ RK3576_CLK_GPLL_DIV6, RK3576_CLK_CPLL_DIV10,
+		  RK3576_CLK_CPLL_DIV20, RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_TSADC, RK3576_CRU_CLKSEL_CON(59),
+		0, DIV(7, 0),
+		{ RK3576_XIN24M },
+	},
+	{
+		RK3576_SCLK_UART0, RK3576_CRU_CLKSEL_CON(60),
+		SEL(10, 8), DIV(7, 0),
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_PLL_AUPLL,
+		  RK3576_XIN24M, RK3576_CLK_UART_FRAC_0, 
+		  RK3576_CLK_UART_FRAC_1, RK3576_CLK_UART_FRAC_2 },
+	},
+	{
+		RK3576_HCLK_DDR_ROOT, RK3576_CRU_CLKSEL_CON(77),
+		SEL(5, 5), DIV(4, 0),
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_FCLK_DDR_CM0_CORE, 0, 0, 0,
+		{ RK3576_HCLK_DDR_ROOT },
+	},
+	{
+		RK3576_ACLK_PHP_ROOT, RK3576_CRU_CLKSEL_CON(92),
+		SEL(9, 9), DIV(8, 4),
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL },
+	},
+	{
+		RK3576_CCLK_SRC_SDMMC0, RK3576_CRU_CLKSEL_CON(105),
+		SEL(14, 13), DIV(12, 7),
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_REF_PCIE0_PHY, RK3576_PHPTOPCRU_CLKSEL_CON(0),
+		SEL(13, 12), 0,
+		{ RK3576_CLK_PCIE_100M_SRC, RK3576_CLK_PCIE_100M_NDUTY_SRC,
+		  RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_PCIE_100M_SRC, RK3576_PHPTOPCRU_CLKSEL_CON(0),
+		0, DIV(6, 2),
+		{ RK3576_PLL_PPLL },
+	},
+	{
+		RK3576_CLK_PCIE_100M_NDUTY_SRC, RK3576_PHPTOPCRU_CLKSEL_CON(0),
+		0, DIV(11, 7),
+		{ RK3576_PLL_PPLL },
+	},
+	{
+		RK3576_CLK_REF_PCIE1_PHY, RK3576_PHPTOPCRU_CLKSEL_CON(0),
+		SEL(15, 14), 0,
+		{ RK3576_CLK_PCIE_100M_SRC, RK3576_CLK_PCIE_100M_NDUTY_SRC,
+		  RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_AUDIO_FRAC_0_SRC, RK3576_CRU_CLKSEL_CON(13),
+		SEL(1, 0), 0,
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_PLL_AUPLL,
+		  RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_AUDIO_FRAC_1_SRC, RK3576_CRU_CLKSEL_CON(15),
+		SEL(1, 0), 0,
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_PLL_AUPLL,
+		  RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_UART_FRAC_0_SRC, RK3576_CRU_CLKSEL_CON(22),
+		SEL(1, 0), 0,
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_PLL_AUPLL,
+		  RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_UART_FRAC_1_SRC, RK3576_CRU_CLKSEL_CON(24),
+		SEL(1, 0), 0,
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_PLL_AUPLL,
+		  RK3576_XIN24M },
+	},
+	{
+		RK3576_CLK_UART_FRAC_2_SRC, RK3576_CRU_CLKSEL_CON(26),
+		SEL(1, 0), 0,
+		{ RK3576_PLL_GPLL, RK3576_PLL_CPLL, RK3576_PLL_AUPLL,
+		  RK3576_XIN24M },
+	},
+	{
+		/* Sentinel */
+	}
+};
+
+/* Certain test clocks are disabled. */
+const uint32_t rk3576_gates[79] = {
+	[2] = 0x00000b00,
+};
+
+void
+rk3576_init(struct rkclock_softc *sc)
+{
+	int i;
+
+	/* The code below assumes all clocks are enabled.  Check this!. */
+	for (i = 0; i < nitems(rk3576_gates); i++) {
+		if (HREAD4(sc, RK3576_CRU_GATE_CON(i)) != rk3576_gates[i]) {
+			printf("CRU_GATE_CON%d: 0x%08x\n", i,
+			    HREAD4(sc, RK3576_CRU_GATE_CON(i)));
+		}
+	}
+
+	sc->sc_clocks = rk3576_clocks;
+}
+
+uint32_t
+rk3576_get_frequency(void *cookie, uint32_t *cells)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+
+	switch (idx) {
+	case RK3576_PLL_AUPLL:
+		return rk3588_get_pll(sc, RK3576_CRU_AUPLL_CON(0));
+	case RK3576_PLL_CPLL:
+		return rk3588_get_pll(sc, RK3576_CRU_CPLL_CON(0));
+	case RK3576_PLL_GPLL:
+		return rk3588_get_pll(sc, RK3576_CRU_GPLL_CON(0));
+	case RK3576_PLL_PPLL:
+		return 2 * rk3588_get_pll(sc, RK3576_PHPTOPCRU_PPLL_CON(0));
+	case RK3588_XIN24M:
+		return 24000000;
+	default:
+		break;
+	}
+
+	return rkclock_get_frequency(sc, idx);
+}
+
+int
+rk3576_set_frequency(void *cookie, uint32_t *cells, uint32_t freq)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+
+	switch (idx) {
+	case RK3576_PLL_AUPLL:
+		return rk3588_set_pll(sc, RK3576_CRU_AUPLL_CON(0), freq);
+	case RK3576_PLL_CPLL:
+		if (rk3588_get_pll(sc, RK3576_CRU_CPLL_CON(0)) == freq)
+			return 0;
+		return rk3588_set_pll(sc, RK3576_CRU_CPLL_CON(0), freq);
+	case RK3576_PLL_GPLL:
+		return rk3588_set_pll(sc, RK3576_CRU_GPLL_CON(0), freq);
+	case RK3576_CLK_AUDIO_FRAC_0:
+		return rk3399_set_frac(sc, RK3576_CLK_AUDIO_FRAC_0_SRC,
+		    RK3576_CRU_CLKSEL_CON(12), freq);
+	case RK3576_CLK_AUDIO_FRAC_1:
+		return rk3399_set_frac(sc, RK3576_CLK_AUDIO_FRAC_1_SRC,
+		    RK3576_CRU_CLKSEL_CON(14), freq);
+	case RK3576_CLK_UART_FRAC_0:
+		return rk3399_set_frac(sc, RK3576_CLK_UART_FRAC_0_SRC,
+		    RK3576_CRU_CLKSEL_CON(21), freq);
+	case RK3576_CLK_UART_FRAC_1:
+		return rk3399_set_frac(sc, RK3576_CLK_UART_FRAC_1_SRC,
+		    RK3576_CRU_CLKSEL_CON(23), freq);
+	case RK3576_CLK_UART_FRAC_2:
+		return rk3399_set_frac(sc, RK3576_CLK_UART_FRAC_2_SRC,
+		    RK3576_CRU_CLKSEL_CON(25), freq);
+	default:
+		break;
+	}
+
+	return rkclock_set_frequency(sc, idx, freq);
+}
+
+int
+rk3576_set_parent(void *cookie, uint32_t *cells, uint32_t *pcells)
+{
+	struct rkclock_softc *sc = cookie;
+
+	return rkclock_set_parent(sc, cells[0], pcells[1]);
+}
+
+void
+rk3576_enable(void *cookie, uint32_t *cells, int on)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+	uint32_t bit, mask, reg = -1;
+
+	switch (idx) {
+	case RK3576_CLK_OTP_PHY_G:
+		reg = RK3576_CRU_GATE_CON(6);
+		bit = 3;
+		break;
+	case RK3576_PCLK_OTPC_NS:
+		reg = RK3576_SECURECRU_GATE_CON(0);
+		bit = 8;
+		break;
+	case RK3576_CLK_OTPC_NS:
+		reg = RK3576_SECURECRU_GATE_CON(0);
+		bit = 9;
+		break;
+	}
+
+	if (reg != -1) {
+		mask = (1 << bit);
+		HWRITE4(sc, reg, mask << 16 | (on ? 0 : mask));
+		return;
+	}
+
+	/* All clocks are enabled upon hardware reset. */
+	if (!on) {
+		printf("%s: 0x%08x\n", __func__, idx);
+		return;
+	}
+}
+
+void
+rk3576_reset(void *cookie, uint32_t *cells, int on)
+{
+	struct rkclock_softc *sc = cookie;
+	uint32_t idx = cells[0];
+	uint32_t bit, mask, reg;
+
+	switch (idx) {
+	case RK3576_SRST_P_TSADC:
+		reg = RK3576_CRU_SOFTRST_CON(13);
+		bit = 8;
+		break;
+	case RK3576_SRST_TSADC:
+		reg = RK3576_CRU_SOFTRST_CON(13);
+		bit = 9;
+		break;
+	case RK3576_SRST_P_PCIE0:
+		reg = RK3576_CRU_SOFTRST_CON(34);
+		bit = 13;
+		break;
+	case RK3576_SRST_PCIE0_POWER_UP:
+		reg = RK3576_CRU_SOFTRST_CON(34);
+		bit = 15;
+		break;
+	case RK3576_SRST_A_USB3OTG1:
+		reg = RK3576_CRU_SOFTRST_CON(35);
+		bit = 3;
+		break;
+	case RK3576_SRST_A_GMAC0:
+		reg = RK3576_CRU_SOFTRST_CON(42);
+		bit = 7;
+		break;
+	case RK3576_SRST_H_SDMMC0:
+		reg = RK3576_CRU_SOFTRST_CON(43);
+		bit = 2;
+		break;
+	case RK3576_SRST_A_USB3OTG0:
+		reg = RK3576_CRU_SOFTRST_CON(47);
+		bit = 5;
+		break;
+	case RK3576_SRST_P_PCIE2_COMBOPHY0:
+		reg = RK3576_PHPTOPCRU_SOFTRST_CON(0);
+		bit = 5;
+		break;
+	case RK3576_SRST_P_PCIE2_COMBOPHY1:
+		reg = RK3576_PHPTOPCRU_SOFTRST_CON(0);
+		bit = 6;
+		break;
+	case RK3576_SRST_PCIE0_PIPE_PHY:
+		reg = RK3576_PHPTOPCRU_SOFTRST_CON(1);
+		bit = 5;
+		break;
+	case RK3576_SRST_PCIE1_PIPE_PHY:
+		reg = RK3576_PHPTOPCRU_SOFTRST_CON(1);
+		bit = 8;
+		break;
+	case RK3576_SRST_H_TRNG_NS:
+		reg = RK3576_SECURECRU_SOFTRST_CON(0);
+		bit = 4;
+		break;
+	case RK3576_SRST_P_OTPC_NS:
+		reg = RK3576_SECURECRU_SOFTRST_CON(0);
+		bit = 8;
+		break;
+	case RK3576_SRST_OTPC_NS:
+		reg = RK3576_SECURECRU_SOFTRST_CON(0);
+		bit = 9;
+		break;
+	default:
+		printf("%s: 0x%08x\n", __func__, idx);
+		return;
+	}
+
+	mask = (1 << bit);
+	HWRITE4(sc, reg, mask << 16 | (on ? mask : 0));
+}
+
+/* 
  * Rockchip RK3588 
  */
 
@@ -4321,6 +4924,11 @@ const struct rkclock rk3588_clocks[] = {
 		{ RK3588_CLK_UART0 }
 	},
 	{
+		RK3588_CLK_USBDPPHY_MIPIDCPPHY_REF, RK3588_CRU_CLKSEL_CON(14),
+		SEL(8, 7), DIV(6, 0),
+		{ RK3588_XIN24M, RK3588_PLL_PPLL, RK3588_PLL_SPLL }
+	},
+	{
 		RK3588_CLK_REF_PIPE_PHY0_OSC_SRC, 0, 0, 0,
 		{ RK3588_XIN24M }
 	},
@@ -4405,6 +5013,9 @@ rk3588_set_pll(struct rkclock_softc *sc, bus_size_t base, uint32_t freq)
 	case RK3588_CRU_AUPLL_CON(0):
 		mode_shift = 6;
 		break;
+	case RK3588_CRU_CPLL_CON(0):
+		mode_shift = 8;
+		break;
 	case RK3588_CRU_GPLL_CON(0):
 		mode_shift = 2;
 		break;
@@ -4448,7 +5059,7 @@ rk3588_set_pll(struct rkclock_softc *sc, bus_size_t base, uint32_t freq)
 	 * adjusting the PLL.
 	 */
 	HWRITE4(sc, RK3588_CRU_MODE_CON,
-	    (RK3588_CRU_MODE_MASK << 16 |RK3588_CRU_MODE_SLOW) << mode_shift);
+	    (RK3588_CRU_MODE_MASK << 16 | RK3588_CRU_MODE_SLOW) << mode_shift);
 
 	/* Power down PLL. */
 	HWRITE4(sc, base + 0x0004,
@@ -4573,6 +5184,38 @@ rk3588_reset(void *cookie, uint32_t *cells, int on)
 	uint32_t bit, mask, reg;
 
 	switch (idx) {
+	case RK3588_SRST_USBDP_COMBO_PHY0_INIT:
+		reg = RK3588_CRU_SOFTRST_CON(2);
+		bit = 8;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY0_CMN:
+		reg = RK3588_CRU_SOFTRST_CON(2);
+		bit = 9;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY0_LANE:
+		reg = RK3588_CRU_SOFTRST_CON(2);
+		bit = 10;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY0_PCS:
+		reg = RK3588_CRU_SOFTRST_CON(2);
+		bit = 11;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY1_INIT:
+		reg = RK3588_CRU_SOFTRST_CON(2);
+		bit = 15;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY1_CMN:
+		reg = RK3588_CRU_SOFTRST_CON(3);
+		bit = 0;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY1_LANE:
+		reg = RK3588_CRU_SOFTRST_CON(3);
+		bit = 1;
+		break;
+	case RK3588_SRST_USBDP_COMBO_PHY1_PCS:
+		reg = RK3588_CRU_SOFTRST_CON(3);
+		bit = 2;
+		break;
 	case RK3588_SRST_P_TSADC:
 		reg = RK3588_CRU_SOFTRST_CON(12);
 		bit = 0;
@@ -4660,6 +5303,22 @@ rk3588_reset(void *cookie, uint32_t *cells, int on)
 	case RK3588_SRST_A_USB3OTG1:
 		reg = RK3588_CRU_SOFTRST_CON(42);
 		bit = 7;
+		break;
+	case RK3588_SRST_P_USBDPGRF0:
+		reg = RK3588_CRU_SOFTRST_CON(72);
+		bit = 1;
+		break;
+	case RK3588_SRST_P_USBDPPHY0:
+		reg = RK3588_CRU_SOFTRST_CON(72);
+		bit = 2;
+		break;
+	case RK3588_SRST_P_USBDPGRF1:
+		reg = RK3588_CRU_SOFTRST_CON(72);
+		bit = 3;
+		break;
+	case RK3588_SRST_P_USBDPPHY1:
+		reg = RK3588_CRU_SOFTRST_CON(72);
+		bit = 4;
 		break;
 	case RK3588_SRST_REF_PIPE_PHY0:
 		reg = RK3588_CRU_SOFTRST_CON(77);

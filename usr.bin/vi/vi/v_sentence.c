@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_sentence.c,v 1.8 2022/12/26 19:16:04 jmc Exp $	*/
+/*	$OpenBSD: v_sentence.c,v 1.13 2026/06/16 22:59:03 millert Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -66,18 +66,27 @@ v_sentencef(SCR *sp, VICMD *vp)
 
 	/*
 	 * !!!
-	 * If in white-space, the next start of sentence counts as one.
-	 * This may not handle "  .  " correctly, but it's real unclear
-	 * what correctly means in that case.
+	 * If in white-space, check if we are at a sentence boundary.
+	 * If so, the next start of sentence counts as one.
 	 */
 	if (cs.cs_flags == CS_EMP || (cs.cs_flags == 0 && isblank(cs.cs_ch))) {
-		if (cs_fblank(sp, &cs))
-			return (1);
-		if (--cnt == 0) {
-			if (vp->m_start.lno != cs.cs_lno ||
-			    vp->m_start.cno != cs.cs_cno)
+		VCS tmp = cs;
+
+		/* If we aren't in an empty line, find last non-blank. */
+		if (tmp.cs_flags != CS_EMP) {
+			if (cs_bblank(sp, &tmp))
+				return (1);
+		}
+
+		/* Check if the previous non-blank char started a sentence. */
+		if (tmp.cs_flags == CS_EMP || (tmp.cs_flags == 0 &&
+		    (tmp.cs_ch == '.' || tmp.cs_ch == '?' ||
+		    tmp.cs_ch == '!'))) {
+			/* Empty line or space after a period, jump ahead. */
+			if (cs_fblank(sp, &cs))
+				return (1);
+			if (--cnt == 0)
 				goto okret;
-			return (1);
 		}
 	}
 
@@ -143,7 +152,8 @@ v_sentencef(SCR *sp, VICMD *vp)
 	}
 
 	/* EOF is a movement sink, but it's an error not to have moved. */
-	if (vp->m_start.lno == cs.cs_lno && vp->m_start.cno == cs.cs_cno) {
+	if (vp->m_start.lno == cs.cs_lno && vp->m_start.cno == cs.cs_cno &&
+	    !ISMOTION(vp)) {
 		v_eof(sp, NULL);
 		return (1);
 	}
@@ -165,8 +175,20 @@ okret:	vp->m_stop.lno = cs.cs_lno;
 	 * range for motion commands.
 	 */
 	if (ISMOTION(vp)) {
-		if (vp->m_start.cno == 0 &&
+		if (cs.cs_flags == CS_EOF) {
+			/*
+			 * If EOF is reached, maintain the stop position
+			 * at the very end of the file (cs_len - 1) instead
+			 * of decrementing it.
+			 */
+			vp->m_stop.lno = cs.cs_lno;
+			vp->m_stop.cno = cs.cs_len > 0 ? cs.cs_len - 1 : 0;
+		} else if (vp->m_start.cno == 0 &&
 		    (cs.cs_flags != 0 || vp->m_stop.cno == 0)) {
+			/*
+			 * If in line mode, adjust stop to the end of
+			 * the previous line.
+			 */
 			if (vp->m_start.lno < vp->m_stop.lno) {
 				if (db_get(sp,
 				    --vp->m_stop.lno, DBG_FATAL, NULL, &len))
@@ -174,11 +196,13 @@ okret:	vp->m_stop.lno = cs.cs_lno;
 				vp->m_stop.cno = len ? len - 1 : 0;
 			}
 			F_SET(vp, VM_LMODE);
-		} else
+		} else if (vp->m_stop.cno > 0) {
 			--vp->m_stop.cno;
+		}
 		vp->m_final = vp->m_start;
-	} else
+	} else {
 		vp->m_final = vp->m_stop;
+	}
 	return (0);
 }
 
@@ -195,7 +219,7 @@ v_sentenceb(SCR *sp, VICMD *vp)
 	recno_t slno;
 	size_t len, scno;
 	u_long cnt;
-	int last;
+	int last, next;
 
 	/*
 	 * !!!
@@ -239,7 +263,7 @@ v_sentenceb(SCR *sp, VICMD *vp)
 				break;
 		}
 
-	for (last = 0;;) {
+	for (last = 0, next = '\0';;) {
 		if (cs_prev(sp, &cs))
 			return (1);
 		if (cs.cs_flags == CS_SOF)	/* SOF is a movement sink. */
@@ -289,7 +313,7 @@ ret:			slno = cs.cs_lno;
 			 * we can end up where we started.  Fix it.
 			 */
 			if (vp->m_start.lno != cs.cs_lno ||
-			    vp->m_start.cno != cs.cs_cno)
+			    vp->m_start.cno > cs.cs_cno)
 				goto okret;
 
 			/*
@@ -322,7 +346,12 @@ ret:			slno = cs.cs_lno;
 			    cs.cs_flags == CS_EOL || isblank(cs.cs_ch) ||
 			    cs.cs_ch == ')' || cs.cs_ch == ']' ||
 			    cs.cs_ch == '"' || cs.cs_ch == '\'' ? 1 : 0;
+
+			/* A sentence ends with two spaces. */
+			if (cs.cs_ch == ' ' && next != ' ')
+				last = 0;
 		}
+		next = cs.cs_ch;
 	}
 
 okret:	vp->m_stop.lno = cs.cs_lno;

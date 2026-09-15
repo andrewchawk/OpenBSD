@@ -2,12 +2,12 @@
 ./sbin/kbd
 ./sbin/wsconsctl
 ./usr/bin/ld.bfd
-./usr/lib/gcc-lib/sh-unknown-openbsd7.6
-./usr/lib/gcc-lib/sh-unknown-openbsd7.6/4.2.1
-./usr/lib/gcc-lib/sh-unknown-openbsd7.6/4.2.1/collect2
-./usr/lib/gcc-lib/sh-unknown-openbsd7.6/4.2.1/libgcc.a
-./usr/lib/gcc-lib/sh-unknown-openbsd7.6/4.2.1/specs
-./usr/lib/libstdc++.so.57.0
+./usr/lib/gcc-lib/sh-unknown-openbsd8.0
+./usr/lib/gcc-lib/sh-unknown-openbsd8.0/4.2.1
+./usr/lib/gcc-lib/sh-unknown-openbsd8.0/4.2.1/collect2
+./usr/lib/gcc-lib/sh-unknown-openbsd8.0/4.2.1/libgcc.a
+./usr/lib/gcc-lib/sh-unknown-openbsd8.0/4.2.1/specs
+./usr/lib/libstdc++.so.59.0
 ./usr/libdata/perl5/sh-openbsd
 ./usr/libdata/perl5/sh-openbsd/.packlist
 ./usr/libdata/perl5/sh-openbsd/B
@@ -22,7 +22,7 @@
 ./usr/libdata/perl5/sh-openbsd/CORE/XSUB.h
 ./usr/libdata/perl5/sh-openbsd/CORE/av.h
 ./usr/libdata/perl5/sh-openbsd/CORE/bitcount.h
-./usr/libdata/perl5/sh-openbsd/CORE/charclass_invlists.h
+./usr/libdata/perl5/sh-openbsd/CORE/charclass_invlists.inc
 ./usr/libdata/perl5/sh-openbsd/CORE/config.h
 ./usr/libdata/perl5/sh-openbsd/CORE/cop.h
 ./usr/libdata/perl5/sh-openbsd/CORE/cv.h
@@ -45,6 +45,7 @@
 ./usr/libdata/perl5/sh-openbsd/CORE/iperlsys.h
 ./usr/libdata/perl5/sh-openbsd/CORE/keywords.h
 ./usr/libdata/perl5/sh-openbsd/CORE/l1_char_class_tab.h
+./usr/libdata/perl5/sh-openbsd/CORE/locale_table.h
 ./usr/libdata/perl5/sh-openbsd/CORE/malloc_ctl.h
 ./usr/libdata/perl5/sh-openbsd/CORE/metaconfig.h
 ./usr/libdata/perl5/sh-openbsd/CORE/mg.h
@@ -83,6 +84,7 @@
 ./usr/libdata/perl5/sh-openbsd/CORE/regcomp.h
 ./usr/libdata/perl5/sh-openbsd/CORE/regcomp_internal.h
 ./usr/libdata/perl5/sh-openbsd/CORE/regexp.h
+./usr/libdata/perl5/sh-openbsd/CORE/regexp_constants.h
 ./usr/libdata/perl5/sh-openbsd/CORE/reginline.h
 ./usr/libdata/perl5/sh-openbsd/CORE/regnodes.h
 ./usr/libdata/perl5/sh-openbsd/CORE/sbox32_hash.h
@@ -94,7 +96,6 @@
 ./usr/libdata/perl5/sh-openbsd/CORE/thread.h
 ./usr/libdata/perl5/sh-openbsd/CORE/time64.h
 ./usr/libdata/perl5/sh-openbsd/CORE/time64_config.h
-./usr/libdata/perl5/sh-openbsd/CORE/uconfig.h
 ./usr/libdata/perl5/sh-openbsd/CORE/uni_keywords.h
 ./usr/libdata/perl5/sh-openbsd/CORE/unicode_constants.h
 ./usr/libdata/perl5/sh-openbsd/CORE/unixish.h
@@ -186,6 +187,7 @@
 ./usr/libdata/perl5/sh-openbsd/IO
 ./usr/libdata/perl5/sh-openbsd/IO.pm
 ./usr/libdata/perl5/sh-openbsd/IO/Compress
+./usr/libdata/perl5/sh-openbsd/IO/Compress.pm
 ./usr/libdata/perl5/sh-openbsd/IO/Compress/Adapter
 ./usr/libdata/perl5/sh-openbsd/IO/Compress/Adapter/Bzip2.pm
 ./usr/libdata/perl5/sh-openbsd/IO/Compress/Adapter/Deflate.pm
@@ -256,10 +258,11 @@
 ./usr/libdata/perl5/sh-openbsd/PerlIO
 ./usr/libdata/perl5/sh-openbsd/PerlIO/encoding.pm
 ./usr/libdata/perl5/sh-openbsd/PerlIO/mmap.pm
-./usr/libdata/perl5/sh-openbsd/PerlIO/scalar.pm
 ./usr/libdata/perl5/sh-openbsd/PerlIO/via.pm
 ./usr/libdata/perl5/sh-openbsd/SDBM_File.pm
 ./usr/libdata/perl5/sh-openbsd/Scalar
+./usr/libdata/perl5/sh-openbsd/Scalar/List
+./usr/libdata/perl5/sh-openbsd/Scalar/List/Utils.pm
 ./usr/libdata/perl5/sh-openbsd/Scalar/Util.pm
 ./usr/libdata/perl5/sh-openbsd/Socket.pm
 ./usr/libdata/perl5/sh-openbsd/Storable.pm
@@ -374,8 +377,6 @@
 ./usr/libdata/perl5/sh-openbsd/auto/PerlIO/encoding/encoding.so
 ./usr/libdata/perl5/sh-openbsd/auto/PerlIO/mmap
 ./usr/libdata/perl5/sh-openbsd/auto/PerlIO/mmap/mmap.so
-./usr/libdata/perl5/sh-openbsd/auto/PerlIO/scalar
-./usr/libdata/perl5/sh-openbsd/auto/PerlIO/scalar/scalar.so
 ./usr/libdata/perl5/sh-openbsd/auto/PerlIO/via
 ./usr/libdata/perl5/sh-openbsd/auto/PerlIO/via/via.so
 ./usr/libdata/perl5/sh-openbsd/auto/SDBM_File

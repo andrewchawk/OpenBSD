@@ -1,4 +1,4 @@
-/*	$OpenBSD: authpf.c,v 1.129 2022/01/28 06:33:26 guenther Exp $	*/
+/*	$OpenBSD: authpf.c,v 1.132 2026/09/06 18:49:03 deraadt Exp $	*/
 
 /*
  * Copyright (C) 1998 - 2007 Bob Beck (beck@openbsd.org).
@@ -396,8 +396,8 @@ read_config(FILE *f)
 		if (ap != &pair[2])
 			goto parse_error;
 
-		tp = pair[1] + strlen(pair[1]);
-		while ((*tp == ' ' || *tp == '\t') && tp >= pair[1])
+		tp = pair[1] + strlen(pair[1]) - 1;
+		while (tp >= pair[1] && (*tp == ' ' || *tp == '\t'))
 			*tp-- = '\0';
 
 		if (strcasecmp(pair[0], "anchor") == 0) {
@@ -528,8 +528,17 @@ allowed_luser(struct passwd *pw)
 				}
 
 				if (!gl_init) {
-					(void) getgrouplist(pw->pw_name,
+					int maxgroups, ret;
+
+					maxgroups = ngroups;
+					ret = getgrouplist(pw->pw_name,
 					    pw->pw_gid, groups, &ngroups);
+					if (ret == -1) {
+						/*
+						 * Silently truncate group list
+						 */
+						ngroups = maxgroups;
+					}
 					gl_init++;
 				}
 
@@ -807,7 +816,7 @@ change_filter(int add, const char *luser, const char *ipsrc)
 			if (setresgid(gid, gid, gid) == -1) {
 				err(1, "setregid");
 			}
-			execvp(PATH_PFCTL, pargv);
+			execv(PATH_PFCTL, pargv);
 			warn("exec of %s failed", PATH_PFCTL);
 			_exit(1);
 		}

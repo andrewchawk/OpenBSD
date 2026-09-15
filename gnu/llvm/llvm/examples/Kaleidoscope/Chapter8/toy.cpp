@@ -13,11 +13,11 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Host.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -1225,10 +1225,11 @@ int main() {
   InitializeAllAsmPrinters();
 
   auto TargetTriple = sys::getDefaultTargetTriple();
-  TheModule->setTargetTriple(TargetTriple);
+  TheModule->setTargetTriple(Triple(TargetTriple));
 
   std::string Error;
-  auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
+  auto Target =
+      TargetRegistry::lookupTarget(TheModule->getTargetTriple(), Error);
 
   // Print an error and exit if we couldn't find the requested target.
   // This generally occurs if we've forgotten to initialise the
@@ -1242,9 +1243,8 @@ int main() {
   auto Features = "";
 
   TargetOptions opt;
-  auto RM = std::optional<Reloc::Model>();
-  auto TheTargetMachine =
-      Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
+  auto TheTargetMachine = Target->createTargetMachine(
+      Triple(TargetTriple), CPU, Features, opt, Reloc::PIC_);
 
   TheModule->setDataLayout(TheTargetMachine->createDataLayout());
 
@@ -1258,7 +1258,7 @@ int main() {
   }
 
   legacy::PassManager pass;
-  auto FileType = CGFT_ObjectFile;
+  auto FileType = CodeGenFileType::ObjectFile;
 
   if (TheTargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
     errs() << "TheTargetMachine can't emit a file of this type";

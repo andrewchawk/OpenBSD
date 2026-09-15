@@ -1,4 +1,4 @@
-/*	$OpenBSD: nvmevar.h,v 1.30 2024/06/26 21:41:30 asou Exp $ */
+/*	$OpenBSD: nvmevar.h,v 1.33 2026/05/27 15:04:14 jcs Exp $ */
 
 /*
  * Copyright (c) 2014 David Gwynne <dlg@openbsd.org>
@@ -15,6 +15,8 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+
+#include <sys/sensors.h>
 
 #define NVME_IO_Q	1
 #define NVME_HIB_Q	2
@@ -40,13 +42,14 @@ struct nvme_ccb {
 
 	void			*ccb_cookie;
 	void			(*ccb_done)(struct nvme_softc *sc,
-				    struct nvme_ccb *, struct nvme_cqe *);
+				    struct nvme_ccb *);
 
 	bus_addr_t		ccb_prpl_off;
 	u_int64_t		ccb_prpl_dva;
 	u_int64_t		*ccb_prpl;
 
 	u_int16_t		ccb_id;
+	u_int16_t		ccb_cqe_flags;
 };
 SIMPLEQ_HEAD(nvme_ccb_list, nvme_ccb);
 
@@ -108,6 +111,7 @@ struct nvme_softc {
 	size_t			sc_mdts;
 	u_int			sc_max_prpl;
 	u_int			sc_dstrd;
+	u_int			sc_sqe_size;
 
 	struct nvm_identify_controller
 				sc_identify;
@@ -126,6 +130,11 @@ struct nvme_softc {
 	struct scsi_iopool	sc_iopool;
 	struct rwlock		sc_lock;
 	struct scsibus_softc	*sc_scsibus;
+
+	struct ksensordev	sc_sensordev;
+	struct ksensor		sc_temp_sensor;
+	struct ksensor		sc_spare_sensor;
+	struct ksensor		sc_usage_sensor;
 };
 
 #define DEVNAME(_sc) ((_sc)->sc_dev.dv_xname)

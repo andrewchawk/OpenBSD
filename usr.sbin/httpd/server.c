@@ -1,4 +1,4 @@
-/*	$OpenBSD: server.c,v 1.129 2023/11/08 19:19:10 millert Exp $	*/
+/*	$OpenBSD: server.c,v 1.138 2026/09/01 05:22:00 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -43,21 +43,22 @@
 #include <vis.h>
 
 #include "httpd.h"
+#include "log.h"
 
 #define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 int		 server_dispatch_parent(int, struct privsep_proc *,
-		    struct imsg *);
+    struct imsg *);
 int		 server_dispatch_logger(int, struct privsep_proc *,
-		    struct imsg *);
+    struct imsg *);
 void		 server_shutdown(void);
 
 void		 server_init(struct privsep *, struct privsep_proc *p, void *);
-void		 server_launch(void);
+int		 server_launch(void);
 int		 server_socket(struct sockaddr_storage *, in_port_t,
-		    struct server_config *, int, int);
+    struct server_config *, int, int);
 int		 server_socket_listen(struct sockaddr_storage *, in_port_t,
-		    struct server_config *);
+    struct server_config *);
 struct server	*server_byid(uint32_t);
 
 int		 server_tls_init(struct server *);
@@ -70,7 +71,7 @@ void		 server_input(struct client *);
 void		 server_inflight_dec(struct client *, const char *);
 
 extern void	 bufferevent_read_pressure_cb(struct evbuffer *, size_t,
-		    size_t, void *);
+    size_t, void *);
 
 volatile int server_clients;
 volatile int server_inflight = 0;
@@ -140,6 +141,15 @@ server_tls_cmp(struct server *s1, struct server *s2)
 		return (-1);
 	if (sc1->tls_ticket_lifetime != sc2->tls_ticket_lifetime)
 		return (-1);
+
+	/* TLS client certificates */
+	if ((sc1->tls_flags & TLSFLAG_CA) &&
+	    strcmp(sc1->tls_ca_file, sc2->tls_ca_file) != 0)
+		return (-1);
+	if ((sc1->tls_flags & TLSFLAG_CRL) &&
+	    strcmp(sc1->tls_crl_file, sc2->tls_crl_file) != 0)
+		return (-1);
+
 	if (strcmp(sc1->tls_ciphers, sc2->tls_ciphers) != 0)
 		return (-1);
 	if (strcmp(sc1->tls_dhe_params, sc2->tls_dhe_params) != 0)
@@ -405,7 +415,7 @@ server_init(struct privsep *ps, struct privsep_proc *p, void *arg)
 #endif
 }
 
-void
+int
 server_launch(void)
 {
 	struct server		*srv;
@@ -414,8 +424,8 @@ server_launch(void)
 		log_debug("%s: configuring server %s", __func__,
 		    srv->srv_conf.name);
 
-		server_tls_init(srv);
-		server_http_init(srv);
+		if (server_tls_init(srv) != 0)
+			return (-1);
 
 		log_debug("%s: running server %s", __func__,
 		    srv->srv_conf.name);
@@ -425,6 +435,7 @@ server_launch(void)
 		event_add(&srv->srv_ev, NULL);
 		evtimer_set(&srv->srv_evt, server_accept, srv);
 	}
+	return (0);
 }
 
 void
@@ -460,10 +471,23 @@ server_purge(struct server *srv)
 		}
 	}
 
+	server_headers_free(&srv->srv_conf.headers);
 	tls_config_free(srv->srv_tls_config);
 	tls_free(srv->srv_tls_ctx);
 
 	free(srv);
+}
+
+void
+server_headers_free(struct server_headers *headers)
+{
+	struct custom_header	*hdr, *thdr;
+
+	TAILQ_FOREACH_SAFE(hdr, headers, entry, thdr) {
+		free(hdr->name);
+		free(hdr->value);
+		free(hdr);
+	}
 }
 
 void
@@ -483,8 +507,12 @@ serverconfig_free(struct server_config *srv_conf)
 	freezero(srv_conf->tls_cert, srv_conf->tls_cert_len);
 	freezero(srv_conf->tls_key, srv_conf->tls_key_len);
 
-	TAILQ_FOREACH_SAFE(param, &srv_conf->fcgiparams, entry, tparam)
+	TAILQ_FOREACH_SAFE(param, &srv_conf->fcgiparams, entry, tparam) {
+		free(param->name);
+		free(param->value);
 		free(param);
+	}
+	server_headers_free(&srv_conf->headers);
 }
 
 void
@@ -503,6 +531,7 @@ serverconfig_reset(struct server_config *srv_conf)
 	srv_conf->tls_ocsp_staple = NULL;
 	srv_conf->tls_ocsp_staple_file = NULL;
 	TAILQ_INIT(&srv_conf->fcgiparams);
+	TAILQ_INIT(&srv_conf->headers);
 }
 
 struct server *
@@ -552,7 +581,7 @@ server_byid(uint32_t id)
 
 int
 server_foreach(int (*srv_cb)(struct server *,
-    struct server_config *, void *), void *arg)
+	struct server_config *, void *), void *arg)
 {
 	struct server		*srv;
 	struct server_config	*srv_conf;
@@ -887,8 +916,6 @@ void
 server_input(struct client *clt)
 {
 	struct server_config	*srv_conf = clt->clt_srv_conf;
-	evbuffercb		 inrd = server_read;
-	evbuffercb		 inwr = server_write;
 	socklen_t		 slen;
 
 	if (server_httpdesc_init(clt) == -1) {
@@ -897,7 +924,6 @@ server_input(struct client *clt)
 	}
 
 	clt->clt_toread = TOREAD_HTTP_HEADER;
-	inrd = server_read_http;
 
 	slen = sizeof(clt->clt_sndbufsiz);
 	if (getsockopt(clt->clt_s, SOL_SOCKET, SO_SNDBUF,
@@ -909,8 +935,8 @@ server_input(struct client *clt)
 	/*
 	 * Client <-> Server
 	 */
-	clt->clt_bev = bufferevent_new(clt->clt_s, inrd, inwr,
-	    server_error, clt);
+	clt->clt_bev = bufferevent_new(clt->clt_s, server_read_http,
+	    server_write, server_error, clt);
 	if (clt->clt_bev == NULL) {
 		server_close(clt, "failed to allocate input buffer event");
 		return;
@@ -940,6 +966,12 @@ server_write(struct bufferevent *bev, void *arg)
 	struct client		*clt = arg;
 	struct evbuffer		*dst = EVBUFFER_OUTPUT(bev);
 
+	if (EVBUFFER_LENGTH(dst) == 0 && clt->clt_close_after_write) {
+		server_close(clt, clt->clt_close_msg != NULL ?
+		    clt->clt_close_msg : "response sent");
+		return;
+	}
+
 	if (EVBUFFER_LENGTH(dst) == 0 &&
 	    clt->clt_toread == TOREAD_HTTP_NONE)
 		goto done;
@@ -958,24 +990,6 @@ server_write(struct bufferevent *bev, void *arg)
  done:
 	(*bev->errorcb)(bev, EVBUFFER_WRITE, bev->cbarg);
 	return;
-}
-
-void
-server_dump(struct client *clt, const void *buf, size_t len)
-{
-	if (!len)
-		return;
-
-	/*
-	 * This function will dump the specified message directly
-	 * to the underlying client, without waiting for success
-	 * of non-blocking events etc. This is useful to print an
-	 * error message before gracefully closing the client.
-	 */
-	if (clt->clt_tls_ctx != NULL)
-		(void)tls_write(clt->clt_tls_ctx, buf, len);
-	else
-		(void)write(clt->clt_s, buf, len);
 }
 
 void
@@ -1253,7 +1267,8 @@ server_sendlog(struct server_config *srv_conf, int cmd, const char *emsg, ...)
 void
 server_log(struct client *clt, const char *msg)
 {
-	char			 ibuf[HOST_NAME_MAX+1], obuf[HOST_NAME_MAX+1];
+	char			 ibuf[HOST_NAME_MAX + 1],
+				 obuf[HOST_NAME_MAX + 1];
 	struct server_config	*srv_conf = clt->clt_srv_conf;
 	char			*ptr = NULL, *vmsg = NULL;
 	int			 debug_cmd = -1;
@@ -1343,6 +1358,8 @@ server_close(struct client *clt, const char *msg)
 	if (clt->clt_log != NULL)
 		evbuffer_free(clt->clt_log);
 
+	free(clt->clt_close_msg);
+
 	free(clt);
 	server_clients--;
 }
@@ -1355,37 +1372,53 @@ server_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 
 	switch (imsg->hdr.type) {
 	case IMSG_CFG_MEDIA:
-		config_getmedia(httpd_env, imsg);
+		if (config_getmedia(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_CFG_AUTH:
-		config_getauth(httpd_env, imsg);
+		if (config_getauth(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_CFG_SERVER:
-		config_getserver(httpd_env, imsg);
+		if (config_getserver(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_CFG_TLS:
-		config_getserver_tls(httpd_env, imsg);
+		if (config_getserver_tls(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_CFG_FCGI:
-		config_getserver_fcgiparams(httpd_env, imsg);
+		if (config_getserver_fcgiparams(httpd_env, imsg) != 0)
+			return (-1);
+		break;
+	case IMSG_CFG_HEADERS:
+		if (config_getserver_headers(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_CFG_DONE:
-		config_getcfg(httpd_env, imsg);
+		if (config_getcfg(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_CTL_START:
-		server_launch();
+		if (server_launch() != 0)
+			return (-1);
 		break;
 	case IMSG_CTL_RESET:
-		config_getreset(httpd_env, imsg);
+		if (config_getreset(httpd_env, imsg) != 0)
+			return (-1);
 		break;
 	case IMSG_TLSTICKET_REKEY:
 		IMSG_SIZE_CHECK(imsg, (&key));
 		memcpy(&key, imsg->data, sizeof(key));
 		/* apply to the right server */
-		srv = server_byid(key.tt_id);
-		if (srv) {
-			tls_config_add_ticket_key(srv->srv_tls_config,
-			    key.tt_keyrev, key.tt_key, sizeof(key.tt_key));
+		if ((srv = server_byid(key.tt_id)) == NULL) {
+			log_debug("%s: invalid sever id", __func__);
+			return (-1);
+		}
+		if (tls_config_add_ticket_key(srv->srv_tls_config,
+		    key.tt_keyrev, key.tt_key, sizeof(key.tt_key)) == -1) {
+			log_debug("%s: tls_config_add_ticket_key", __func__);
+			return (-1);
 		}
 		break;
 	default:
@@ -1472,6 +1505,20 @@ server_bufferevent_write(struct client *clt, void *data, size_t size)
 {
 	if (clt->clt_bev == NULL)
 		return (evbuffer_add(clt->clt_output, data, size));
+	return (bufferevent_write(clt->clt_bev, data, size));
+}
+
+int
+server_bufferevent_write_close(struct client *clt, void *data, size_t size)
+{
+	if (clt->clt_bev == NULL)
+		return (-1);
+	if (clt->clt_close_after_write)
+		return (-1);
+
+	clt->clt_persist = 0;
+	clt->clt_close_after_write = 1;
+
 	return (bufferevent_write(clt->clt_bev, data, size));
 }
 

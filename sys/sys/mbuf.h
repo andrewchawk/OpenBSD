@@ -1,4 +1,4 @@
-/*	$OpenBSD: mbuf.h,v 1.263 2024/04/14 20:46:27 bluhm Exp $	*/
+/*	$OpenBSD: mbuf.h,v 1.271 2026/07/03 11:51:57 dlg Exp $	*/
 /*	$NetBSD: mbuf.h,v 1.19 1996/02/09 18:25:14 christos Exp $	*/
 
 /*
@@ -58,12 +58,10 @@
 
 #define	MAXMCLBYTES	(64 * 1024)		/* largest cluster from the stack */
 #define	MINCLSIZE	(MHLEN + MLEN + 1)	/* smallest amount to put in cluster */
-#define	M_MAXCOMPRESS	(MHLEN / 2)		/* max amount to copy for compression */
 
 #define	MCLSHIFT	11		/* convert bytes to m_buf clusters */
 					/* 2K cluster can hold Ether frame */
 #define	MCLBYTES	(1 << MCLSHIFT)	/* size of a m_buf cluster */
-#define	MCLOFSET	(MCLBYTES - 1)
 
 /* Packet tags structure */
 struct m_tag {
@@ -147,8 +145,6 @@ struct mbuf_ext {
 	void	*ext_arg;
 	u_int	ext_free_fn;		/* index of free function */
 	u_int	ext_size;		/* size of buffer, for ext_free_fn */
-	struct mbuf *ext_nextref;
-	struct mbuf *ext_prevref;
 #ifdef DEBUG
 	const char *ext_ofile;
 	const char *ext_nfile;
@@ -284,13 +280,22 @@ struct mbuf {
 #define MCLREFDEBUGO(m, file, line)
 #endif
 
-#define	MCLISREFERENCED(m)	((m)->m_ext.ext_nextref != (m))
+int	m_ext_refs_shared(struct mbuf *);
 
-#define	MCLADDREFERENCE(o, n)	m_extref((o), (n))
+static inline int
+m_extreferenced(struct mbuf *m)
+{
+	extern u_int m_extfree_refs_fn;
+
+	if (m->m_ext.ext_free_fn != m_extfree_refs_fn)
+		return (0);
+
+	return (m_ext_refs_shared(m));
+}
+
+#define	MCLISREFERENCED(m)	m_extreferenced(m)
 
 #define	MCLINITREFERENCE(m)	do {					\
-		(m)->m_ext.ext_prevref = (m);				\
-		(m)->m_ext.ext_nextref = (m);				\
 		MCLREFDEBUGO((m), __FILE__, __LINE__);			\
 		MCLREFDEBUGN((m), NULL, 0);				\
 	} while (/* CONSTCOND */ 0)
@@ -363,11 +368,18 @@ u_int mextfree_register(void (*)(caddr_t, u_int, void *));
 /* length to m_copy to copy all */
 #define	M_COPYALL	1000000000
 
-#define MBSTAT_TYPES           MT_NTYPES
-#define MBSTAT_DROPS           (MBSTAT_TYPES + 0)
-#define MBSTAT_WAIT            (MBSTAT_TYPES + 1)
-#define MBSTAT_DRAIN           (MBSTAT_TYPES + 2)
-#define MBSTAT_COUNT           (MBSTAT_TYPES + 3)
+enum mbstat_counters {
+	mbs_drops = MT_NTYPES,
+	mbs_wait,
+	mbs_drain,
+	mbs_defrag_alloc,
+	mbs_prepend_alloc,
+	mbs_pullup_alloc,
+	mbs_pullup_copy,
+	mbs_pulldown_alloc,
+	mbs_pulldown_copy,
+	mbs_ncounters
+};
 
 /*
  * Mbuf statistics.
@@ -375,11 +387,16 @@ u_int mextfree_register(void (*)(caddr_t, u_int, void *));
  * pool headers (mbpool and mclpool).
  */
 struct mbstat {
-	u_long	m_drops;	/* times failed to find space */
-	u_long	m_wait;		/* times waited for space */
-	u_long	m_drain;	/* times drained protocols for space */
-	u_long	m_mtypes[MBSTAT_COUNT];
-				/* type specific mbuf allocations */
+	u_long	m_drops;		/* times failed to find space */
+	u_long	m_wait;			/* times waited for space */
+	u_long	m_drain;		/* times drained protocols for space */
+	u_long	m_mtypes[MT_NTYPES];	/* type specific mbuf allocations */
+	u_long	m_defrag_alloc;
+	u_long	m_prepend_alloc;
+	u_long	m_pullup_alloc;
+	u_long	m_pullup_copy;
+	u_long	m_pulldown_alloc;
+	u_long	m_pulldown_copy;
 };
 
 #include <sys/mutex.h>
@@ -404,6 +421,7 @@ extern	long nmbclust;			/* limit on the # of clusters */
 extern	int max_linkhdr;		/* largest link-level header */
 extern	int max_protohdr;		/* largest protocol header */
 extern	int max_hdr;			/* largest link+protocol header */
+extern	struct cpumem *mbstat;		/* mbuf statistics counter */
 
 void	mbinit(void);
 void	mbcpuinit(void);
@@ -428,8 +446,8 @@ int	m_leadingspace(struct mbuf *);
 int	m_trailingspace(struct mbuf *);
 void	m_align(struct mbuf *, int);
 struct mbuf *m_clget(struct mbuf *, int, u_int);
-void	m_extref(struct mbuf *, struct mbuf *);
 void	m_pool_init(struct pool *, u_int, u_int, const char *);
+void	m_pool_noconstraints(void);
 u_int	m_pool_used(void);
 void	m_extfree_pool(caddr_t, u_int, void *);
 void	m_adj(struct mbuf *, int);
@@ -443,8 +461,8 @@ int	m_apply(struct mbuf *, int, int,
 	    int (*)(caddr_t, caddr_t, unsigned int), caddr_t);
 struct mbuf *m_dup_pkt(struct mbuf *, unsigned int, int);
 int	m_dup_pkthdr(struct mbuf *, struct mbuf *, int);
-
 void	m_microtime(const struct mbuf *, struct timeval *);
+void	mbuf_dma_64bit_enable(void);
 
 static inline struct mbuf *
 m_freemp(struct mbuf **mp)
@@ -455,6 +473,16 @@ m_freemp(struct mbuf **mp)
 	return m_freem(m);
 }
 
+#include <sys/percpu.h>
+
+static inline void
+mbstat_inc(enum mbstat_counters c)
+{
+	int s = splnet();
+	counters_inc(mbstat, c);
+	splx(s);
+}
+
 /* Packet tag routines */
 struct m_tag *m_tag_get(int, int, int);
 void	m_tag_prepend(struct mbuf *, struct m_tag *);
@@ -463,7 +491,6 @@ void	m_tag_delete_chain(struct mbuf *);
 struct m_tag *m_tag_find(struct mbuf *, int, struct m_tag *);
 struct m_tag *m_tag_copy(struct m_tag *, int);
 int	m_tag_copy_chain(struct mbuf *, struct mbuf *, int);
-void	m_tag_init(struct mbuf *);
 struct m_tag *m_tag_first(struct mbuf *);
 struct m_tag *m_tag_next(struct mbuf *, struct m_tag *);
 
@@ -538,7 +565,6 @@ int			mq_enqueue(struct mbuf_queue *, struct mbuf *);
 struct mbuf *		mq_dequeue(struct mbuf_queue *);
 int			mq_enlist(struct mbuf_queue *, struct mbuf_list *);
 void			mq_delist(struct mbuf_queue *, struct mbuf_list *);
-struct mbuf *		mq_dechain(struct mbuf_queue *);
 unsigned int		mq_purge(struct mbuf_queue *);
 unsigned int		mq_hdatalen(struct mbuf_queue *);
 void			mq_set_maxlen(struct mbuf_queue *, u_int);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ripd.c,v 1.37 2023/03/08 04:43:15 guenther Exp $ */
+/*	$OpenBSD: ripd.c,v 1.48 2026/09/13 14:13:41 remi Exp $ */
 
 /*
  * Copyright (c) 2006 Michele Marchetto <mydecay@openbeer.it>
@@ -235,9 +235,11 @@ main(int argc, char *argv[])
 	if ((iev_ripe = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_rde = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_ripe->ibuf, pipe_parent2ripe[0]);
+	if (imsgbuf_init(&iev_ripe->ibuf, pipe_parent2ripe[0]) == -1)
+		fatal(NULL);
 	iev_ripe->handler = main_dispatch_ripe;
-	imsg_init(&iev_rde->ibuf, pipe_parent2rde[0]);
+	if (imsgbuf_init(&iev_rde->ibuf, pipe_parent2rde[0]) == -1)
+		fatal(NULL);
 	iev_rde->handler = main_dispatch_rde;
 
 	/* setup event handler */
@@ -270,9 +272,9 @@ ripd_shutdown(void)
 	int		 status;
 
 	/* close pipes */
-	msgbuf_clear(&iev_ripe->ibuf.w);
+	imsgbuf_clear(&iev_ripe->ibuf);
 	close(iev_ripe->ibuf.fd);
-	msgbuf_clear(&iev_rde->ibuf.w);
+	imsgbuf_clear(&iev_rde->ibuf);
 	close(iev_rde->ibuf.fd);
 
 	while ((i = LIST_FIRST(&conf->iface_list)) != NULL) {
@@ -310,26 +312,26 @@ main_dispatch_ripe(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
 	struct demote_msg	 dmsg;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -362,9 +364,11 @@ main_dispatch_ripe(int fd, short event, void *bula)
 			carp_demote_set(dmsg.demote_group, dmsg.level);
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by ripe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warn("wrong imsg len");
+			else
+				log_verbose(verbose);
 			break;
 		default:
 			log_debug("main_dispatch_ripe: error handling imsg %d",
@@ -388,26 +392,26 @@ main_dispatch_rde(int fd, short event, void *bula)
 	struct imsgev	*iev = bula;
 	struct imsgbuf	*ibuf = &iev->ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 shut = 0;
+	int		 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -458,6 +462,14 @@ rip_redistribute(struct kroute *kr)
 
 	if (kr->flags & F_RIPD_INSERTED)
 		return (1);
+
+	/* redistribute prefixes from passive interfaces */
+	if (kr->flags & F_CONNECTED) {
+		struct iface *iface = if_find_index(kr->ifindex);
+
+		if (iface != NULL && iface->passive)
+			return (1);
+	}
 
 	/* only allow 0.0.0.0/0 via REDIST_DEFAULT */
 	if (kr->prefix.s_addr == INADDR_ANY && kr->netmask.s_addr == INADDR_ANY)
@@ -522,12 +534,12 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	if (iev->handler == NULL) {
-		imsg_flush(&iev->ibuf);
+		imsgbuf_flush(&iev->ibuf);
 		return;
 	}
 
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);

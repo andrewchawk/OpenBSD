@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwxreg.h,v 1.7 2024/02/21 14:40:50 kevlo Exp $	*/
+/*	$OpenBSD: qwxreg.h,v 1.12 2025/08/04 11:39:50 stsp Exp $	*/
 
 /*
  * Copyright (c) 2021-2022, Qualcomm Innovation Center, Inc.
@@ -56,6 +56,8 @@ enum ath11k_hw_rev {
 	ATH11K_HW_WCN6855_HW20,
 	ATH11K_HW_WCN6855_HW21,
 	ATH11K_HW_WCN6750_HW10,
+	ATH11K_HW_IPQ5018_HW10,
+	ATH11K_HW_QCA2066_HW21,
 };
 
 enum ath11k_firmware_mode {
@@ -163,7 +165,7 @@ struct wmi_tlv {
  *                        to be communicated separately.
  * @WMI_HOST_HW_MODE_DBS_SBS: 3 PHYs, with 2 on the same band doing SBS
  *                           as in WMI_HW_MODE_SBS, and 3rd on the other band
- * @WMI_HOST_HW_MODE_DBS_OR_SBS: Two PHY with one PHY capabale of both 2G and
+ * @WMI_HOST_HW_MODE_DBS_OR_SBS: Two PHY with one PHY capable of both 2G and
  *                        5G. It can support SBS (5G + 5G) OR DBS (5G + 2G).
  * @WMI_HOST_HW_MODE_MAX: Max hw_mode_id. Used to indicate invalid mode.
  */
@@ -2233,9 +2235,9 @@ enum {
 #define WMI_VDEV_SLOT_TIME_LONG         0x1
 /* slot time short */
 #define WMI_VDEV_SLOT_TIME_SHORT        0x2
-/* preablbe long */
+/* preamble long */
 #define WMI_VDEV_PREAMBLE_LONG          0x1
-/* preablbe short */
+/* preamble short */
 #define WMI_VDEV_PREAMBLE_SHORT         0x2
 
 enum wmi_peer_smps_state {
@@ -4224,7 +4226,7 @@ enum wmi_vdev_start_resp_status_code {
 	WMI_VDEV_START_RESPONSE_INVALID_REGDOMAIN = 4,
 };
 
-/* Regaulatory Rule Flags Passed by FW */
+/* Regulatory Rule Flags Passed by FW */
 #define REGULATORY_CHAN_DISABLED     BIT(0)
 #define REGULATORY_CHAN_NO_IR        BIT(1)
 #define REGULATORY_CHAN_RADAR        BIT(3)
@@ -5206,6 +5208,7 @@ enum wmi_ap_ps_peer_param {
 
 #define WMI_KEY_PAIRWISE 0x00
 #define WMI_KEY_GROUP    0x01
+#define WMI_KEY_TX_USAGE 0x02
 
 #define WMI_CIPHER_NONE     0x0 /* clear key */
 #define WMI_CIPHER_WEP      0x1
@@ -8273,7 +8276,7 @@ struct hal_reo_cmd_hdr {
 #define HAL_REO_CMD_FLG_UNBLK_RESOURCE		BIT(7)
 #define HAL_REO_CMD_FLG_UNBLK_CACHE		BIT(8)
 
-/* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO0_UPD_* feilds */
+/* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO0_UPD_* fields */
 #define HAL_REO_CMD_UPD0_RX_QUEUE_NUM		BIT(8)
 #define HAL_REO_CMD_UPD0_VLD			BIT(9)
 #define HAL_REO_CMD_UPD0_ALDC			BIT(10)
@@ -8298,7 +8301,7 @@ struct hal_reo_cmd_hdr {
 #define HAL_REO_CMD_UPD0_PN_VALID		BIT(29)
 #define HAL_REO_CMD_UPD0_PN			BIT(30)
 
-/* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO1_* feilds */
+/* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO1_* fields */
 #define HAL_REO_CMD_UPD1_VLD			BIT(16)
 #define HAL_REO_CMD_UPD1_ALDC			GENMASK(18, 17)
 #define HAL_REO_CMD_UPD1_DIS_DUP_DETECTION	BIT(19)
@@ -8314,7 +8317,7 @@ struct hal_reo_cmd_hdr {
 #define HAL_REO_CMD_UPD1_PN_HANDLE_ENABLE	BIT(30)
 #define HAL_REO_CMD_UPD1_IGNORE_AMPDU_FLG	BIT(31)
 
-/* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO2_* feilds */
+/* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO2_* fields */
 #define HAL_REO_CMD_UPD2_SVLD			BIT(10)
 #define HAL_REO_CMD_UPD2_SSN			GENMASK(22, 11)
 #define HAL_REO_CMD_UPD2_SEQ_2K_ERR		BIT(23)
@@ -10421,8 +10424,6 @@ enum rx_desc_sw_frame_grp_id {
 	RX_DESC_SW_FRAME_GRP_ID_PHY_ERR,
 };
 
-#define DP_MAX_NWIFI_HDR_LEN	30
-
 #define DP_RX_MPDU_ERR_FCS			BIT(0)
 #define DP_RX_MPDU_ERR_DECRYPT			BIT(1)
 #define DP_RX_MPDU_ERR_TKIP_MIC			BIT(2)
@@ -10677,7 +10678,7 @@ struct rx_attention {
  * msdu_limit_error
  *		Indicates that the MSDU threshold was exceeded and thus
  *		all the rest of the MSDUs will not be scattered and will not
- *		be decasulated but will be DMA'ed in RAW format as a single
+ *		be decapsulated but will be DMA'ed in RAW format as a single
  *		MSDU buffer.
  *
  * da_is_valid
@@ -13251,3 +13252,45 @@ struct ath11k_htt_extd_stats_msg {
 #define	HTT_MAC_ADDR_L32_3	GENMASK(31, 24)
 #define	HTT_MAC_ADDR_H16_0	GENMASK(7, 0)
 #define	HTT_MAC_ADDR_H16_1	GENMASK(15, 8)
+
+#define WMI_HOST_RC_DS_FLAG			0x01
+#define WMI_HOST_RC_CW40_FLAG			0x02
+#define WMI_HOST_RC_SGI_FLAG			0x04
+#define WMI_HOST_RC_HT_FLAG			0x08
+#define WMI_HOST_RC_RTSCTS_FLAG			0x10
+#define WMI_HOST_RC_TX_STBC_FLAG		0x20
+#define WMI_HOST_RC_RX_STBC_FLAG		0xC0
+#define WMI_HOST_RC_RX_STBC_FLAG_S		6
+#define WMI_HOST_RC_WEP_TKIP_FLAG		0x100
+#define WMI_HOST_RC_TS_FLAG			0x200
+#define WMI_HOST_RC_UAPSD_FLAG			0x400
+
+#define WMI_HT_CAP_ENABLED			0x0001
+#define WMI_HT_CAP_HT20_SGI			0x0002
+#define WMI_HT_CAP_DYNAMIC_SMPS			0x0004
+#define WMI_HT_CAP_TX_STBC			0x0008
+#define WMI_HT_CAP_TX_STBC_MASK_SHIFT		3
+#define WMI_HT_CAP_RX_STBC			0x0030
+#define WMI_HT_CAP_RX_STBC_MASK_SHIFT		4
+#define WMI_HT_CAP_LDPC				0x0040
+#define WMI_HT_CAP_L_SIG_TXOP_PROT		0x0080
+#define WMI_HT_CAP_MPDU_DENSITY			0x0700
+#define WMI_HT_CAP_MPDU_DENSITY_MASK_SHIFT	8
+#define WMI_HT_CAP_HT40_SGI			0x0800
+#define WMI_HT_CAP_RX_LDPC			0x1000
+#define WMI_HT_CAP_TX_LDPC			0x2000
+#define WMI_HT_CAP_IBF_BFER			0x4000
+
+/* These macros should be used when we wish to advertise STBC support for
+ * only 1SS or 2SS or 3SS.
+ */
+#define WMI_HT_CAP_RX_STBC_1SS			0x0010
+#define WMI_HT_CAP_RX_STBC_2SS			0x0020
+#define WMI_HT_CAP_RX_STBC_3SS			0x0030
+
+#define WMI_HT_CAP_DEFAULT_ALL (WMI_HT_CAP_ENABLED    | \
+				WMI_HT_CAP_HT20_SGI   | \
+				WMI_HT_CAP_HT40_SGI   | \
+				WMI_HT_CAP_TX_STBC    | \
+				WMI_HT_CAP_RX_STBC    | \
+				WMI_HT_CAP_LDPC)

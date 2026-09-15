@@ -1,4 +1,4 @@
-/*	$OpenBSD: pool.h,v 1.78 2021/01/02 03:23:59 cheloha Exp $	*/
+/*	$OpenBSD: pool.h,v 1.81 2025/05/21 09:33:49 mvs Exp $	*/
 /*	$NetBSD: pool.h,v 1.27 2001/06/06 22:00:17 rafal Exp $	*/
 
 /*-
@@ -149,6 +149,7 @@ union pool_lock {
 };
 
 struct pool {
+	struct refcnt	pr_refcnt;
 	union pool_lock	pr_lock;
 	const struct pool_lock_ops *
 			pr_lock_ops;
@@ -210,14 +211,6 @@ struct pool {
 	int		pr_phoffset;	/* Offset in page of page header */
 
 	/*
-	 * Warning message to be issued, and a per-time-delta rate cap,
-	 * if the hard limit is reached.
-	 */
-	const char	*pr_hardlimit_warning;
-	struct timeval	pr_hardlimit_ratecap;
-	struct timeval	pr_hardlimit_warning_last;
-
-	/*
 	 * pool item requests queue
 	 */
 	union pool_lock	pr_requests_lock;
@@ -261,8 +254,7 @@ void		pool_cache_init(struct pool *);
 void		pool_destroy(struct pool *);
 void		pool_setlowat(struct pool *, int);
 void		pool_sethiwat(struct pool *, int);
-int		pool_sethardlimit(struct pool *, u_int, const char *, int);
-struct uvm_constraint_range; /* XXX */
+int		pool_sethardlimit(struct pool *, u_int);
 void		pool_set_constraints(struct pool *,
 		    const struct kmem_pa_mode *mode);
 

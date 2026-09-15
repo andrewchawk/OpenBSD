@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.2 2023/07/10 17:46:03 anton Exp $
+#	$OpenBSD: Makefile,v 1.4 2025/07/31 19:51:06 bluhm Exp $
 
 PROGS+=	dev-limit
 PROGS+=	iocmd-limit
@@ -10,14 +10,41 @@ REGRESS_ROOT_TARGETS=	run-regress-dev-limit \
 
 TIMEOUT?=	10
 
+.include <bsd.own.mk>
+
+.if ! (make(clean) || make(cleandir) || make(obj))
+
+PF_STATUS !=	${SUDO} /sbin/pfctl -si | sed -n 's/^Status: \([^ ]*\) .*/\1/p'
+.if empty(PF_STATUS:MEnabled)
+regress:
+	@echo pf status: "${PF_STATUS}"
+	@echo Enable pf to run this regress.
+	@echo SKIPPED
+.endif
+
+PF_ANCHOR !=	${SUDO} /sbin/pfctl -sr |\
+		    sed -n 's/^anchor "\([^"]*\)" all$$/\1/p'
+.if empty(PF_ANCHOR:Mregress)
+regress:
+	@echo pf anchor: "${PF_ANCHOR}"
+	@echo Need anchor '"regress"' in pf.conf to load additional rules.
+	@echo SKIPPED
+.endif
+
+PF_PREOPEN !=	fstat /dev/pf | grep -c ' pf ' || true
+PF_MAXOPEN !=	expr 1023 - ${PF_PREOPEN}
+
+.endif
+
 #
 # Create 2048 processes. Each child process will attempt
-# open /dev/pf and waith for 10secs on success. If
+# open /dev/pf and wait for 10 secs on success. If
 # /dev/pf can not be opened child exits immediately.
 # There should be 1023 children, which could open /dev/pf.
+# snmpd might keep /dev/pf open that must be subtracted
 #
 run-regress-dev-limit:
-	${SUDO} ./dev-limit -c 2048 -s 1023 -t ${TIMEOUT}
+	${SUDO} ./dev-limit -c 2048 -s ${PF_MAXOPEN} -t ${TIMEOUT}
 
 #
 # Open 1024 tickets for DIOCGETRULES without closing them.

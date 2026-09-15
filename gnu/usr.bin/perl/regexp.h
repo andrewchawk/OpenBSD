@@ -113,25 +113,38 @@ struct reg_code_block {
 
 struct reg_code_blocks {
     int refcnt; /* we may be pointed to from a regex and from the savestack */
-    int  count;    /* how many code blocks */
+    int  count; /* how many code block slots currently in use */
+    int  size;  /* how many slots allocated in code_block[]  */
     struct reg_code_block *cb; /* array of reg_code_block's */
 };
 
 
 /*
-= for apidoc AyT||regexp
-  The regexp/REGEXP struct, see L<perlreapi> for further documentation
-  on the individual fields. The struct is ordered so that the most
-  commonly used fields are placed at the start.
+=for apidoc AyT||regexp
+The regexp/REGEXP struct, see L<perlreapi> for further documentation
+on the individual fields. The struct is ordered so that the most
+commonly used fields are placed at the start.
 
-  Any patch that adds items to this struct will need to include
-  changes to F<sv.c> (C<Perl_re_dup()>) and F<regcomp.c>
-  (C<pregfree()>). This involves freeing or cloning items in the
-  regexp's data array based on the data item's type.
+Any patch that adds items to this struct will need to include
+changes to F<sv.c> (C<Perl_re_dup()>) and F<regcomp.c>
+(C<pregfree()>). This involves freeing or cloning items in the
+regexp's data array based on the data item's type.
+=cut
 */
 
+/* NOTE: There is a copy of this struct in the documentation in perlreapi.pod
+ *       if you make ANY changes please make sure they are ALSO made there.
+ */
 typedef struct regexp {
+    /*----------------------------------------------------------------------
+     * Fields required for compatibility with SV types
+     */
     _XPV_HEAD;
+
+    /*----------------------------------------------------------------------
+     * Operational fields
+     */
+
     const struct regexp_engine* engine; /* what engine created this regexp? */
     REGEXP *mother_re; /* what re is this a lightweight copy of? */
     HV *paren_names;   /* Optional hash of paren names */
@@ -144,12 +157,11 @@ typedef struct regexp {
        the distinction between physical and logical capture buffers */
     U32 nparens;                    /* physical number of capture buffers */
     U32 logical_nparens;            /* logical_number of capture buffers */
-    I32 *logical_to_parno;          /* map logical parno to first physcial */
+    I32 *logical_to_parno;          /* map logical parno to first physical */
     I32 *parno_to_logical;          /* map every physical parno to logical */
     I32 *parno_to_logical_next;     /* map every physical parno to the next
                                        physical with the same logical id */
 
-    U32 extflags;      /* Flags used both externally and internally */
     SSize_t maxlen;    /* maximum possible number of chars in string to match */
     SSize_t minlen;    /* minimum possible number of chars in string to match */
     SSize_t minlenret; /* minimum possible number of chars in $& */
@@ -163,6 +175,8 @@ typedef struct regexp {
 
     void *pprivate;    /* Data private to the regex engine which
                         * created this object. */
+
+    U32 extflags;      /* Flags used both externally and internally */
     U32 intflags;      /* Engine Specific Internal flags */
 
     /*----------------------------------------------------------------------
@@ -170,10 +184,9 @@ typedef struct regexp {
      */
 
     U32 lastparen;           /* highest close paren matched ($+) */
+    U32 lastcloseparen;      /* last close paren matched ($^N) */
     regexp_paren_pair *offs; /* Array of offsets for (@-) and (@+) */
     char **recurse_locinput; /* used to detect infinite recursion, XXX: move to internal */
-    U32 lastcloseparen;      /* last close paren matched ($^N) */
-
 
     /*---------------------------------------------------------------------- */
 
@@ -192,8 +205,9 @@ typedef struct regexp {
     SSize_t suboffset;  /* byte offset of subbeg from logical start of str */
     SSize_t subcoffset; /* suboffset equiv, but in chars (for @-/@+) */
 
-    /*---------------------------------------------------------------------- */
-
+    /*----------------------------------------------------------------------
+     * More Operational fields
+     */
 
     CV *qr_anoncv;      /* the anon sub wrapped round qr/(?{..})/ */
 } regexp;
@@ -210,9 +224,51 @@ typedef struct regexp {
 #define RXp_OFFS_VALID(rx,n) \
      (RXp_OFFSp(rx)[(n)].end != -1 && RXp_OFFSp(rx)[(n)].start != -1 )
 
+
 #define RX_OFFS_START(rx_sv,n)  RXp_OFFS_START(ReANY(rx_sv),n)
 #define RX_OFFS_END(rx_sv,n)    RXp_OFFS_END(ReANY(rx_sv),n)
 #define RX_OFFS_VALID(rx_sv,n)  RXp_OFFS_VALID(ReANY(rx_sv),n)
+
+/*
+
+=for apidoc mh||RX_OFFSp|const REGEXP * rx_sv
+Returns the RX_OFFS structure as a pointer.  This should NOT be used
+directly, and the structure it returns may change in future versions of
+perl.  Use one of the other RX_OFFS_xxx macros instead, which should be
+stable as Perl evolves. The 'p' suffix on the macro is meant to indicate
+both that the macro is "private" to the internals, and that it returns
+a pointer.
+
+=for apidoc Amh||RX_OFFS_START|const REGEXP * rx_sv|U32 n
+Returns the start offset of the C<n>'th capture buffer, when
+C<n> is 0 it refers to the overall match as a whole. A value of
+-1 is returned if the C<n>'th capture buffer did not match.
+
+=for apidoc Amh||RXp_OFFS_START|const regexp * rx|U32 n
+Same as RX_OFFS_START() but operates on a C<struct regexp *> instead of
+an C<SV *>.
+
+=for apidoc Amh||RX_OFFS_END|const REGEXP * rx_sv|U32 n
+Returns the end offset of the C<n>'th capture buffer, when C<n> is 0 it
+refers to the overall match as a whole. A value of
+-1 is returned if the C<n>'th capture buffer did not match.
+
+=for apidoc Amh||RXp_OFFS_END|const regexp * rx|U32 n
+Same as RX_OFFS_END() but operates on a C<struct regexp *> instead of
+an C<SV *>.
+
+=for apidoc Amh||RX_OFFS_VALID|const REGEXP * rx_sv|U32 n
+Returns true if the C<n>'th offset buffer matched, false otherwise, when
+C<n> is 0 it refers to the overall match as a whole which should always
+return true.
+
+=for apidoc Amh||RXp_OFFS_VALID|const regexp * rx|U32 n
+Same as RX_OFFS_VLAID() but operates on a C<struct regexp *> instead of
+an C<SV *>.
+
+=cut
+
+*/
 
 /* used for high speed searches */
 typedef struct re_scream_pos_data_s
@@ -624,6 +680,8 @@ and check for NULL.
 
 /* Stuff that needs to be included in the pluggable extension goes below here */
 
+#include "regexp_constants.h"
+
 #ifdef PERL_ANY_COW
 #  define RXp_MATCH_COPY_FREE(prog)                                 \
     STMT_START {                                                    \
@@ -718,7 +776,10 @@ struct regmatch_slab;
  * regmatch_state stack at the start of execution */
 
 typedef struct {
-    regexp *rex;
+    REGEXP *rx;
+    PMOP   *old_op;           /* saved value of PL_op and ... */
+    REGEXP *old_op_val;       /* ... saved value of PM_GETRE(PL_op) if any */
+    REGEXP *old_regcurpm_val; /* saved value of PM_GETRE(PL_reg_curpm) */
     PMOP    *curpm;     /* saved PL_curpm */
 #ifdef PERL_ANY_COW
     SV      *saved_copy; /* saved saved_copy field from rex */
@@ -768,8 +829,8 @@ typedef struct {
     char *cutpoint;      /* (*COMMIT) position (if any) */
     regmatch_info_aux      *info_aux; /* extra fields that need cleanup */
     regmatch_info_aux_eval *info_aux_eval; /* extra saved state for (?{}) */
-    I32  poscache_maxiter; /* how many whilems todo before S-L cache kicks in */
-    I32  poscache_iter;    /* current countdown from _maxiter to zero */
+    STRLEN poscache_maxiter; /* how many whilems todo before S-L cache kicks in */
+    STRLEN poscache_iter;    /* current countdown from _maxiter to zero */
     STRLEN poscache_size;  /* size of regmatch_info_aux.poscache */
     bool intuit;    /* re_intuit_start() is the top-level caller */
     bool is_utf8_pat;    /* regex is utf8 */

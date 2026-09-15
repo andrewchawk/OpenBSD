@@ -1,4 +1,4 @@
-/*	$OpenBSD: stivar.h,v 1.28 2024/05/29 00:48:15 jsg Exp $	*/
+/*	$OpenBSD: stivar.h,v 1.30 2026/05/01 20:03:58 miod Exp $	*/
 
 /*
  * Copyright (c) 2000-2003 Michael Shalayeff
@@ -40,29 +40,22 @@ struct sti_rom {
 	int			 rom_devtype;
 
 	bus_space_tag_t		 iot, memt;	/* XXX iot unused */
-	bus_space_handle_t	 romh;
 	bus_space_handle_t	 regh[STI_REGION_MAX];
 	bus_addr_t		*bases;
 
 	struct sti_dd		 rom_dd;	/* in word format */
-	u_int8_t		*rom_code;
+	const uint8_t		*rom_code;
+
+	const uint8_t		*rom_copy;	/* rom image if needed */
 
 	/*
 	 * ROM-provided function pointers
 	 */
 	sti_init_t		 init;
-	sti_mgmt_t		 mgmt;
 	sti_unpmv_t		 unpmv;
 	sti_blkmv_t		 blkmv;
-	sti_test_t		 test;
-	sti_exhdl_t		 exhdl;
 	sti_inqconf_t		 inqconf;
 	sti_scment_t		 scment;
-	sti_dmac_t		 dmac;
-	sti_flowc_t		 flowc;
-	sti_utiming_t		 utiming;
-	sti_pmgr_t		 pmgr;
-	sti_util_t		 util;
 };
 
 /*
@@ -82,7 +75,7 @@ struct sti_screen {
 	struct sti_ecfg		 scr_ecfg;
 	u_int8_t		 name[STI_DEVNAME_LEN];
 
-	void			*scr_romfont;	/* ROM font copy in memory... */
+	const void		*scr_romfont;	/* ROM font copy in memory... */
 	u_int			 scr_fontmaxcol;/* ...or in off-screen area */
 	u_int			 scr_fontbase;
 
@@ -125,7 +118,6 @@ struct sti_softc {
 	u_int			 sc_flags;
 #define	STI_CONSOLE	0x0001	/* first head is console... */
 #define	STI_ATTACHED	0x0002	/* ... and wsdisplay_cnattach() has been done */
-#define	STI_ROM_ENABLED	0x0004	/* PCI ROM is enabled */
 
 	bus_addr_t		 bases[STI_REGION_MAX];
 	struct sti_rom		*sc_rom;
@@ -137,7 +129,7 @@ struct sti_softc {
 };
 
 int	sti_attach_common(struct sti_softc *, bus_space_tag_t, bus_space_tag_t,
-	    bus_space_handle_t, u_int);
+	    bus_space_handle_t, const uint8_t *, u_int);
 void	sti_describe(struct sti_softc *);
 void	sti_end_attach(void *);
 u_int	sti_rom_size(bus_space_tag_t, bus_space_handle_t);

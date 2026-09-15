@@ -1,4 +1,4 @@
-/*	$OpenBSD: radiusd_file.c,v 1.5 2024/07/18 22:40:09 yasuoka Exp $	*/
+/*	$OpenBSD: radiusd_file.c,v 1.10 2026/09/06 18:59:22 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2024 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -96,10 +96,9 @@ main(int argc, char *argv[])
 {
 	int				 ch, pairsock[2], status;
 	pid_t				 pid;
-	char				*saved_argv0;
+	char				 execpath[PATH_MAX];
 	struct imsgbuf			 ibuf;
 	struct imsg			 imsg;
-	ssize_t				 n;
 	size_t				 datalen;
 	struct module_file_params	*paramsp, params;
 	char				 pathdb[PATH_MAX];
@@ -111,10 +110,12 @@ main(int argc, char *argv[])
 			/* not reached */
 			break;
 		}
-	saved_argv0 = argv[0];
 
 	argc -= optind;
 	argv += optind;
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, PF_UNSPEC,
 	    pairsock) == -1)
@@ -122,17 +123,18 @@ main(int argc, char *argv[])
 
 	log_init(0);
 
-	pid = start_child(saved_argv0, pairsock[1]);
+	pid = start_child(execpath, pairsock[1]);
 
 	/* Privileged process */
 	if (pledge("stdio rpath unveil", NULL) == -1)
 		err(EXIT_FAILURE, "pledge");
 	setproctitle("[priv]");
-	imsg_init(&ibuf, pairsock[0]);
+	if (imsgbuf_init(&ibuf, pairsock[0]) == -1)
+		err(EXIT_FAILURE, "imsgbuf_init");
 
 	/* Receive parameters from the main process. */
 	if (imsg_sync_read(&ibuf, 2000) <= 0 ||
-	    (n = imsg_get(&ibuf, &imsg)) <= 0)
+	    imsgbuf_get(&ibuf, &imsg) <= 0)
 		exit(EXIT_FAILURE);
 	if (imsg.hdr.type != IMSG_RADIUSD_FILE_PARAMS)
 		err(EXIT_FAILURE, "Receieved unknown message type %d",
@@ -158,20 +160,22 @@ main(int argc, char *argv[])
 	memcpy(&params, paramsp, sizeof(params));
 
 	for (;;) {
-		if ((n = imsg_read(&ibuf)) <= 0 && errno != EAGAIN)
+		if (imsgbuf_read(&ibuf) != 1)
 			break;
 		for (;;) {
-			if ((n = imsg_get(&ibuf, &imsg)) == -1)
+			int	n;
+
+			if ((n = imsgbuf_get(&ibuf, &imsg)) == -1)
 				break;
 			if (n == 0)
 				break;
 			parent_dispatch_main(&params, &ibuf, &imsg);
 			imsg_free(&imsg);
-			imsg_flush(&ibuf);
+			imsgbuf_flush(&ibuf);
 		}
-		imsg_flush(&ibuf);
+		imsgbuf_flush(&ibuf);
 	}
-	imsg_clear(&ibuf);
+	imsgbuf_clear(&ibuf);
 
 	while (waitpid(pid, &status, 0) == -1) {
 		if (errno != EINTR)
@@ -244,7 +248,8 @@ module_file_main(void)
 	module_drop_privilege(module_file.base, 0);
 
 	module_load(module_file.base);
-	imsg_init(&module_file.ibuf, 3);
+	if (imsgbuf_init(&module_file.ibuf, 3) == -1)
+		err(EXIT_FAILURE, "imsgbuf_init");
 
 	if (pledge("stdio", NULL) == -1)
 		err(EXIT_FAILURE, "pledge");
@@ -257,7 +262,7 @@ module_file_main(void)
 }
 
 pid_t
-start_child(char *argv0, int fd)
+start_child(char *execpath, int fd)
 {
 	char *argv[5];
 	int argc = 0;
@@ -279,11 +284,11 @@ start_child(char *argv0, int fd)
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	argv[argc++] = "-M";	/* main proc */
 	argv[argc++] = NULL;
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 void
@@ -331,7 +336,7 @@ module_file_start(void *ctx)
 	}
 	imsg_compose(&module->ibuf, IMSG_RADIUSD_FILE_PARAMS, 0, -1, -1,
 	    &module->params, sizeof(module->params));
-	imsg_flush(&module->ibuf);
+	imsgbuf_flush(&module->ibuf);
 
 	module_send_message(module->base, IMSG_OK, NULL);
 }
@@ -344,7 +349,6 @@ module_file_access_request(void *ctx, u_int query_id, const u_char *pkt,
 	struct module_file		*self = ctx;
 	RADIUS_PACKET			*radpkt = NULL;
 	char				 username[256];
-	ssize_t				 n;
 	struct imsg			 imsg;
 	struct module_file_userinfo	*ent;
 
@@ -359,17 +363,17 @@ module_file_access_request(void *ctx, u_int query_id, const u_char *pkt,
 
 	imsg_compose(&self->ibuf, IMSG_RADIUSD_FILE_USERINFO, 0, -1, -1,
 	    username, strlen(username) + 1);
-	imsg_flush(&self->ibuf);
-	if ((n = imsg_read(&self->ibuf)) == -1 || n == 0) {
-		log_warn("%s: imsg_read()", __func__);
+	imsgbuf_flush(&self->ibuf);
+	if (imsgbuf_read(&self->ibuf) != 1) {
+		log_warn("%s: imsgbuf_read()", __func__);
 		goto out;
 	}
-	if ((n = imsg_get(&self->ibuf, &imsg)) <= 0) {
-		log_warn("%s: imsg_get()", __func__);
+	if (imsgbuf_get(&self->ibuf, &imsg) <= 0) {
+		log_warn("%s: imsgbuf_get()", __func__);
 		goto out;
 	}
 
-	datalen = imsg.hdr.len - IMSG_HEADER_SIZE;
+	datalen = imsg_get_len(&imsg);
 	if (imsg.hdr.type == IMSG_RADIUSD_FILE_USERINFO) {
 		if (datalen <= offsetof(struct module_file_userinfo,
 		    password[0])) {

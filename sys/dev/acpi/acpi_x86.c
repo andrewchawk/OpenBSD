@@ -1,4 +1,4 @@
-/* $OpenBSD: acpi_x86.c,v 1.24 2024/08/06 17:38:56 kettenis Exp $ */
+/* $OpenBSD: acpi_x86.c,v 1.36 2026/03/11 16:18:42 kettenis Exp $ */
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  * Copyright (c) 2005 Jordan Hargrave <jordan@openbsd.org>
@@ -27,17 +27,26 @@
 
 #include <machine/apmvar.h>
 
+#include <ddb/db_var.h>
+
 int
 sleep_showstate(void *v, int sleepmode)
 {
 	struct acpi_softc *sc = v;
 	int fallback_state = -1;
+	extern int lid_action;
 
 	switch (sleepmode) {
 	case SLEEP_SUSPEND:
 		sc->sc_state = ACPI_STATE_S3;
 #ifdef __amd64__
+		if (lid_action == -1)
+			sc->sc_state = ACPI_STATE_S0;
 		fallback_state = ACPI_STATE_S0; /* No S3, use S0 */
+#endif
+#ifdef DDB
+		if (db_suspend)
+			sc->sc_state = ACPI_STATE_S0;
 #endif
 		break;
 	case SLEEP_HIBERNATE:
@@ -80,13 +89,13 @@ sleep_setstate(void *v)
 		if (aml_node_setval(sc, sc->sc_pts, sc->sc_state) != 0)
 			return (EINVAL);
 	}
-	acpi_indicator(sc, ACPI_SST_WAKING);    /* blink */
 	return 0;
 }
 
 int
 gosleep(void *v)
 {
+	extern int cpu_wakeups;
 	struct acpi_softc *sc = v;
 	int ret;
 
@@ -107,10 +116,14 @@ gosleep(void *v)
 	if (sc->sc_pmc_suspend)
 		sc->sc_pmc_suspend(sc->sc_pmc_cookie);
 
+	cpu_wakeups = 0;
 	sc->sc_wakeup = 0;
+	sc->sc_wakeups = 0;
 	while (!sc->sc_wakeup) {
+		sc->sc_wakegpe = WAKEGPE_NONE;
 		ret = acpi_sleep_cpu(sc, sc->sc_state);
 		acpi_resume_cpu(sc, sc->sc_state);
+		sc->sc_wakeups++;
 
 		if (sc->sc_ec && sc->sc_wakegpe == sc->sc_ec->sc_gpe) {
 			sc->sc_wakeup = 0;
@@ -122,6 +135,11 @@ gosleep(void *v)
 	if (sc->sc_pmc_resume)
 		sc->sc_pmc_resume(sc->sc_pmc_cookie);
 
+	acpi_indicator(sc, ACPI_SST_WAKING);    /* blink */
+
+	/* 1st resume AML step: _WAK(fromstate) */
+	if (sc->sc_state != ACPI_STATE_S0)
+		aml_node_setval(sc, sc->sc_wak, sc->sc_state);
 	return ret;
 }
 
@@ -130,8 +148,6 @@ sleep_resume(void *v)
 {
 	struct acpi_softc *sc = v;
 
-	sc->sc_resume_time = getuptime();
-
 	acpibtn_disable_psw();		/* disable _LID for wakeup */
 
 	/* 3rd resume AML step: _TTS(runstate) */
@@ -139,7 +155,6 @@ sleep_resume(void *v)
 		if (aml_node_setval(sc, sc->sc_tts, ACPI_STATE_S0) != 0)
 			return (EINVAL);
 	}
-	acpi_indicator(sc, ACPI_SST_WAKING);    /* blink */
 	return 0;
 }
 
@@ -152,7 +167,7 @@ checklids(struct acpi_softc *sc)
 
 	lids = acpibtn_numopenlids();
 	if (lids == 0 && lid_action != 0)
-		return EAGAIN;
+		return 1;
 	return 0;
 }	
 
@@ -160,24 +175,33 @@ checklids(struct acpi_softc *sc)
 int
 suspend_finish(void *v)
 {
+	extern int cpu_wakeups;
 	struct acpi_softc *sc = v;
+	int sleepmode = SLEEP_RESUME;
 
+	printf("wakeups: %d %d\n", cpu_wakeups, sc->sc_wakeups);
 	printf("wakeup event: ");
 	switch (sc->sc_wakegpe) {
 	case 0:
 		printf("unknown\n");
 		break;
-	case -1:
+	case WAKEGPE_PWRBTN:
 		printf("PWRBTN\n");
 		break;
-	case -2:
-		printf("SLPTN\n");
+	case WAKEGPE_SLPBTN:
+		printf("SLPBTN\n");
+		break;
+	case WAKEGPE_RTC:
+		printf("RTC\n");
+		sleepmode = SLEEP_HIBERNATE;
+		break;
+	case WAKEGPE_GPIO:
+		printf("GPIO 0x%x\n", sc->sc_wakegpio);
 		break;
 	default:
 		printf("GPE 0x%x\n", sc->sc_wakegpe);
 		break;
 	}
-	sc->sc_wakegpe = 0;
 
 	acpi_record_event(sc, APM_NORMAL_RESUME);
 	acpi_indicator(sc, ACPI_SST_WORKING);
@@ -185,5 +209,8 @@ suspend_finish(void *v)
 	sc->sc_state = ACPI_STATE_S0;
 
 	/* If we woke up but all the lids are closed, go back to sleep */
-	return checklids(sc);
+	if (sleepmode == SLEEP_RESUME && checklids(sc))
+		sleepmode = SLEEP_SUSPEND;
+	
+	return sleepmode;
 }

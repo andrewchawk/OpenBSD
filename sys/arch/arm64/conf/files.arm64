@@ -1,19 +1,22 @@
-# $OpenBSD: files.arm64,v 1.70 2024/07/02 10:25:16 kettenis Exp $
+# $OpenBSD: files.arm64,v 1.81 2026/09/06 18:25:22 mglocker Exp $
 
 maxpartitions	16
 maxusers	2 8 128
 
-major	{wd = 16}
-major	{sd = 24}
-major	{cd = 26}
+major	{wd = 0}
+major	{sd = 4}
+major	{cd = 6}
 major	{rd = 17}
 
 file	arch/arm64/arm64/autoconf.c
+file	arch/arm64/arm64/codepatch.c
 file	arch/arm64/arm64/copy.S
 file	arch/arm64/arm64/copystr.S
 file	arch/arm64/arm64/cpuswitch.S
 file	arch/arm64/arm64/conf.c
 file	arch/arm64/arm64/disksubr.c
+file	arch/arm64/arm64/hibernate_machdep.c	hibernate
+file	arch/arm64/arm64/hibernate_asm.S	hibernate
 file	arch/arm64/arm64/locore.S
 file	arch/arm64/arm64/machdep.c
 file	arch/arm64/arm64/mem.c
@@ -27,7 +30,6 @@ file	arch/arm64/arm64/sys_machdep.c
 file	arch/arm64/arm64/cpu.c
 file	arch/arm64/arm64/fpu.c
 file	arch/arm64/arm64/intr.c
-file	arch/arm64/arm64/softintr.c
 file	arch/arm64/arm64/exception.S
 file	arch/arm64/arm64/trampoline.S
 file	arch/arm64/arm64/trap.c
@@ -37,8 +39,8 @@ file	arch/arm64/arm64/cpufunc_asm.S
 file	arch/arm64/arm64/lse.S
 file	arch/arm64/arm64/support.S
 file	arch/arm64/arm64/bus_dma.c
+file	arch/arm64/arm64/bus_space.c
 
-file	arch/arm64/dev/arm64_bus_space.c
 file	arch/arm64/dev/pci_machdep.c
 
 file	arch/arm64/arm64/cryptox.c		crypto
@@ -251,6 +253,10 @@ device	bcmintc
 attach	bcmintc at fdt
 file	arch/arm64/dev/bcm2836_intr.c		bcmintc
 
+device	bcmmip
+attach	bcmmip at fdt
+file	arch/arm64/dev/bcm2712_mip.c		bcmmip
+
 device	pciecam: pcibus
 attach	pciecam at fdt
 file	dev/fdt/pciecam.c			pciecam
@@ -260,15 +266,33 @@ attach	smmu at fdt with smmu_fdt
 file	arch/arm64/dev/smmu.c			smmu
 file	arch/arm64/dev/smmu_fdt.c		smmu_fdt
 
+# Raspberry Pi RP1
+device	rpone: fdt
+attach	rpone at pci
+file	arch/arm64/dev/rpone.c			rpone
+
+device	rpiclock
+attach	rpiclock at fdt
+file	arch/arm64/dev/rpiclock.c		rpiclock
+
 device	rpigpio
 attach	rpigpio at fdt
 file	arch/arm64/dev/rpigpio.c		rpigpio
+
+device	rpipwm
+attach	rpipwm at fdt
+file	arch/arm64/dev/rpipwm.c			rpipwm
+
+device	rpirtc
+attach	rpirtc at fdt
+file	arch/arm64/dev/rpirtc.c			rpirtc
 
 # ACPI
 include "dev/acpi/files.acpi"
 
 attach	acpi at fdt with acpi_fdt
 file	arch/arm64/arm64/acpi_machdep.c		acpi_fdt
+file	arch/arm64/dev/acpicpu.c		acpicpu
 
 define	acpiiort {}
 device	acpiiort: acpiiort

@@ -17,7 +17,7 @@ sub _carp {
     return warn @_, " at $file line $line\n";
 }
 
-our $VERSION = '1.302194';
+our $VERSION = '1.302210';
 
 use Test::Builder::Module;
 our @ISA    = qw(Test::Builder::Module);
@@ -177,7 +177,7 @@ sub import_extra {
     my $class = shift;
     my $list  = shift;
 
-    my @other = ();
+    my @other;
     my $idx   = 0;
     my $import;
     while( $idx <= $#{$list} ) {
@@ -395,7 +395,7 @@ different from some other value:
   isnt $obj, $clone, "clone() produces a different object";
 
 Historically we supported an C<isn't()> function as an alias of
-C<isnt()>, however in Perl 5.37.9 support for the use of aprostrophe as
+C<isnt()>, however in Perl 5.37.9 support for the use of apostrophe as
 a package separator was deprecated and by Perl 5.42.0 support for it
 will have been removed completely. Accordingly use of C<isn't()> is also
 deprecated, and will produce warnings when used unless 'deprecated'
@@ -579,7 +579,7 @@ sub can_ok ($@) {
         return $ok;
     }
 
-    my @nok = ();
+    my @nok;
     foreach my $method (@methods) {
         $tb->_try( sub { $proto->can($method) } ) or push @nok, $method;
     }
@@ -997,7 +997,7 @@ import anything, use C<require_ok>.
 
 sub use_ok ($;@) {
     my( $module, @imports ) = @_;
-    @imports = () unless @imports;
+
     my $tb = Test::More->builder;
 
     my %caller;
@@ -1185,7 +1185,7 @@ sub _format_stack {
     }
 
     my @vals = @{ $Stack[-1]{vals} }[ 0, 1 ];
-    my @vars = ();
+    my @vars;
     ( $vars[0] = $var ) =~ s/\$FOO/     \$got/;
     ( $vars[1] = $var ) =~ s/\$FOO/\$expected/;
 
@@ -1206,13 +1206,28 @@ sub _format_stack {
     return $out;
 }
 
+my %_types = (
+  (map +($_ => $_), qw(
+    Regexp
+    ARRAY
+    HASH
+    SCALAR
+    REF
+    GLOB
+    CODE
+  )),
+  'LVALUE'  => 'SCALAR',
+  'REF'     => 'SCALAR',
+  'VSTRING' => 'SCALAR',
+);
+
 sub _type {
     my $thing = shift;
 
     return '' if !ref $thing;
 
-    for my $type (qw(Regexp ARRAY HASH REF SCALAR GLOB CODE VSTRING)) {
-        return $type if UNIVERSAL::isa( $thing, $type );
+    for my $type (keys %_types) {
+        return $_types{$type} if UNIVERSAL::isa( $thing, $type );
     }
 
     return '';
@@ -1872,9 +1887,9 @@ There is a full version history in the Changes file, and the Test::More versions
 
 =over 4
 
-=item utf8 / "Wide character in print"
+=item UTF-8 / "Wide character in print"
 
-If you use utf8 or other non-ASCII characters with Test::More you
+If you use UTF-8 or other non-ASCII characters with Test::More you
 might get a "Wide character in print" warning.  Using
 C<< binmode STDOUT, ":utf8" >> will not fix it.
 L<Test::Builder> (which powers
@@ -1885,16 +1900,16 @@ Test::More.
 One work around is to apply encodings to STDOUT and STDERR as early
 as possible and before Test::More (or any other Test module) loads.
 
-    use open ':std', ':encoding(utf8)';
+    use open ':std', ':encoding(UTF-8)';
     use Test::More;
 
 A more direct work around is to change the filehandles used by
 L<Test::Builder>.
 
     my $builder = Test::More->builder;
-    binmode $builder->output,         ":encoding(utf8)";
-    binmode $builder->failure_output, ":encoding(utf8)";
-    binmode $builder->todo_output,    ":encoding(utf8)";
+    binmode $builder->output,         ":encoding(UTF-8)";
+    binmode $builder->failure_output, ":encoding(UTF-8)";
+    binmode $builder->todo_output,    ":encoding(UTF-8)";
 
 
 =item Overloaded objects
@@ -1987,6 +2002,10 @@ comes from.
 
 L<Test::Most> Most commonly needed test functions and features.
 
+=head1 ENVIRONMENT VARIABLES
+
+See L<Test2::Env> for a list of meaningul environment variables.
+
 =head1 AUTHORS
 
 Michael G Schwern E<lt>schwern@pobox.comE<gt> with much inspiration
@@ -2005,13 +2024,13 @@ the perl-qa gang.
 
 =head1 BUGS
 
-See F<https://github.com/Test-More/test-more/issues> to report and view bugs.
+See L<https://github.com/Test-More/test-more/issues> to report and view bugs.
 
 
 =head1 SOURCE
 
 The source code repository for Test::More can be found at
-F<http://github.com/Test-More/test-more/>.
+L<https://github.com/Test-More/test-more/>.
 
 
 =head1 COPYRIGHT
@@ -2021,7 +2040,7 @@ Copyright 2001-2008 by Michael G Schwern E<lt>schwern@pobox.comE<gt>.
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.
 
-See F<http://www.perl.com/perl/misc/Artistic.html>
+See L<https://dev.perl.org/licenses/>
 
 =cut
 

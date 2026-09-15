@@ -17,7 +17,7 @@ BEGIN
     # use Test::NoWarnings, if available
     my $extra = 0 ;
     $extra = 1
-        if eval { require Test::NoWarnings ;  import Test::NoWarnings; 1 };
+        if eval { require Test::NoWarnings ;  Test::NoWarnings->import; 1 };
 
     my $tests ;
     $BadPerl = ($] >= 5.006 and $] <= 5.008) ;
@@ -289,7 +289,7 @@ EOT
 
                 ok sysread($io, $buf, 3, 2) == 3 ;
                 ok $buf eq "Ths i"
-                    or print "# [$buf]\n" ;;
+                    or print "# [$buf]\n" ;
                 ok ! $io->eof;
 
         #        $io->seek(-4, 2);

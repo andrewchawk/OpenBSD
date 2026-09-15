@@ -52,14 +52,8 @@
    don't. */
 #define HAVE_DECL_STRERROR_S 0
 
-/* Define to 1 if you have the <dlfcn.h> header file. */
-#define HAVE_DLFCN_H 1
-
 /* Define if dlopen() is available on this platform. */
 #define HAVE_DLOPEN 1
-
-/* Define if dladdr() is available on this platform. */
-#define HAVE_DLADDR 1
 
 /* test from libunwind */
 #if defined(__arm__) && !defined(__USING_SJLJ_EXCEPTIONS__) && \
@@ -77,14 +71,8 @@
 #define HAVE_DEREGISTER_FRAME 1
 #endif
 
-/* Define to 1 if you have the <errno.h> header file. */
-#define HAVE_ERRNO_H 1
-
-/* Define to 1 if you have the <fcntl.h> header file. */
-#define HAVE_FCNTL_H 1
-
-/* Define to 1 if you have the <fenv.h> header file. */
-#define HAVE_FENV_H 1
+/* Define if __unw_add_dynamic_fde() is available on this platform. */
+/* #undef HAVE_UNW_ADD_DYNAMIC_FDE */
 
 /* Define if libffi is available on this platform. */
 /* #undef HAVE_FFI_CALL */
@@ -103,9 +91,6 @@
 
 /* Define to 1 if you have the `getpagesize' function. */
 #define HAVE_GETPAGESIZE 1
-
-/* Define to 1 if you have the `getrlimit' function. */
-#define HAVE_GETRLIMIT 1
 
 /* Define to 1 if you have the `getrusage' function. */
 #define HAVE_GETRUSAGE 1
@@ -134,8 +119,11 @@
 /* Define to 1 if you have the `pthread_setname_np' function. */
 /* #undef HAVE_PTHREAD_SETNAME_NP */
 
-/* Define to 1 if you have the <link.h> header file. */
-#define HAVE_LINK_H 1
+/* Define to 1 if you have the `pthread_get_name_np' function. */
+#define HAVE_PTHREAD_GET_NAME_NP 1
+
+/* Define to 1 if you have the `pthread_set_name_np' function. */
+#define HAVE_PTHREAD_SET_NAME_NP 1
 
 /* Define to 1 if you have the <mach/mach.h> header file. */
 /* #undef HAVE_MACH_MACH_H */
@@ -176,17 +164,8 @@
 /* Define to 1 if you have the `setenv' function. */
 #define HAVE_SETENV 1
 
-/* Define to 1 if you have the `setrlimit' function. */
-#define HAVE_SETRLIMIT 1
-
 /* Define to 1 if you have the `sigaltstack' function. */
 #define HAVE_SIGALTSTACK 1
-
-/* Define to 1 if you have the <signal.h> header file. */
-#define HAVE_SIGNAL_H 1
-
-/* Define to 1 if you have the `strerror' function. */
-#define HAVE_STRERROR 1
 
 /* Define to 1 if you have the `strerror_r' function. */
 #define HAVE_STRERROR_R 1
@@ -194,38 +173,17 @@
 /* Define to 1 if you have the `sysconf' function. */
 #define HAVE_SYSCONF 1
 
-/* Define to 1 if you have the <sys/ioctl.h> header file. */
-#define HAVE_SYS_IOCTL_H 1
-
 /* Define to 1 if you have the <sys/mman.h> header file. */
 #define HAVE_SYS_MMAN_H 1
 
-/* Define to 1 if you have the <sys/param.h> header file. */
-#define HAVE_SYS_PARAM_H 1
-
-/* Define to 1 if you have the <sys/resource.h> header file. */
-#define HAVE_SYS_RESOURCE_H 1
-
-/* Define to 1 if you have the <sys/stat.h> header file. */
-#define HAVE_SYS_STAT_H 1
-
-/* Define to 1 if you have the <sys/time.h> header file. */
-#define HAVE_SYS_TIME_H 1
+/* Define to 1 if you have the <sys/ioctl.h> header file. */
+#define HAVE_SYS_IOCTL_H 1
 
 /* Define to 1 if stat struct has st_mtimespec member .*/
 #define HAVE_STRUCT_STAT_ST_MTIMESPEC_TV_NSEC 1
 
 /* Define to 1 if stat struct has st_mtim member. */
 #define HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC 1
-
-/* Define to 1 if you have the <sys/types.h> header file. */
-#define HAVE_SYS_TYPES_H 1
-
-/* Define if the setupterm() function is supported this platform. */
-/* #undef LLVM_ENABLE_TERMINFO */
-
-/* Define to 1 if you have the <termios.h> header file. */
-#define HAVE_TERMIOS_H 1
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #define HAVE_UNISTD_H 1
@@ -293,6 +251,12 @@
 /* Have host's ___chkstk_ms */
 /* #undef HAVE____CHKSTK_MS */
 
+/* Define if ICU library is available */
+#define HAVE_ICU 0
+
+/* Define if iconv library is available */
+#define HAVE_ICONV 0
+
 /* Linker version detected at compile time. */
 /* #undef HOST_LINK_VERSION */
 
@@ -301,6 +265,9 @@
 
 /* Whether tools show host and target info when invoked with --version */
 #define LLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO 1
+
+/* Whether tools show optional build config flags when invoked with --version */
+#define LLVM_VERSION_PRINTER_SHOW_BUILD_CONFIG 1
 
 /* Define if libxml2 is supported on this platform. */
 /* #undef LLVM_ENABLE_LIBXML2 */
@@ -318,10 +285,10 @@
 #define PACKAGE_NAME "LLVM"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "LLVM 16.0.6"
+#define PACKAGE_STRING "LLVM 22.1.6"
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "16.0.6"
+#define PACKAGE_VERSION "22.1.6"
 
 /* Define to the vendor of this package. */
 /* #undef PACKAGE_VENDOR */
@@ -342,5 +309,9 @@
 #define LLVM_SUPPORT_XCODE_SIGNPOSTS 0
 
 /* #undef HAVE_PROC_PID_RUSAGE */
+
+#define HAVE_BUILTIN_THREAD_POINTER 1
+
+/* #undef HAVE_GETAUXVAL */
 
 #endif

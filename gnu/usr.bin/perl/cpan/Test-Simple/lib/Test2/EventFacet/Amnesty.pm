@@ -2,7 +2,7 @@ package Test2::EventFacet::Amnesty;
 use strict;
 use warnings;
 
-our $VERSION = '1.302194';
+our $VERSION = '1.302210';
 
 sub is_list { 1 }
 
@@ -61,7 +61,7 @@ marked todo.
 =head1 SOURCE
 
 The source code repository for Test2 can be found at
-F<http://github.com/Test-More/test-more/>.
+L<https://github.com/Test-More/test-more/>.
 
 =head1 MAINTAINERS
 
@@ -81,11 +81,11 @@ F<http://github.com/Test-More/test-more/>.
 
 =head1 COPYRIGHT
 
-Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+Copyright Chad Granum E<lt>exodist@cpan.orgE<gt>.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.
 
-See F<http://dev.perl.org/licenses/>
+See L<https://dev.perl.org/licenses/>
 
 =cut

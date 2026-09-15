@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.45 2024/01/17 10:01:24 claudio Exp $	*/
+/*	$OpenBSD: config.c,v 1.56 2026/08/12 18:38:17 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -29,6 +29,7 @@
 #include <imsg.h>
 
 #include "relayd.h"
+#include "log.h"
 
 int
 config_init(struct relayd *env)
@@ -67,14 +68,12 @@ config_init(struct relayd *env)
 		env->sc_empty_table.conf.flags |= F_DISABLE;
 		(void)strlcpy(env->sc_empty_table.conf.name, "empty",
 		    sizeof(env->sc_empty_table.conf.name));
-
 	}
 	if (what & CONFIG_RDRS) {
 		if ((env->sc_rdrs =
 		    calloc(1, sizeof(*env->sc_rdrs))) == NULL)
 			return (-1);
 		TAILQ_INIT(env->sc_rdrs);
-
 	}
 	if (what & CONFIG_RELAYS) {
 		if ((env->sc_relays =
@@ -185,11 +184,6 @@ config_purge(struct relayd *env, u_int reset)
 			while ((rule = TAILQ_FIRST(&proto->rules)) != NULL)
 				rule_delete(&proto->rules, rule);
 			proto->rulecount = 0;
-		}
-	}
-	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
-		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
-			TAILQ_REMOVE(env->sc_protos, proto, entry);
 			free(proto->style);
 			free(proto->tlscapass);
 			while ((keyname =
@@ -236,7 +230,9 @@ config_setreset(struct relayd *env, u_int reset)
 		if ((reset & ps->ps_what[id]) == 0 ||
 		    id == privsep_process)
 			continue;
-		proc_compose(ps, id, IMSG_CTL_RESET, &reset, sizeof(reset));
+		if (proc_compose(ps, id, IMSG_CTL_RESET, &reset,
+		    sizeof(reset)) == -1)
+			fatal("%s: proc_compose", __func__);
 
 		/*
 		 * XXX Make sure that the reset message is sent
@@ -254,9 +250,10 @@ int
 config_getreset(struct relayd *env, struct imsg *imsg)
 {
 	u_int		 mode;
-
-	IMSG_SIZE_CHECK(imsg, &mode);
-	memcpy(&mode, imsg->data, sizeof(mode));
+	if (imsg_get_data(imsg, &mode, sizeof(mode)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		return (-1);
+	}
 
 	config_purge(env, mode);
 
@@ -271,11 +268,14 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 	struct host		*h, *ph;
 	u_int			 what;
 
-	if (IMSG_DATA_SIZE(imsg) != sizeof(struct relayd_config))
-		return (0); /* ignore */
-
 	/* Update runtime flags */
-	memcpy(&env->sc_conf, imsg->data, sizeof(env->sc_conf));
+	if (imsg_get_data(imsg, &env->sc_conf,
+	    sizeof(struct relayd_config)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		return (-1);
+	}
+
+	log_setverbose((env->sc_conf.opts & RELAYD_OPT_VERBOSE) ? 2 : 0);
 
 	what = ps->ps_what[privsep_process];
 
@@ -298,7 +298,9 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 	}
 
 	if (privsep_process != PROC_PARENT)
-		proc_compose(env->sc_ps, PROC_PARENT, IMSG_CFG_DONE, NULL, 0);
+		if (proc_compose(env->sc_ps, PROC_PARENT, IMSG_CFG_DONE, NULL,
+		    0) == -1)
+			fatal("%s: proc_compose", __func__);
 
 	return (0);
 }
@@ -320,7 +322,7 @@ config_settable(struct relayd *env, struct table *tb)
 		if (id == PROC_HCE && tb->conf.check == CHECK_NOCHECK)
 			continue;
 
-		DPRINTF("%s: sending table %s %d to %s", __func__,
+		log_debug("%s: sending table %s %d to %s", __func__,
 		    tb->conf.name, tb->conf.id, env->sc_ps->ps_title[id]);
 
 		c = 0;
@@ -331,11 +333,13 @@ config_settable(struct relayd *env, struct table *tb)
 			iov[c++].iov_len = strlen(tb->sendbuf);
 		}
 
-		proc_composev(ps, id, IMSG_CFG_TABLE, iov, c);
+		if (proc_composev(ps, id, IMSG_CFG_TABLE, iov, c) == -1)
+			fatal("%s: proc_composev", __func__);
 
 		TAILQ_FOREACH(host, &tb->hosts, entry) {
-			proc_compose(ps, id, IMSG_CFG_HOST,
-			    &host->conf, sizeof(host->conf));
+			if (proc_compose(ps, id, IMSG_CFG_HOST, &host->conf,
+			    sizeof(host->conf)) == -1)
+				fatal("%s: proc_compose", __func__);
 		}
 	}
 
@@ -345,21 +349,26 @@ config_settable(struct relayd *env, struct table *tb)
 int
 config_gettable(struct relayd *env, struct imsg *imsg)
 {
+	struct ibuf		 ibuf;
 	struct table		*tb;
 	size_t			 sb;
-	u_int8_t		*p = imsg->data;
-	size_t			 s;
+
+	if (imsg_get_ibuf(imsg, &ibuf) == -1) {
+		log_warn("%s: imsg_get_ibuf", __func__);
+		return (-1);
+	}
 
 	if ((tb = calloc(1, sizeof(*tb))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, &tb->conf);
-	memcpy(&tb->conf, p, sizeof(tb->conf));
-	s = sizeof(tb->conf);
-
-	sb = IMSG_DATA_SIZE(imsg) - s;
-	if (sb > 0) {
-		if ((tb->sendbuf = get_string(p + s, sb)) == NULL) {
+	if (ibuf_get(&ibuf, &tb->conf, sizeof(tb->conf)) == -1) {
+		log_warn("%s: ibuf_get", __func__);
+		free(tb);
+		return (-1);
+	}
+	if ((sb = ibuf_size(&ibuf)) > 0) {
+		if ((tb->sendbuf = ibuf_get_string(&ibuf, sb)) == NULL) {
+			log_warn("%s: ibuf_get_string", __func__);
 			free(tb);
 			return (-1);
 		}
@@ -367,6 +376,7 @@ config_gettable(struct relayd *env, struct imsg *imsg)
 	if (tb->conf.check == CHECK_BINSEND_EXPECT) {
 		tb->sendbinbuf = string2binary(tb->sendbuf);
 		if (tb->sendbinbuf == NULL) {
+			free(tb->sendbuf);
 			free(tb);
 			return (-1);
 		}
@@ -377,7 +387,7 @@ config_gettable(struct relayd *env, struct imsg *imsg)
 
 	env->sc_tablecount++;
 
-	DPRINTF("%s: %s %d received table %d (%s)", __func__,
+	log_debug("%s: %s %d received table %d (%s)", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    tb->conf.id, tb->conf.name);
 
@@ -393,8 +403,11 @@ config_gethost(struct relayd *env, struct imsg *imsg)
 	if ((host = calloc(1, sizeof(*host))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, &host->conf);
-	memcpy(&host->conf, imsg->data, sizeof(host->conf));
+	if (imsg_get_data(imsg, &host->conf, sizeof(host->conf)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		free(host);
+		return (-1);
+	}
 
 	if (host_find(env, host->conf.id) != NULL) {
 		log_debug("%s: host %d already exists",
@@ -418,7 +431,7 @@ config_gethost(struct relayd *env, struct imsg *imsg)
 	TAILQ_INSERT_TAIL(&tb->hosts, host, entry);
 	TAILQ_INSERT_TAIL(&env->sc_hosts, host, globalentry);
 
-	DPRINTF("%s: %s %d received host %s for table %s", __func__,
+	log_debug("%s: %s %d received host %s for table %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    host->conf.name, tb->conf.name);
 
@@ -437,16 +450,18 @@ config_setrdr(struct relayd *env, struct rdr *rdr)
 		    id == privsep_process)
 			continue;
 
-		DPRINTF("%s: sending rdr %s to %s", __func__,
+		log_debug("%s: sending rdr %s to %s", __func__,
 		    rdr->conf.name, ps->ps_title[id]);
 
-		proc_compose(ps, id, IMSG_CFG_RDR,
-		    &rdr->conf, sizeof(rdr->conf));
+		if (proc_compose(ps, id, IMSG_CFG_RDR, &rdr->conf,
+		    sizeof(rdr->conf)) == -1)
+			fatal("%s: proc_compose", __func__);
 
 		TAILQ_FOREACH(virt, &rdr->virts, entry) {
 			virt->rdrid = rdr->conf.id;
-			proc_compose(ps, id, IMSG_CFG_VIRT,
-			    virt, sizeof(*virt));
+			if (proc_compose(ps, id, IMSG_CFG_VIRT, virt,
+			    sizeof(*virt)) == -1)
+				fatal("%s: proc_compose", __func__);
 		}
 	}
 
@@ -461,8 +476,11 @@ config_getrdr(struct relayd *env, struct imsg *imsg)
 	if ((rdr = calloc(1, sizeof(*rdr))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, &rdr->conf);
-	memcpy(&rdr->conf, imsg->data, sizeof(rdr->conf));
+	if (imsg_get_data(imsg, &rdr->conf, sizeof(rdr->conf)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		free(rdr);
+		return (-1);
+	}
 
 	if ((rdr->table = table_find(env, rdr->conf.table_id)) == NULL) {
 		log_debug("%s: table not found", __func__);
@@ -479,7 +497,7 @@ config_getrdr(struct relayd *env, struct imsg *imsg)
 
 	env->sc_rdrcount++;
 
-	DPRINTF("%s: %s %d received rdr %s", __func__,
+	log_debug("%s: %s %d received rdr %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    rdr->conf.name);
 
@@ -492,11 +510,14 @@ config_getvirt(struct relayd *env, struct imsg *imsg)
 	struct rdr	*rdr;
 	struct address	*virt;
 
-	IMSG_SIZE_CHECK(imsg, virt);
-
 	if ((virt = calloc(1, sizeof(*virt))) == NULL)
 		return (-1);
-	memcpy(virt, imsg->data, sizeof(*virt));
+
+	if (imsg_get_data(imsg, virt, sizeof(*virt)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		free(virt);
+		return (-1);
+	}
 
 	if ((rdr = rdr_find(env, virt->rdrid)) == NULL) {
 		log_debug("%s: rdr not found", __func__);
@@ -506,7 +527,7 @@ config_getvirt(struct relayd *env, struct imsg *imsg)
 
 	TAILQ_INSERT_TAIL(&rdr->virts, virt, entry);
 
-	DPRINTF("%s: %s %d received address for rdr %s", __func__,
+	log_debug("%s: %s %d received address for rdr %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    rdr->conf.name);
 
@@ -525,15 +546,17 @@ config_setrt(struct relayd *env, struct router *rt)
 		    id == privsep_process)
 			continue;
 
-		DPRINTF("%s: sending router %s to %s tbl %d", __func__,
+		log_debug("%s: sending router %s to %s tbl %d", __func__,
 		    rt->rt_conf.name, ps->ps_title[id], rt->rt_conf.gwtable);
 
-		proc_compose(ps, id, IMSG_CFG_ROUTER,
-		    &rt->rt_conf, sizeof(rt->rt_conf));
+		if (proc_compose(ps, id, IMSG_CFG_ROUTER,
+		    &rt->rt_conf, sizeof(rt->rt_conf)) == -1)
+			fatal("%s: proc_compose", __func__);
 
 		TAILQ_FOREACH(nr, &rt->rt_netroutes, nr_entry) {
-			proc_compose(ps, id, IMSG_CFG_ROUTE,
-			    &nr->nr_conf, sizeof(nr->nr_conf));
+			if (proc_compose(ps, id, IMSG_CFG_ROUTE,
+			    &nr->nr_conf, sizeof(nr->nr_conf)) == -1)
+				fatal("%s: proc_compose", __func__);
 		}
 	}
 
@@ -548,8 +571,11 @@ config_getrt(struct relayd *env, struct imsg *imsg)
 	if ((rt = calloc(1, sizeof(*rt))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, &rt->rt_conf);
-	memcpy(&rt->rt_conf, imsg->data, sizeof(rt->rt_conf));
+	if (imsg_get_data(imsg, &rt->rt_conf, sizeof(rt->rt_conf)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		free(rt);
+		return (-1);
+	}
 
 	if ((rt->rt_gwtable = table_find(env, rt->rt_conf.gwtable)) == NULL) {
 		log_debug("%s: table not found", __func__);
@@ -562,7 +588,7 @@ config_getrt(struct relayd *env, struct imsg *imsg)
 
 	env->sc_routercount++;
 
-	DPRINTF("%s: %s %d received router %s", __func__,
+	log_debug("%s: %s %d received router %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    rt->rt_conf.name);
 
@@ -578,8 +604,11 @@ config_getroute(struct relayd *env, struct imsg *imsg)
 	if ((nr = calloc(1, sizeof(*nr))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, &nr->nr_conf);
-	memcpy(&nr->nr_conf, imsg->data, sizeof(nr->nr_conf));
+	if (imsg_get_data(imsg, &nr->nr_conf, sizeof(nr->nr_conf)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		free(nr);
+		return (-1);
+	}
 
 	if (route_find(env, nr->nr_conf.id) != NULL) {
 		log_debug("%s: route %d already exists",
@@ -601,7 +630,7 @@ config_getroute(struct relayd *env, struct imsg *imsg)
 
 	env->sc_routecount++;
 
-	DPRINTF("%s: %s %d received route %d for router %s", __func__,
+	log_debug("%s: %s %d received route %d for router %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    nr->nr_conf.id, rt->rt_conf.name);
 
@@ -621,7 +650,7 @@ config_setproto(struct relayd *env, struct protocol *proto)
 		    id == privsep_process)
 			continue;
 
-		DPRINTF("%s: sending protocol %s to %s", __func__,
+		log_debug("%s: sending protocol %s to %s", __func__,
 		    proto->name, ps->ps_title[id]);
 
 		c = 0;
@@ -633,7 +662,8 @@ config_setproto(struct relayd *env, struct protocol *proto)
 			iov[c++].iov_len = strlen(proto->style) + 1;
 		}
 
-		proc_composev(ps, id, IMSG_CFG_PROTO, iov, c);
+		if (proc_composev(ps, id, IMSG_CFG_PROTO, iov, c) == -1)
+			fatal("%s: proc_composev", __func__);
 	}
 
 	return (0);
@@ -653,7 +683,7 @@ config_setrule(struct relayd *env, struct protocol *proto)
 		    id == privsep_process)
 			continue;
 
-		DPRINTF("%s: sending rules %s to %s", __func__,
+		log_debug("%s: sending rules %s to %s", __func__,
 		    proto->name, ps->ps_title[id]);
 
 		/* Now send all the rules */
@@ -684,7 +714,8 @@ config_setrule(struct relayd *env, struct protocol *proto)
 					rule->rule_ctl.kvlen[i].value = -1;
 			}
 
-			proc_composev(ps, id, IMSG_CFG_RULE, iov, c);
+			if (proc_composev(ps, id, IMSG_CFG_RULE, iov, c) == -1)
+				fatal("%s: proc_composev", __func__);
 		}
 	}
 
@@ -694,22 +725,28 @@ config_setrule(struct relayd *env, struct protocol *proto)
 int
 config_getproto(struct relayd *env, struct imsg *imsg)
 {
+	struct ibuf		 ibuf;
 	struct protocol		*proto;
-	size_t			 styl;
 	size_t			 s;
-	u_int8_t		*p = imsg->data;
+
+	if (imsg_get_ibuf(imsg, &ibuf) == -1) {
+		log_warn("%s: imsg_get_ibuf", __func__);
+		return (-1);
+	}
 
 	if ((proto = calloc(1, sizeof(*proto))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, proto);
-	memcpy(proto, p, sizeof(*proto));
-	s = sizeof(*proto);
-
-	styl = IMSG_DATA_SIZE(imsg) - s;
-	proto->style = NULL;
-	if (styl > 0) {
-		if ((proto->style = get_string(p + s, styl - 1)) == NULL) {
+	if (ibuf_get(&ibuf, proto, sizeof(*proto)) == -1) {
+		log_warn("%s: ibuf_get", __func__);
+		free(proto);
+		return (-1);
+	}
+	if ((s = ibuf_size(&ibuf)) > 0) {
+		proto->style = NULL;
+		if ((proto->style = ibuf_get_string(&ibuf, s - 1)) ==
+		    NULL) {
+			log_warn("%s: ibuf_get_string", __func__);
 			free(proto);
 			return (-1);
 		}
@@ -723,7 +760,7 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 
 	env->sc_protocount++;
 
-	DPRINTF("%s: %s %d received protocol %s", __func__,
+	log_debug("%s: %s %d received protocol %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    proto->name);
 
@@ -733,19 +770,25 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 int
 config_getrule(struct relayd *env, struct imsg *imsg)
 {
+	struct ibuf		 ibuf;
 	struct protocol		*proto;
 	struct relay_rule	*rule;
-	size_t			 s, i;
-	u_int8_t		*p = imsg->data;
+	size_t			 i;
 	ssize_t			 len;
+
+	if (imsg_get_ibuf(imsg, &ibuf) == -1) {
+		log_warn("%s: imsg_get_ibuf", __func__);
+		return (-1);
+	}
 
 	if ((rule = calloc(1, sizeof(*rule))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, rule);
-	memcpy(rule, p, sizeof(*rule));
-	s = sizeof(*rule);
-	len = IMSG_DATA_SIZE(imsg) - s;
+	if (ibuf_get(&ibuf, rule, sizeof(*rule)) == -1) {
+		log_warn("%s: ibuf_get", __func__);
+		free(rule);
+		return (-1);
+	}
 
 	if ((proto = proto_find(env, rule->rule_protoid)) == NULL) {
 		free(rule);
@@ -753,20 +796,17 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 	}
 
 #define GETKV(_n, _f)	{						\
-	if (rule->rule_ctl.kvlen[_n]._f >= 0) {				\
+	len = rule->rule_ctl.kvlen[_n]._f;				\
+	if (len >= 0) {							\
 		/* Also accept "empty" 0-length strings */		\
-		if ((len < rule->rule_ctl.kvlen[_n]._f) ||		\
+		if (ibuf_size(&ibuf) < (size_t)len ||			\
 		    (rule->rule_kv[_n].kv_##_f =			\
-		    get_string(p + s,					\
-		    rule->rule_ctl.kvlen[_n]._f)) == NULL) {		\
+		    ibuf_get_string(&ibuf, len)) == NULL) {		\
 			free(rule);					\
 			return (-1);					\
 		}							\
-		s += rule->rule_ctl.kvlen[_n]._f;			\
-		len -= rule->rule_ctl.kvlen[_n]._f;			\
-									\
-		DPRINTF("%s: %s %s (len %ld, option %d): %s", __func__,	\
-		    #_n, #_f, rule->rule_ctl.kvlen[_n]._f,		\
+		log_debug("%s: %s %s (len %ld, option %d): %s", __func__,\
+		    #_n, #_f, len,					\
 		    rule->rule_kv[_n].kv_option,			\
 		    rule->rule_kv[_n].kv_##_f);				\
 	}								\
@@ -792,7 +832,7 @@ config_getrule(struct relayd *env, struct imsg *imsg)
 
 	TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
 
-	DPRINTF("%s: %s %d received rule %u for protocol %s", __func__,
+	log_debug("%s: %s %d received rule %u for protocol %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    rule->rule_id, proto->name);
 
@@ -843,7 +883,7 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 		if ((what & CONFIG_RELAYS) == 0 || id == privsep_process)
 			continue;
 
-		DPRINTF("%s: sending relay %s to %s fd %d", __func__,
+		log_debug("%s: sending relay %s to %s fd %d", __func__,
 		    rlay->rl_conf.name, ps->ps_title[id], rlay->rl_s);
 
 		memcpy(&rl, &rlay->rl_conf, sizeof(rl));
@@ -953,6 +993,15 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 					    rlay->rl_conf.name);
 					return (-1);
 				}
+				if (rlay->rl_tls_client_ca_fd != -1 &&
+				    config_setrelayfd(ps, id, n, 0,
+				    rlay->rl_conf.id, RELAY_FD_CLIENTCACERT,
+				    rlay->rl_tls_client_ca_fd) == -1) {
+					log_warn("%s: fd passing failed for "
+					    "`%s'", __func__,
+					    rlay->rl_conf.name);
+					return (-1);
+				}
 				/* Prevent fd exhaustion in the parent. */
 				if (proc_flush_imsg(ps, id, n) == -1) {
 					log_warn("%s: failed to flush "
@@ -977,7 +1026,9 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 			iov[c].iov_base = &crt;
 			iov[c++].iov_len = sizeof(crt);
 
-			proc_composev(ps, id, IMSG_CFG_RELAY_TABLE, iov, c);
+			if (proc_composev(ps, id, IMSG_CFG_RELAY_TABLE, iov,
+			    c) == -1)
+				fatal("%s: proc_composev", __func__);
 		}
 	}
 
@@ -985,6 +1036,10 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 	if (rlay->rl_s != -1) {
 		close(rlay->rl_s);
 		rlay->rl_s = -1;
+	}
+	if (rlay->rl_tls_client_ca_fd != -1) {
+		close(rlay->rl_tls_client_ca_fd);
+		rlay->rl_tls_client_ca_fd = -1;
 	}
 	if (rlay->rl_tls_cacert_fd != -1) {
 		close(rlay->rl_tls_cacert_fd);
@@ -1018,21 +1073,29 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 int
 config_getrelay(struct relayd *env, struct imsg *imsg)
 {
-	struct privsep		*ps = env->sc_ps;
-	struct relay		*rlay;
-	u_int8_t		*p = imsg->data;
-	size_t			 s;
+	struct ibuf	 ibuf;
+	struct privsep	*ps = env->sc_ps;
+	struct relay	*rlay;
+	size_t		 s;
+
+	if (imsg_get_ibuf(imsg, &ibuf) == -1) {
+		log_warn("%s: imsg_get_ibuf", __func__);
+		return (-1);
+	}
 
 	if ((rlay = calloc(1, sizeof(*rlay))) == NULL)
 		return (-1);
 
-	IMSG_SIZE_CHECK(imsg, &rlay->rl_conf);
-	memcpy(&rlay->rl_conf, p, sizeof(rlay->rl_conf));
-	s = sizeof(rlay->rl_conf);
+	if (ibuf_get(&ibuf, &rlay->rl_conf, sizeof(rlay->rl_conf)) == -1) {
+		log_warn("%s: ibuf_get", __func__);
+		free(rlay);
+		return (-1);
+	}
 
 	rlay->rl_s = imsg_get_fd(imsg);
 	rlay->rl_tls_ca_fd = -1;
 	rlay->rl_tls_cacert_fd = -1;
+	rlay->rl_tls_client_ca_fd = -1;
 
 	if (ps->ps_what[privsep_process] & CONFIG_PROTOS) {
 		if (rlay->rl_conf.proto == EMPTY_ID)
@@ -1044,17 +1107,14 @@ config_getrelay(struct relayd *env, struct imsg *imsg)
 		}
 	}
 
-	if ((off_t)(IMSG_DATA_SIZE(imsg) - s) <
-	    (rlay->rl_conf.tls_cakey_len)) {
+	s = ibuf_size(&ibuf);
+	if (s != (size_t)rlay->rl_conf.tls_cakey_len) {
 		log_debug("%s: invalid message length", __func__);
 		goto fail;
 	}
-
-	if (rlay->rl_conf.tls_cakey_len) {
-		if ((rlay->rl_tls_cakey = get_data(p + s,
-		    rlay->rl_conf.tls_cakey_len)) == NULL)
+	if (s > 0) {
+		if ((rlay->rl_tls_cakey = get_data(&ibuf, s)) == NULL)
 			goto fail;
-		s += rlay->rl_conf.tls_cakey_len;
 	}
 
 	TAILQ_INIT(&rlay->rl_tables);
@@ -1062,7 +1122,7 @@ config_getrelay(struct relayd *env, struct imsg *imsg)
 
 	env->sc_relaycount++;
 
-	DPRINTF("%s: %s %d received relay %s", __func__,
+	log_debug("%s: %s %d received relay %s", __func__,
 	    ps->ps_title[privsep_process], ps->ps_instance,
 	    rlay->rl_conf.name);
 
@@ -1082,10 +1142,14 @@ config_getrelaytable(struct relayd *env, struct imsg *imsg)
 	struct ctl_relaytable	 crt;
 	struct relay		*rlay;
 	struct table		*table;
-	u_int8_t		*p = imsg->data;
 
-	IMSG_SIZE_CHECK(imsg, &crt);
-	memcpy(&crt, p, sizeof(crt));
+	if (imsg_get_data(imsg, &crt, sizeof(crt)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		return (-1);
+	}
+
+	if ((rlt = calloc(1, sizeof(*rlt))) == NULL)
+		goto fail;
 
 	if ((rlay = relay_find(env, crt.relayid)) == NULL) {
 		log_debug("%s: unknown relay", __func__);
@@ -1097,16 +1161,13 @@ config_getrelaytable(struct relayd *env, struct imsg *imsg)
 		goto fail;
 	}
 
-	if ((rlt = calloc(1, sizeof(*rlt))) == NULL)
-		goto fail;
-
 	rlt->rlt_table = table;
 	rlt->rlt_mode = crt.mode;
 	rlt->rlt_flags = crt.flags;
 
 	TAILQ_INSERT_TAIL(&rlay->rl_tables, rlt, rlt_entry);
 
-	DPRINTF("%s: %s %d received relay table %s for relay %s", __func__,
+	log_debug("%s: %s %d received relay table %s for relay %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    table->conf.name, rlay->rl_conf.name);
 
@@ -1123,10 +1184,11 @@ config_getrelayfd(struct relayd *env, struct imsg *imsg)
 	struct ctl_relayfd	 crfd;
 	struct relay		*rlay = NULL;
 	struct relay_cert	*cert;
-	u_int8_t		*p = imsg->data;
 
-	IMSG_SIZE_CHECK(imsg, &crfd);
-	memcpy(&crfd, p, sizeof(crfd));
+	if (imsg_get_data(imsg, &crfd, sizeof(crfd)) == -1) {
+		log_warn("%s: imsg_get_data", __func__);
+		return (-1);
+	}
 
 	switch (crfd.type) {
 	case RELAY_FD_CERT:
@@ -1162,11 +1224,14 @@ config_getrelayfd(struct relayd *env, struct imsg *imsg)
 	case RELAY_FD_CAFILE:
 		rlay->rl_tls_cacert_fd = imsg_get_fd(imsg);
 		break;
+	case RELAY_FD_CLIENTCACERT:
+		rlay->rl_tls_client_ca_fd = imsg_get_fd(imsg);
+		break;
 	}
 
-	DPRINTF("%s: %s %d received relay fd %d type %d for relay %s", __func__,
+	log_debug("%s: %s %d received relay type %d for relay %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
-	    imsg->fd, crfd.type, rlay->rl_conf.name);
+	    crfd.type, rlay->rl_conf.name);
 
 	return (0);
 }

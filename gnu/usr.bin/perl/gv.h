@@ -23,6 +23,24 @@ struct gp {
     HEK *	gp_file_hek;	/* file first declared in (for -w) */
 };
 
+/*
+=for apidoc_section $GV
+
+=for apidoc      Am|GV *|GvREFCNT_inc|GV *gv
+=for apidoc_item   |GV *|GvREFCNT_inc_simple|GV *gv
+=for apidoc_item   |GV *|GvREFCNT_inc_simple_NN|GV *gv
+
+These all increment the reference count of the given SV, which must be a GV.
+They are useful when assigning the result into a typed pointer as they avoid
+the need to cast the result to the appropriate type.
+
+=cut
+*/
+
+#define GvREFCNT_inc(gv)            ((GV *)SvREFCNT_inc((SV *)gv))
+#define GvREFCNT_inc_simple(gv)     ((GV *)SvREFCNT_inc_simple((SV *)gv))
+#define GvREFCNT_inc_simple_NN(gv)  ((GV *)SvREFCNT_inc_simple_NN((SV *)gv))
+
 #define GvXPVGV(gv)	((XPVGV*)SvANY(gv))
 
 
@@ -158,6 +176,15 @@ Return the CV from the GV.
 /* GVf_INTRO is one-shot flag which indicates that the next assignment
    of a reference to the glob is to be localised; it distinguishes
    'local *g = $ref' from '*g = $ref'.
+
+   GVf_MULTI is used to implement the "used only once" warning.  It is
+   always set on a glob when an existing name is referenced, and when
+   a name is created when the warning is disabled.  A post parse scan
+   in gv_check() then reports any names where this isn't set.
+
+   GVf_ONCE_FATAL is set on a glob when it is created and fatal "used
+   only once" warnings are enabled, since PL_curcop no longer has the
+   fatal flag set at the point where the warnings are reported.
 */
 #define GVf_INTRO	0x01
 #define GVf_MULTI	0x02
@@ -168,6 +195,7 @@ Return the CV from the GV.
 #define GVf_IMPORTED_AV	  0x20
 #define GVf_IMPORTED_HV	  0x40
 #define GVf_IMPORTED_CV	  0x80
+#define GVf_ONCE_FATAL	0x100
 
 #define GvINTRO(gv)		(GvFLAGS(gv) & GVf_INTRO)
 #define GvINTRO_on(gv)		(GvFLAGS(gv) |= GVf_INTRO)
@@ -200,6 +228,10 @@ Return the CV from the GV.
 #define GvIMPORTED_CV(gv)	(GvFLAGS(gv) & GVf_IMPORTED_CV)
 #define GvIMPORTED_CV_on(gv)	(GvFLAGS(gv) |= GVf_IMPORTED_CV)
 #define GvIMPORTED_CV_off(gv)	(GvFLAGS(gv) &= ~GVf_IMPORTED_CV)
+
+#define GvONCE_FATAL(gv)	(GvFLAGS(gv) & GVf_ONCE_FATAL)
+#define GvONCE_FATAL_on(gv)	(GvFLAGS(gv) |= GVf_ONCE_FATAL)
+#define GvONCE_FATAL_off(gv)	(GvFLAGS(gv) &= ~GVf_ONCE_FATAL)
 
 #ifndef PERL_CORE
 #  define GvIN_PAD(gv)		0
@@ -248,7 +280,8 @@ Return the CV from the GV.
 #define GV_NOUNIVERSAL  0x2000  /* Skip UNIVERSAL lookup */
 
 /* Flags for gv_autoload_*/
-#define GV_AUTOLOAD_ISMETHOD 1	/* autoloading a method? */
+#define GV_AUTOLOAD_ISMETHOD 1	/* autoloading a method?  gv_autoload4 will
+                                   break if this is changed from being 1 */
 
 /*      SVf_UTF8 (more accurately the return value from SvUTF8) is also valid
         as a flag to various gv_* functions, so ensure it lies
@@ -267,7 +300,13 @@ Return the CV from the GV.
 #define gv_fullname3(sv,gv,prefix) gv_fullname4(sv,gv,prefix,TRUE)
 #define gv_efullname3(sv,gv,prefix) gv_efullname4(sv,gv,prefix,TRUE)
 #define gv_fetchmethod(stash, name) gv_fetchmethod_autoload(stash, name, TRUE)
+
+/*
+=for apidoc_defn Am|GV *|gv_fetchsv_nomg|SV *name|I32 flags|const svtype sv_type
+=cut
+*/
 #define gv_fetchsv_nomg(n,f,t) gv_fetchsv(n,(f)|GV_NO_SVGMAGIC,t)
+
 #define gv_init(gv,stash,name,len,multi) \
         gv_init_pvn(gv,stash,name,len,GV_ADDMULTI*cBOOL(multi))
 #define gv_fetchmeth(stash,name,len,level) gv_fetchmeth_pvn(stash, name, len, level, 0)
@@ -275,10 +314,12 @@ Return the CV from the GV.
 #define gv_fetchmethod_flags(stash,name,flags) gv_fetchmethod_pv_flags(stash, name, flags)
 
 /*
-=for apidoc gv_autoload4
-Equivalent to C<L</gv_autoload_pvn>>.
-
+=for apidoc_defn ARmd|GV *|gv_autoload4|NULLOK HV *stash                    \
+                                       |NN const char *name                 \
+                                       |STRLEN len                          \
+                                       |I32 method
 =cut
+
 */
 #define gv_autoload4(stash, name, len, autoload) \
         gv_autoload_pvn(stash, name, len, cBOOL(autoload))

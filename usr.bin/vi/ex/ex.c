@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex.c,v 1.23 2023/06/23 15:06:45 millert Exp $	*/
+/*	$OpenBSD: ex.c,v 1.25 2026/06/16 02:03:35 millert Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -801,7 +801,8 @@ skip_srch:	if (ecp->cmd == &cmds[C_VISUAL_EX] && F_ISSET(sp, SC_VI))
 	ecp->cp = ecp->save_cmd;
 	ecp->save_cmd = p;
 	ecp->save_cmdlen = ecp->clen;
-	ecp->clen = ((ecp->save_cmd - ecp->cp) - 1) - discard;
+	len = ecp->save_cmd - ecp->cp;
+	ecp->clen = (len > 1 + discard) ? len - 1 - discard : 0;
 
 	/*
 	 * QUOTING NOTE:
@@ -1439,7 +1440,7 @@ addr_verify:
 		 * The print commands have already handled the `print' flags.
 		 * If so, clear them.
 		 */
-		if (FL_ISSET(ecp->iflags, E_CLRFLAG))
+		if (F_ISSET(ecp, E_CLRFLAG))
 			FL_CLR(ecp->iflags, E_C_HASH | E_C_LIST | E_C_PRINT);
 
 		/* If hash set only because of the number option, discard it. */

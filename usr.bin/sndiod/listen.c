@@ -1,4 +1,4 @@
-/*	$OpenBSD: listen.c,v 1.14 2020/01/23 20:55:01 ratchov Exp $	*/
+/*	$OpenBSD: listen.c,v 1.17 2026/03/15 10:05:09 ratchov Exp $	*/
 /*
  * Copyright (c) 2008 Alexandre Ratchov <alex@caoua.org>
  *
@@ -60,59 +60,95 @@ listen_close(struct listen *f)
 	for (pf = &listen_list; *pf != f; pf = &(*pf)->next) {
 #ifdef DEBUG
 		if (*pf == NULL) {
-			log_puts("listen_close: not on list\n");
+			logx(0, "%s: not on list", __func__);
 			panic();
 		}
 #endif
 	}
 	*pf = f->next;
 
-	if (f->path != NULL) {
-		xfree(f->path);
-	}
 	file_del(f->file);
 	close(f->fd);
 	xfree(f);
 }
 
 int
-listen_new_un(char *path)
+listen_new_un(unsigned int unit)
 {
-	int sock, oldumask;
+	int len, sock, oldumask;
 	struct sockaddr_un sockname;
 	struct listen *f;
+	struct stat sb;
+	uid_t uid;
+	mode_t mask, omask;
+	char dir[sizeof(sockname.sun_path)];
+
+	uid = geteuid();
+	if (uid == 0) {
+		mask = 022;
+		len = snprintf(sockname.sun_path, sizeof(sockname.sun_path),
+		    SOCKPATH_DIR "/" SOCKPATH_FILE "%u", unit);
+	} else {
+		mask = 077;
+		len = snprintf(sockname.sun_path, sizeof(sockname.sun_path),
+		    SOCKPATH_DIR "-%u/" SOCKPATH_FILE "%u", uid, unit);
+	}
+	if (len >= sizeof(sockname.sun_path)) {
+		logx(0, "unix socket name too long");
+		return 0;
+	}
+
+	while (sockname.sun_path[len] != '/')
+		len--;
+	memcpy(dir, sockname.sun_path, len);
+	dir[len] = 0;
+
+	omask = umask(mask);
+	if (mkdir(dir, 0777) == -1) {
+		if (errno != EEXIST) {
+			logx(0, "mkdir(\"%s\")", dir);
+			return 0;
+		}
+	}
+	umask(omask);
+	if (stat(dir, &sb) == -1) {
+		logx(0, "stat(\"%s\")", dir);
+		return 0;
+	}
+	if (!S_ISDIR(sb.st_mode)) {
+		logx(0, "%s is not a directory", dir);
+		return 0;
+	}
+	if (sb.st_uid != uid || (sb.st_mode & mask) != 0) {
+		logx(0, "%s has wrong permissions", dir);
+		return 0;
+	}
 
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock == -1) {
-		log_puts(path);
-		log_puts(": failed to create socket\n");
+		logx(0, "%s: failed to create socket", sockname.sun_path);
 		return 0;
 	}
-	if (unlink(path) == -1 && errno != ENOENT) {
-		log_puts(path);
-		log_puts(": failed to unlink socket\n");
+	if (unlink(sockname.sun_path) == -1 && errno != ENOENT) {
+		logx(0, "%s: failed to unlink socket", sockname.sun_path);
 		goto bad_close;
 	}
 	sockname.sun_family = AF_UNIX;
-	strlcpy(sockname.sun_path, path, sizeof(sockname.sun_path));
 	oldumask = umask(0111);
 	if (bind(sock, (struct sockaddr *)&sockname,
 		sizeof(struct sockaddr_un)) == -1) {
-		log_puts(path);
-		log_puts(": failed to bind socket\n");
+		logx(0, "%s: failed to bind socket", sockname.sun_path);
 		goto bad_close;
 	}
 	if (listen(sock, 1) == -1) {
-		log_puts(path);
-		log_puts(": failed to listen\n");
+		logx(0, "%s: failed to listen", sockname.sun_path);
 		goto bad_close;
 	}
 	umask(oldumask);
 	f = xmalloc(sizeof(struct listen));
-	f->file = file_new(&listen_fileops, f, path, 1);
+	f->file = file_new(&listen_fileops, f, "unix", 1);
 	if (f->file == NULL)
 		goto bad_close;
-	f->path = xstrdup(path);
 	f->fd = sock;
 	f->next = listen_list;
 	listen_list = f;
@@ -141,8 +177,7 @@ listen_new_tcp(char *addr, unsigned int port)
 	aihints.ai_protocol = IPPROTO_TCP;
 	error = getaddrinfo(host, serv, &aihints, &ailist);
 	if (error) {
-		log_puts(addr);
-		log_puts(": failed to resolve address\n");
+		logx(0, "%s: failed to resolve address", addr);
 		return 0;
 	}
 
@@ -153,35 +188,30 @@ listen_new_tcp(char *addr, unsigned int port)
 	for (ai = ailist; ai != NULL; ai = ai->ai_next) {
 		s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (s == -1) {
-			log_puts(addr);
-			log_puts(": failed to create socket\n");
+			logx(0, "%s: failed to create socket", addr);
 			continue;
 		}
 		opt = 1;
 		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
 		    &opt, sizeof(int)) == -1) {
-			log_puts(addr);
-			log_puts(": failed to set SO_REUSEADDR\n");
+			logx(0, "%s: failed to set SO_REUSEADDR", addr);
 			goto bad_close;
 		}
 		if (bind(s, ai->ai_addr, ai->ai_addrlen) == -1) {
-			log_puts(addr);
-			log_puts(": failed to bind socket\n");
+			logx(0, "%s: failed to bind socket", addr);
 			goto bad_close;
 		}
 		if (listen(s, 1) == -1) {
-			log_puts(addr);
-			log_puts(": failed to listen\n");
+			logx(0, "%s: failed to listen", addr);
 			goto bad_close;
 		}
 		f = xmalloc(sizeof(struct listen));
-		f->file = file_new(&listen_fileops, f, addr, 1);
-		if (f == NULL) {
+		f->file = file_new(&listen_fileops, f, "tcp", 1);
+		if (f->file == NULL) {
 		bad_close:
 			close(s);
 			continue;
 		}
-		f->path = NULL;
 		f->fd = s;
 		f->next = listen_list;
 		listen_list = f;
@@ -237,16 +267,14 @@ listen_in(void *arg)
 		return;
 	}
 	if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
-		file_log(f->file);
-		log_puts(": failed to set non-blocking mode\n");
+		logx(0, "%s: failed to set non-blocking mode", f->file->name);
 		goto bad_close;
 	}
-	if (f->path == NULL) {
+	if (caddr.sa_family == AF_INET || caddr.sa_family == AF_INET6) {
 		opt = 1;
 		if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
 		    &opt, sizeof(int)) == -1) {
-			file_log(f->file);
-			log_puts(": failed to set TCP_NODELAY flag\n");
+			logx(0, "%s: failed to set TCP_NODELAY flag", f->file->name);
 			goto bad_close;
 		}
 	}

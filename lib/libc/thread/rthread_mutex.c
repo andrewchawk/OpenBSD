@@ -1,4 +1,4 @@
-/*	$OpenBSD: rthread_mutex.c,v 1.5 2019/02/13 13:09:32 mpi Exp $ */
+/*	$OpenBSD: rthread_mutex.c,v 1.8 2026/03/27 12:26:58 claudio Exp $ */
 /*
  * Copyright (c) 2017 Martin Pieuchot <mpi@openbsd.org>
  * Copyright (c) 2012 Philip Guenther <guenther@openbsd.org>
@@ -43,7 +43,7 @@ enum {
 #define SPIN_WAIT()	do { } while (0)
 #endif
 
-static _atomic_lock_t static_init_lock = _SPINLOCK_UNLOCKED;
+static struct __cmtx static_init_lock = __CMTX_INITIALIZER();
 
 int
 pthread_mutex_init(pthread_mutex_t *mutexp, const pthread_mutexattr_t *attr)
@@ -73,7 +73,7 @@ pthread_mutex_destroy(pthread_mutex_t *mutexp)
 {
 	pthread_mutex_t mutex;
 
-	if (mutexp == NULL || *mutexp == NULL)
+	if (mutexp == NULL)
 		return (EINVAL);
 
 	mutex = *mutexp;
@@ -151,10 +151,10 @@ _rthread_mutex_timedlock(pthread_mutex_t *mutexp, int trywait,
 	 * is NULL.
 	 */
 	if (*mutexp == NULL) {
-		_spinlock(&static_init_lock);
+		__cmtx_enter(&static_init_lock);
 		if (*mutexp == NULL)
 			error = pthread_mutex_init(mutexp, NULL);
-		_spinunlock(&static_init_lock);
+		__cmtx_leave(&static_init_lock);
 		if (error != 0)
 			return (EINVAL);
 	}
@@ -197,7 +197,7 @@ _rthread_mutex_timedlock(pthread_mutex_t *mutexp, int trywait,
 		 * doubt set the state to CONTENDED.
 		 */
 		lock = atomic_swap_uint(&mutex->lock, CONTENDED);
-	};
+	}
 
 	membar_enter_after_atomic();
 	mutex->owner = self;

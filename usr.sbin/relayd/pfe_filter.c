@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_filter.c,v 1.66 2024/06/17 08:02:57 sashan Exp $	*/
+/*	$OpenBSD: pfe_filter.c,v 1.69 2026/08/07 10:21:39 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -38,6 +38,7 @@
 #define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 #include "relayd.h"
+#include "log.h"
 
 int	 transaction_init(struct relayd *, const char *);
 int	 transaction_commit(struct relayd *);
@@ -237,7 +238,7 @@ kill_srcnodes(struct relayd *env, struct table *table)
 
 		switch (host->conf.ss.ss_family) {
 		case AF_INET:
-		sain = (struct sockaddr_in *)&host->conf.ss;
+			sain = (struct sockaddr_in *)&host->conf.ss;
 			bcopy(&sain->sin_addr,
 			    &psnk.psnk_dst.addr.v.a.addr.v4,
 			    sizeof(psnk.psnk_dst.addr.v.a.addr.v4));
@@ -413,7 +414,7 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 		rio.rule.dst.port[1] = address->port.val[1];
 		rio.rule.rtableid = -1; /* stay in the main routing table */
 		rio.rule.onrdomain = env->sc_rtable;
-		DPRINTF("%s rtable %d",__func__,env->sc_rtable);
+		log_debug("%s rtable %d", __func__, env->sc_rtable);
 
 		if (rio.rule.proto == IPPROTO_TCP)
 			rio.rule.timeout[PFTM_TCP_ESTABLISHED] =

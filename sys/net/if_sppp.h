@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_sppp.h,v 1.30 2021/11/17 18:00:24 bket Exp $	*/
+/*	$OpenBSD: if_sppp.h,v 1.33 2026/05/16 13:27:03 daniel Exp $	*/
 /*	$NetBSD: if_sppp.h,v 1.2.2.1 1999/04/04 06:57:39 explorer Exp $	*/
 
 /*
@@ -174,6 +174,7 @@ struct sppp {
 	time_t	pp_last_receive;	/* peer's last "sign of life" */
 	time_t	pp_last_activity;	/* second of last payload data s/r */
 	enum ppp_phase pp_phase;	/* phase we're currently in */
+	struct task pp_autodial;
 	int	state[IDX_COUNT];	/* state machine */
 	u_char  confid[IDX_COUNT];	/* id of last configuration request */
 	int	rst_counter[IDX_COUNT];	/* restart counter */
@@ -232,9 +233,10 @@ struct sppp {
 void sppp_attach (struct ifnet *ifp);
 void sppp_detach (struct ifnet *ifp);
 void sppp_input (struct ifnet *ifp, struct mbuf *m);
+int sppp_proto_up(struct ifnet *ifp, uint16_t);
 
 /* Workaround */
-void spppattach (struct ifnet *ifp);
+void spppattach (int);
 int sppp_ioctl(struct ifnet *ifp, u_long cmd, void *data);
 
 struct mbuf *sppp_dequeue (struct ifnet *ifp);

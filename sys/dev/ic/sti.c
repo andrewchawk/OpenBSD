@@ -1,4 +1,4 @@
-/*	$OpenBSD: sti.c,v 1.83 2022/07/15 19:29:27 deraadt Exp $	*/
+/*	$OpenBSD: sti.c,v 1.86 2026/05/12 14:49:35 miod Exp $	*/
 
 /*
  * Copyright (c) 2000-2003 Michael Shalayeff
@@ -105,15 +105,16 @@ int	sti_inqcfg(struct sti_screen *, struct sti_inqconfout *);
 int	sti_setcment(struct sti_screen *, u_int, u_char, u_char, u_char);
 
 struct sti_screen *
-	sti_attach_screen(struct sti_softc *, int);
+	sti_attach_screen(struct sti_softc *, bus_space_handle_t, int);
 void	sti_describe_screen(struct sti_softc *, struct sti_screen *);
 void	sti_end_attach_screen(struct sti_softc *, struct sti_screen *, int);
-int	sti_fetchfonts(struct sti_screen *, struct sti_inqconfout *, u_int32_t,
-	    u_int);
-void	sti_region_setup(struct sti_screen *);
+int	sti_fetchfonts(struct sti_screen *, bus_space_handle_t,
+	    struct sti_inqconfout *, u_int32_t, u_int);
+int32_t	sti_gvid(void *, uint32_t, uint32_t *);
+void	sti_region_setup(struct sti_screen *, bus_space_handle_t);
 int	sti_rom_setup(struct sti_rom *, bus_space_tag_t, bus_space_tag_t,
 	    bus_space_handle_t, bus_addr_t *, u_int);
-int	sti_screen_setup(struct sti_screen *, int);
+int	sti_screen_setup(struct sti_screen *, bus_space_handle_t, int);
 
 int	ngle_default_putcmap(struct sti_screen *, u_int, u_int);
 
@@ -122,6 +123,10 @@ void	ngle_elk_setupfb(struct sti_screen *);
 void	ngle_timber_setupfb(struct sti_screen *);
 int	ngle_putcmap(struct sti_screen *, u_int, u_int);
 
+/*
+ * Helper macros to control whether the STI ROM is accessible on PCI
+ * devices.
+ */
 #if NSTI_PCI > 0
 #define	STI_ENABLE_ROM(sc) \
 do { \
@@ -148,9 +153,11 @@ do { \
 	 (bus_space_read_1(memt, romh, (o) + 11) <<  8) | \
 	 (bus_space_read_1(memt, romh, (o) + 15)))
 
+/* invoked with the device name already printed */
 int
 sti_attach_common(struct sti_softc *sc, bus_space_tag_t iot,
-    bus_space_tag_t memt, bus_space_handle_t romh, u_int codebase)
+    bus_space_tag_t memt, bus_space_handle_t romh, const uint8_t *rom_copy,
+    u_int codebase)
 {
 	struct sti_rom *rom;
 	int rc;
@@ -158,11 +165,12 @@ sti_attach_common(struct sti_softc *sc, bus_space_tag_t iot,
 	rom = (struct sti_rom *)malloc(sizeof(*rom), M_DEVBUF,
 	    M_NOWAIT | M_ZERO);
 	if (rom == NULL) {
-		printf("cannot allocate rom data\n");
+		printf(": cannot allocate rom data\n");
 		return (ENOMEM);
 	}
 
 	rom->rom_softc = sc;
+	rom->rom_copy = rom_copy;	/* may be NULL */
 	rc = sti_rom_setup(rom, iot, memt, romh, sc->bases, codebase);
 	if (rc != 0) {
 		free(rom, M_DEVBUF, sizeof *rom);
@@ -173,7 +181,7 @@ sti_attach_common(struct sti_softc *sc, bus_space_tag_t iot,
 
 	sti_describe(sc);
 
-	sc->sc_scr = sti_attach_screen(sc,
+	sc->sc_scr = sti_attach_screen(sc, romh,
 	    sc->sc_flags & STI_CONSOLE ?  0 : STI_CLEARSCR);
 	if (sc->sc_scr == NULL)
 		rc = ENOMEM;
@@ -182,7 +190,7 @@ sti_attach_common(struct sti_softc *sc, bus_space_tag_t iot,
 }
 
 struct sti_screen *
-sti_attach_screen(struct sti_softc *sc, int flags)
+sti_attach_screen(struct sti_softc *sc, bus_space_handle_t romh, int flags)
 {
 	struct sti_screen *scr;
 	int rc;
@@ -190,12 +198,13 @@ sti_attach_screen(struct sti_softc *sc, int flags)
 	scr = (struct sti_screen *)malloc(sizeof(*scr), M_DEVBUF,
 	    M_NOWAIT | M_ZERO);
 	if (scr == NULL) {
-		printf("cannot allocate screen data\n");
+		printf("%s: cannot allocate screen data\n",
+		    sc->sc_dev.dv_xname);
 		return (NULL);
 	}
 
 	scr->scr_rom = sc->sc_rom;
-	rc = sti_screen_setup(scr, flags);
+	rc = sti_screen_setup(scr, romh, flags);
 	if (rc != 0) {
 		free(scr, M_DEVBUF, sizeof *scr);
 		return (NULL);
@@ -206,6 +215,7 @@ sti_attach_screen(struct sti_softc *sc, int flags)
 	return (scr);
 }
 
+/* invoked with the device name already printed */
 int
 sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
     bus_space_handle_t romh, bus_addr_t *bases, u_int codebase)
@@ -215,11 +225,8 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 	vaddr_t va;
 	paddr_t pa;
 
-	STI_ENABLE_ROM(rom->rom_softc);
-
 	rom->iot = iot;
 	rom->memt = memt;
-	rom->romh = romh;
 	rom->bases = bases;
 
 	/*
@@ -227,62 +234,70 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 	 */
 
 	dd = &rom->rom_dd;
-	rom->rom_devtype = bus_space_read_1(memt, romh, 3);
-	if (rom->rom_devtype == STI_DEVTYPE1) {
-		dd->dd_type      = bus_space_read_1(memt, romh, 0x03);
-		dd->dd_nmon      = bus_space_read_1(memt, romh, 0x07);
-		dd->dd_grrev     = bus_space_read_1(memt, romh, 0x0b);
-		dd->dd_lrrev     = bus_space_read_1(memt, romh, 0x0f);
-		dd->dd_grid[0]   = parseword(0x10);
-		dd->dd_grid[1]   = parseword(0x20);
-		dd->dd_fntaddr   = parseword(0x30) & ~3;
-		dd->dd_maxst     = parseword(0x40);
-		dd->dd_romend    = parseword(0x50) & ~3;
-		dd->dd_reglst    = parseword(0x60) & ~3;
-		dd->dd_maxreent  = parseshort(0x70);
-		dd->dd_maxtimo   = parseshort(0x78);
-		dd->dd_montbl    = parseword(0x80) & ~3;
-		dd->dd_udaddr    = parseword(0x90) & ~3;
-		dd->dd_stimemreq = parseword(0xa0);
-		dd->dd_udsize    = parseword(0xb0);
-		dd->dd_pwruse    = parseshort(0xc0);
-		dd->dd_bussup    = bus_space_read_1(memt, romh, 0xcb);
-		dd->dd_ebussup   = bus_space_read_1(memt, romh, 0xcf);
-		dd->dd_altcodet  = bus_space_read_1(memt, romh, 0xd3);
-		dd->dd_eddst[0]  = bus_space_read_1(memt, romh, 0xd7);
-		dd->dd_eddst[1]  = bus_space_read_1(memt, romh, 0xdb);
-		dd->dd_eddst[2]  = bus_space_read_1(memt, romh, 0xdf);
-		dd->dd_cfbaddr   = parseword(0xe0) & ~3;
-
-		codebase <<= 2;
-		dd->dd_pacode[0x0] = parseword(codebase + 0x000) & ~3;
-		dd->dd_pacode[0x1] = parseword(codebase + 0x010) & ~3;
-		dd->dd_pacode[0x2] = parseword(codebase + 0x020) & ~3;
-		dd->dd_pacode[0x3] = parseword(codebase + 0x030) & ~3;
-		dd->dd_pacode[0x4] = parseword(codebase + 0x040) & ~3;
-		dd->dd_pacode[0x5] = parseword(codebase + 0x050) & ~3;
-		dd->dd_pacode[0x6] = parseword(codebase + 0x060) & ~3;
-		dd->dd_pacode[0x7] = parseword(codebase + 0x070) & ~3;
-		dd->dd_pacode[0x8] = parseword(codebase + 0x080) & ~3;
-		dd->dd_pacode[0x9] = parseword(codebase + 0x090) & ~3;
-		dd->dd_pacode[0xa] = parseword(codebase + 0x0a0) & ~3;
-		dd->dd_pacode[0xb] = parseword(codebase + 0x0b0) & ~3;
-		dd->dd_pacode[0xc] = parseword(codebase + 0x0c0) & ~3;
-		dd->dd_pacode[0xd] = parseword(codebase + 0x0d0) & ~3;
-		dd->dd_pacode[0xe] = parseword(codebase + 0x0e0) & ~3;
-		dd->dd_pacode[0xf] = parseword(codebase + 0x0f0) & ~3;
-	} else {	/* STI_DEVTYPE4 */
-		bus_space_read_raw_region_4(memt, romh, 0, (u_int8_t *)dd,
-		    sizeof(*dd));
+	if (rom->rom_copy != NULL) {
+		rom->rom_devtype = STI_DEVTYPE4;
+		memcpy(dd, rom->rom_copy, sizeof(*dd));
 		/* fix pacode... */
-		bus_space_read_raw_region_4(memt, romh, codebase,
-		    (u_int8_t *)dd->dd_pacode, sizeof(dd->dd_pacode));
+		memcpy(dd->dd_pacode, rom->rom_copy + codebase,
+		    sizeof(dd->dd_pacode));
+	} else {
+		STI_ENABLE_ROM(rom->rom_softc);
+		rom->rom_devtype = bus_space_read_1(memt, romh, 3);
+		if (rom->rom_devtype == STI_DEVTYPE1) {
+			dd->dd_type      = bus_space_read_1(memt, romh, 0x03);
+			dd->dd_nmon      = bus_space_read_1(memt, romh, 0x07);
+			dd->dd_grrev     = bus_space_read_1(memt, romh, 0x0b);
+			dd->dd_lrrev     = bus_space_read_1(memt, romh, 0x0f);
+			dd->dd_grid[0]   = parseword(0x10);
+			dd->dd_grid[1]   = parseword(0x20);
+			dd->dd_fntaddr   = parseword(0x30) & ~3;
+			dd->dd_maxst     = parseword(0x40);
+			dd->dd_romend    = parseword(0x50) & ~3;
+			dd->dd_reglst    = parseword(0x60) & ~3;
+			dd->dd_maxreent  = parseshort(0x70);
+			dd->dd_maxtimo   = parseshort(0x78);
+			dd->dd_montbl    = parseword(0x80) & ~3;
+			dd->dd_udaddr    = parseword(0x90) & ~3;
+			dd->dd_stimemreq = parseword(0xa0);
+			dd->dd_udsize    = parseword(0xb0);
+			dd->dd_pwruse    = parseshort(0xc0);
+			dd->dd_bussup    = bus_space_read_1(memt, romh, 0xcb);
+			dd->dd_ebussup   = bus_space_read_1(memt, romh, 0xcf);
+			dd->dd_altcodet  = bus_space_read_1(memt, romh, 0xd3);
+			dd->dd_eddst[0]  = bus_space_read_1(memt, romh, 0xd7);
+			dd->dd_eddst[1]  = bus_space_read_1(memt, romh, 0xdb);
+			dd->dd_eddst[2]  = bus_space_read_1(memt, romh, 0xdf);
+			dd->dd_cfbaddr   = parseword(0xe0) & ~3;
+
+			codebase <<= 2;
+			dd->dd_pacode[0x0] = parseword(codebase + 0x000) & ~3;
+			dd->dd_pacode[0x1] = parseword(codebase + 0x010) & ~3;
+			dd->dd_pacode[0x2] = parseword(codebase + 0x020) & ~3;
+			dd->dd_pacode[0x3] = parseword(codebase + 0x030) & ~3;
+			dd->dd_pacode[0x4] = parseword(codebase + 0x040) & ~3;
+			dd->dd_pacode[0x5] = parseword(codebase + 0x050) & ~3;
+			dd->dd_pacode[0x6] = parseword(codebase + 0x060) & ~3;
+			dd->dd_pacode[0x7] = parseword(codebase + 0x070) & ~3;
+			dd->dd_pacode[0x8] = parseword(codebase + 0x080) & ~3;
+			dd->dd_pacode[0x9] = parseword(codebase + 0x090) & ~3;
+			dd->dd_pacode[0xa] = parseword(codebase + 0x0a0) & ~3;
+			dd->dd_pacode[0xb] = parseword(codebase + 0x0b0) & ~3;
+			dd->dd_pacode[0xc] = parseword(codebase + 0x0c0) & ~3;
+			dd->dd_pacode[0xd] = parseword(codebase + 0x0d0) & ~3;
+			dd->dd_pacode[0xe] = parseword(codebase + 0x0e0) & ~3;
+			dd->dd_pacode[0xf] = parseword(codebase + 0x0f0) & ~3;
+		} else {	/* STI_DEVTYPE4 */
+			bus_space_read_raw_region_4(memt, romh, 0,
+			    (u_int8_t *)dd, sizeof(*dd));
+			/* fix pacode... */
+			bus_space_read_raw_region_4(memt, romh, codebase,
+			    (u_int8_t *)dd->dd_pacode, sizeof(dd->dd_pacode));
+		}
+		STI_DISABLE_ROM(rom->rom_softc);
 	}
 
-	STI_DISABLE_ROM(rom->rom_softc);
-
 #ifdef STIDEBUG
-	printf("dd:\n"
+	printf(": "
 	    "devtype=%x, rev=%x;%d, altt=%x, gid=%08x%08x, font=%x, mss=%x\n"
 	    "end=%x, regions=%x, msto=%x, timo=%d, mont=%x, user=%x[%x]\n"
 	    "memrq=%x, pwr=%d, bus=%x, ebus=%x, cfb=%x\n"
@@ -299,6 +314,7 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 	    dd->dd_pacode[0x9], dd->dd_pacode[0xa], dd->dd_pacode[0xb],
 	    dd->dd_pacode[0xc], dd->dd_pacode[0xd], dd->dd_pacode[0xe],
 	    dd->dd_pacode[0xf]);
+	printf("%s", rom->rom_softc->sc_dev.dv_xname);
 #endif
 
 	/*
@@ -308,7 +324,7 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 	 */
 
 	for (i = STI_END; dd->dd_pacode[i] == 0; i--)
-		;
+		continue;
 	size = dd->dd_pacode[i] - dd->dd_pacode[STI_BEGIN];
 	if (rom->rom_devtype == STI_DEVTYPE1)
 		size = (size + 3) / 4;
@@ -317,34 +333,40 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 		return (EINVAL);
 	}
 
-	if (!(rom->rom_code = km_alloc(round_page(size), &kv_any,
-	    &kp_zero, &kd_waitok))) {
-		printf(": cannot allocate %u bytes for code\n", size);
-		return (ENOMEM);
-	}
+	if (rom->rom_copy != NULL) {
+		rom->rom_code = rom->rom_copy + dd->dd_pacode[STI_BEGIN];
+	} else {
+		if (!(rom->rom_code = km_alloc(round_page(size), &kv_any,
+		    &kp_zero, &kd_waitok))) {
+			printf(": cannot allocate %u bytes for code\n", size);
+			return (ENOMEM);
+		}
 #ifdef STIDEBUG
-	printf("code=%p[%x]\n", rom->rom_code, size);
+		printf(": code=%p[%x]\n", rom->rom_code, size);
+		printf("%s", rom->rom_softc->sc_dev.dv_xname);
 #endif
 
-	/*
-	 * Copy code into memory and make it executable.
-	 */
+		/*
+		 * Copy code into memory.
+		 */
 
-	STI_ENABLE_ROM(rom->rom_softc);
+		STI_ENABLE_ROM(rom->rom_softc);
+		if (rom->rom_devtype == STI_DEVTYPE1) {
+			uint8_t *p = (uint8_t *)rom->rom_code;
+			uint32_t addr, eaddr;
 
-	if (rom->rom_devtype == STI_DEVTYPE1) {
-		u_int8_t *p = rom->rom_code;
-		u_int32_t addr, eaddr;
-
-		for (addr = dd->dd_pacode[STI_BEGIN], eaddr = addr + size * 4;
-		    addr < eaddr; addr += 4 )
-			*p++ = bus_space_read_4(memt, romh, addr) & 0xff;
-
-	} else	/* STI_DEVTYPE4 */
-		bus_space_read_raw_region_4(memt, romh,
-		    dd->dd_pacode[STI_BEGIN], rom->rom_code, size);
-
-	STI_DISABLE_ROM(rom->rom_softc);
+			for (addr = dd->dd_pacode[STI_BEGIN],
+			    eaddr = addr + size * 4; addr < eaddr; addr += 4) {
+				*p++ =
+				    bus_space_read_4(memt, romh, addr) & 0xff;
+			}
+		} else {	/* STI_DEVTYPE4 */
+			bus_space_read_raw_region_4(memt, romh,
+			    dd->dd_pacode[STI_BEGIN], (uint8_t *)rom->rom_code,
+			    size);
+		}
+		STI_DISABLE_ROM(rom->rom_softc);
+	}
 
 	/*
 	 * Remap the ROM code as executable.  This happens to be the
@@ -353,8 +375,8 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 	 * high-level interface to map kernel memory as executable we
 	 * use low-level pmap calls for this.
 	 */
-	for (va = (vaddr_t)rom->rom_code;
-	     va < (vaddr_t)rom->rom_code + round_page(size);
+	for (va = trunc_page((vaddr_t)rom->rom_code);
+	     va < round_page((vaddr_t)rom->rom_code + size);
 	     va += PAGE_SIZE) {
 		pmap_extract(pmap_kernel(), va, &pa);
 		pmap_kenter_pa(va, pa, PROT_READ | PROT_EXEC);
@@ -371,18 +393,10 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
 	      (rom->rom_devtype == STI_DEVTYPE1? 4 : 1)))
 
 	rom->init	= (sti_init_t)O(STI_INIT_GRAPH);
-	rom->mgmt	= (sti_mgmt_t)O(STI_STATE_MGMT);
 	rom->unpmv	= (sti_unpmv_t)O(STI_FONT_UNPMV);
 	rom->blkmv	= (sti_blkmv_t)O(STI_BLOCK_MOVE);
-	rom->test	= (sti_test_t)O(STI_SELF_TEST);
-	rom->exhdl	= (sti_exhdl_t)O(STI_EXCEP_HDLR);
 	rom->inqconf	= (sti_inqconf_t)O(STI_INQ_CONF);
 	rom->scment	= (sti_scment_t)O(STI_SCM_ENT);
-	rom->dmac	= (sti_dmac_t)O(STI_DMA_CTRL);
-	rom->flowc	= (sti_flowc_t)O(STI_FLOW_CTRL);
-	rom->utiming	= (sti_utiming_t)O(STI_UTIMING);
-	rom->pmgr	= (sti_pmgr_t)O(STI_PROC_MGR);
-	rom->util	= (sti_util_t)O(STI_UTIL);
 
 #undef	O
 
@@ -401,11 +415,10 @@ sti_rom_setup(struct sti_rom *rom, bus_space_tag_t iot, bus_space_tag_t memt,
  * Map all regions.
  */
 void
-sti_region_setup(struct sti_screen *scr)
+sti_region_setup(struct sti_screen *scr, bus_space_handle_t romh)
 {
 	struct sti_rom *rom = scr->scr_rom;
 	bus_space_tag_t memt = rom->memt;
-	bus_space_handle_t romh = rom->romh;
 	bus_addr_t *bases = rom->bases;
 	struct sti_dd *dd = &rom->rom_dd;
 	struct sti_cfg *cc = &scr->scr_cfg;
@@ -414,25 +427,28 @@ sti_region_setup(struct sti_screen *scr)
 	bus_addr_t addr;
 
 #ifdef STIDEBUG
-	printf("stiregions @%p:\n", (void *)dd->dd_reglst);
+	printf("%s: regions @%p:\n",
+	    rom->rom_softc->sc_dev.dv_xname, (void *)dd->dd_reglst);
 #endif
 
 	/*
 	 * Read the region information.
 	 */
 
-	STI_ENABLE_ROM(rom->rom_softc);
-
-	if (rom->rom_devtype == STI_DEVTYPE1) {
-		for (regno = 0; regno < STI_REGION_MAX; regno++)
-			*(u_int *)(regions + regno) =
-			    parseword(dd->dd_reglst + regno * 0x10);
+	if (rom->rom_copy != NULL) {
+		memcpy(regions, rom->rom_copy + dd->dd_reglst, sizeof regions);
 	} else {
-		bus_space_read_raw_region_4(memt, romh, dd->dd_reglst,
-		    (u_int8_t *)regions, sizeof regions);
+		STI_ENABLE_ROM(rom->rom_softc);
+		if (rom->rom_devtype == STI_DEVTYPE1) {
+			for (regno = 0; regno < STI_REGION_MAX; regno++)
+				*(u_int *)(regions + regno) =
+				    parseword(dd->dd_reglst + regno * 0x10);
+		} else {
+			bus_space_read_raw_region_4(memt, romh, dd->dd_reglst,
+			    (u_int8_t *)regions, sizeof regions);
+		}
+		STI_DISABLE_ROM(rom->rom_softc);
 	}
-
-	STI_DISABLE_ROM(rom->rom_softc);
 
 	/*
 	 * Count them.
@@ -451,13 +467,10 @@ sti_region_setup(struct sti_screen *scr)
 		if (r->length == 0)
 			continue;
 
-		/*
-		 * Assume an existing mapping exists.
-		 */
 		addr = bases[regno] + (r->offset << PGSHIFT);
 
 #ifdef STIDEBUG
-		printf("%08x @ 0x%08lx%s%s%s%s\n",
+		printf("%08x @ 0x%08lx%s%s%s%s",
 		    r->length << PGSHIFT, addr, r->sys_only ? " sys" : "",
 		    r->cache ? " cache" : "", r->btlb ? " btlb" : "",
 		    r->last ? " last" : "");
@@ -466,30 +479,65 @@ sti_region_setup(struct sti_screen *scr)
 		/*
 		 * Region #0 is always the rom, and it should have been
 		 * mapped already.
-		 * XXX This expects a 1:1 mapping...
+		 *
+		 * However, if we are attaching a PCI device, then either
+		 * STI_BUSSUPPORT_ROMMAP is set in dd->dd_bussup, and we
+		 * use a copy of the ROM image in memory, or it isn't set,
+		 * in which case we want to access the rom through a regular
+		 * BAR instead of the PCI ROM BAR anymway.
 		 */
-		if (regno == 0 && romh == bases[0]) {
-			cc->regions[0] = addr;
-			continue;
+		if (regno == 0) {
+			if (rom->rom_copy != NULL) {
+				cc->regions[0] = bases[0];
+#ifdef STIDEBUG
+				printf(" -> 0x%08lx (ram copy)\n", bases[0]);
+#endif
+				continue;
+			} else {
+				if (romh == bases[0]) {
+					/*
+					 * XXX This expects a 1:1 mapping...
+					 */
+					cc->regions[0] = addr;
+#ifdef STIDEBUG
+					printf(" -> 0x%08lx (in rom mapping)\n",
+					    addr);
+#endif
+					continue;
+				}
+			}
 		}
 
 		if (bus_space_map(memt, addr, r->length << PGSHIFT,
 		    BUS_SPACE_MAP_LINEAR | (r->cache ?
 		    BUS_SPACE_MAP_CACHEABLE : 0), &rom->regh[regno]) != 0) {
-			rom->regh[regno] = romh;	/* XXX */
+			/*
+			 * If bus_space_map() fails, we are probably
+			 * overlapping the existing ROM mapping, so use it
+			 * anyway.
+			 * This is unlikely to occur on PCI devices, due to
+			 * the ROM being mapped separately at attach time.
+			 *
+			 * XXX only do this is the return value is EAGAIN,
+			 * XXX fail hard for any other value?
+			 */
+			rom->regh[regno] = romh;
 #ifdef STIDEBUG
-			printf("already mapped region\n");
+			printf(" -> 0x%08lx (already mapped region)\n", romh);
 #endif
 		} else {
 			addr = (bus_addr_t)
 			    bus_space_vaddr(memt, rom->regh[regno]);
-			if (regno == 1) {
-				scr->fbaddr = addr;
-				scr->fblen = r->length << PGSHIFT;
-			}
+#ifdef STIDEBUG
+			printf(" -> 0x%08lx\n", addr);
+#endif
 		}
 
 		cc->regions[regno] = addr;
+		if (regno == 1) {
+			scr->fbaddr = addr;
+			scr->fblen = r->length << PGSHIFT;
+		}
 	}
 
 #ifdef STIDEBUG
@@ -502,16 +550,51 @@ sti_region_setup(struct sti_screen *scr)
 #endif
 }
 
+/*
+ * ``gvid'' callback routine.
+ *
+ * The FireGL-UX board is using this interface, and will revert to direct
+ * PDC calls if no gvid callback is set.
+ * Unfortunately, under OpenBSD it is not possible to invoke PDC directly
+ * from its physical address once the MMU is turned on, and no documentation
+ * for the gvid interface (or for the particular PDC_PCI subroutines used
+ * by the FireGL-UX rom) has been found.
+ */
+int32_t
+sti_gvid(void *v, uint32_t cmd, uint32_t *params)
+{
+	struct sti_screen *scr = v;
+	struct sti_rom *rom = scr->scr_rom;
+
+	/* paranoia */
+	if (cmd != 0x000c0003)
+		return -1;
+
+	switch (params[0]) {
+	case 4:
+		/* register read */
+		params[2] =
+		    bus_space_read_4(rom->memt, rom->regh[2], params[1]);
+		return 0;
+	case 5:
+		/* register write */
+		bus_space_write_4(rom->memt, rom->regh[2], params[1],
+		    params[2]);
+		return 0;
+	default:
+		return -1;
+	}
+}
+
 int
-sti_screen_setup(struct sti_screen *scr, int flags)
+sti_screen_setup(struct sti_screen *scr, bus_space_handle_t romh, int flags)
 {
 	struct sti_rom *rom = scr->scr_rom;
 	bus_space_tag_t memt = rom->memt;
-	bus_space_handle_t romh = rom->romh;
 	struct sti_dd *dd = &rom->rom_dd;
 	struct sti_cfg *cc = &scr->scr_cfg;
-	struct sti_inqconfout cfg;
-	struct sti_einqconfout ecfg;
+	struct sti_inqconfout inq;
+	struct sti_einqconfout einq;
 	int error, i;
 	int geometry_kluge = 0;
 	u_int fontindex = 0;
@@ -522,26 +605,34 @@ sti_screen_setup(struct sti_screen *scr, int flags)
 
 	if (dd->dd_stimemreq) {
 		scr->scr_ecfg.addr =
-		    malloc(dd->dd_stimemreq, M_DEVBUF, M_NOWAIT);
+		    malloc(dd->dd_stimemreq, M_DEVBUF, M_NOWAIT | M_ZERO);
 		if (!scr->scr_ecfg.addr) {
-			printf("cannot allocate %d bytes for STI\n",
-			    dd->dd_stimemreq);
+			printf("%s: cannot allocate %d bytes for STI\n",
+			    rom->rom_softc->sc_dev.dv_xname, dd->dd_stimemreq);
 			return (ENOMEM);
 		}
 	}
 
-	sti_region_setup(scr);
+	if (dd->dd_ebussup & STI_EBUSSUPPORT_GVID) {
+		scr->scr_ecfg.future.g.gvid_cmd_arg = scr;
+		scr->scr_ecfg.future.g.gvid_cmd =
+		    (int32_t (*)(void *, ...))sti_gvid;
+	}
+
+	sti_region_setup(scr, romh);
 
 	if ((error = sti_init(scr, 0))) {
-		printf(": can not initialize (%d)\n", error);
+		printf("%s: can not initialize (%d)\n",
+		    rom->rom_softc->sc_dev.dv_xname, error);
 		goto fail;
 	}
 
-	bzero(&cfg, sizeof(cfg));
-	bzero(&ecfg, sizeof(ecfg));
-	cfg.ext = &ecfg;
-	if ((error = sti_inqcfg(scr, &cfg))) {
-		printf(": error %d inquiring config\n", error);
+	bzero(&inq, sizeof(inq));
+	bzero(&einq, sizeof(einq));
+	inq.ext = &einq;
+	if ((error = sti_inqcfg(scr, &inq))) {
+		printf("%s: error %d inquiring config\n",
+		    rom->rom_softc->sc_dev.dv_xname, error);
 		goto fail;
 	}
 
@@ -550,38 +641,39 @@ sti_screen_setup(struct sti_screen *scr, int flags)
 	 * similar to the displayable area size, at least in m68k mode.
 	 * Attempt to detect this and adjust here.
 	 */
-	if (cfg.owidth == cfg.width &&
-	    cfg.oheight == cfg.height)
+	if (inq.owidth == inq.width && inq.oheight == inq.height)
 		geometry_kluge = 1;
 
 	if (geometry_kluge) {
-		scr->scr_cfg.oscr_width = cfg.owidth =
-		    cfg.fbwidth - cfg.width;
-		scr->scr_cfg.oscr_height = cfg.oheight =
-		    cfg.fbheight - cfg.height;
+		scr->scr_cfg.oscr_width = inq.owidth =
+		    inq.fbwidth - inq.width;
+		scr->scr_cfg.oscr_height = inq.oheight =
+		    inq.fbheight - inq.height;
 	}
 
 	/*
 	 * Save a few fields for sti_describe_screen() later
 	 */
-	scr->fbheight = cfg.fbheight;
-	scr->fbwidth = cfg.fbwidth;
-	scr->oheight = cfg.oheight;
-	scr->owidth = cfg.owidth;
-	bcopy(cfg.name, scr->name, sizeof(scr->name));
+	scr->fbheight = inq.fbheight;
+	scr->fbwidth = inq.fbwidth;
+	scr->oheight = inq.oheight;
+	scr->owidth = inq.owidth;
+	bcopy(inq.name, scr->name, sizeof(scr->name));
 
 	if ((error = sti_init(scr, STI_TEXTMODE | flags))) {
-		printf(": can not initialize (%d)\n", error);
+		printf("%s: can not initialize (%d)\n",
+		    rom->rom_softc->sc_dev.dv_xname, error);
 		goto fail;
 	}
 #ifdef STIDEBUG
-	printf("conf: bpp=%d planes=%d attr=%b\n"
-	    "crt=0x%x:0x%x:0x%x hw=0x%x:0x%x:0x%x\n", cfg.bpp,
-	    cfg.planes, cfg.attributes, STI_INQCONF_BITS,
-	    ecfg.crt_config[0], ecfg.crt_config[1], ecfg.crt_config[2],
-	    ecfg.crt_hw[0], ecfg.crt_hw[1], ecfg.crt_hw[2]);
+	printf("%s: conf: bpp=%d planes=%d attr=%b\n"
+	    "crt=0x%x:0x%x:0x%x hw=0x%x:0x%x:0x%x\n",
+	    rom->rom_softc->sc_dev.dv_xname,
+	    inq.bpp, inq.planes, inq.attributes, STI_INQCONF_BITS,
+	    einq.crt_config[0], einq.crt_config[1], einq.crt_config[2],
+	    einq.crt_hw[0], einq.crt_hw[1], einq.crt_hw[2]);
 #endif
-	scr->scr_bpp = cfg.bppu;
+	scr->scr_bpp = inq.bppu;
 
 	/*
 	 * Although scr->scr_ecfg.current_monitor is not filled by
@@ -590,36 +682,49 @@ sti_screen_setup(struct sti_screen *scr, int flags)
 	 * resolution, pick its font index.
 	 */
 	if (dd->dd_montbl != 0) {
-		STI_ENABLE_ROM(rom->rom_softc);
-
-		for (i = 0; i < dd->dd_nmon; i++) {
-			u_int offs = dd->dd_montbl + 8 * i;
-			u_int32_t m[2];
-			sti_mon_t mon = (void *)m;
-			if (rom->rom_devtype == STI_DEVTYPE1) {
-				m[0] = parseword(4 * offs);
-				m[1] = parseword(4 * (offs + 4));
-			} else {
-				bus_space_read_raw_region_4(memt, romh, offs,
-				    (u_int8_t *)mon, sizeof(*mon));
+		if (rom->rom_copy != NULL) {
+			const struct sti_mon *mon = (const struct sti_mon *)
+			    (rom->rom_copy + dd->dd_montbl);
+			for (i = 0; i < dd->dd_nmon; i++, mon++) {
+				if (mon->width == scr->scr_cfg.scr_width &&
+				    mon->height == scr->scr_cfg.scr_height) {
+					fontindex = mon->font;
+					break;
+				}
 			}
+		} else {
+			STI_ENABLE_ROM(rom->rom_softc);
+			for (i = 0; i < dd->dd_nmon; i++) {
+				u_int offs = dd->dd_montbl + 8 * i;
+				uint32_t m[2];
+				sti_mon_t mon = (void *)m;
+				if (rom->rom_devtype == STI_DEVTYPE1) {
+					m[0] = parseword(4 * offs);
+					m[1] = parseword(4 * (offs + 4));
+				} else {
+					bus_space_read_raw_region_4(memt, romh,
+					    offs, (uint8_t *)mon, sizeof(*mon));
+				}
 
-			if (mon->width == scr->scr_cfg.scr_width &&
-			    mon->height == scr->scr_cfg.scr_height) {
-				fontindex = mon->font;
-				break;
+				if (mon->width == scr->scr_cfg.scr_width &&
+				    mon->height == scr->scr_cfg.scr_height) {
+					fontindex = mon->font;
+					break;
+				}
 			}
+			STI_DISABLE_ROM(rom->rom_softc);
 		}
 
-		STI_DISABLE_ROM(rom->rom_softc);
-
 #ifdef STIDEBUG
-		printf("font index: %d\n", fontindex);
+		printf("%s: font index: %d\n",
+		    rom->rom_softc->sc_dev.dv_xname, fontindex);
 #endif
 	}
 
-	if ((error = sti_fetchfonts(scr, &cfg, dd->dd_fntaddr, fontindex))) {
-		printf(": cannot fetch fonts (%d)\n", error);
+	if ((error =
+	    sti_fetchfonts(scr, romh, &inq, dd->dd_fntaddr, fontindex))) {
+		printf("%s: cannot fetch fonts (%d)\n",
+		    rom->rom_softc->sc_dev.dv_xname, error);
 		goto fail;
 	}
 
@@ -631,8 +736,8 @@ sti_screen_setup(struct sti_screen *scr, int flags)
 	 */
 
 	strlcpy(scr->scr_wsd.name, "std", sizeof(scr->scr_wsd.name));
-	scr->scr_wsd.ncols = cfg.width / scr->scr_curfont.width;
-	scr->scr_wsd.nrows = cfg.height / scr->scr_curfont.height;
+	scr->scr_wsd.ncols = inq.width / scr->scr_curfont.width;
+	scr->scr_wsd.nrows = inq.height / scr->scr_curfont.height;
 	scr->scr_wsd.textops = &sti_emulops;
 	scr->scr_wsd.fontwidth = scr->scr_curfont.width;
 	scr->scr_wsd.fontheight = scr->scr_curfont.height;
@@ -699,9 +804,10 @@ sti_screen_setup(struct sti_screen *scr, int flags)
 	case STI_DD_3X2V:
 	case STI_DD_DUAL_CRX:
 	case STI_DD_HCRX:
-	case STI_DD_LEGO:
 	case STI_DD_SUMMIT:
 	case STI_DD_PINNACLE:
+	case STI_DD_LEGO:
+	case STI_DD_FIREGL:
 	default:
 		scr->setupfb = NULL;
 		scr->putcmap =
@@ -713,7 +819,11 @@ sti_screen_setup(struct sti_screen *scr, int flags)
 	return (0);
 
 fail:
-	/* XXX free resources */
+	/* free resources */
+	if (scr->scr_romfont != NULL) {
+		free((void *)scr->scr_romfont, M_DEVBUF, 0);
+		scr->scr_romfont = NULL;
+	}
 	if (scr->scr_ecfg.addr != NULL) {
 		free(scr->scr_ecfg.addr, M_DEVBUF, 0);
 		scr->scr_ecfg.addr = NULL;
@@ -736,6 +846,7 @@ sti_describe_screen(struct sti_softc *sc, struct sti_screen *scr)
 	    fp->type, fp->bpc, fp->first, fp->last);
 }
 
+/* invoked with the device name already printed */
 void
 sti_describe(struct sti_softc *sc)
 {
@@ -809,12 +920,11 @@ sti_rom_size(bus_space_tag_t memt, bus_space_handle_t romh)
 }
 
 int
-sti_fetchfonts(struct sti_screen *scr, struct sti_inqconfout *cfg,
-    u_int32_t baseaddr, u_int fontindex)
+sti_fetchfonts(struct sti_screen *scr, bus_space_handle_t romh,
+    struct sti_inqconfout *inq, u_int32_t baseaddr, u_int fontindex)
 {
 	struct sti_rom *rom = scr->scr_rom;
 	bus_space_tag_t memt = rom->memt;
-	bus_space_handle_t romh = rom->romh;
 	struct sti_font *fp = &scr->scr_curfont;
 	u_int32_t addr;
 	int size;
@@ -831,52 +941,61 @@ sti_fetchfonts(struct sti_screen *scr, struct sti_inqconfout *cfg,
 	 * Get the first PROM font in memory
 	 */
 
-	STI_ENABLE_ROM(rom->rom_softc);
-
 rescan:
 	addr = baseaddr;
 	do {
-		if (rom->rom_devtype == STI_DEVTYPE1) {
-			fp->first  = parseshort(addr + 0x00);
-			fp->last   = parseshort(addr + 0x08);
-			fp->width  = bus_space_read_1(memt, romh,
-			    addr + 0x13);
-			fp->height = bus_space_read_1(memt, romh,
-			    addr + 0x17);
-			fp->type   = bus_space_read_1(memt, romh,
-			    addr + 0x1b);
-			fp->bpc    = bus_space_read_1(memt, romh,
-			    addr + 0x1f);
-			fp->next   = parseword(addr + 0x20);
-			fp->uheight= bus_space_read_1(memt, romh,
-			    addr + 0x33);
-			fp->uoffset= bus_space_read_1(memt, romh,
-			    addr + 0x37);
-		} else { /* STI_DEVTYPE4 */
-			bus_space_read_raw_region_4(memt, romh, addr,
-			    (u_int8_t *)fp, sizeof(struct sti_font));
+		if (rom->rom_copy != NULL) {
+			memcpy(fp, rom->rom_copy + addr,
+			    sizeof(struct sti_font));
+		} else {
+			STI_ENABLE_ROM(rom->rom_softc);
+			if (rom->rom_devtype == STI_DEVTYPE1) {
+				fp->first  = parseshort(addr + 0x00);
+				fp->last   = parseshort(addr + 0x08);
+				fp->width  = bus_space_read_1(memt, romh,
+				    addr + 0x13);
+				fp->height = bus_space_read_1(memt, romh,
+				    addr + 0x17);
+				fp->type   = bus_space_read_1(memt, romh,
+				    addr + 0x1b);
+				fp->bpc    = bus_space_read_1(memt, romh,
+				    addr + 0x1f);
+				fp->next   = parseword(addr + 0x20);
+				fp->uheight= bus_space_read_1(memt, romh,
+				    addr + 0x33);
+				fp->uoffset= bus_space_read_1(memt, romh,
+				    addr + 0x37);
+			} else { /* STI_DEVTYPE4 */
+				bus_space_read_raw_region_4(memt, romh, addr,
+				    (u_int8_t *)fp, sizeof(struct sti_font));
+			}
+			STI_DISABLE_ROM(rom->rom_softc);
 		}
 
 #ifdef STIDEBUG
-		STI_DISABLE_ROM(rom->rom_softc);
 		printf("font@%p: %d-%d, %dx%d, type %d, next %x\n",
 		    (void *)addr, fp->first, fp->last, fp->width, fp->height,
 		    fp->type, fp->next);
-		STI_ENABLE_ROM(rom->rom_softc);
 #endif
 
 		if (fontindex == 0) {
-			size = sizeof(struct sti_font) +
-			    (fp->last - fp->first + 1) * fp->bpc;
-			if (rom->rom_devtype == STI_DEVTYPE1)
-				size *= 4;
-			scr->scr_romfont = malloc(size, M_DEVBUF, M_NOWAIT);
-			if (scr->scr_romfont == NULL)
-				return (ENOMEM);
+			if (rom->rom_copy != NULL) {
+				scr->scr_romfont = rom->rom_copy + addr;
+			} else {
+				size = sizeof(struct sti_font) +
+				    (fp->last - fp->first + 1) * fp->bpc;
+				if (rom->rom_devtype == STI_DEVTYPE1)
+					size *= 4;
+				scr->scr_romfont =
+				    malloc(size, M_DEVBUF, M_NOWAIT);
+				if (scr->scr_romfont == NULL)
+					return (ENOMEM);
 
-			bus_space_read_raw_region_4(memt, romh, addr,
-			    (u_int8_t *)scr->scr_romfont, size);
-
+				STI_ENABLE_ROM(rom->rom_softc);
+				bus_space_read_raw_region_4(memt, romh, addr,
+				    (u_int8_t *)scr->scr_romfont, size);
+				STI_DISABLE_ROM(rom->rom_softc);
+			}
 			break;
 		}
 
@@ -893,24 +1012,22 @@ rescan:
 		goto rescan;
 	}
 
-	STI_DISABLE_ROM(rom->rom_softc);
-
 #ifdef notyet
 	/*
 	 * If there is enough room in the off-screen framebuffer memory,
 	 * display all the characters there in order to display them
 	 * faster with blkmv operations rather than unpmv later on.
 	 */
-	if (size <= cfg->fbheight *
-	    (cfg->fbwidth - cfg->width - cfg->owidth)) {
+	if (size <= inq->fbheight *
+	    (inq->fbwidth - inq->width - inq->owidth)) {
 		bzero(&a, sizeof(a));
 		a.flags.flags = STI_UNPMVF_WAIT;
 		a.in.fg_colour = STI_COLOUR_WHITE;
 		a.in.bg_colour = STI_COLOUR_BLACK;
 		a.in.font_addr = scr->scr_romfont;
 
-		scr->scr_fontmaxcol = cfg->fbheight / fp->height;
-		scr->scr_fontbase = cfg->width + cfg->owidth;
+		scr->scr_fontmaxcol = inq->fbheight / fp->height;
+		scr->scr_fontbase = inq->width + inq->owidth;
 		for (uc = fp->first; uc <= fp->last; uc++) {
 			a.in.x = ((uc - fp->first) / scr->scr_fontmaxcol) *
 			    fp->width + scr->scr_fontbase;
@@ -918,7 +1035,7 @@ rescan:
 			    fp->height;
 			a.in.index = uc;
 
-			(*scr->unpmv)(&a.flags, &a.in, &a.out, &scr->scr_cfg);
+			(*rom->unpmv)(&a.flags, &a.in, &a.out, &scr->scr_cfg);
 			if (a.out.errno) {
 #ifdef STIDEBUG
 				printf("sti_unpmv %d returned %d\n",
@@ -928,7 +1045,8 @@ rescan:
 			}
 		}
 
-		free(scr->scr_romfont, M_DEVBUF, 0);
+		if (rom->rom_copy == NULL)
+			free(scr->scr_romfont, M_DEVBUF, 0);
 		scr->scr_romfont = NULL;
 	}
 #endif

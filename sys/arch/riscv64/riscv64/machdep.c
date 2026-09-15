@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.38 2024/04/06 18:33:54 kettenis Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.45 2026/07/07 12:12:44 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2014 Patrick Wildt <patrick@blueri.se>
@@ -19,6 +19,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/kernel.h>
 #include <sys/sched.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
@@ -33,16 +34,15 @@
 #include <sys/sensors.h>
 #include <sys/malloc.h>
 #include <sys/syscallargs.h>
+#include <sys/pledge.h>
 
 #include <net/if.h>
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
 #include <dev/cons.h>
 #include <dev/ofw/fdt.h>
 #include <dev/ofw/openfirm.h>
-#include <machine/param.h>
 #include <machine/bootconfig.h>
 #include <machine/bus.h>
-#include <machine/riscv64var.h>
 #include <machine/sbi.h>
 #include <machine/sysarch.h>
 
@@ -87,6 +87,9 @@ struct uvm_constraint_range *uvm_md_constraints[] = {
 	&dma_constraint,
 	NULL,
 };
+
+void blink_led_timeout(void *);
+int led_blink = 1;
 
 /* the following is used externally (sysctl_hw) */
 char    machine[] = MACHINE;		/* from <machine/param.h> */
@@ -293,10 +296,12 @@ cpu_switchto(struct proc *old, struct proc *new)
 
 		if (pcb->pcb_flags & PCB_FPU)
 			fpu_save(old, tf);
+		if (pcb->pcb_flags & PCB_VECTOR)
+			vector_save(old, tf);
 
-		/* drop FPU state */
-		tf->tf_sstatus &= ~SSTATUS_FS_MASK;
-		tf->tf_sstatus |= SSTATUS_FS_OFF;
+		/* Drop FPU and vector state */
+		tf->tf_sstatus &= ~(SSTATUS_FS_MASK | SSTATUS_VS_MASK);
+		tf->tf_sstatus |= SSTATUS_FS_OFF | SSTATUS_VS_OFF;
 	}
 
 	cpu_switchto_asm(old, new);
@@ -312,6 +317,7 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 {
 	char *compatible;
 	int node, len, error;
+	int oldval;
 
 	/* all sysctl names at this level are terminal */
 	if (namelen != 1)
@@ -328,6 +334,15 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		compatible[len - 1] = 0;
 		error = sysctl_rdstring(oldp, oldlenp, newp, compatible);
 		free(compatible, M_TEMP, len);
+		return error;
+	case CPU_LED_BLINK:
+		oldval = led_blink;
+		error = sysctl_int(oldp, oldlenp, newp, newlen, &led_blink);
+		/*
+		 * If we were false and are now true, start the timer.
+		 */
+		if (!oldval && led_blink > oldval)
+			blink_led_timeout(NULL);
 		return error;
 	default:
 		return (EOPNOTSUPP);
@@ -404,10 +419,15 @@ setregs(struct proc *p, struct exec_package *pack, u_long stack,
 	struct trapframe *tf = p->p_addr->u_pcb.pcb_tf;
 	struct pcb *pcb = &p->p_addr->u_pcb;
 
-	/* If we were using the FPU, forget about it. */
-	pcb->pcb_flags &= ~PCB_FPU;
-	tf->tf_sstatus &= ~SSTATUS_FS_MASK;
-	tf->tf_sstatus |= SSTATUS_FS_OFF;
+	/* If we were using the FPU or vector, forget about it. */
+	if (pcb->pcb_flags & PCB_VECTOR) {
+		free(pcb->pcb_vstate, M_SUBPROC,
+		    sizeof(struct vreg) + 32 * riscv_vlenb);
+		pcb->pcb_vstate = NULL;
+	}
+	pcb->pcb_flags &= ~(PCB_FPU | PCB_VECTOR);
+	tf->tf_sstatus &= ~(SSTATUS_FS_MASK | SSTATUS_VS_MASK);
+	tf->tf_sstatus |= SSTATUS_FS_OFF | SSTATUS_VS_OFF;
 
 	memset(tf, 0, sizeof *tf);
 	tf->tf_sp = STACKALIGN(stack);
@@ -506,8 +526,12 @@ sys_sysarch(struct proc *p, void *v, register_t *retval)
 	} */ *uap = v;
 	struct riscv_sync_icache_args args;
 	int error = 0;
+	int op = SCARG(uap, op);
 
-	switch (SCARG(uap, op)) {
+	if ((p->p_p->ps_flags & PS_PLEDGE) && op != RISCV_SYNC_ICACHE)
+		return pledge_fail(p, EINVAL, 0);
+
+	switch (op) {
 	case RISCV_SYNC_ICACHE:
 		if (SCARG(uap, parms) != NULL)
 			error = copyin(SCARG(uap, parms), &args, sizeof(args));
@@ -812,25 +836,29 @@ initriscv(struct riscv_bootparams *rbp)
 	/*
 	 * Determine physical RAM size from the /memory nodes in the
 	 * FDT.  There can be multiple nodes and each node can contain
-	 * multiple ranges.
+	 * multiple ranges.  If there are no /memory nodes, use
+	 * information from the EFI memory map instead.
 	 */
 	node = fdt_find_node("/memory");
-	if (node == NULL)
-		panic("%s: no memory specified", __func__);
-	while (node) {
-		const char *s = fdt_node_name(node);
-		if (strncmp(s, "memory", 6) == 0 &&
-		    (s[6] == '\0' || s[6] == '@')) {
-			for (i = 0; i < VM_PHYSSEG_MAX; i++) {
-				if (fdt_get_reg(node, i, &reg))
-					break;
-				if (reg.size == 0)
-					continue;
-				physmem += atop(reg.size);
+	if (node) {
+		while (node) {
+			const char *s = fdt_node_name(node);
+			if (strncmp(s, "memory", 6) == 0 &&
+			    (s[6] == '\0' || s[6] == '@')) {
+				for (i = 0; i < VM_PHYSSEG_MAX; i++) {
+					if (fdt_get_reg(node, i, &reg))
+						break;
+					if (reg.size == 0)
+						continue;
+					physmem += atop(reg.size);
+				}
 			}
-		}
 
-		node = fdt_next_node(node);
+			node = fdt_next_node(node);
+		}
+	} else {
+		for (i = 0; i < nmemreg; i++)
+			physmem += atop(memreg[i].size);
 	}
 
 	kmeminit_nkmempages();
@@ -1004,4 +1032,51 @@ memreg_remove(const struct fdt_reg *reg)
 			nmemreg--;
 		}
 	}
+}
+
+struct blink_led_softc {
+	SLIST_HEAD(, blink_led) bls_head;
+	int bls_on;
+	struct timeout bls_to;
+} blink_sc = { SLIST_HEAD_INITIALIZER(blink_sc.bls_head), 0 };
+
+void
+blink_led_register(struct blink_led *l)
+{
+	if (SLIST_EMPTY(&blink_sc.bls_head)) {
+		timeout_set(&blink_sc.bls_to, blink_led_timeout, &blink_sc);
+		blink_sc.bls_on = 0;
+		if (led_blink)
+			timeout_add(&blink_sc.bls_to, 1);
+	}
+	SLIST_INSERT_HEAD(&blink_sc.bls_head, l, bl_next);
+}
+
+void
+blink_led_timeout(void *vsc)
+{
+	struct blink_led_softc *sc = &blink_sc;
+	struct blink_led *l;
+	int t;
+
+	if (SLIST_EMPTY(&sc->bls_head))
+		return;
+
+	SLIST_FOREACH(l, &sc->bls_head, bl_next) {
+		(*l->bl_func)(l->bl_arg, sc->bls_on);
+	}
+	sc->bls_on = !sc->bls_on;
+
+	if (!led_blink)
+		return;
+
+	/*
+	 * Blink rate is:
+	 *      full cycle every second if completely idle (loadav = 0)
+	 *      full cycle every 2 seconds if loadav = 1
+	 *      full cycle every 3 seconds if loadav = 2
+	 * etc.
+	 */
+	t = (((averunnable.ldavg[0] + FSCALE) * hz) >> (FSHIFT + 1));
+	timeout_add(&sc->bls_to, t);
 }

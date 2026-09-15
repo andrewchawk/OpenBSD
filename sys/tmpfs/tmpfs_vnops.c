@@ -1,4 +1,4 @@
-/*	$OpenBSD: tmpfs_vnops.c,v 1.55 2024/05/13 11:17:41 semarie Exp $	*/
+/*	$OpenBSD: tmpfs_vnops.c,v 1.57 2025/09/20 13:53:36 mpi Exp $	*/
 /*	$NetBSD: tmpfs_vnops.c,v 1.100 2012/11/05 17:27:39 dholland Exp $	*/
 
 /*
@@ -148,7 +148,7 @@ tmpfs_lookup(void *v)
 	 * directory/name couple is already in the cache.
 	 */
 	cachefound = cache_lookup(dvp, vpp, cnp);
-	if (cachefound == ENOENT /* && *vpp == NULLVP */)
+	if (cachefound == ENOENT /* && *vpp == NULL */)
 		return ENOENT; /* Negative cache hit. */
 	else if (cachefound != -1)
 		return 0; /* Found in cache. */
@@ -1126,6 +1126,7 @@ tmpfs_advlock(void *v)
 int
 tmpfs_print(void *v)
 {
+#if defined(DEBUG) || defined(DIAGNOSTIC) || defined(VFSLCKDEBUG)
 	struct vop_print_args /* {
 		struct vnode	*a_vp;
 	} */ *ap = v;
@@ -1141,6 +1142,7 @@ tmpfs_print(void *v)
 		fifo_printinfo(vp);
 #endif
 	printf("\n");
+#endif
 	return 0;
 }
 

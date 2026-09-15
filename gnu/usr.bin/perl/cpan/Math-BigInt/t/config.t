@@ -3,148 +3,533 @@
 use strict;
 use warnings;
 
-use Test::More tests => 72;
-
-# test whether Math::BigInt->config() and Math::BigFloat->config() work
+use Test::More tests => 246;
 
 use Math::BigInt lib => 'Calc';
 use Math::BigFloat;
+use Math::BigRat;
 
 my $mbi = 'Math::BigInt';
 my $mbf = 'Math::BigFloat';
+my $mbr = 'Math::BigRat';
 
-my @defaults =
-  ([ 'lib',         'Math::BigInt::Calc'           ],
-   [ 'lib_version', $Math::BigInt::Calc::VERSION, ],
-   [ 'upgrade',     undef,  ],
-   [ 'div_scale',   40,     ],
-   [ 'precision',   undef,  ],
-   [ 'accuracy',    undef,  ],
-   [ 'round_mode',  'even', ],
-   [ 'trap_nan',    0,      ],
-   [ 'trap_inf',    0,      ]);
+my @classes = ($mbi, $mbf, $mbr);
+
+# Default configuration for all classes.
+#
+# config() can also return 'lib', 'lib_version', 'class', and 'version' but
+# they are read-only.
+
+my %defaults = (
+  'accuracy'    => undef,
+  'precision'   => undef,
+  'round_mode'  => 'even',
+  'div_scale'   => 40,
+  'trap_inf'    => 0,
+  'trap_nan'    => 0,
+  'upgrade'     => undef,
+  'downgrade'   => undef,
+);
 
 ##############################################################################
-# Math::BigInt
+# Test config() as a class method getter.
+##############################################################################
 
-{
-    can_ok($mbi, 'config');
+for my $class (@classes) {
 
-    my @table = @defaults;
-    unshift @table, ['class', $mbi ];
+    note <<"EOF";
 
-    # Test getting via the new-style $class->($key):
+Verify that $class -> config("key") works.
 
-    for (my $i = 0 ; $i <= $#table ; ++ $i) {
-        my $key = $table[$i][0];
-        my $val = $table[$i][1];
-        is($mbi->config($key), $val, qq|$mbi->config("$key")|);
-    }
+EOF
 
-    # Test getting via the old-style $class->()->{$key}, which is still
-    # supported:
+    can_ok($class, 'config');
 
-    my $cfg = $mbi->config();
-    is(ref($cfg), 'HASH', 'ref() of output from $mbi->config()');
+    my %table = (%defaults,
+                 # the following three are read-only
+                 'lib'         => 'Math::BigInt::Calc',
+                 'lib_version' => $Math::BigInt::Calc::VERSION,
+                 'class'       => $class,
+                 'version'     => $Math::BigInt::VERSION,
+                );
 
-    for (my $i = 0 ; $i <= $#table ; ++ $i) {
-        my $key = $table[$i][0];
-        my $val = $table[$i][1];
-        is($cfg->{$key}, $val, qq|$mbi->config()->{$key}|);
-    }
+    # Test getting via the new style $class -> config($key).
 
-    # can set via hash ref?
-    $cfg = $mbi->config({ trap_nan => 1 });
-    is($cfg->{trap_nan}, 1, 'can set "trap_nan" via hash ref');
+    subtest qq|New-style getter $class -> config("\$key")| => sub {
+        plan tests => scalar keys %table;
 
-    # reset for later
-    $mbi->config(trap_nan => 0);
+        for my $key (sort keys %table) {
+            my $val = $table{$key};
+            note qq|\n$class -> config("$key")\n\n|;
+            is($class -> config($key), $val, qq|$class -> config("$key")|);
+        }
+    };
+
+    # Test getting via the old style $class -> config()->{$key}, which is still
+    # supported.
+
+    my $cfg = $class -> config();
+    is(ref($cfg), 'HASH', "ref() of output from $class -> config()");
+
+    subtest qq|Old-style getter $class -> config()->{"\$key"}| => sub {
+        plan tests => scalar keys %table;
+
+       for my $key (sort keys %table) {
+            my $val = $table{$key};
+            note qq|\n$class -> config() -> {$key}\n\n|;
+            is($cfg->{$key}, $val, qq|$class -> config()->{$key}|);
+        }
+    };
 }
 
 ##############################################################################
-# Math::BigFloat
+# Test config() as a class method setter.
+##############################################################################
 
-{
-    can_ok($mbf, 'config');
+# Alternative configuration. All values should be different from the default
+# configuration. Note that in reality, both "accuracy" and "precision" cannot
+# both be set simultaneously. This configuration is just for testing.
 
-    my @table = @defaults;
-    unshift @table, ['class', $mbf ];
+my %test = (
+  'accuracy'   => 2,
+  'precision'  => 3,
+  'round_mode' => 'zero',
+  'div_scale'  => '100',
+  'trap_inf'   => 1,
+  'trap_nan'   => 1,
+  'upgrade'    => 'Math::BigInt::SomeClass',
+  'downgrade'  => 'Math::BigInt::SomeClass',
+);
 
-    # Test getting via the new-style $class->($key):
+for my $class (@classes) {
 
-    for (my $i = 0 ; $i <= $#table ; ++ $i) {
-        my $key = $table[$i][0];
-        my $val = $table[$i][1];
-        is($mbf->config($key), $val, qq|$mbf->config("$key")|);
+    note <<"EOF";
+
+Verify that $class -> config("key" => value) works and that
+it doesn't affect the configuration of other classes.
+
+EOF
+
+    for my $key (sort keys %test) {
+
+        # Get the original value for restoring it later.
+
+        my $orig = $class -> config($key);
+
+        # Try setting the new value.
+
+        eval { $class -> config($key => $test{$key}); };
+        die $@ if $@;
+
+        # Verify that the value was set correctly.
+
+        is($class -> config($key), $test{$key},
+           qq|$class -> config("$key") is $test{$key}|);
+
+        # Verify that setting it in class $class didn't affect other classes.
+
+        for my $other (@classes) {
+            next if $other eq $class;
+
+            isnt($other -> config($key), $class -> config($key),
+                 qq|$other -> config("$key") isn't affected by setting | .
+                 qq|$class -> config("$key")|);
+        }
+
+        # Restore the value.
+
+        $class -> config($key => $orig);
+
+        # Verify that the value was restored.
+
+        is($class -> config($key), $orig,
+           qq|$class -> config("$key") reset to | .
+           (defined($orig) ? qq|"$orig"| : "undef"));
     }
 
-    # Test getting via the old-style $class->()->{$key}, which is still
-    # supported:
+    note <<"EOF";
 
-    my $cfg = $mbf->config();
-    is(ref($cfg), 'HASH', 'ref() of output from $mbf->config()');
+Verify that $class -> config({"key" => value}) works and that
+it doesn't affect the configuration of other classes.
 
-    for (my $i = 0 ; $i <= $#table ; ++ $i) {
-        my $key = $table[$i][0];
-        my $val = $table[$i][1];
-        is($cfg->{$key}, $val, qq|$mbf->config()->{$key}|);
+EOF
+
+    for my $key (sort keys %test) {
+
+        # Get the original value for restoring it later.
+
+        my $orig = $class -> config($key);
+
+        # Try setting the new value.
+
+        eval { $class -> config({ $key => $test{$key} }); };
+        die $@ if $@;
+
+        # Verify that the value was set correctly.
+
+        is($class -> config($key), $test{$key},
+           qq|$class -> config("$key") is $test{$key}|);
+
+        # Verify that setting it in class $class didn't affect other classes.
+
+        for my $other (@classes) {
+            next if $other eq $class;
+
+            isnt($other -> config($key), $class -> config($key),
+                 qq|$other -> config("$key") isn't affected by setting | .
+                 qq|$class -> config("$key")|);
+        }
+
+        # Restore the value.
+
+        $class -> config($key => $orig);
+
+        # Verify that the value was restored.
+
+        is($class -> config($key), $orig,
+           qq|$class -> config("$key") reset to | .
+           (defined($orig) ? qq|"$orig"| : "undef"));
     }
+}
 
-    # can set via hash ref?
-    $cfg = $mbf->config({ trap_nan => 1 });
-    is($cfg->{trap_nan}, 1, 'can set "trap_nan" via hash ref');
+# Verify that setting via a hash doesn't modify the hash.
 
-    # reset for later
-    $mbf->config(trap_nan => 0);
+# In the %test configuration, both accuracy and precision are defined, which
+# won't work, so set one of them to undef.
+
+$test{accuracy} = undef;
+
+for my $class (@classes) {
+
+    note <<"EOF";
+
+Verify that $class -> config({key1 => val1, key2 => val2, ...})
+doesn't modify the hash ref argument.
+
+EOF
+
+    subtest "Verify that $class -> config(\$cfg) doesn't modify \$cfg" => sub {
+        plan tests => 2 * keys %test;
+
+        # Make copy of the configuration hash and use it as input to config().
+
+        my $cfg = { %test };
+        eval { $class -> config($cfg); };
+        die $@ if $@;
+
+        # Verify that the configuration hash hasn't been modified.
+
+        for my $key (sort keys %test) {
+            ok(exists $cfg->{$key}, qq|existens of \$cfg->{"$key"}|);
+            is($cfg->{$key}, $test{$key}, qq|value of \$cfg->{"$key"}|);
+        }
+    };
+}
+
+# Special testing of setting both accuracy and precision simultaneouly with
+# config(). This didn't work correctly before.
+
+for my $class (@classes) {
+
+    note <<"EOF";
+
+Verify that $class -> config({accuracy => \$a, precision => \$p})
+works as intended.
+
+EOF
+
+    $class -> config({"accuracy" => 4, "precision" => undef});
+
+    subtest qq|$class -> config({"accuracy" => 4, "precision" => undef})|
+      => sub {
+          plan tests => 2;
+
+          is($class -> config("accuracy"), 4,
+             qq|$class -> config("accuracy")|);
+          is($class -> config("precision"), undef,
+             qq|$class -> config("precision")|);
+      };
+
+    $class -> config({"accuracy" => undef, "precision" => 5});
+
+    subtest qq|$class -> config({"accuracy" => undef, "precision" => 5})|
+      => sub {
+          plan tests => 2;
+
+          is($class -> config("accuracy"), undef,
+             qq|$class -> config("accuracy")|);
+          is($class -> config("precision"), 5,
+             qq|$class -> config("precision")|);
+      };
+}
+
+# Test getting an invalid key (should croak).
+
+note <<"EOF";
+
+Verify behaviour when getting an invalid key.
+
+EOF
+
+for my $class (@classes) {
+    eval { $class -> config('some_garbage' => 1); };
+    like($@,
+         qr/ ^ Illegal \s+ key\(s\) \s+ 'some_garbage' \s+ passed \s+ to \s+ /x,
+         "Passing invalid key to $class -> config() causes an error.");
+}
+
+# Restore global configuration.
+
+for my $class (@classes) {
+    my %config = %defaults;
+    $class -> config(%defaults);
 }
 
 ##############################################################################
-# test setting values
+# Test config() as an instance method getter.
+##############################################################################
 
-my $test = {
-    trap_nan   => 1,
-    trap_inf   => 1,
-    accuracy   => 2,
-    precision  => 3,
-    round_mode => 'zero',
-    div_scale  => '100',
-    upgrade    => 'Math::BigInt::SomeClass',
-    downgrade  => 'Math::BigInt::SomeClass',
-};
+# The following must be extended as global variables are moved into the OO
+# interface. XXX
 
-my $cfg;
+for my $class (@classes) {
 
-foreach my $key (keys %$test) {
+    note <<"EOF";
 
-    # see if setting in MBI works
-    eval { $mbi->config($key => $test->{$key}); };
-    $cfg = $mbi->config();
-    is("$key = $cfg->{$key}", "$key = $test->{$key}", "$key = $test->{$key}");
-    $cfg = $mbf->config();
+$class: Verify that \$x -> config("key") works.
 
-    # see if setting it in MBI leaves MBF alone
-    ok(($cfg->{$key} || 0) ne $test->{$key},
-       "$key ne \$cfg->{$key}");
+EOF
 
-    # see if setting in MBF works
-    eval { $mbf->config($key => $test->{$key}); };
-    $cfg = $mbf->config();
-    is("$key = $cfg->{$key}", "$key = $test->{$key}", "$key = $test->{$key}");
+    my $x = $class -> bzero();
+
+    #my %table = %defaults;
+    my %table = map { $_ => $defaults{$_} } 'accuracy', 'precision';
+
+    # Test getting via $x -> config($key).
+
+    subtest qq|$class: Test getter \$x -> config("\$key") where \$x is a $class|
+      => sub {
+          plan tests => 2;
+
+          for my $key (sort keys %table) {
+              my $val = $table{$key};
+              is($x -> config($key), $val, qq|\$x -> config("$key")|);
+          }
+      };
+
+    note <<"EOF";
+
+$class: Verify that \$x -> config() works.
+
+EOF
+
+    subtest qq|$class: Test that \$x -> config() where \$x is a $class|
+      => sub {
+          plan tests => 3;
+
+          my $cfg = $x -> config();
+
+          cmp_ok(scalar(keys(%$cfg)), "==", 2,
+                 qq|configuration hash has correct number of keys|);
+
+          for my $key ('accuracy', 'precision') {
+              ok(exists($cfg->{$key}), qq|configuration has contains key "$key"|);
+          }
+      };
 }
 
 ##############################################################################
-# test setting illegal keys (should croak)
+# Test config() as an instance method setter.
+##############################################################################
 
-eval { $mbi->config('some_garbage' => 1); };
-like($@,
-     qr/ ^ Illegal \s+ key\(s\) \s+ 'some_garbage' \s+ passed \s+ to \s+
-         Math::BigInt->config\(\) \s+ at
-       /x,
-     'Passing invalid key to Math::BigInt->config() causes an error.');
+# Alternative configuration. All values should be different from the default
+# configuration. Note that in reality, both "accuracy" and "precision" cannot
+# both be set simultaneously. This configuration is just for testing.
 
-eval { $mbf->config('some_garbage' => 1); };
-like($@,
-     qr/ ^ Illegal \s+ key\(s\) \s+ 'some_garbage' \s+ passed \s+ to \s+
-         Math::BigFloat->config\(\) \s+ at
-       /x,
-     'Passing invalid key to Math::BigFloat->config() causes an error.');
+# At the moment, not all variables have been moved into the OO interface. XXX
+
+%test = (
+  'accuracy'   => 2,
+  'precision'  => 3,
+  #'round_mode' => 'zero',
+  #'div_scale'  => '100',
+  #'trap_inf'   => 1,
+  #'trap_nan'   => 1,
+  #'upgrade'    => 'Math::BigInt::SomeClass',
+  #'downgrade'  => 'Math::BigInt::SomeClass',
+);
+
+for my $class (@classes) {
+
+    note <<"EOF";
+
+$class: Verify that \$x -> config("key" => value) works and that
+it doesn't affect the configuration of other classes.
+
+EOF
+
+    my $x = $class -> bone();
+
+    for my $key (sort keys %test) {
+
+        # Get the original value for restoring it later.
+
+        my $orig = $x -> config($key);
+
+        # Try setting the new value.
+
+        subtest "$class: \$x -> config($key => $test{$key})" => sub {
+            plan tests => 2;
+
+            eval { $x -> config($key => $test{$key}); };
+            die $@ if $@;
+
+            # Verify that the value was set correctly.
+
+            is($x -> config($key), $test{$key},
+               qq|$class: \$x -> config("$key") is $test{$key}|);
+
+            # Restore the value.
+
+            $x -> config($key => $orig);
+
+            # Verify that the value was restored.
+
+            is($x -> config($key), $orig,
+               qq|$class: \$x -> config("$key") reset to | .
+               (defined($orig) ? qq|"$orig"| : "undef"));
+        };
+    }
+
+    note <<"EOF";
+
+$class: Verify that \$x -> config({"key" => value}) works and that
+it doesn't affect the configuration of other classes.
+
+EOF
+
+    for my $key (sort keys %test) {
+
+        # Get the original value for restoring it later.
+
+        my $orig = $x -> config($key);
+
+        # Try setting the new value.
+
+        subtest "$class: \$x -> config({ $key => $test{$key} })" => sub {
+            plan tests => 2;
+
+            eval { $x -> config({ $key => $test{$key} }); };
+            die $@ if $@;
+
+            # Verify that the value was set correctly.
+
+            is($x -> config($key), $test{$key},
+               qq|$class: \$x -> config("$key") is $test{$key}|);
+
+            # Restore the value.
+
+            $x -> config($key => $orig);
+
+            # Verify that the value was restored.
+
+            is($x -> config($key), $orig,
+               qq|\$x -> config("$key") reset to | .
+               (defined($orig) ? qq|"$orig"| : "undef"));
+        };
+    }
+}
+
+# Verify that setting via a hash doesn't modify the hash.
+
+# In the %test configuration, both accuracy and precision are defined, which
+# won't work, so set one of them to undef.
+
+$test{accuracy} = undef;
+
+for my $class (@classes) {
+
+    note <<"EOF";
+
+$class: Verify that \$x -> config({key1 => val1, key2 => val2, ...})
+doesn't modify the hash ref argument.
+
+EOF
+
+    my $x = $class -> bone();
+
+    subtest "$class: Verify that \$x -> config(\$cfg) doesn't modify \$cfg"
+      => sub {
+          plan tests => 2 * keys %test;
+
+          # Make copy of the configuration hash and use it as input to
+          # config().
+
+          #my $cfg = { %test };
+          my $cfg = { map { $_ => $test{$_} } 'accuracy', 'precision' };
+
+          eval { $x -> config($cfg); };
+          die $@ if $@;
+
+          # Verify that the configuration hash hasn't been modified.
+
+          for my $key (sort keys %test) {
+              ok(exists $cfg->{$key}, qq|existens of \$cfg->{"$key"}|);
+              is($cfg->{$key}, $test{$key}, qq|value of \$cfg->{"$key"}|);
+          }
+      };
+}
+
+# Special testing of setting both accuracy and precision simultaneouly with
+# config(). This didn't work correctly before.
+
+for my $class (@classes) {
+
+    note <<"EOF";
+
+$class: Verify that \$x -> config({accuracy => \$a, precision => \$p})
+works as intended.
+
+EOF
+
+    my $x = $class -> bone();
+    $x -> config({"accuracy" => 4, "precision" => undef});
+
+    subtest qq|$class: \$x -> config({"accuracy" => 4, "precision" => undef})|
+      => sub {
+          plan tests => 2;
+
+          is($x -> config("accuracy"), 4,
+             qq|\$x -> config("accuracy")|);
+          is($x -> config("precision"), undef,
+             qq|\$x -> config("precision")|);
+      };
+
+    $x -> config({"accuracy" => undef, "precision" => 5});
+
+    subtest qq|$class: \$x -> config({"accuracy" => undef, "precision" => 5})|
+      => sub {
+          plan tests => 2;
+
+          is($x -> config("accuracy"), undef,
+             qq|\$x -> config("accuracy")|);
+          is($x -> config("precision"), 5,
+             qq|\$x -> config("precision")|);
+      };
+}
+
+# Test getting an invalid key (should croak).
+
+note <<"EOF";
+
+Verify behaviour when getting an invalid key.
+
+EOF
+
+for my $class (@classes) {
+    my $x = $class -> bone();
+    eval { $x -> config('some_garbage' => 1); };
+    like($@,
+         qr/ ^ Illegal \s+ key\(s\) \s+ 'some_garbage' \s+ passed \s+ to \s+ /x,
+         "$class: Passing invalid key to \$x -> config() causes an error.");
+}

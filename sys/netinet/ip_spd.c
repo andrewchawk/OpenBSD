@@ -1,4 +1,4 @@
-/* $OpenBSD: ip_spd.c,v 1.120 2024/04/17 20:48:51 bluhm Exp $ */
+/* $OpenBSD: ip_spd.c,v 1.122 2025/07/08 00:47:41 jsg Exp $ */
 /*
  * The author of this code is Angelos D. Keromytis (angelos@cis.upenn.edu)
  *
@@ -24,18 +24,14 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/kernel.h>
-#include <sys/socketvar.h>
 #include <sys/pool.h>
 #include <sys/timeout.h>
 
-#include <net/route.h>
-#include <net/netisr.h>
+#include <net/rtable.h>
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
-#include <netinet/in_pcb.h>
+#include <netinet/ip6.h>
 #include <netinet/ip_ipsp.h>
 #include <net/pfkeyv2.h>
 
@@ -888,7 +884,8 @@ ipsp_acquire_sa(struct ipsec_policy *ipo, union sockaddr_union *gw,
 
 	mtx_enter(&ipsec_acquire_mtx);
 #ifdef IPSEC
-	if (timeout_add_sec(&ipa->ipa_timeout, ipsec_expire_acquire) == 1)
+	if (timeout_add_sec(&ipa->ipa_timeout,
+	    atomic_load_int(&ipsec_expire_acquire)) == 1)
 		refcnt_take(&ipa->ipa_refcnt);
 #endif
 	TAILQ_INSERT_TAIL(&ipsec_acquire_head, ipa, ipa_next);

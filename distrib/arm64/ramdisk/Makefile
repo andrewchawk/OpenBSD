@@ -1,4 +1,9 @@
-#	$OpenBSD: Makefile,v 1.31 2023/10/26 17:13:50 deraadt Exp $
+#	$OpenBSD: Makefile,v 1.36 2025/12/15 16:02:47 deraadt Exp $
+#
+# Install media requires the following packages:
+# - raspberrypi-firmware
+# - u-boot-rpi
+#
 
 FS=		miniroot${OSrev}.img
 FSSIZE=		88064
@@ -34,11 +39,21 @@ PIFILES=\
 	bcm2710-rpi-3-b.dtb \
 	bcm2710-rpi-3-b-plus.dtb \
 	bcm2710-rpi-cm3.dtb \
+	bcm2710-rpi-zero-2-w.dtb \
 	bcm2711-rpi-4-b.dtb \
 	bcm2711-rpi-400.dtb \
-	bcm2711-rpi-cm4.dtb
+	bcm2711-rpi-cm4.dtb \
+	bcm2712-d-rpi-5-b.dtb \
+	bcm2712-rpi-5-b.dtb \
+	bcm2712-rpi-500.dtb \
+	bcm2712-rpi-cm5-cm4io.dtb \
+	bcm2712-rpi-cm5-cm5io.dtb \
+	bcm2712-rpi-cm5l-cm4io.dtb \
+	bcm2712-rpi-cm5l-cm5io.dtb \
+	bcm2712d0-rpi-5-b.dtb
 
 PIDTBO=\
+	bcm2712d0.dtbo \
 	disable-bt.dtbo
 
 all: ${FS} ${CDROM}
@@ -93,10 +108,10 @@ ${CDROM}: ${BASE} ${XBASE} cdbr bsd.rd
 	cp ${.OBJDIR}/bsd.rd ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	cp -p ${.OBJDIR}/cdbr ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	mkhybrid -a -R -T -L -l -d -D -N -o ${.OBJDIR}/${CDROM} \
-	    -A "OpenBSD ${OSREV} ${MACHINE} Install CD" \
+	    -A "OpenBSD ${OSREV} ${MACHINE} bootonly CD" \
 	    -P "Copyright (c) `date +%Y` Theo de Raadt, The OpenBSD project" \
 	    -p "Theo de Raadt <deraadt@openbsd.org>" \
-	    -V "OpenBSD/${MACHINE}   ${OSREV} Install CD" \
+	    -V "OpenBSD/${MACHINE}   ${OSREV} bootonly CD" \
 	    -b ${OSREV}/${MACHINE}/cdbr -c ${OSREV}/${MACHINE}/boot.catalog \
 	    ${.OBJDIR}/cd-dir
 

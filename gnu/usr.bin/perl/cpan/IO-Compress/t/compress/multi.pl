@@ -11,7 +11,7 @@ BEGIN {
     # use Test::NoWarnings, if available
     my $extra = 0 ;
     $extra = 1
-        if eval { require Test::NoWarnings ;  import Test::NoWarnings; 1 };
+        if eval { require Test::NoWarnings ;  Test::NoWarnings->import; 1 };
 
     plan tests => 1828 + $extra ;
 
@@ -217,7 +217,7 @@ EOM
                         is $gz->streamCount(), $stream, "    streamCount is $stream"
                             or diag "Stream count is " . $gz->streamCount();
                         is $un, $buff, "    expected output"
-                            or diag "Stream count is " . $gz->streamCount();                        ;
+                            or diag "Stream count is " . $gz->streamCount();
                         #is $gz->tell(), length $buff, "    tell is ok";
                         is $gz->nextStream(), 1, "    nextStream ok";
                         is $gz->tell(), 0, "    tell is 0";

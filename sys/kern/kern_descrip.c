@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_descrip.c,v 1.208 2024/06/22 10:22:29 jsg Exp $	*/
+/*	$OpenBSD: kern_descrip.c,v 1.213 2026/03/08 16:41:21 deraadt Exp $	*/
 /*	$NetBSD: kern_descrip.c,v 1.42 1996/03/30 22:24:38 christos Exp $	*/
 
 /*
@@ -39,6 +39,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/atomic.h>
 #include <sys/filedesc.h>
 #include <sys/vnode.h>
 #include <sys/proc.h>
@@ -79,6 +80,7 @@ int dodup3(struct proc *, int, int, int, register_t *);
 
 #define DUPF_CLOEXEC	0x01
 #define DUPF_DUP2	0x02
+#define DUPF_CLOFORK	0x04
 
 struct pool file_pool;
 struct pool fdesc_pool;
@@ -335,7 +337,7 @@ sys_dup3(struct proc *p, void *v, register_t *retval)
 
 	if (SCARG(uap, from) == SCARG(uap, to))
 		return (EINVAL);
-	if (SCARG(uap, flags) & ~O_CLOEXEC)
+	if (SCARG(uap, flags) & ~(O_CLOEXEC | O_CLOFORK))
 		return (EINVAL);
 	return (dodup3(p, SCARG(uap, from), SCARG(uap, to),
 	    SCARG(uap, flags), retval));
@@ -362,7 +364,7 @@ restart:
 		return (0);
 	}
 	if ((u_int)new >= lim_cur(RLIMIT_NOFILE) ||
-	    (u_int)new >= maxfiles) {
+	    (u_int)new >= atomic_load_int(&maxfiles)) {
 		FRELE(fp, p);
 		return (EBADF);
 	}
@@ -387,6 +389,8 @@ restart:
 	dupflags = DUPF_DUP2;
 	if (flags & O_CLOEXEC)
 		dupflags |= DUPF_CLOEXEC;
+	if (flags & O_CLOFORK)
+		dupflags |= DUPF_CLOFORK;
 
 	/* No need for FRELE(), finishdup() uses current ref. */
 	return (finishdup(p, fp, old, new, retval, dupflags));
@@ -422,9 +426,10 @@ restart:
 
 	case F_DUPFD:
 	case F_DUPFD_CLOEXEC:
+	case F_DUPFD_CLOFORK:
 		newmin = (long)SCARG(uap, arg);
 		if ((u_int)newmin >= lim_cur(RLIMIT_NOFILE) ||
-		    (u_int)newmin >= maxfiles) {
+		    (u_int)newmin >= atomic_load_int(&maxfiles)) {
 			error = EINVAL;
 			break;
 		}
@@ -443,6 +448,8 @@ restart:
 
 			if (SCARG(uap, cmd) == F_DUPFD_CLOEXEC)
 				dupflags |= DUPF_CLOEXEC;
+			if (SCARG(uap, cmd) == F_DUPFD_CLOFORK)
+				dupflags |= DUPF_CLOFORK;
 
 			/* No need for FRELE(), finishdup() uses current ref. */
 			error = finishdup(p, fp, fd, i, retval, dupflags);
@@ -451,16 +458,17 @@ restart:
 
 	case F_GETFD:
 		fdplock(fdp);
-		*retval = fdp->fd_ofileflags[fd] & UF_EXCLOSE ? 1 : 0;
+		*retval = (fdp->fd_ofileflags[fd] & UF_EXCLOSE   ? FD_CLOEXEC : 0)
+			| (fdp->fd_ofileflags[fd] & UF_FORKCLOSE ? FD_CLOFORK : 0);
 		fdpunlock(fdp);
 		break;
 
 	case F_SETFD:
 		fdplock(fdp);
-		if ((long)SCARG(uap, arg) & 1)
-			fdp->fd_ofileflags[fd] |= UF_EXCLOSE;
-		else
-			fdp->fd_ofileflags[fd] &= ~UF_EXCLOSE;
+		i = ((long)SCARG(uap, arg) & FD_CLOEXEC ? UF_EXCLOSE   : 0) |
+		    ((long)SCARG(uap, arg) & FD_CLOFORK ? UF_FORKCLOSE : 0);
+		fdp->fd_ofileflags[fd] = (fdp->fd_ofileflags[fd] &
+		    ~(UF_EXCLOSE | UF_FORKCLOSE)) | i;
 		fdpunlock(fdp);
 		break;
 
@@ -484,17 +492,8 @@ restart:
 			tmp &= ~FCNTLFLAGS;
 			tmp |= FFLAGS((long)SCARG(uap, arg)) & FCNTLFLAGS;
 		} while (atomic_cas_uint(&fp->f_flag, prev, tmp) != prev);
-		tmp = fp->f_flag & FNONBLOCK;
-		error = (*fp->f_ops->fo_ioctl)(fp, FIONBIO, (caddr_t)&tmp, p);
-		if (error)
-			break;
 		tmp = fp->f_flag & FASYNC;
 		error = (*fp->f_ops->fo_ioctl)(fp, FIOASYNC, (caddr_t)&tmp, p);
-		if (!error)
-			break;
-		atomic_clearbits_int(&fp->f_flag, FNONBLOCK);
-		tmp = 0;
-		(void) (*fp->f_ops->fo_ioctl)(fp, FIONBIO, (caddr_t)&tmp, p);
 		break;
 
 	case F_GETOWN:
@@ -675,9 +674,12 @@ finishdup(struct proc *p, struct file *fp, int old, int new,
 	fdp->fd_ofiles[new] = fp;
 	mtx_leave(&fdp->fd_fplock);
 
-	fdp->fd_ofileflags[new] = fdp->fd_ofileflags[old] & ~UF_EXCLOSE;
+	fdp->fd_ofileflags[new] = fdp->fd_ofileflags[old] &
+	    ~(UF_EXCLOSE | UF_FORKCLOSE);
 	if (dupflags & DUPF_CLOEXEC)
 		fdp->fd_ofileflags[new] |= UF_EXCLOSE;
+	if (dupflags & DUPF_CLOFORK)
+		fdp->fd_ofileflags[new] |= UF_FORKCLOSE;
 	*retval = new;
 
 	if (oldfp != NULL) {
@@ -719,7 +721,8 @@ fdinsert(struct filedesc *fdp, int fd, int flags, struct file *fp)
 	fdp->fd_ofiles[fd] = fp;
 	mtx_leave(&fdp->fd_fplock);
 
-	fdp->fd_ofileflags[fd] |= (flags & UF_EXCLOSE);
+	fdp->fd_ofileflags[fd] |= (flags & (UF_EXCLOSE | UF_FORKCLOSE |
+	    UF_PLEDGEOPEN));
 }
 
 void
@@ -877,7 +880,7 @@ fdalloc(struct proc *p, int want, int *result)
 	 * expanding the ofile array.
 	 */
 restart:
-	lim = min((int)lim_cur(RLIMIT_NOFILE), maxfiles);
+	lim = min((int)lim_cur(RLIMIT_NOFILE), atomic_load_int(&maxfiles));
 	last = min(fdp->fd_nfiles, lim);
 	if ((i = want) < fdp->fd_freefile)
 		i = fdp->fd_freefile;
@@ -1037,7 +1040,7 @@ fnew(struct proc *p)
 	int nfiles;
 
 	nfiles = atomic_inc_int_nv(&numfiles);
-	if (nfiles > maxfiles) {
+	if (nfiles > atomic_load_int(&maxfiles)) {
 		atomic_dec_int(&numfiles);
 		tablefull("file");
 		return (NULL);
@@ -1149,7 +1152,9 @@ fdcopy(struct process *pr)
 		struct file *fp = fdp->fd_ofiles[i];
 
 		if (fp != NULL) {
+			int fileflags = fdp->fd_ofileflags[i];
 			/*
+			 * If the UF_FORKCLOSE flag is set, skip the fd.
 			 * XXX Gruesome hack. If count gets too high, fail
 			 * to copy an fd, since fdcopy()'s callers do not
 			 * permit it to indicate failure yet.
@@ -1158,6 +1163,7 @@ fdcopy(struct process *pr)
 			 * their internal consistency, so close them here.
 			 */
 			if (fp->f_count >= FDUP_MAX_COUNT ||
+			    (fileflags & UF_FORKCLOSE) ||
 			    fp->f_type == DTYPE_KQUEUE) {
 				if (i < newfdp->fd_freefile)
 					newfdp->fd_freefile = i;
@@ -1166,7 +1172,7 @@ fdcopy(struct process *pr)
 
 			FREF(fp);
 			newfdp->fd_ofiles[i] = fp;
-			newfdp->fd_ofileflags[i] = fdp->fd_ofileflags[i];
+			newfdp->fd_ofileflags[i] = fileflags;
 			fd_used(newfdp, i);
 		}
 	}
@@ -1210,6 +1216,7 @@ fdfree(struct proc *p)
 		vrele(fdp->fd_cdir);
 	if (fdp->fd_rdir)
 		vrele(fdp->fd_rdir);
+	KASSERT(atomic_load_int(&fdp->fd_nuserevents) == 0);
 	pool_put(&fdesc_pool, fdp);
 }
 
@@ -1414,24 +1421,26 @@ dupfdopen(struct proc *p, int indx, int mode)
 	fdp->fd_ofiles[indx] = wfp;
 	mtx_leave(&fdp->fd_fplock);
 
-	fdp->fd_ofileflags[indx] = (fdp->fd_ofileflags[indx] & UF_EXCLOSE) |
-	    (fdp->fd_ofileflags[dupfd] & ~UF_EXCLOSE);
+	fdp->fd_ofileflags[indx] =
+	    (fdp->fd_ofileflags[indx] & (UF_EXCLOSE | UF_FORKCLOSE)) |
+	    (fdp->fd_ofileflags[dupfd] & ~(UF_EXCLOSE | UF_FORKCLOSE));
 
 	return (0);
 }
 
 /*
- * Close any files on exec?
+ * Doing an exec, so handle fd flags: do close-on-exec and clear
+ * pledged and close-on-fork
  */
 void
-fdcloseexec(struct proc *p)
+fdprepforexec(struct proc *p)
 {
 	struct filedesc *fdp = p->p_fd;
 	int fd;
 
 	fdplock(fdp);
 	for (fd = 0; fd <= fdp->fd_lastfile; fd++) {
-		fdp->fd_ofileflags[fd] &= ~UF_PLEDGED;
+		fdp->fd_ofileflags[fd] &= ~(UF_PLEDGED | UF_FORKCLOSE);
 		if (fdp->fd_ofileflags[fd] & UF_EXCLOSE) {
 			/* fdrelease() unlocks fdp. */
 			(void) fdrelease(p, fd);

@@ -8,6 +8,7 @@
 
 #include "llvm/ExecutionEngine/Orc/COFFVCRuntimeSupport.h"
 
+#include "llvm/ExecutionEngine/Orc/COFF.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LookupAndRecordAddrs.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -81,13 +82,14 @@ Error COFFVCRuntimeBootstrapper::loadVCRuntime(
   auto LoadLibrary = [&](SmallString<256> LibPath, StringRef LibName) -> Error {
     sys::path::append(LibPath, LibName);
 
-    auto G = StaticLibraryDefinitionGenerator::Load(ObjLinkingLayer,
-                                                    LibPath.c_str());
+    std::set<std::string> NewImportedLibraries;
+    auto G = StaticLibraryDefinitionGenerator::Load(
+        ObjLinkingLayer, LibPath.c_str(),
+        COFFImportFileScanner(NewImportedLibraries));
     if (!G)
       return G.takeError();
 
-    for (auto &Lib : (*G)->getImportedDynamicLibraries())
-      ImportedLibraries.push_back(Lib);
+    llvm::append_range(ImportedLibraries, NewImportedLibraries);
 
     JD.addGenerator(std::move(*G));
 
@@ -160,7 +162,7 @@ COFFVCRuntimeBootstrapper::getMSVCToolchainPath() {
   if (!findVCToolChainViaCommandLine(*VFS, std::nullopt, std::nullopt,
                                      std::nullopt, VCToolChainPath, VSLayout) &&
       !findVCToolChainViaEnvironment(*VFS, VCToolChainPath, VSLayout) &&
-      !findVCToolChainViaSetupConfig(*VFS, VCToolChainPath, VSLayout) &&
+      !findVCToolChainViaSetupConfig(*VFS, {}, VCToolChainPath, VSLayout) &&
       !findVCToolChainViaRegistry(VCToolChainPath, VSLayout))
     return make_error<StringError>("Couldn't find msvc toolchain.",
                                    inconvertibleErrorCode());

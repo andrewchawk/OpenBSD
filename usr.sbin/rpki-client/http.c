@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.c,v 1.85 2024/04/23 10:27:46 tb Exp $ */
+/*	$OpenBSD: http.c,v 1.109 2026/08/05 19:15:22 claudio Exp $ */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -44,6 +44,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
@@ -137,6 +138,7 @@ struct http_connection {
 	int			fd;
 	int			chunked;
 	int			gzipped;
+	int			was_gzipped;
 	int			keep_alive;
 	short			events;
 	enum http_state		state;
@@ -163,7 +165,7 @@ static struct http_conn_list	idle = LIST_HEAD_INITIALIZER(idle);
 static struct http_req_queue	queue = TAILQ_HEAD_INITIALIZER(queue);
 static unsigned int		http_conn_count;
 
-static struct msgbuf msgq;
+static struct msgbuf *msgq;
 static struct sockaddr_storage http_bindaddr;
 static struct tls_config *tls_config;
 static uint8_t *tls_ca_mem;
@@ -219,7 +221,7 @@ static enum res	data_inflate_write(struct http_connection *);
 static const char *
 http_info(const char *uri)
 {
-	static char buf[80];
+	static char buf[200];
 
 	if (strnvis(buf, uri, sizeof buf, VIS_SAFE) >= (int)sizeof buf) {
 		/* overflow, add indicator */
@@ -250,7 +252,7 @@ ip_info(const struct http_connection *conn)
 static const char *
 conn_info(const struct http_connection *conn)
 {
-	static char	 buf[100 + NI_MAXHOST];
+	static char	 buf[220 + NI_MAXHOST];
 	const char	*uri;
 
 	if (conn->req == NULL)
@@ -415,7 +417,7 @@ proxy_parse_uri(char *uri)
 	if (strncasecmp(uri, HTTP_PROTO, HTTP_PROTO_LEN) != 0)
 		errx(1, "%s: http_proxy not using http schema", http_info(uri));
 
-	host = uri + 7;
+	host = uri + HTTP_PROTO_LEN;
 	if ((fullhost = strndup(host, strcspn(host, "/"))) == NULL)
 		err(1, NULL);
 
@@ -483,7 +485,7 @@ http_parse_uri(char *uri, char **ohost, char **oport, char **opath)
 		warnx("%s: not using https schema", http_info(uri));
 		return -1;
 	}
-	host = uri + 8;
+	host = uri + HTTPS_PROTO_LEN;
 	if ((path = strchr(host, '/')) == NULL) {
 		warnx("%s: missing https path", http_info(uri));
 		return -1;
@@ -624,8 +626,8 @@ http_req_done(unsigned int id, enum http_result res, const char *last_modified)
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
 	io_simple_buffer(b, &res, sizeof(res));
-	io_str_buffer(b, last_modified);
-	io_close_buffer(&msgq, b);
+	io_opt_str_buffer(b, last_modified);
+	io_close_buffer(msgq, b);
 }
 
 /*
@@ -640,8 +642,8 @@ http_req_fail(unsigned int id)
 	b = io_new_buffer();
 	io_simple_buffer(b, &id, sizeof(id));
 	io_simple_buffer(b, &res, sizeof(res));
-	io_str_buffer(b, NULL);
-	io_close_buffer(&msgq, b);
+	io_opt_str_buffer(b, NULL);
+	io_close_buffer(msgq, b);
 }
 
 /*
@@ -709,7 +711,7 @@ http_inflate_new(struct http_connection *conn)
 	return 0;
 
  fail:
-	warnx("%s: decompression initalisation failed", conn_info(conn));
+	warnx("%s: decompression initialisation failed", conn_info(conn));
 	if (zctx != NULL)
 		free(zctx->zbuf);
 	free(zctx);
@@ -799,9 +801,16 @@ http_inflate_advance(struct http_connection *conn)
 		/* all compressed data processed */
 		conn->gzipped = 0;
 		http_inflate_done(conn);
+		conn->was_gzipped = 1;
 
 		if (conn->iosz == 0) {
 			if (!conn->chunked) {
+				if (conn->bufpos != 0) {
+					warnx("%s: trailing data after "
+					    "compressed transfer",
+					    conn_info(conn));
+					return http_failed(conn);
+				}
 				return http_done(conn, HTTP_OK);
 			} else {
 				conn->state = STATE_RESPONSE_CHUNKED_CRLF;
@@ -823,7 +832,7 @@ http_inflate_advance(struct http_connection *conn)
 
 /*
  * Create a new HTTP connection which will be used for the HTTP request req.
- * On errors a req faulure is issued and both connection and request are freed.
+ * On errors a req failure is issued and both connection and request are freed.
  */
 static void
 http_new(struct http_request *req)
@@ -911,7 +920,12 @@ http_done(struct http_connection *conn, enum http_result res)
 	if (conn->gzipped) {
 		conn->gzipped = 0;
 		http_inflate_done(conn);
+		conn->was_gzipped = 1;
 	}
+
+	if (!conn->was_gzipped && conn->totalsz > (1024 * 1024))
+		logx("%s: downloaded %zu bytes without HTTP "
+		    "compression", conn_info(conn), conn->totalsz);
 
 	conn->state = STATE_IDLE;
 	conn->idle_time = getmonotime() + HTTP_IDLE_TIMEOUT;
@@ -928,9 +942,13 @@ http_done(struct http_connection *conn, enum http_result res)
 	LIST_REMOVE(conn, entry);
 	LIST_INSERT_HEAD(&idle, conn, entry);
 
-	/* reset status and keep-alive for good measures */
+	/* reset connection parameters in preparation for a next request */
+	conn->totalsz = 0;
+	conn->was_gzipped = 0;
 	conn->status = 0;
 	conn->keep_alive = 0;
+	free(conn->last_modified);
+	conn->last_modified = NULL;
 
 	return WANT_POLLIN;
 }
@@ -1007,7 +1025,7 @@ static enum res
 http_connect(struct http_connection *conn)
 {
 	const char *cause = NULL;
-	struct addrinfo *res;
+	struct addrinfo *res = NULL;
 
 	assert(conn->fd == -1);
 	conn->state = STATE_CONNECT;
@@ -1070,7 +1088,7 @@ http_connect(struct http_connection *conn)
 }
 
 /*
- * Called once an asynchronus connect request finished.
+ * Called once an asynchronous connect request finished.
  */
 static enum res
 http_finish_connect(struct http_connection *conn)
@@ -1240,7 +1258,7 @@ http_request(struct http_connection *conn)
 
 /*
  * Parse the HTTP status line.
- * Return 0 for status codes 100, 103, 200, 203, 301-304, 307-308.
+ * Return 0 for status codes 200, 203, 301-304, 307-308.
  * The other 1xx and 2xx status codes are explicitly not handled and are
  * considered an error.
  * Failure codes and other errors return -1.
@@ -1287,9 +1305,6 @@ http_parse_status(struct http_connection *conn, char *buf)
 			return -1;
 		}
 		/* FALLTHROUGH */
-	case 100:	/* Informational: continue (ignored) */
-	case 103:	/* Informational: early hints (ignored) */
-		/* FALLTHROUGH */
 	case 200:	/* Success: OK */
 	case 203:	/* Success: non-authoritative information (proxy) */
 	case 304:	/* Redirect: not modified */
@@ -1302,6 +1317,18 @@ http_parse_status(struct http_connection *conn, char *buf)
 		return -1;
 	}
 
+	return 0;
+}
+
+/*
+ * Return true if the response should not contain a message-body.
+ */
+static inline int
+http_isbodyless(struct http_connection *conn)
+{
+	if ((conn->status >= 100 && conn->status <= 199) ||
+	    conn->status == 204 || conn->status == 205 || conn->status == 304)
+		return 1;
 	return 0;
 }
 
@@ -1366,9 +1393,30 @@ http_parse_header(struct http_connection *conn, char *buf)
 
 	cp = buf;
 	/* empty line, end of header */
-	if (*cp == '\0')
+	if (*cp == '\0') {
+		/* check consistency of header fields */
+		if (http_isredirect(conn) && conn->redir_uri == NULL) {
+			warnx("%s: redirect with no location",
+			    http_info(conn->req->uri));
+			return -1;
+		}
+		if (conn->iosz != 0 && conn->chunked) {
+			warnx("%s: mutually exclusive, Content-Length set with"
+			    "Transfer-Encoding: chunked", conn_info(conn));
+			return -1;
+		}
+		if (http_isbodyless(conn)) {
+			if (conn->bufpos != 0) {
+				/* no pipelining so no extra data */
+				warnx("%s: unexpected trailing data",
+				    conn_info(conn));
+				return -1;
+			}
+			conn->chunked = 0;
+			conn->iosz = 0;
+		}
 		return 0;
-	else if (strncasecmp(cp, CONTENTLEN, sizeof(CONTENTLEN) - 1) == 0) {
+	} else if (strncasecmp(cp, CONTENTLEN, sizeof(CONTENTLEN) - 1) == 0) {
 		cp += sizeof(CONTENTLEN) - 1;
 		cp += strspn(cp, " \t");
 		conn->iosz = strtonum(cp, 0, MAX_CONTENTLEN, &errstr);
@@ -1418,12 +1466,17 @@ http_parse_header(struct http_connection *conn, char *buf)
 		loctail = strchr(redirurl, '#');
 		if (loctail != NULL)
 			*loctail = '\0';
-		conn->redir_uri = redirurl;
 		if (!valid_origin(redirurl, conn->req->uri)) {
-			warnx("%s: cross origin redirect to %s", conn->req->uri,
-			    http_info(redirurl));
+			char redirbuf[200];
+
+			(void)strlcpy(redirbuf, http_info(redirurl),
+			    sizeof(redirbuf));
+			warnx("%s: cross origin redirect to %s",
+			    http_info(conn->req->uri), redirbuf);
+			free(redirurl);
 			return -1;
 		}
+		conn->redir_uri = redirurl;
 	} else if (strncasecmp(cp, TRANSFER_ENCODING,
 	    sizeof(TRANSFER_ENCODING) - 1) == 0) {
 		cp += sizeof(TRANSFER_ENCODING) - 1;
@@ -1526,6 +1579,10 @@ http_read(struct http_connection *conn)
 		goto again;
 
 read_more:
+	if (conn->bufpos >= conn->bufsz) {
+		warnx("%s: read buffer full", conn_info(conn));
+		return http_failed(conn);
+	}
 	s = tls_read(conn->tls, conn->buf + conn->bufpos,
 	    conn->bufsz - conn->bufpos);
 	if (s == -1) {
@@ -1608,12 +1665,13 @@ again:
 				done = 1;
 		}
 
+		conn->totalsz = 0;
+
 		/* Check status header and decide what to do next */
 		if (http_isok(conn) || http_isredirect(conn)) {
 			if (http_isredirect(conn))
 				http_redirect(conn);
 
-			conn->totalsz = 0;
 			if (conn->chunked)
 				conn->state = STATE_RESPONSE_CHUNKED_HEADER;
 			else
@@ -1750,6 +1808,10 @@ proxy_read(struct http_connection *conn)
 	char *buf;
 	int done;
 
+	if (conn->bufpos >= conn->bufsz) {
+		warnx("%s: read buffer full", conn_info(conn));
+		return http_failed(conn);
+	}
 	s = read(conn->fd, conn->buf + conn->bufpos,
 	    conn->bufsz - conn->bufpos);
 	if (s == -1) {
@@ -1811,6 +1873,7 @@ proxy_write(struct http_connection *conn)
 
 	assert(conn->state == STATE_PROXY_REQUEST);
 
+	assert(conn->bufpos < conn->bufsz);
 	s = write(conn->fd, conn->buf + conn->bufpos,
 	    conn->bufsz - conn->bufpos);
 	if (s == -1) {
@@ -1894,8 +1957,14 @@ data_write(struct http_connection *conn)
 	memmove(conn->buf, conn->buf + s, conn->bufpos);
 
 	/* check if regular file transfer is finished */
-	if (!conn->chunked && conn->iosz == 0)
+	if (!conn->chunked && conn->iosz == 0) {
+		if (conn->bufpos != 0) {
+			warnx("%s: trailing data after transfer",
+			    conn_info(conn));
+			return http_failed(conn);
+		}
 		return http_done(conn, HTTP_OK);
+	}
 
 	/* all data written, switch back to read */
 	if (conn->bufpos == 0 || conn->iosz == 0) {
@@ -2044,7 +2113,7 @@ proc_http(char *bind_addr, int fd)
 	struct pollfd pfds[NPFDS];
 	struct http_connection *conn, *nc;
 	struct http_request *req, *nr;
-	struct ibuf *b, *inbuf = NULL;
+	struct ibuf *b;
 
 	if (pledge("stdio rpath inet dns recvfd", NULL) == -1)
 		err(1, "pledge");
@@ -2066,8 +2135,9 @@ proc_http(char *bind_addr, int fd)
 	if (pledge("stdio inet dns recvfd", NULL) == -1)
 		err(1, "pledge");
 
-	msgbuf_init(&msgq);
-	msgq.fd = fd;
+	if ((msgq = msgbuf_new_reader(sizeof(size_t), io_parse_hdr, NULL)) ==
+	    NULL)
+		err(1, NULL);
 
 	for (;;) {
 		time_t now;
@@ -2077,7 +2147,7 @@ proc_http(char *bind_addr, int fd)
 		memset(&pfds, 0, sizeof(pfds));
 		pfds[0].fd = fd;
 		pfds[0].events = POLLIN;
-		if (msgq.queued)
+		if (msgbuf_queuelen(msgq) > 0)
 			pfds[0].events |= POLLOUT;
 
 		i = 1;
@@ -2138,23 +2208,31 @@ proc_http(char *bind_addr, int fd)
 		if (pfds[0].revents & POLLHUP)
 			break;
 		if (pfds[0].revents & POLLOUT) {
-			switch (msgbuf_write(&msgq)) {
-			case 0:
-				errx(1, "write: connection closed");
-			case -1:
-				err(1, "write");
+			if (msgbuf_write(fd, msgq) == -1) {
+				if (errno == EPIPE)
+					errx(1, "write: connection closed");
+				else
+					err(1, "write");
 			}
 		}
 		if (pfds[0].revents & POLLIN) {
-			b = io_buf_recvfd(fd, &inbuf);
-			if (b != NULL) {
+			switch (msgbuf_read(fd, msgq)) {
+			case -1:
+				err(1, "msgbuf_read");
+			case 0:
+				errx(1, "msgbuf_read: connection closed");
+			}
+			while ((b = io_buf_get(msgq)) != NULL) {
 				unsigned int id;
 				char *uri;
 				char *mod;
 
+				if (!ibuf_fd_avail(b))
+					errx(1, "expected fd not received");
+
 				io_read_buf(b, &id, sizeof(id));
 				io_read_str(b, &uri);
-				io_read_str(b, &mod);
+				io_read_opt_str(b, &mod);
 
 				/* queue up new requests */
 				http_req_new(id, uri, mod, 0, ibuf_fd_get(b));

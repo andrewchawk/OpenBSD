@@ -1,5 +1,5 @@
 /* $NetBSD: loadfile.c,v 1.10 2000/12/03 02:53:04 tsutsui Exp $ */
-/* $OpenBSD: loadfile_elf.c,v 1.48 2024/07/09 09:31:37 dv Exp $ */
+/* $OpenBSD: loadfile_elf.c,v 1.59 2026/08/30 23:23:18 jsg Exp $ */
 
 /*-
  * Copyright (c) 1997 The NetBSD Foundation, Inc.
@@ -82,19 +82,15 @@
  */
 
 #include <sys/param.h>	/* PAGE_SIZE PAGE_MASK roundup */
-#include <sys/ioctl.h>
 #include <sys/reboot.h>
 #include <sys/exec.h>
 
 #include <elf.h>
-#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <err.h>
-#include <stddef.h>
 
 #include <dev/vmm/vmm.h>
 
@@ -108,6 +104,9 @@
 
 #define LOADADDR(a)            ((((u_long)(a)) + offset)&0xfffffff)
 
+/* Cap section name tables to prevent excessive ELF loader allocations. */
+#define MAX_SHSTRTAB_SIZE      (16 * 1024 * 1024)
+
 union {
 	Elf32_Ehdr elf32;
 	Elf64_Ehdr elf64;
@@ -117,24 +116,21 @@ static void setsegment(struct mem_segment_descriptor *, uint32_t,
     size_t, int, int, int, int);
 static int elf32_exec(gzFile, Elf32_Ehdr *, u_long *, int);
 static int elf64_exec(gzFile, Elf64_Ehdr *, u_long *, int);
-static size_t create_bios_memmap(struct vm_create_params *, bios_memmap_t *);
+static size_t create_bios_memmap(struct vmop_create_params *, bios_memmap_t *);
 static uint32_t push_bootargs(bios_memmap_t *, size_t, bios_bootmac_t *);
 static size_t push_stack(uint32_t, uint32_t);
 static void push_gdt(void);
-static void push_pt_32(void);
-static void push_pt_64(void);
 static void marc4random_buf(paddr_t, int);
 static void mbzero(paddr_t, int);
 static void mbcopy(void *, paddr_t, int);
 
-extern char *__progname;
 extern int vm_id;
 
 /*
  * setsegment
  *
  * Initializes a segment selector entry with the provided descriptor.
- * For the purposes of the bootloader mimiced by vmd(8), we only need
+ * For the purposes of the bootloader mimicked by vmd(8), we only need
  * memory-type segment descriptor support.
  *
  * This function was copied from machdep.c
@@ -144,7 +140,7 @@ extern int vm_id;
  *  base: base of the segment
  *  limit: limit of the segment
  *  type: type of the segment
- *  dpl: privilege level of the egment
+ *  dpl: privilege level of the segment
  *  def32: default 16/32 bit size of the segment
  *  gran: granularity of the segment (byte/page)
  */
@@ -194,55 +190,7 @@ push_gdt(void)
 	setsegment(&sd[2], 0, 0xffffffff, SDT_MEMRWA, SEL_KPL, 1, 1);
 
 	write_mem(GDT_PAGE, gdtpage, PAGE_SIZE);
-}
-
-/*
- * push_pt_32
- *
- * Create an identity-mapped page directory hierarchy mapping the first
- * 4GB of physical memory. This is used during bootstrapping i386 VMs on
- * CPUs without unrestricted guest capability.
- */
-static void
-push_pt_32(void)
-{
-	uint32_t ptes[1024], i;
-
-	memset(ptes, 0, sizeof(ptes));
-	for (i = 0 ; i < 1024; i++) {
-		ptes[i] = PG_V | PG_RW | PG_u | PG_PS | ((4096 * 1024) * i);
-	}
-	write_mem(PML3_PAGE, ptes, PAGE_SIZE);
-}
-
-/*
- * push_pt_64
- *
- * Create an identity-mapped page directory hierarchy mapping the first
- * 1GB of physical memory. This is used during bootstrapping 64 bit VMs on
- * CPUs without unrestricted guest capability.
- */
-static void
-push_pt_64(void)
-{
-	uint64_t ptes[512], i;
-
-	/* PDPDE0 - first 1GB */
-	memset(ptes, 0, sizeof(ptes));
-	ptes[0] = PG_V | PML3_PAGE;
-	write_mem(PML4_PAGE, ptes, PAGE_SIZE);
-
-	/* PDE0 - first 1GB */
-	memset(ptes, 0, sizeof(ptes));
-	ptes[0] = PG_V | PG_RW | PG_u | PML2_PAGE;
-	write_mem(PML3_PAGE, ptes, PAGE_SIZE);
-
-	/* First 1GB (in 2MB pages) */
-	memset(ptes, 0, sizeof(ptes));
-	for (i = 0 ; i < 512; i++) {
-		ptes[i] = PG_V | PG_RW | PG_u | PG_PS | ((2048 * 1024) * i);
-	}
-	write_mem(PML2_PAGE, ptes, PAGE_SIZE);
+	sev_register_encryption(GDT_PAGE, PAGE_SIZE);
 }
 
 /*
@@ -266,13 +214,12 @@ int
 loadfile_elf(gzFile fp, struct vmd_vm *vm, struct vcpu_reg_state *vrs,
     unsigned int bootdevice)
 {
-	int r, is_i386 = 0;
+	int r;
 	uint32_t bootargsz;
 	size_t n, stacksize;
 	u_long marks[MARK_MAX];
 	bios_memmap_t memmap[VMM_MAX_MEM_RANGES + 1];
 	bios_bootmac_t bm, *bootmac = NULL;
-	struct vm_create_params *vcp = &vm->vm_params.vmc_params;
 
 	if ((r = gzread(fp, &hdr, sizeof(hdr))) != sizeof(hdr))
 		return 1;
@@ -281,7 +228,6 @@ loadfile_elf(gzFile fp, struct vmd_vm *vm, struct vcpu_reg_state *vrs,
 	if (memcmp(hdr.elf32.e_ident, ELFMAG, SELFMAG) == 0 &&
 	    hdr.elf32.e_ident[EI_CLASS] == ELFCLASS32) {
 		r = elf32_exec(fp, &hdr.elf32, marks, LOAD_ALL);
-		is_i386 = 1;
 	} else if (memcmp(hdr.elf64.e_ident, ELFMAG, SELFMAG) == 0 &&
 	    hdr.elf64.e_ident[EI_CLASS] == ELFCLASS64) {
 		r = elf64_exec(fp, &hdr.elf64, marks, LOAD_ALL);
@@ -293,21 +239,21 @@ loadfile_elf(gzFile fp, struct vmd_vm *vm, struct vcpu_reg_state *vrs,
 
 	push_gdt();
 
-	if (is_i386) {
-		push_pt_32();
-		/* Reconfigure the default flat-64 register set for 32 bit */
-		vrs->vrs_crs[VCPU_REGS_CR3] = PML3_PAGE;
-		vrs->vrs_crs[VCPU_REGS_CR4] = CR4_PSE;
-		vrs->vrs_msrs[VCPU_REGS_EFER] = 0ULL;
-	}
-	else
-		push_pt_64();
+	/*
+	 * As both amd64 and i386 kernels are launched in 32 bit
+	 * protected mode with paging disabled reconfigure the default
+	 * flat 64 bit register set.
+	 */
+	vrs->vrs_crs[VCPU_REGS_CR3] = 0ULL;
+	vrs->vrs_crs[VCPU_REGS_CR4] = 0ULL;
+	vrs->vrs_msrs[VCPU_REGS_EFER] = 0ULL;
+	vrs->vrs_crs[VCPU_REGS_CR0] = CR0_ET | CR0_PE;
 
 	if (bootdevice == VMBOOTDEV_NET) {
 		bootmac = &bm;
 		memcpy(bootmac, vm->vm_params.vmc_macs[0], ETHER_ADDR_LEN);
 	}
-	n = create_bios_memmap(vcp, memmap);
+	n = create_bios_memmap(&vm->vm_params, memmap);
 	bootargsz = push_bootargs(memmap, n, bootmac);
 	stacksize = push_stack(bootargsz, marks[MARK_END]);
 
@@ -326,20 +272,20 @@ loadfile_elf(gzFile fp, struct vmd_vm *vm, struct vcpu_reg_state *vrs,
  * Construct a memory map as returned by the BIOS INT 0x15, e820 routine.
  *
  * Parameters:
- *  vcp: the VM create parameters, containing the memory map passed to vmm(4)
+ *  vmc: the VM create parameters, containing the memory map passed to vmm(4)
  *   memmap (out): the BIOS memory map
  *
  * Return values:
  * Number of bios_memmap_t entries, including the terminating nul-entry.
  */
 static size_t
-create_bios_memmap(struct vm_create_params *vcp, bios_memmap_t *memmap)
+create_bios_memmap(struct vmop_create_params *vmc, bios_memmap_t *memmap)
 {
 	size_t i, n = 0;
 	struct vm_mem_range *vmr;
 
-	for (i = 0; i < vcp->vcp_nmemranges; i++, n++) {
-		vmr = &vcp->vcp_memranges[i];
+	for (i = 0; i < vmc->vmc_nmemranges; i++, n++) {
+		vmr = &vmc->vmc_memranges[i];
 		memmap[n].addr = vmr->vmr_gpa;
 		memmap[n].size = vmr->vmr_size;
 		if (vmr->vmr_type == VM_MEM_RAM)
@@ -378,7 +324,7 @@ push_bootargs(bios_memmap_t *memmap, size_t n, bios_bootmac_t *bootmac)
 {
 	uint32_t memmap_sz, consdev_sz, bootmac_sz, i;
 	bios_consdev_t consdev;
-	uint32_t ba[1024];
+	uint32_t ba[1024] = { 0 };
 
 	memmap_sz = 3 * sizeof(uint32_t) + n * sizeof(bios_memmap_t);
 	ba[0] = BOOTARG_MEMMAP;
@@ -413,6 +359,7 @@ push_bootargs(bios_memmap_t *memmap, size_t n, bios_bootmac_t *bootmac)
 	ba[i++] = 0xFFFFFFFF; /* BOOTARG_END */
 
 	write_mem(BOOTARGS_PAGE, ba, PAGE_SIZE);
+	sev_register_encryption(BOOTARGS_PAGE, PAGE_SIZE);
 
 	return (i * sizeof(uint32_t));
 }
@@ -463,6 +410,7 @@ push_stack(uint32_t bootargsz, uint32_t end)
 	stack[--loc] = 0;
 
 	write_mem(STACK_PAGE, &stack, PAGE_SIZE);
+	sev_register_encryption(STACK_PAGE, PAGE_SIZE);
 
 	return (1024 - (loc - 1)) * sizeof(uint32_t);
 }
@@ -490,6 +438,8 @@ mread(gzFile fp, paddr_t addr, size_t sz)
 	size_t i, osz;
 	char buf[PAGE_SIZE];
 
+	sev_register_encryption(addr, sz);
+
 	/*
 	 * break up the 'sz' bytes into PAGE_SIZE chunks for use with
 	 * write_mem
@@ -507,8 +457,7 @@ mread(gzFile fp, paddr_t addr, size_t sz)
 			errstr = gzerror(fp, &errnum);
 			if (errnum == Z_ERRNO)
 				errnum = errno;
-			log_warnx("%s: error %d in mread, %s", __progname,
-			    errnum, errstr);
+			log_warnx("error %d in mread, %s", errnum, errstr);
 			return (0);
 		}
 
@@ -534,8 +483,7 @@ mread(gzFile fp, paddr_t addr, size_t sz)
 			errstr = gzerror(fp, &errnum);
 			if (errnum == Z_ERRNO)
 				errnum = errno;
-			log_warnx("%s: error %d in mread, %s", __progname,
-			    errnum, errstr);
+			log_warnx("error %d in mread, %s", errnum, errstr);
 			return (0);
 		}
 
@@ -564,6 +512,8 @@ marc4random_buf(paddr_t addr, int sz)
 {
 	int i, ct;
 	char buf[PAGE_SIZE];
+
+	sev_register_encryption(addr, sz);
 
 	/*
 	 * break up the 'sz' bytes into PAGE_SIZE chunks for use with
@@ -614,6 +564,7 @@ mbzero(paddr_t addr, int sz)
 {
 	if (write_mem(addr, NULL, sz))
 		return;
+	sev_register_encryption(addr, sz);
 }
 
 /*
@@ -633,6 +584,7 @@ static void
 mbcopy(void *src, paddr_t dst, int sz)
 {
 	write_mem(dst, src, sz);
+	sev_register_encryption(dst, sz);
 }
 
 /*
@@ -773,8 +725,20 @@ elf64_exec(gzFile fp, Elf64_Ehdr *elf, u_long *marks, int flags)
 		shpp = maxp;
 		maxp += roundup(sz, sizeof(Elf64_Addr));
 
+		if (elf->e_shstrndx >= elf->e_shnum) {
+			free(shp);
+			return 1;
+		}
 		size_t shstrsz = shp[elf->e_shstrndx].sh_size;
+		if (shstrsz > MAX_SHSTRTAB_SIZE) {
+			free(shp);
+			return 1;
+		}
 		char *shstr = malloc(shstrsz);
+		if (shstr == NULL) {
+			free(shp);
+			return 1;
+		}
 		if (gzseek(fp, (off_t)shp[elf->e_shstrndx].sh_offset,
 		    SEEK_SET) == -1) {
 			free(shstr);
@@ -799,10 +763,16 @@ elf64_exec(gzFile fp, Elf64_Ehdr *elf, u_long *marks, int flags)
 				havesyms = 1;
 
 		for (i = 0; i < elf->e_shnum; i++) {
+			char *shname = NULL;
+
+			if (shp[i].sh_name < shstrsz &&
+			    memchr(shstr + shp[i].sh_name, '\0',
+			    shstrsz - shp[i].sh_name) != NULL)
+				shname = shstr + shp[i].sh_name;
 			if (shp[i].sh_type == SHT_SYMTAB ||
 			    shp[i].sh_type == SHT_STRTAB ||
-			    !strcmp(shstr + shp[i].sh_name, ".debug_line") ||
-			    !strcmp(shstr + shp[i].sh_name, ELF_CTF)) {
+			    (shname != NULL && !strcmp(shname, ".debug_line")) ||
+			    (shname != NULL && !strcmp(shname, ELF_CTF))) {
 				if (havesyms && (flags & LOAD_SYM)) {
 					if (gzseek(fp, (off_t)shp[i].sh_offset,
 					    SEEK_SET) == -1) {
@@ -987,12 +957,24 @@ elf32_exec(gzFile fp, Elf32_Ehdr *elf, u_long *marks, int flags)
 			free(shp);
 			return 1;
 		}
+		if (elf->e_shstrndx >= elf->e_shnum) {
+			free(shp);
+			return 1;
+		}
 
 		shpp = maxp;
 		maxp += roundup(sz, sizeof(Elf32_Addr));
 
 		size_t shstrsz = shp[elf->e_shstrndx].sh_size;
+		if (shstrsz > MAX_SHSTRTAB_SIZE) {
+			free(shp);
+			return 1;
+		}
 		char *shstr = malloc(shstrsz);
+		if (shstr == NULL) {
+			free(shp);
+			return 1;
+		}
 		if (gzseek(fp, (off_t)shp[elf->e_shstrndx].sh_offset,
 		    SEEK_SET) == -1) {
 			free(shstr);
@@ -1017,9 +999,15 @@ elf32_exec(gzFile fp, Elf32_Ehdr *elf, u_long *marks, int flags)
 				havesyms = 1;
 
 		for (i = 0; i < elf->e_shnum; i++) {
+			char *shname = NULL;
+
+			if (shp[i].sh_name < shstrsz &&
+			    memchr(shstr + shp[i].sh_name, '\0',
+			    shstrsz - shp[i].sh_name) != NULL)
+				shname = shstr + shp[i].sh_name;
 			if (shp[i].sh_type == SHT_SYMTAB ||
 			    shp[i].sh_type == SHT_STRTAB ||
-			    !strcmp(shstr + shp[i].sh_name, ".debug_line")) {
+			    (shname != NULL && !strcmp(shname, ".debug_line"))) {
 				if (havesyms && (flags & LOAD_SYM)) {
 					if (gzseek(fp, (off_t)shp[i].sh_offset,
 					    SEEK_SET) == -1) {

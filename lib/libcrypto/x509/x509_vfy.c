@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_vfy.c,v 1.144 2024/08/04 08:15:36 tb Exp $ */
+/* $OpenBSD: x509_vfy.c,v 1.153 2026/06/26 06:03:32 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -67,7 +67,6 @@
 #include <openssl/asn1.h>
 #include <openssl/buffer.h>
 #include <openssl/crypto.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/lhash.h>
 #include <openssl/objects.h>
@@ -75,7 +74,9 @@
 #include <openssl/x509v3.h>
 
 #include "asn1_local.h"
+#include "err_local.h"
 #include "x509_internal.h"
+#include "x509_issuer_cache.h"
 #include "x509_local.h"
 
 /* CRL score values */
@@ -704,9 +705,6 @@ x509_vfy_get_trusted_issuer(X509 **issuer, X509_STORE_CTX *ctx, X509 *x)
 int
 x509_vfy_check_chain_extensions(X509_STORE_CTX *ctx)
 {
-#ifdef OPENSSL_NO_CHAIN_VERIFY
-	return 1;
-#else
 	int i, ok = 0, must_be_ca, plen = 0;
 	X509 *x;
 	int (*cb)(int xok, X509_STORE_CTX *xctx);
@@ -797,11 +795,11 @@ x509_vfy_check_chain_extensions(X509_STORE_CTX *ctx)
 			plen++;
 		must_be_ca = 1;
 	}
+
 	ok = 1;
 
-end:
+ end:
 	return ok;
-#endif
 }
 
 static int
@@ -1076,26 +1074,35 @@ get_crl_sk(X509_STORE_CTX *ctx, X509_CRL **pcrl, X509_CRL **pdcrl,
 		reasons = *preasons;
 		crl_score = get_crl_score(ctx, &crl_issuer, &reasons, crl, x);
 
-		if (crl_score > best_score) {
-			best_crl = crl;
-			best_crl_issuer = crl_issuer;
-			best_score = crl_score;
-			best_reasons = reasons;
+		if (crl_score < best_score || crl_score == 0)
+			continue;
+
+		if (crl_score == best_score && best_crl != NULL) {
+			int day, sec;
+
+			if (!ASN1_TIME_diff(&day, &sec, best_crl->crl->lastUpdate,
+			    crl->crl->lastUpdate))
+				continue;
+
+			if (day <= 0 && sec <= 0)
+				continue;
 		}
+
+		best_crl = crl;
+		best_crl_issuer = crl_issuer;
+		best_score = crl_score;
+		best_reasons = reasons;
 	}
 
-	if (best_crl) {
-		if (*pcrl)
-			X509_CRL_free(*pcrl);
+	if (best_crl != NULL) {
+		X509_CRL_free(*pcrl);
 		*pcrl = best_crl;
 		*pissuer = best_crl_issuer;
 		*pscore = best_score;
 		*preasons = best_reasons;
 		CRYPTO_add(&best_crl->references, 1, CRYPTO_LOCK_X509_CRL);
-		if (*pdcrl) {
-			X509_CRL_free(*pdcrl);
-			*pdcrl = NULL;
-		}
+		X509_CRL_free(*pdcrl);
+		*pdcrl = NULL;
 		get_delta_sk(ctx, pdcrl, pscore, best_crl, crls);
 	}
 
@@ -1150,11 +1157,15 @@ crl_extension_match(X509_CRL *a, X509_CRL *b, int nid)
 static int
 check_delta_base(X509_CRL *delta, X509_CRL *base)
 {
-	/* Delta CRL must be a delta */
-	if (!delta->base_crl_number)
+	/*
+	 * Delta CRL must be a delta and have a CRL number.
+	 * XXX - This means EXFLAG_INVALID was set by crl_cb(),
+	 * which we should check somewhere and bail out.
+	 */
+	if (delta->base_crl_number == NULL || delta->crl_number == NULL)
 		return 0;
 	/* Base must have a CRL number */
-	if (!base->crl_number)
+	if (base->crl_number == NULL)
 		return 0;
 	/* Issuer names must match */
 	if (X509_NAME_cmp(X509_CRL_get_issuer(base),
@@ -1551,12 +1562,42 @@ done:
 	return 0;
 }
 
+/* Matches x509_verify_parent_signature() */
+static int
+x509_crl_verify_parent_signature(X509 *parent, X509_CRL *crl, int *error)
+{
+	EVP_PKEY *pkey;
+	int cached;
+	int ret = 0;
+
+	/* Use cached value if we have it */
+	if ((cached = x509_issuer_cache_find(parent->hash, crl->hash)) >= 0) {
+		if (cached == 0)
+			*error = X509_V_ERR_CRL_SIGNATURE_FAILURE;
+		return cached;
+	}
+
+	/* Check signature. Did parent sign crl? */
+	if ((pkey = X509_get0_pubkey(parent)) == NULL) {
+		*error = X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY;
+		return 0;
+	}
+	if (X509_CRL_verify(crl, pkey) <= 0)
+		*error = X509_V_ERR_CRL_SIGNATURE_FAILURE;
+	else
+		ret = 1;
+
+	/* Add result to cache */
+	x509_issuer_cache_add(parent->hash, crl->hash, ret);
+
+	return ret;
+}
+
 /* Check CRL validity */
 static int
 x509_vfy_check_crl(X509_STORE_CTX *ctx, X509_CRL *crl)
 {
 	X509 *issuer = NULL;
-	EVP_PKEY *ikey = NULL;
 	int ok = 0, chnum, cnum;
 
 	cnum = ctx->error_depth;
@@ -1628,29 +1669,16 @@ x509_vfy_check_crl(X509_STORE_CTX *ctx, X509_CRL *crl)
 				goto err;
 		}
 
-		/* Attempt to get issuer certificate public key */
-		ikey = X509_get_pubkey(issuer);
-
-		if (!ikey) {
-			ctx->error = X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY;
+		if (!x509_crl_verify_parent_signature(issuer, crl, &ctx->error)) {
 			ok = ctx->verify_cb(0, ctx);
 			if (!ok)
 				goto err;
-		} else {
-			/* Verify CRL signature */
-			if (X509_CRL_verify(crl, ikey) <= 0) {
-				ctx->error = X509_V_ERR_CRL_SIGNATURE_FAILURE;
-				ok = ctx->verify_cb(0, ctx);
-				if (!ok)
-					goto err;
-			}
 		}
 	}
 
 	ok = 1;
 
-err:
-	EVP_PKEY_free(ikey);
+ err:
 	return ok;
 }
 
@@ -2401,9 +2429,9 @@ LCRYPTO_ALIAS(X509_STORE_get_check_issued);
 
 void
 X509_STORE_set_check_issued(X509_STORE *store,
-    X509_STORE_CTX_check_issued_fn check_issued)
+    X509_STORE_CTX_check_issued_fn check_issued_fn)
 {
-	store->check_issued = check_issued;
+	store->check_issued = check_issued_fn;
 }
 LCRYPTO_ALIAS(X509_STORE_set_check_issued);
 
@@ -2541,27 +2569,10 @@ check_key_level(X509_STORE_CTX *ctx, X509 *cert)
 static int
 check_sig_level(X509_STORE_CTX *ctx, X509 *cert)
 {
-	const EVP_MD *md;
-	int bits, nid, md_nid;
+	int bits;
 
-	if ((nid = X509_get_signature_nid(cert)) == NID_undef)
+	if (!X509_get_signature_info(cert, NULL, NULL, &bits, NULL))
 		return 0;
-
-	/*
-	 * Look up signature algorithm digest.
-	 */
-
-	if (!OBJ_find_sigid_algs(nid, &md_nid, NULL))
-		return 0;
-
-	if (md_nid == NID_undef)
-		return 0;
-
-	if ((md = EVP_get_digestbynid(md_nid)) == NULL)
-		return 0;
-
-	/* Assume 4 bits of collision resistance for each hash octet. */
-	bits = EVP_MD_size(md) * 4;
 
 	return enough_bits_for_security_level(bits, ctx->param->security_level);
 }

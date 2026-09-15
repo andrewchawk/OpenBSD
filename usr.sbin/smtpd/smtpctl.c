@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpctl.c,v 1.172 2023/05/31 16:51:46 op Exp $	*/
+/*	$OpenBSD: smtpctl.c,v 1.179 2026/09/13 19:14:41 op Exp $	*/
 
 /*
  * Copyright (c) 2013 Eric Faurot <eric@openbsd.org>
@@ -118,7 +118,9 @@ srv_connect(void)
 	}
 
 	ibuf = xcalloc(1, sizeof(struct imsgbuf));
-	imsg_init(ibuf, ctl_sock);
+	if (imsgbuf_init(ibuf, ctl_sock) == -1)
+		err(1, "imsgbuf_init");
+	imsgbuf_allow_fdpass(ibuf);
 
 	return (1);
 }
@@ -158,7 +160,7 @@ offline_file(void)
 static void
 srv_flush(void)
 {
-	if (imsg_flush(ibuf) == -1)
+	if (imsgbuf_flush(ibuf) == -1)
 		err(1, "write error");
 }
 
@@ -173,13 +175,13 @@ srv_send(int msg, const void *data, size_t len)
 static void
 srv_recv(int type)
 {
-	ssize_t	n;
+	int	n;
 
 	srv_flush();
 
 	while (1) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			errx(1, "imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			errx(1, "imsgbuf_get error");
 		if (n) {
 			if (imsg.hdr.type == IMSG_CTL_FAIL &&
 			    imsg.hdr.peerid != 0 &&
@@ -192,8 +194,8 @@ srv_recv(int type)
 			break;
 		}
 
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			errx(1, "imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			err(1, "read error");
 		if (n == 0)
 			errx(1, "pipe closed");
 	}
@@ -1126,7 +1128,7 @@ sendmail_compat(int argc, char **argv)
 			err(1, "setresgid");
 
 		/* we'll reduce further down the road */
-		if (pledge("stdio rpath wpath cpath tmppath flock "
+		if (pledge("stdio rpath wpath cpath flock "
 			"dns getpw recvfd", NULL) == -1)
 			err(1, "pledge");
 
@@ -1159,6 +1161,7 @@ show_queue_envelope(struct envelope *e, int online)
 	getflag(&e->flags, EF_BOUNCE, "bounce", status, sizeof(status));
 	getflag(&e->flags, EF_AUTHENTICATED, "auth", status, sizeof(status));
 	getflag(&e->flags, EF_INTERNAL, "internal", status, sizeof(status));
+	getflag(&e->flags, EF_TLS, "tls", status, sizeof(status));
 	getflag(&e->flags, EF_SUSPEND, "suspend", status, sizeof(status));
 	getflag(&e->flags, EF_HOLD, "hold", status, sizeof(status));
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_wg.h,v 1.5 2023/06/01 18:57:53 kn Exp $ */
+/*	$OpenBSD: if_wg.h,v 1.7 2025/07/10 05:28:13 dlg Exp $ */
 
 /*
  * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
@@ -19,9 +19,6 @@
 
 #ifndef __IF_WG_H__
 #define __IF_WG_H__
-
-#include <sys/limits.h>
-#include <sys/errno.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
@@ -49,6 +46,7 @@ struct wg_aip_io {
 	sa_family_t	 a_af;
 	int		 a_cidr;
 	union wg_aip_addr {
+		uint8_t			addr_bytes;
 		struct in_addr		addr_ipv4;
 		struct in6_addr		addr_ipv6;
 	}		 a_addr;

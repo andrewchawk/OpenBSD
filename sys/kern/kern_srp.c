@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_srp.c,v 1.13 2020/12/06 19:18:30 cheloha Exp $ */
+/*	$OpenBSD: kern_srp.c,v 1.15 2025/12/15 05:50:47 dlg Exp $ */
 
 /*
  * Copyright (c) 2014 Jonathan Matthew <jmatthew@openbsd.org>
@@ -79,12 +79,6 @@ void *
 srp_get_locked(struct srp *srp)
 {
 	return (srp->ref);
-}
-
-void
-srp_gc_finalize(struct srp_gc *srp_gc)
-{
-	refcnt_finalize(&srp_gc->srp_gc_refcnt, "srpfini");
 }
 
 #ifdef MULTIPROCESSOR
@@ -241,7 +235,14 @@ srp_enter(struct srp_ref *sr, struct srp *srp)
 void *
 srp_follow(struct srp_ref *sr, struct srp *srp)
 {
-	return (srp_v(sr->hz, srp));
+	struct srp_ref nsr;
+	void *nv;
+
+	nv = srp_enter(&nsr, srp);
+	srp_leave(sr);
+	sr->hz = nsr.hz;
+
+	return (nv);
 }
 
 void

@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.105 2024/02/21 15:53:07 deraadt Exp $	*/
+/*	$OpenBSD: trap.c,v 1.119 2026/08/19 08:56:28 hshoexer Exp $	*/
 /*	$NetBSD: trap.c,v 1.2 2003/05/04 23:51:56 fvdl Exp $	*/
 
 /*-
@@ -86,6 +86,8 @@
 #include <machine/fpu.h>
 #include <machine/psl.h>
 #include <machine/trap.h>
+#include <machine/ghcb.h>
+#include <machine/vmmvar.h>
 #ifdef DDB
 #include <ddb/db_output.h>
 #include <machine/db_machdep.h>
@@ -95,6 +97,9 @@
 
 int	upageflttrap(struct trapframe *, uint64_t);
 int	kpageflttrap(struct trapframe *, uint64_t);
+#ifdef AMDSEV
+int	vctrap(struct trapframe *, int, int *, int *);
+#endif
 void	kerntrap(struct trapframe *);
 void	usertrap(struct trapframe *);
 void	ast(struct trapframe *);
@@ -123,6 +128,7 @@ const char * const trap_type[] = {
 	"SSE FP exception",			/* 19 T_XMM */
 	"virtualization exception",		/* 20 T_VE */
 	"control protection exception",		/* 21 T_CP */
+	"VMM communication exception",		/* 29 T_VC */
 };
 const int	trap_types = nitems(trap_type);
 
@@ -182,7 +188,7 @@ upageflttrap(struct trapframe *frame, uint64_t cr2)
 	int signal, sicode, error;
 
 	/*
-	 * If NX is not enabled, we cant distinguish between PROT_READ
+	 * If NX is not enabled, we can't distinguish between PROT_READ
 	 * and PROT_EXEC access, so try both.
 	 */
 	error = uvm_fault(&p->p_vmspace->vm_map, va, 0, access_type);
@@ -297,6 +303,200 @@ kpageflttrap(struct trapframe *frame, uint64_t cr2)
 	return 1;
 }
 
+#ifdef AMDSEV
+int
+vctrap(struct trapframe *frame, int user, int *sig, int *code)
+{
+	uint8_t		*rip = (uint8_t *)(frame->tf_rip);
+	uint64_t	 port;
+	struct ghcb_sync syncout, syncin;
+	struct ghcb_sa	*ghcb;
+	struct ghcb_extra_regs	ghcb_regs;
+
+	KASSERT((read_rflags() & PSL_I) == 0);
+
+	if (user) {
+		KASSERT(sig != NULL);
+		KASSERT(code != NULL);
+	}
+
+	memset(&syncout, 0, sizeof(syncout));
+	memset(&syncin, 0, sizeof(syncin));
+	memset(&ghcb_regs, 0, sizeof(ghcb_regs));
+
+	ghcb_regs.exitcode = frame->tf_err;
+
+	/*
+	 * The #VC trap occurs when the guest (us) performs an
+	 * operation which requires sharing data with the host. In
+	 * order to ascertain which instruction caused the #VC,
+	 * examine the instruction by reading %rip, Then, sync the
+	 * appropriate values out (to the host), perform VMGEXIT
+	 * to request that the host handle the operation which
+	 * caused the #VC, then sync the returned values back in
+	 * (from the host).
+	 */
+	switch (ghcb_regs.exitcode) {
+	case SVM_VMEXIT_CPUID:
+		ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncout);
+		ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncout);
+		ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncin);
+		ghcb_sync_val(GHCB_RBX, GHCB_SZ32, &syncin);
+		ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncin);
+		ghcb_sync_val(GHCB_RDX, GHCB_SZ32, &syncin);
+		frame->tf_rip += 2;
+		break;
+	case SVM_VMEXIT_MSR: {
+		if (user) {
+			*sig = SIGILL;
+			*code = ILL_PRVOPC;
+			return 0;	/* not allowed from userspace */
+		}
+		if (*rip == 0x0f && *(rip + 1) == 0x30) {
+			/* WRMSR */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncout);
+			ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncout);
+			ghcb_sync_val(GHCB_RDX, GHCB_SZ32, &syncout);
+			ghcb_regs.exitinfo1 = 1;
+		} else if (*rip == 0x0f && *(rip + 1) == 0x32) {
+			/* RDMSR */
+			ghcb_sync_val(GHCB_RCX, GHCB_SZ32, &syncout);
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncin);
+			ghcb_sync_val(GHCB_RDX, GHCB_SZ32, &syncin);
+		} else
+			panic("failed to decode MSR");
+		frame->tf_rip += 2;
+		break;
+	    }
+	case SVM_VMEXIT_IOIO: {
+		if (user) {
+			*sig = SIGILL;
+			*code = ILL_PRVOPC;
+			return 0;	/* not allowed from userspace */
+		}
+		switch (*rip) {
+		case 0x66: {
+			switch (*(rip + 1)) {
+			case 0xef:	/* out %ax,(%dx) */
+				ghcb_sync_val(GHCB_RAX, GHCB_SZ16, &syncout);
+				port = frame->tf_rdx & 0xffff;
+				ghcb_regs.exitinfo1 = (port << 16) |
+				    (1ULL << 5);
+				frame->tf_rip += 2;
+				break;
+			case 0xed:	/* in (%dx),%ax */
+				ghcb_sync_val(GHCB_RAX, GHCB_SZ16, &syncin);
+				port = frame->tf_rdx & 0xffff;
+				ghcb_regs.exitinfo1 = (port << 16) |
+				    (1ULL << 5) | (1ULL << 0);
+				frame->tf_rip += 2;
+				break;
+			default:
+				panic("failed to decode prefixed IOIO");
+			}
+			break;
+		    }
+		case 0xe4:	/* in $port,%al */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncin);
+			port = *(rip + 1) & 0xff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4) |
+			    (1ULL << 0);
+			frame->tf_rip += 2;
+			break;
+		case 0xe6:	/* outb %al,$port */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncout);
+			port = *(rip + 1) & 0xff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4);
+			frame->tf_rip += 2;
+			break;
+		case 0xec:	/* in (%dx),%al */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncin);
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4) |
+			    (1ULL << 0);
+			frame->tf_rip += 1;
+			break;
+		case 0xed:	/* in (%dx),%eax */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncin);
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 6) |
+			    (1ULL << 0);
+			frame->tf_rip += 1;
+			break;
+		case 0xee:	/* out %al,(%dx) */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ8, &syncout);
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 4);
+			frame->tf_rip += 1;
+			break;
+		case 0xef:	/* out %eax,(%dx) */
+			ghcb_sync_val(GHCB_RAX, GHCB_SZ32, &syncout);
+			port = frame->tf_rdx & 0xffff;
+			ghcb_regs.exitinfo1 = (port << 16) | (1ULL << 6);
+			frame->tf_rip += 1;
+			break;
+		default:
+			panic("failed to decode IOIO");
+		}
+		break;
+	    }
+	case SVM_VMEXIT_VMMCALL:
+		if (user) {
+			*sig = SIGILL;
+			*code = ILL_PRVOPC;
+			return 0;	/* not allowed from userspace */
+		}
+		panic("unexpected VMMCALL in kernelspace");
+		/* NOTREACHED */
+	case SVM_VMEXIT_NPF:
+		if (user) {
+			*sig = SIGBUS;
+			*code = BUS_ADRERR;
+			return 0;	/* not allowed from userspace */
+		}
+		panic("unexpected MMIO in kernelspace");
+		/* NOTREACHED */
+	case SVM_VMEXIT_WBINVD:
+		/*
+		 * There is no special GHCB request for WBNOINVD.
+		 * Signal WBINVD to emulate WBNOINVD.
+		 */
+		if (*rip == 0xf3)
+			frame->tf_rip += 3;
+		else
+			frame->tf_rip += 2;
+		break;
+	default:
+		panic("invalid exit code 0x%llx", ghcb_regs.exitcode);
+	}
+
+	/* Always required */
+	ghcb_sync_val(GHCB_SW_EXITCODE, GHCB_SZ64, &syncout);
+	ghcb_sync_val(GHCB_SW_EXITINFO1, GHCB_SZ64, &syncout);
+	ghcb_sync_val(GHCB_SW_EXITINFO2, GHCB_SZ64, &syncout);
+
+	/* Sync out to GHCB */
+	ghcb = (struct ghcb_sa *)ghcb_vaddr;
+	ghcb_sync_out(frame, &ghcb_regs, ghcb, &syncout);
+
+	wrmsr(MSR_SEV_GHCB, ghcb_paddr);
+
+	/* Call hypervisor. */
+	vmgexit();
+
+	/* Verify response */
+	if (ghcb_verify_bm(ghcb->valid_bitmap, syncin.valid_bitmap)) {
+		ghcb_clear(ghcb);
+		panic("invalid hypervisor response");
+	}
+
+	/* Sync in from GHCB */
+	ghcb_sync_in(frame, NULL, ghcb, &syncin);
+
+	return 1;
+}
+#endif	/* AMDSEV */
+
 
 /*
  * kerntrap(frame):
@@ -312,7 +512,7 @@ kerntrap(struct trapframe *frame)
 	uint64_t cr2 = rcr2();
 
 	verify_smap(__func__);
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	debug_trap(frame, curproc, type);
 
 	switch (type) {
@@ -348,6 +548,13 @@ kerntrap(struct trapframe *frame)
 		else
 			return;
 #endif /* NISA > 0 */
+
+#ifdef AMDSEV
+	case T_VC:
+		if (vctrap(frame, 0, NULL, NULL))
+			return;
+		goto we_re_toast;
+#endif
 	}
 }
 
@@ -379,7 +586,7 @@ usertrap(struct trapframe *frame)
 	int sig, code;
 
 	verify_smap(__func__);
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	debug_trap(frame, p, type);
 
 	p->p_md.md_regs = frame;
@@ -427,7 +634,12 @@ usertrap(struct trapframe *frame)
 		code = (frame->tf_err & 0x7fff) < 4 ? ILL_BTCFI
 		    : ILL_BADSTK;
 		break;
-
+#ifdef AMDSEV
+	case T_VC:
+		if (vctrap(frame, 1, &sig, &code))
+			goto out;
+		break;
+#endif
 	case T_PAGEFLT:			/* page fault */
 		if (!uvm_map_inentry(p, &p->p_spinentry, PROC_STACK(p),
 		    "[%s]%d/%d sp=%lx inside %lx-%lx: not MAP_STACK\n",
@@ -465,6 +677,8 @@ trap_print(struct trapframe *frame, int type)
 	    frame->tf_rflags, rcr2(), curcpu()->ci_ilevel, frame->tf_rsp);
 	printf("gsbase %p  kgsbase %p\n",
 	    (void *)rdmsr(MSR_GSBASE), (void *)rdmsr(MSR_KERNELGSBASE));
+	if (type == T_TRCTRAP)
+		printf("dr6 %llx dr7 %llx\n", rdr6(), rdr7());
 }
 
 
@@ -533,11 +747,11 @@ ast(struct trapframe *frame)
 {
 	struct proc *p = curproc;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	KASSERT(!KERNELMODE(frame->tf_cs, frame->tf_rflags));
 	p->p_md.md_regs = frame;
 	refreshcreds(p);
-	uvmexp.softs++;
+	atomic_inc_int(&uvmexp.softs);
 	mi_ast(p, curcpu()->ci_want_resched);
 	userret(p);
 }
@@ -556,7 +770,7 @@ syscall(struct trapframe *frame)
 	register_t code, *args, rval[2];
 
 	verify_smap(__func__);
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 	p = curproc;
 
 	if (verify_pkru(p)) {

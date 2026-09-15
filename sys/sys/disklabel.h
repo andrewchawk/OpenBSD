@@ -1,4 +1,4 @@
-/*	$OpenBSD: disklabel.h,v 1.86 2022/11/07 10:33:22 krw Exp $	*/
+/*	$OpenBSD: disklabel.h,v 1.94 2025/11/13 20:59:14 deraadt Exp $	*/
 /*	$NetBSD: disklabel.h,v 1.41 1996/05/10 23:07:37 mark Exp $	*/
 
 /*
@@ -50,29 +50,31 @@
 #include <sys/uuid.h>
 
 /*
- * The absolute maximum number of disk partitions allowed.
- * This is the maximum value of MAXPARTITIONS for which 'struct disklabel'
- * is <= DEV_BSIZE bytes long.  If MAXPARTITIONS is greater than this, beware.
+ * The dev_t split has 64 partitions, but only 52 are visible
+ * and easily useable in userland (a-z and A-Z).
+ * The MD variable MAXPARTITIONS remains 52 (or less).
  */
-#define	MAXMAXPARTITIONS	22
-#if MAXPARTITIONS > MAXMAXPARTITIONS
-#warn beware: MAXPARTITIONS bigger than MAXMAXPARTITIONS
-#endif
+#define	MAXPARTITIONSUNIT	64
+
+/*
+ * Various situations still have structures limited to 16 partitions.
+ */
+#define MAXPARTITIONS16		16
 
 /*
  * Translate between device numbers and major/disk unit/disk partition.
  */
-#define	DISKUNIT(dev)	(minor(dev) / MAXPARTITIONS)
-#define	DISKPART(dev)	(minor(dev) % MAXPARTITIONS)
+#define	DISKUNIT(dev)	(minor(dev) / MAXPARTITIONSUNIT)
+#define	DISKPART(dev)	(minor(dev) % MAXPARTITIONSUNIT)
 #define	RAW_PART	2	/* 'c' partition */
 #define	DISKMINOR(unit, part) \
-    (((unit) * MAXPARTITIONS) + (part))
+    (((unit) * MAXPARTITIONSUNIT) + (part))
 #define	MAKEDISKDEV(maj, unit, part) \
     (makedev((maj), DISKMINOR((unit), (part))))
 #define	DISKLABELDEV(dev) \
     (MAKEDISKDEV(major(dev), DISKUNIT(dev), RAW_PART))
 
-#define DISKMAGIC	((u_int32_t)0x82564557)	/* The disk magic number */
+#define DISKMAGIC	0x82564557U	/* The disk magic number */
 
 #define MAXDISKSIZE	0x7fffffffffffLL	/* 47 bits of reach */
 
@@ -127,20 +129,7 @@ struct disklabel {
 		u_int8_t p_fstype;	/* filesystem type, see below */
 		u_int8_t p_fragblock;	/* encoded filesystem frag/block */
 		u_int16_t p_cpg;	/* UFS: FS cylinders per group */
-	} d_partitions[MAXPARTITIONS];	/* actually may be more */
-};
-
-
-struct	__partitionv0 {		/* old (v0) partition table entry */
-	u_int32_t p_size;	/* number of sectors in partition */
-	u_int32_t p_offset;	/* starting sector */
-	u_int32_t p_fsize;	/* filesystem basic fragment size */
-	u_int8_t p_fstype;	/* filesystem type, see below */
-	u_int8_t p_frag;	/* filesystem fragments per block */
-	union {
-		u_int16_t cpg;	/* UFS: FS cylinders per group */
-		u_int16_t sgs;	/* LFS: FS segment shift */
-	} __partitionv0_u1;
+	} d_partitions[MAXPARTITIONSUNIT]; /* maximum 52 in use */
 };
 #endif /* _LOCORE */
 
@@ -193,6 +182,32 @@ struct	__partitionv0 {		/* old (v0) partition table entry */
 #define DL_SECTOBLK(d, n)	((n) * DL_BLKSPERSEC(d))
 #define DL_BLKTOSEC(d, n)	((n) / DL_BLKSPERSEC(d))
 #define DL_BLKOFFSET(d, n)	(((n) % DL_BLKSPERSEC(d)) * DEV_BSIZE)
+
+static __inline char
+DL_PARTNUM2NAME(int partnum)
+{
+	if (partnum >= MAXPARTITIONS)
+		return -1;
+	if (partnum <= 'z' - 'a')
+		return 'a' + partnum;
+	else if (partnum - 26 <= 'Z' - 'A')
+		return 'A' + partnum - 26;
+	return -1;
+}
+
+static __inline int
+DL_PARTNAME2NUM(char partname)
+{
+	int partnum = -1;
+
+	if (partname >= 'a' && partname <= 'z')
+		partnum = partname - 'a';
+	else if (partname >= 'A' && partname <= 'Z')
+		partnum = partname - 'A' + 26;
+	if (partnum >= MAXPARTITIONS)
+		partnum = -1;
+	return partnum;
+}
 
 /* d_type values: */
 #define	DTYPE_SMD		1		/* SMD, XSMD; VAX hp/up */
@@ -385,51 +400,12 @@ struct gpt_partition {
 	   and must be zero */
 };
 
-#define GPT_UUID_UNUSED \
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
-#define GPT_UUID_MSDOS \
-    { 0xeb, 0xd0, 0xa0, 0xa2, 0xb9, 0xe5, 0x44, 0x33, \
-      0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 }
 #define GPT_UUID_EFI_SYSTEM \
     { 0xc1, 0x2a, 0x73, 0x28, 0xf8, 0x1f, 0x11, 0xd2, \
       0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b }
-#define GPT_UUID_LEGACY_MBR \
-    { 0x02, 0x4d, 0xee, 0x41, 0x33, 0x37, 0x11, 0xd3, \
-      0x9d, 0x69, 0x00, 0x08, 0xc7, 0x81, 0xf3, 0x9f }
 #define GPT_UUID_OPENBSD \
     { 0x82, 0x4c, 0xc7, 0xa0, 0x36, 0xa8, 0x11, 0xe3, \
       0x89, 0x0a, 0x95, 0x25, 0x19, 0xad, 0x3f, 0x61 }
-#define GPT_UUID_CHROMEROOTFS \
-    { 0x3c, 0xb8, 0xe2, 0x02, 0x3b, 0x7e, 0x47, 0xdd, \
-      0x8a, 0x3c, 0x7f, 0xf2, 0xa1, 0x3c, 0xfc, 0xec }
-#define GPT_UUID_LINUX \
-    { 0x0f, 0xc6, 0x3d, 0xaf, 0x84, 0x83, 0x47, 0x72, \
-      0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4 }
-#define GPT_UUID_LINUX_HOME \
-    { 0x93, 0x3a, 0xc7, 0xe1, 0x2e, 0xb4, 0x4f, 0x13, \
-      0xb8, 0x44, 0x0e, 0x14, 0xe2, 0xae, 0xf9, 0x15 }
-#define GPT_UUID_LINUX_SRV \
-    { 0x3b, 0x8f, 0x84, 0x25, 0x20, 0xe0, 0x4f, 0x3b, \
-      0x90, 0x7f, 0x1a, 0x25, 0xa7, 0x6f, 0x98, 0xe8 }
-#define GPT_UUID_FBSD_DATA \
-    { 0x51, 0x6e, 0x7c, 0xb4, 0x6e, 0xcf, 0x11, 0xd6, \
-      0x8f, 0xf8, 0x00, 0x02, 0x2d, 0x09, 0x71, 0x2b }
-#define GPT_UUID_FBSD_UFS \
-    { 0x51, 0x6e, 0x7c, 0xb6, 0x6e, 0xcf, 0x11, 0xd6, \
-      0x8f, 0xf8, 0x00, 0x02, 0x2d, 0x09, 0x71, 0x2b }
-#define GPT_UUID_NBSD_UFS \
-    { 0x49, 0xf4, 0x8d, 0x5a, 0xb1, 0x0e, 0x11, 0xdc, \
-      0xb9, 0x9b, 0x00, 0x19, 0xd1, 0x87, 0x96, 0x48 }
-#define GPT_UUID_APPLE_HFS \
-    { 0x48, 0x46, 0x53, 0x00, 0x00, 0x00, 0x11, 0xaa, \
-      0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac }
-#define GPT_UUID_APPLE_UFS \
-    { 0x55, 0x46, 0x53, 0x00, 0x00, 0x00, 0x11, 0xaa, \
-      0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac }
-#define GPT_UUID_BIOS_BOOT \
-    { 0x21, 0x68, 0x61, 0x48, 0x64, 0x49, 0x6e, 0x6f, \
-      0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49 }
 
 /* DOS partition table -- located at start of some disks. */
 #define	DOS_LABELSECTOR 1
@@ -457,10 +433,6 @@ struct dos_partition {
 	u_int32_t	dp_start;	/* absolute starting sector number */
 	u_int32_t	dp_size;	/* partition size in sectors */
 };
-
-/* Isolate the relevant bits to get sector and cylinder. */
-#define	DPSECT(s)	((s) & 0x3f)
-#define	DPCYL(c, s)	((c) + (((s) & 0xc0) << 2))
 
 /* Known DOS partition types. */
 #define	DOSPTYP_UNUSED	0x00		/* Unused partition */
@@ -492,7 +464,7 @@ void	 diskerr(struct buf *, char *, char *, int, int, struct disklabel *);
 u_int	 dkcksum(struct disklabel *);
 int	 initdisklabel(struct disklabel *);
 int	 checkdisklabel(dev_t, void *, struct disklabel *, u_int64_t, u_int64_t);
-int	 setdisklabel(struct disklabel *, struct disklabel *, u_int);
+int	 setdisklabel(struct disklabel *, struct disklabel *, u_int64_t);
 int	 readdisklabel(dev_t, void (*)(struct buf *), struct disklabel *, int);
 int	 writedisklabel(dev_t, void (*)(struct buf *), struct disklabel *);
 int	 bounds_check_with_label(struct buf *, struct disklabel *);

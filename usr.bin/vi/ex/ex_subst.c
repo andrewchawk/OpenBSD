@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_subst.c,v 1.31 2023/06/23 15:06:45 millert Exp $	*/
+/*	$OpenBSD: ex_subst.c,v 1.32 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -154,7 +154,7 @@ subagain:	return (ex_subagain(sp, cmdp));
 		if (re_compile(sp, ptrn, t - ptrn,
 		    &sp->subre, &sp->subre_len, &sp->subre_c, RE_C_SUBST))
 			return (1);
-		
+
 		flags = SUB_FIRST;
 		sp->searchdir = FORWARD;
 	}
@@ -288,7 +288,7 @@ ex_subtilde(SCR *sp, EXCMD *cmdp)
  * Do the substitution.  This stuff is *really* tricky.  There are lots of
  * special cases, and general nastiness.  Don't mess with it unless you're
  * pretty confident.
- * 
+ *
  * The nasty part of the substitution is what happens when the replacement
  * string contains newlines.  It's a bit tricky -- consider the information
  * that has to be retained for "s/f\(o\)o/^M\1^M\1/".  The solution here is
@@ -926,7 +926,7 @@ re_compile(SCR *sp, char *ptrn, size_t plen, char **ptrnp, size_t *lenp,
 		 *
 		 * XXX
 		 * Regcomp isn't 8-bit clean, so the pattern is nul-terminated
-		 * for now.  There's just no other solution.  
+		 * for now.  There's just no other solution.
 		 */
 		MALLOC(sp, *ptrnp, plen + 1);
 		if (*ptrnp != NULL) {
@@ -951,7 +951,7 @@ re_compile(SCR *sp, char *ptrn, size_t plen, char **ptrnp, size_t *lenp,
 	 */
 	if ((rval = regcomp(rep, ptrn, /* plen, */ reflags)) != 0) {
 		if (!LF_ISSET(RE_C_SILENT))
-			re_error(sp, rval, rep); 
+			re_error(sp, rval, rep);
 		return (1);
 	}
 
@@ -1197,7 +1197,7 @@ re_error(SCR *sp, int errcode, regex_t *preg)
 
 /*
  * re_sub --
- * 	Do the substitution for a regular expression.
+ *	Do the substitution for a regular expression.
  */
 static int
 re_sub(SCR *sp, char *ip, char **lbp, size_t *lbclenp, size_t *lblenp,
@@ -1289,7 +1289,7 @@ re_sub(SCR *sp, char *ip, char **lbp, size_t *lbclenp, size_t *lblenp,
 			case '5': case '6': case '7': case '8': case '9':
 				no = *rp++ - '0';
 subzero:			if (match[no].rm_so == -1 ||
-			    	    match[no].rm_eo == -1)
+				    match[no].rm_eo == -1)
 					break;
 				mlen = match[no].rm_eo - match[no].rm_so;
 				for (t = ip + match[no].rm_so; mlen--; ++t)

@@ -4,22 +4,22 @@ use strict;
 use warnings;
 use bytes;
 
-use IO::Compress::Base::Common 2.204 ();
+use IO::Compress::Base::Common 2.223 ();
 
-use IO::Uncompress::Base 2.204 ;
+use IO::Uncompress::Base 2.223 ;
 
 
 require Exporter ;
 
 our ($VERSION, @ISA, @EXPORT_OK, %EXPORT_TAGS, $AnyUncompressError);
 
-$VERSION = '2.204';
+$VERSION = '2.223';
 $AnyUncompressError = '';
 
 @ISA = qw(IO::Uncompress::Base Exporter);
 @EXPORT_OK = qw( $AnyUncompressError anyuncompress ) ;
 %EXPORT_TAGS = %IO::Uncompress::Base::DEFLATE_CONSTANTS if keys %IO::Uncompress::Base::DEFLATE_CONSTANTS;
-push @{ $EXPORT_TAGS{all} }, @EXPORT_OK ;
+$EXPORT_TAGS{all} = [ defined $EXPORT_TAGS{all} ? @{ $EXPORT_TAGS{all} } : (), @EXPORT_OK ] ;
 Exporter::export_ok_tags('all');
 
 # TODO - allow the user to pick a set of the three formats to allow
@@ -33,26 +33,26 @@ BEGIN
    # Don't trigger any __DIE__ Hooks.
    local $SIG{__DIE__};
 
-   eval ' use IO::Uncompress::Adapter::Inflate 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::Bunzip2 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::LZO 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::Lzf 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::UnLzma 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::UnXz 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::UnZstd 2.204 ;';
-   eval ' use IO::Uncompress::Adapter::UnLzip 2.204 ;';
+   eval ' use IO::Uncompress::Adapter::Inflate 2.223 ;';
+   eval ' use IO::Uncompress::Adapter::Bunzip2 2.223 ;';
+   eval ' use IO::Uncompress::Adapter::LZO 2.217 ;';
+   eval ' use IO::Uncompress::Adapter::Lzf 2.217 ;';
+   eval ' use IO::Uncompress::Adapter::UnLzma 2.217 ;';
+   eval ' use IO::Uncompress::Adapter::UnXz 2.217 ;';
+   eval ' use IO::Uncompress::Adapter::UnZstd 2.217 ;';
+   eval ' use IO::Uncompress::Adapter::UnLzip 2.217 ;';
 
-   eval ' use IO::Uncompress::Bunzip2 2.204 ;';
-   eval ' use IO::Uncompress::UnLzop 2.204 ;';
-   eval ' use IO::Uncompress::Gunzip 2.204 ;';
-   eval ' use IO::Uncompress::Inflate 2.204 ;';
-   eval ' use IO::Uncompress::RawInflate 2.204 ;';
-   eval ' use IO::Uncompress::Unzip 2.204 ;';
-   eval ' use IO::Uncompress::UnLzf 2.204 ;';
-   eval ' use IO::Uncompress::UnLzma 2.204 ;';
-   eval ' use IO::Uncompress::UnXz 2.204 ;';
-   eval ' use IO::Uncompress::UnZstd 2.204 ;';
-   eval ' use IO::Uncompress::UnLzip 2.204 ;';
+   eval ' use IO::Uncompress::Bunzip2 2.223 ;';
+   eval ' use IO::Uncompress::UnLzop 2.217 ;';
+   eval ' use IO::Uncompress::Gunzip 2.223 ;';
+   eval ' use IO::Uncompress::Inflate 2.223 ;';
+   eval ' use IO::Uncompress::RawInflate 2.223 ;';
+   eval ' use IO::Uncompress::Unzip 2.223 ;';
+   eval ' use IO::Uncompress::UnLzf 2.217 ;';
+   eval ' use IO::Uncompress::UnLzma 2.217 ;';
+   eval ' use IO::Uncompress::UnXz 2.217 ;';
+   eval ' use IO::Uncompress::UnZstd 2.217 ;';
+   eval ' use IO::Uncompress::UnLzip 2.217 ;';
 
 }
 
@@ -578,7 +578,7 @@ C<InputLength> option.
 
 =back
 
-=head2 Examples
+=head2 OneShot Examples
 
 To read the contents of the file C<file1.txt.Compressed> and write the
 uncompressed data to the file C<file1.txt>.
@@ -638,6 +638,9 @@ The format of the constructor for IO::Uncompress::AnyUncompress is shown below
     my $z = IO::Uncompress::AnyUncompress->new( $input [OPTS] )
         or die "IO::Uncompress::AnyUncompress failed: $AnyUncompressError\n";
 
+The constructor takes one mandatory parameter, C<$input>, defined below, and
+zero or more C<OPTS>, defined in L<Constructor Options>.
+
 Returns an C<IO::Uncompress::AnyUncompress> object on success and undef on failure.
 The variable C<$AnyUncompressError> will contain an error message on failure.
 
@@ -649,6 +652,20 @@ use either of these forms
 
     $line = $z->getline();
     $line = <$z>;
+
+Below is a simple exaple of using the OO interface to read the compressed file
+C<myfile.Compressed> and write its contents to stdout.
+
+    my $filename = "myfile.Compressed";
+    my $z = IO::Uncompress::AnyUncompress->new($filename)
+        or die "IO::Uncompress::AnyUncompress failed: $AnyUncompressError\n";
+
+    while (<$z>) {
+        print $_;
+    }
+    $z->close();
+
+See L</EXAMPLES> for further examples
 
 The mandatory parameter C<$input> is used to determine the source of the
 compressed data. This parameter can take one of three forms.
@@ -792,10 +809,6 @@ prone and can result is false positives.
 Defaults to 0.
 
 =back
-
-=head2 Examples
-
-TODO
 
 =head1 Methods
 
@@ -1077,7 +1090,7 @@ See the Changes file.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (c) 2005-2023 Paul Marquess. All rights reserved.
+Copyright (c) 2005-2026 Paul Marquess. All rights reserved.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.

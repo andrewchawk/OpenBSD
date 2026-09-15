@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.11 2023/11/11 18:35:37 robert Exp $
+# $OpenBSD: Makefile,v 1.13 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMMC
 NOPROFILE=
@@ -6,7 +6,10 @@ NOPROFILE=
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/MC
 
 SRCS+=	ConstantPools.cpp \
+	DXContainerPSVInfo.cpp \
+	DXContainerRootSignature.cpp \
 	ELFObjectWriter.cpp \
+	GOFFObjectWriter.cpp \
 	MCAsmBackend.cpp \
 	MCAsmInfo.cpp \
 	MCAsmInfoCOFF.cpp \
@@ -28,6 +31,7 @@ SRCS+=	ConstantPools.cpp \
 	MCELFStreamer.cpp \
 	MCExpr.cpp \
 	MCFragment.cpp \
+	MCGOFFStreamer.cpp \
 	MCInst.cpp \
 	MCInstPrinter.cpp \
 	MCInstrAnalysis.cpp \
@@ -45,17 +49,14 @@ SRCS+=	ConstantPools.cpp \
 	MCRegisterInfo.cpp \
 	MCSchedule.cpp \
 	MCSection.cpp \
-	MCSectionCOFF.cpp \
-	MCSectionDXContainer.cpp \
-	MCSectionELF.cpp \
 	MCSectionMachO.cpp \
-	MCSectionWasm.cpp \
-	MCSectionXCOFF.cpp \
 	MCStreamer.cpp \
+	MCSFrame.cpp \
 	MCSPIRVStreamer.cpp \
 	MCSubtargetInfo.cpp \
 	MCSymbol.cpp \
 	MCSymbolELF.cpp \
+	MCSymbolGOFF.cpp \
 	MCSymbolXCOFF.cpp \
 	MCTargetOptions.cpp \
 	MCTargetOptionsCommandFlags.cpp \
@@ -70,7 +71,6 @@ SRCS+=	ConstantPools.cpp \
 	MachObjectWriter.cpp \
 	SPIRVObjectWriter.cpp \
 	StringTableBuilder.cpp \
-	SubtargetFeature.cpp \
 	TargetRegistry.cpp \
 	WasmObjectWriter.cpp \
 	WinCOFFObjectWriter.cpp \

@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_trace.c,v 1.16 2024/03/12 13:32:53 kettenis Exp $	*/
+/*	$OpenBSD: db_trace.c,v 1.20 2025/07/22 09:11:13 kettenis Exp $	*/
 /*	$NetBSD: db_trace.c,v 1.8 2003/01/17 22:28:48 thorpej Exp $	*/
 
 /*
@@ -53,13 +53,15 @@ void
 db_stack_trace_print(db_expr_t addr, int have_addr, db_expr_t count,
     char *modif, int (*pr)(const char *, ...))
 {
-	vaddr_t		frame, lastframe, lr, lastlr, sp;
+	struct switchframe sf;
+	vaddr_t		frame, lastframe, lr, lastlr;
 	char		c, *cp = modif;
 	db_expr_t	offset;
 	Elf_Sym *	sym;
-	char		*name;
+	const char	*name;
 	int		kernel_only = 1;
 	int		trace_thread = 0;
+	struct proc	*p;
 
 	while ((c = *cp++) != 0) {
 		if (c == 'u')
@@ -68,34 +70,29 @@ db_stack_trace_print(db_expr_t addr, int have_addr, db_expr_t count,
 			trace_thread = 1;
 	}
 
-	if (!have_addr) {
-		sp = ddb_regs.tf_sp;
-		lr = ddb_regs.tf_lr;
-		lastlr = ddb_regs.tf_elr;
-		frame = ddb_regs.tf_x[29];
-	} else {
-		if (trace_thread) {
-			struct proc *p = tfind((pid_t)addr);
-			if (p == NULL) {
-				(*pr)("not found\n");
-				return;
-			}
-			frame = p->p_addr->u_pcb.pcb_tf->tf_x[29];
-			sp =  p->p_addr->u_pcb.pcb_tf->tf_sp;
-			lr =  p->p_addr->u_pcb.pcb_tf->tf_lr;
-			lastlr =  p->p_addr->u_pcb.pcb_tf->tf_elr;
-		} else {
-			sp = addr;
-			db_read_bytes(sp, sizeof(vaddr_t),
-			    (char *)&frame);
-			db_read_bytes(sp + 8, sizeof(vaddr_t),
-			    (char *)&lr);
-			lastlr = 0;
+	if (trace_thread) {
+		p = tfind((pid_t)addr);
+		if (p == NULL) {
+			(*pr)("not found\n");
+			return;
 		}
 	}
 
+	if (!have_addr) {
+		frame = ddb_regs.tf_x[29];
+		lr = ddb_regs.tf_elr;
+	} else if (trace_thread) {
+		db_read_bytes(p->p_addr->u_pcb.pcb_sp, sizeof(sf), &sf);
+		frame = sf.sf_x29;
+		lr = sf.sf_lr;
+	} else {
+		frame = (vaddr_t)db_get_value(addr, 8, 0);
+		lr = (vaddr_t)db_get_value(addr + 8, 8, 0);
+	}
+
 	while (count-- && frame != 0) {
-		lastframe = frame;
+		lastlr = lr;
+		lr = (vaddr_t)db_get_value(frame + 8, 8, 0);
 
 		if (INKERNEL(frame)) {
 			sym = db_search_symbol(lastlr, DB_STGY_ANY, &offset);
@@ -115,17 +112,19 @@ db_stack_trace_print(db_expr_t addr, int have_addr, db_expr_t count,
 
 		if (name != NULL) {
 			if ((strcmp (name, "handle_el0_irq") == 0) ||
-			    (strcmp (name, "handle_el1_irq") == 0)) {
+			    (strcmp (name, "handle_el1h_irq") == 0) ||
+			    (strcmp (name, "handle_el0_fiq") == 0) ||
+			    (strcmp (name, "handle_el1h_fiq") == 0)) {
 				(*pr)("--- interrupt ---\n");
 			} else if (
 			    (strcmp (name, "handle_el0_sync") == 0) ||
-			    (strcmp (name, "handle_el1_sync") == 0)) {
+			    (strcmp (name, "handle_el1h_sync") == 0)) {
 				(*pr)("--- trap ---\n");
 			}
 		}
 
 		lastframe = frame;
-		db_read_bytes(frame, sizeof(vaddr_t), (char *)&frame);
+		frame = (vaddr_t)db_get_value(frame, 8, 0);
 
 		if (frame == 0) {
 			/* end of chain */
@@ -152,9 +151,6 @@ db_stack_trace_print(db_expr_t addr, int have_addr, db_expr_t count,
 				break;
 			}
 		}
-
-		lastlr = lr;
-		db_read_bytes(frame + 8, sizeof(vaddr_t), (char *)&lr);
 
 		--count;
 	}

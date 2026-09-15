@@ -1,4 +1,4 @@
-/*	$OpenBSD: if.h,v 1.217 2024/06/09 16:25:28 jan Exp $	*/
+/*	$OpenBSD: if.h,v 1.224 2026/06/23 14:40:40 bluhm Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -232,6 +232,7 @@ struct if_status_description {
 #define	IFXF_AUTOCONF4		0x80	/* [N] v4 autoconf (aka dhcp) enabled */
 #define	IFXF_MONITOR		0x100	/* [N] only used for bpf */
 #define	IFXF_LRO		0x200	/* [N] TCP large recv offload */
+#define	IFXF_MBUF_64BIT		0x400	/* [I] mbuf with 64 bit DMA supported */
 
 #define	IFXF_CANTCHANGE \
 	(IFXF_MPSAFE|IFXF_CLONED)
@@ -526,6 +527,9 @@ struct if_sffpage {
 #include <net/if_arp.h>
 
 #ifdef _KERNEL
+
+#define IF_MAX_VECTORS		8
+
 struct socket;
 struct ifnet;
 struct ifq_ops;
@@ -554,13 +558,20 @@ int	if_delgroup(struct ifnet *, const char *);
 void	if_group_routechange(const struct sockaddr *, const struct sockaddr *);
 struct	ifnet *if_unit(const char *);
 struct	ifnet *if_get(unsigned int);
+struct	ifnet *if_ref(struct ifnet *);
+struct	ifnet *if_get_smr(unsigned int);
 void	if_put(struct ifnet *);
 void	ifnewlladdr(struct ifnet *);
 void	if_congestion(void);
 int	if_congested(void);
 __dead void	unhandled_af(int);
 int	if_setlladdr(struct ifnet *, const uint8_t *);
-struct taskq * net_tq(unsigned int);
+void	softnet_init(void);
+void	softnet_percpu(void);
+unsigned int
+	softnet_count(void);
+struct taskq *
+	net_tq(unsigned int);
 void	net_tq_barriers(const char *);
 
 #endif /* _KERNEL */

@@ -1,4 +1,4 @@
-/* $OpenBSD: resize.c,v 1.51 2024/03/21 11:30:42 nicm Exp $ */
+/* $OpenBSD: resize.c,v 1.59 2026/08/20 09:19:24 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -22,10 +22,28 @@
 
 #include "tmux.h"
 
+static void
+resize_fire_window_resized(struct window *w, u_int old_sx, u_int old_sy)
+{
+	struct event_payload	*ep;
+	struct cmd_find_state	 fs;
+
+	ep = event_payload_create();
+	cmd_find_from_window(&fs, w, 0);
+	event_payload_set_target(ep, &fs);
+	event_payload_set_window(ep, "window", w);
+	event_payload_set_uint(ep, "width", w->sx);
+	event_payload_set_uint(ep, "height", w->sy);
+	event_payload_set_uint(ep, "old_width", old_sx);
+	event_payload_set_uint(ep, "old_height", old_sy);
+	events_fire("window-resized", ep);
+}
+
 void
 resize_window(struct window *w, u_int sx, u_int sy, int xpixel, int ypixel)
 {
-	int	zoomed;
+	struct window_pane	*zwp;
+	u_int			 old_sx = w->sx, old_sy = w->sy;
 
 	/* Check size limits. */
 	if (sx < WINDOW_MINIMUM)
@@ -38,30 +56,30 @@ resize_window(struct window *w, u_int sx, u_int sy, int xpixel, int ypixel)
 		sy = WINDOW_MAXIMUM;
 
 	/* If the window is zoomed, unzoom. */
-	zoomed = w->flags & WINDOW_ZOOMED;
-	if (zoomed)
+	zwp = window_zoomed_pane(w);
+	if (zwp != NULL)
 		window_unzoom(w, 1);
 
 	/* Resize the layout first. */
 	layout_resize(w, sx, sy);
 
 	/* Resize the window, it can be no smaller than the layout. */
-	if (sx < w->layout_root->sx)
-		sx = w->layout_root->sx;
-	if (sy < w->layout_root->sy)
-		sy = w->layout_root->sy;
+	if (sx < w->layout_root->g.sx)
+		sx = w->layout_root->g.sx;
+	if (sy < w->layout_root->g.sy)
+		sy = w->layout_root->g.sy;
 	window_resize(w, sx, sy, xpixel, ypixel);
 	log_debug("%s: @%u resized to %ux%u; layout %ux%u", __func__, w->id,
-	    sx, sy, w->layout_root->sx, w->layout_root->sy);
+	    sx, sy, w->layout_root->g.sx, w->layout_root->g.sy);
 
 	/* Restore the window zoom state. */
-	if (zoomed)
-		window_zoom(w->active);
+	if (zwp != NULL && window_has_pane(w, zwp))
+		window_zoom(zwp);
 
 	tty_update_window_offset(w);
 	server_redraw_window(w);
-	notify_window("window-layout-changed", w);
-	notify_window("window-resized", w);
+	events_fire_window("window-layout-changed", w);
+	resize_fire_window_resized(w, old_sx, old_sy);
 	w->flags &= ~WINDOW_RESIZE;
 }
 
@@ -116,9 +134,8 @@ clients_calculate_size(int type, int current, struct client *c,
     int, int, struct session *, struct window *), u_int *sx, u_int *sy,
     u_int *xpixel, u_int *ypixel)
 {
-	struct client		*loop;
-	struct client_window	*cw;
-	u_int			 cx, cy, n = 0;
+	struct client	*loop;
+	u_int		 cx, cy, n = 0;
 
 	/*
 	 * Start comparing with 0 for largest and UINT_MAX for smallest or
@@ -127,7 +144,7 @@ clients_calculate_size(int type, int current, struct client *c,
 	if (type == WINDOW_SIZE_LARGEST) {
 		*sx = 0;
 		*sy = 0;
-	} else if (type == WINDOW_SIZE_MANUAL) {
+	} else if (w != NULL && type == WINDOW_SIZE_MANUAL) {
 		*sx = w->manual_sx;
 		*sy = w->manual_sy;
 		log_debug("%s: manual size %ux%u", __func__, *sx, *sy);
@@ -169,20 +186,10 @@ clients_calculate_size(int type, int current, struct client *c,
 			continue;
 		}
 
-		/*
-		 * If the client has a per-window size, use this instead if it is
-		 * smaller.
-		 */
-		if (w != NULL)
-			cw = server_client_get_client_window(loop, w->id);
-		else
-			cw = NULL;
-
 		/* Work out this client's size. */
-		if (cw != NULL && cw->sx != 0 && cw->sy != 0) {
-			cx = cw->sx;
-			cy = cw->sy;
-		} else {
+		if (w == NULL ||
+		    !control_get_window_size(loop, w->id, &cx, &cy) ||
+		    cx == 0 || cy == 0) {
 			cx = loop->tty.sx;
 			cy = loop->tty.sy - status_line_size(loop);
 		}
@@ -229,17 +236,16 @@ skip:
 			/* Look up per-window size if any. */
 			if (~loop->flags & CLIENT_WINDOWSIZECHANGED)
 				continue;
-			cw = server_client_get_client_window(loop, w->id);
-			if (cw == NULL)
+			if (!control_get_window_size(loop, w->id, &cx, &cy))
 				continue;
 
 			/* Clamp the size. */
 			log_debug("%s: %s size for @%u is %ux%u", __func__,
-			    loop->name, w->id, cw->sx, cw->sy);
-			if (cw->sx != 0 && *sx > cw->sx)
-				*sx = cw->sx;
-			if (cw->sy != 0 && *sy > cw->sy)
-				*sy = cw->sy;
+			    loop->name, w->id, cx, cy);
+			if (cx != 0 && *sx > cx)
+				*sx = cx;
+			if (cy != 0 && *sy > cy)
+				*sy = cy;
 		}
 	}
 	if (*sx != UINT_MAX && *sy != UINT_MAX)
@@ -250,7 +256,7 @@ skip:
 	/* Return whether a suitable size was found. */
 	if (type == WINDOW_SIZE_MANUAL) {
 		log_debug("%s: type is manual", __func__);
-		return (1);
+		return (w != NULL);
 	}
 	if (type == WINDOW_SIZE_LARGEST) {
 		log_debug("%s: type is largest", __func__);
@@ -264,16 +270,9 @@ skip:
 }
 
 static int
-default_window_size_skip_client(struct client *loop, int type,
+default_window_size_skip_client(struct client *loop, __unused int type,
     __unused int current, struct session *s, struct window *w)
 {
-	/*
-	 * Latest checks separately, so do not check here. Otherwise only
-	 * include clients where the session contains the window or where the
-	 * session is the given session.
-	 */
-	if (type == WINDOW_SIZE_LATEST)
-		return (0);
 	if (w != NULL && !session_has(loop->session, w))
 		return (1);
 	if (w == NULL && loop->session != s)
@@ -305,12 +304,12 @@ default_window_size(struct client *c, struct session *s, struct window *w,
 		goto done;
 	}
 
-        /*
-         * Ignore the given client if it is a control client - the creating
-         * client should only affect the size if it is not a control client.
-         */
-        if (c != NULL && (c->flags & CLIENT_CONTROL))
-                c = NULL;
+	/*
+	 * Ignore the given client if it is a control client - the creating
+	 * client should only affect the size if it is not a control client.
+	 */
+	if (c != NULL && (c->flags & CLIENT_CONTROL))
+		c = NULL;
 
 	/*
 	 * Look for a client to base the size on. If none exists (or the type

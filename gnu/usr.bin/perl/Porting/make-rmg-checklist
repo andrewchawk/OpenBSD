@@ -1,7 +1,10 @@
 #!/usr/bin/perl
+
 use strict;
 use warnings;
+
 use Getopt::Long qw< :config no_ignore_case >;
+use FindBin qw< $Bin >;
 
 sub pod {
     my $filename = shift;
@@ -26,7 +29,7 @@ sub _help {
     print << "_END_HELP";
 $0 --version VERSION
 
-This script creates a release checklist as a simple HTML document. It accepts
+This script creates a release checklist as a POD or HTML document. It accepts
 the following arguments:
 
   --version     The version you are working on. This will infer the type
@@ -140,7 +143,7 @@ if ($html) {
 
 my $type = _type_from_version($version);
 
-chomp( my @pod_lines = @{ pod('Porting/release_managers_guide.pod') } );
+chomp( my @pod_lines = @{ pod("$Bin/release_managers_guide.pod") } );
 
 my ( @items, $current_element, @leading_attrs );
 my $skip_headers     = qr/^=encoding/xms;
@@ -149,7 +152,8 @@ my $passthru_headers = qr/^= (?: over | item | back | cut )/xms;
 # version used when generating diffs (acknowledgements, Module::CoreList etc)
 # 5.36.0 -> 5.34.0
 # 5.36.1 -> 5.36.0
-my ($major, $minor, $point) = split(/\./, $version);
+my ($major, $minor, $point_with_maybe_rc) = split(/\./, $version);
+my ($point) = split(/-/, $point_with_maybe_rc);
 my $last_version = join('.', $major, ($point == 0 ? ($minor - 2, 0) : ($minor, $point-1)));
 
 

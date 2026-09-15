@@ -1,4 +1,4 @@
-/*	$OpenBSD: bus_space.c,v 1.28 2022/11/29 21:41:39 guenther Exp $	*/
+/*	$OpenBSD: bus_space.c,v 1.32 2026/08/19 08:56:28 hshoexer Exp $	*/
 /*	$NetBSD: bus_space.c,v 1.2 2003/03/14 18:47:53 christos Exp $	*/
 
 /*-
@@ -149,7 +149,7 @@ void		x86_bus_space_io_copy_8(bus_space_handle_t, bus_size_t,
 void *		x86_bus_space_io_vaddr(bus_space_handle_t);
 paddr_t		x86_bus_space_io_mmap(bus_addr_t, off_t, int, int);
 
-const struct x86_bus_space_ops x86_bus_space_io_ops = {
+const struct x86_bus_space_ops default_bus_space_io_ops = {
 	x86_bus_space_io_read_1,
 	x86_bus_space_io_read_2,
 	x86_bus_space_io_read_4,
@@ -189,6 +189,9 @@ const struct x86_bus_space_ops x86_bus_space_io_ops = {
 	x86_bus_space_io_vaddr,
 	x86_bus_space_io_mmap
 };
+
+const struct x86_bus_space_ops *x86_bus_space_io_ops =
+    &default_bus_space_io_ops;
 
 u_int8_t	x86_bus_space_mem_read_1(bus_space_handle_t, bus_size_t);
 u_int16_t	x86_bus_space_mem_read_2(bus_space_handle_t, bus_size_t);
@@ -271,7 +274,7 @@ void *		x86_bus_space_mem_vaddr(bus_space_handle_t);
 
 paddr_t		x86_bus_space_mem_mmap(bus_addr_t, off_t, int, int);
 
-const struct x86_bus_space_ops x86_bus_space_mem_ops = {
+const struct x86_bus_space_ops default_bus_space_mem_ops = {
 	x86_bus_space_mem_read_1,
 	x86_bus_space_mem_read_2,
 	x86_bus_space_mem_read_4,
@@ -312,6 +315,13 @@ const struct x86_bus_space_ops x86_bus_space_mem_ops = {
 	x86_bus_space_mem_mmap
 };
 
+const struct x86_bus_space_ops *x86_bus_space_mem_ops;
+
+#ifdef AMDSEV
+extern const struct x86_bus_space_ops sev_ghcb_bus_space_io_ops;
+extern const struct x86_bus_space_ops sev_ghcb_bus_space_mem_ops;
+#endif
+
 void
 x86_bus_space_init(void)
 {
@@ -332,6 +342,19 @@ x86_bus_space_init(void)
 	iomem_ex = extent_create("iomem", 0x0, 0xffffffffffff, M_DEVBUF,
 	    (caddr_t)iomem_ex_storage, sizeof(iomem_ex_storage),
 	    EX_NOCOALESCE|EX_NOWAIT);
+
+#ifdef AMDSEV
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED)) {
+		x86_bus_space_mem_ops = &sev_ghcb_bus_space_mem_ops;
+		x86_bus_space_io_ops  = &sev_ghcb_bus_space_io_ops;
+	} else {
+		x86_bus_space_mem_ops = &default_bus_space_mem_ops;
+		x86_bus_space_io_ops  = &default_bus_space_io_ops;
+	}
+#else
+	x86_bus_space_mem_ops = &default_bus_space_mem_ops;
+	x86_bus_space_io_ops  = &default_bus_space_io_ops;
+#endif
 }
 
 void
@@ -596,7 +619,7 @@ bus_space_unmap(bus_space_tag_t t, bus_space_handle_t bsh, bus_size_t size)
 		if (IOM_BEGIN <= bpa && bpa <= IOM_END)
 			goto ok;
 
-		if (bsh >= PMAP_DIRECT_BASE && bsh < PMAP_DIRECT_END) {
+		if (bsh >= pmap_direct_base && bsh < pmap_direct_end) {
 			bpa = PMAP_DIRECT_UNMAP(bsh);
 			goto ok;
 		}

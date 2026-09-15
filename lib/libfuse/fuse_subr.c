@@ -1,4 +1,4 @@
-/* $OpenBSD: fuse_subr.c,v 1.12 2018/05/21 11:47:46 helg Exp $ */
+/* $OpenBSD: fuse_subr.c,v 1.14 2026/06/17 13:29:01 helg Exp $ */
 /*
  * Copyright (c) 2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -57,7 +57,6 @@ alloc_vn(struct fuse *f, const char *path, ino_t ino, ino_t pino)
 	if (ino == (ino_t)-1) {
 		f->max_ino++;
 		vn->ino = f->max_ino;
-		DPRINTF("New Inode: %llu\t", (unsigned long long)vn->ino);
 	}
 
 	return (vn);
@@ -70,13 +69,14 @@ ref_vn(struct fuse_vnode *vn)
 }
 
 void
-unref_vn(struct fuse *f, struct fuse_vnode *vn)
+unref_vn(struct fuse *f, struct fuse_vnode *vn, const uint64_t nlookup)
 {
-	if (--vn->ref == 0) {
+	vn->ref -= nlookup;
+	if (vn->ref == 0) {
 		tree_pop(&f->vnode_tree, vn->ino);
 		remove_vnode_from_name_tree(f, vn);
 		if (vn->parent != NULL)
-			unref_vn(f, vn->parent);
+			unref_vn(f, vn->parent, 1);
 		free(vn);
 	}
 }
@@ -147,11 +147,10 @@ remove_vnode_from_name_tree(struct fuse *f, struct fuse_vnode *vn)
 }
 
 struct fuse_vnode *
-get_vn_by_name_and_parent(struct fuse *f, uint8_t *xpath, ino_t pino)
+get_vn_by_name_and_parent(struct fuse *f, const char *path, ino_t pino)
 {
 	struct fuse_vn_head *vn_head;
 	struct fuse_vnode *v = NULL;
-	const char *path = (const char *)xpath;
 
 	vn_head = dict_get(&f->name_tree, path);
 
@@ -205,6 +204,5 @@ build_realname(struct fuse *f, ino_t ino)
 	if (ino == (ino_t)0)
 		DPRINTF("%s: NULL ino\t", __func__);
 
-	DPRINTF("%s", name);
 	return (name);
 }

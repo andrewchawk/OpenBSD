@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_time.c,v 1.169 2024/07/26 19:16:31 guenther Exp $	*/
+/*	$OpenBSD: kern_time.c,v 1.171 2026/05/05 12:28:59 kettenis Exp $	*/
 /*	$NetBSD: kern_time.c,v 1.20 1996/02/18 11:57:06 fvdl Exp $	*/
 
 /*
@@ -147,8 +147,10 @@ clock_gettime(struct proc *p, clockid_t clock_id, struct timespec *tp)
 			q = tfind_user(__CLOCK_PTID(clock_id), p->p_p);
 			if (q == NULL)
 				error = ESRCH;
-			else
-				*tp = q->p_tu.tu_runtime;
+			else {
+				tuagg_get_proc(&tu, q);
+				*tp = tu.tu_runtime;
+			}
 			KERNEL_UNLOCK();
 		} else
 			error = EINVAL;
@@ -663,7 +665,7 @@ sys_setitimer(struct proc *p, void *v, register_t *retval)
 		error = copyout(&olditv, SCARG(uap, oitv), sizeof(olditv));
 #ifdef KTRACE
 		if (error == 0 && KTRPOINT(p, KTR_STRUCT))
-			ktritimerval(p, &aitv);
+			ktritimerval(p, &olditv);
 #endif
 		return error;
 	}

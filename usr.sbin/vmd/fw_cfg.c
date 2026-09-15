@@ -1,4 +1,4 @@
-/*	$OpenBSD: fw_cfg.c,v 1.9 2024/07/09 09:31:37 dv Exp $	*/
+/*	$OpenBSD: fw_cfg.c,v 1.16 2026/07/24 14:24:49 dv Exp $	*/
 /*
  * Copyright (c) 2018 Claudio Jeker <claudio@openbsd.org>
  *
@@ -15,7 +15,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <sys/types.h>
-#include <sys/uio.h>
 #include <machine/biosvar.h>	/* bios_memmap_t */
 #include <dev/pv/virtioreg.h>
 #include <dev/vmm/vmm.h>
@@ -56,14 +55,14 @@ struct fw_cfg_file {
 	char		name[56];
 };
 
-extern char *__progname;
-
 static struct fw_cfg_state {
 	size_t offset;
 	size_t size;
 	uint8_t *data;
 } fw_cfg_state;
 
+/* Guards fw_cfg_state and fw_cfg_dma_addr. */
+static pthread_mutex_t fw_cfg_mtx;
 static uint64_t	fw_cfg_dma_addr;
 
 static bios_memmap_t e820[VMM_MAX_MEM_RANGES];
@@ -75,16 +74,23 @@ void
 fw_cfg_init(struct vmop_create_params *vmc)
 {
 	unsigned int sd = 0;
-	size_t i, e820_len = 0;
+	size_t i, j, e820_len = 0;
 	char bootorder[64];
 	const char *bootfmt;
 	int bootidx = -1;
 
+	if (pthread_mutex_init(&fw_cfg_mtx, NULL) != 0)
+		fatalx("unable to create fw_cfg mutex");
+
 	/* Define e820 memory ranges. */
 	memset(&e820, 0, sizeof(e820));
-	for (i = 0; i < vmc->vmc_params.vcp_nmemranges; i++) {
-		struct vm_mem_range *range = &vmc->vmc_params.vcp_memranges[i];
-		bios_memmap_t *entry = &e820[i];
+	for (i = 0, j = 0; i < vmc->vmc_nmemranges; i++) {
+		struct vm_mem_range *range = &vmc->vmc_memranges[i];
+		if (range->vmr_type == VM_MEM_MMIO) {
+			/* Create a hole for MMIO regions. */
+			continue;
+		}
+		bios_memmap_t *entry = &e820[j++];
 		entry->addr = range->vmr_gpa;
 		entry->size = range->vmr_size;
 		if (range->vmr_type == VM_MEM_RAM)
@@ -118,66 +124,6 @@ fw_cfg_init(struct vmop_create_params *vmc)
 		log_debug("%s: bootorder: %s", __func__, bootorder);
 		fw_cfg_add_file("bootorder", bootorder, strlen(bootorder) + 1);
 	}
-}
-
-int
-fw_cfg_dump(int fd)
-{
-	log_debug("%s: sending fw_cfg state", __func__);
-	if (atomicio(vwrite, fd, &fw_cfg_dma_addr,
-	    sizeof(fw_cfg_dma_addr)) != sizeof(fw_cfg_dma_addr)) {
-		log_warnx("%s: error writing fw_cfg to fd", __func__);
-		return -1;
-	}
-	if (atomicio(vwrite, fd, &fw_cfg_state.offset,
-	    sizeof(fw_cfg_state.offset)) != sizeof(fw_cfg_state.offset)) {
-		log_warnx("%s: error writing fw_cfg to fd", __func__);
-		return -1;
-	}
-	if (atomicio(vwrite, fd, &fw_cfg_state.size,
-	    sizeof(fw_cfg_state.size)) != sizeof(fw_cfg_state.size)) {
-		log_warnx("%s: error writing fw_cfg to fd", __func__);
-		return -1;
-	}
-	if (fw_cfg_state.size != 0)
-		if (atomicio(vwrite, fd, fw_cfg_state.data,
-		    fw_cfg_state.size) != fw_cfg_state.size) {
-			log_warnx("%s: error writing fw_cfg to fd", __func__);
-			return (-1);
-		}
-	return 0;
-}
-
-int
-fw_cfg_restore(int fd)
-{
-	log_debug("%s: receiving fw_cfg state", __func__);
-	if (atomicio(read, fd, &fw_cfg_dma_addr,
-	    sizeof(fw_cfg_dma_addr)) != sizeof(fw_cfg_dma_addr)) {
-		log_warnx("%s: error reading fw_cfg from fd", __func__);
-		return -1;
-	}
-	if (atomicio(read, fd, &fw_cfg_state.offset,
-	    sizeof(fw_cfg_state.offset)) != sizeof(fw_cfg_state.offset)) {
-		log_warnx("%s: error reading fw_cfg from fd", __func__);
-		return -1;
-	}
-	if (atomicio(read, fd, &fw_cfg_state.size,
-	    sizeof(fw_cfg_state.size)) != sizeof(fw_cfg_state.size)) {
-		log_warnx("%s: error reading fw_cfg from fd", __func__);
-		return -1;
-	}
-	fw_cfg_state.data = NULL;
-	if (fw_cfg_state.size != 0) {
-		if ((fw_cfg_state.data = malloc(fw_cfg_state.size)) == NULL)
-			fatal("%s", __func__);
-		if (atomicio(read, fd, fw_cfg_state.data,
-		    fw_cfg_state.size) != fw_cfg_state.size) {
-			log_warnx("%s: error reading fw_cfg from fd", __func__);
-			return -1;
-		}
-	}
-	return 0;
 }
 
 static void
@@ -277,11 +223,12 @@ vcpu_exit_fw_cfg(struct vm_run_params *vrp)
 
 	get_input_data(vei, &data);
 
+	mutex_lock(&fw_cfg_mtx);
 	switch (vei->vei.vei_port) {
 	case FW_CFG_IO_SELECT:
 		if (vei->vei.vei_dir == VEI_DIR_IN) {
-			log_warnx("%s: fw_cfg: read from selector port "
-			    "unsupported", __progname);
+			log_warnx("fw_cfg: read from selector port "
+			    "unsupported");
 			set_return_data(vei, 0);
 			break;
 		}
@@ -290,8 +237,8 @@ vcpu_exit_fw_cfg(struct vm_run_params *vrp)
 		break;
 	case FW_CFG_IO_DATA:
 		if (vei->vei.vei_dir == VEI_DIR_OUT) {
-			log_debug("%s: fw_cfg: discarding data written to "
-			    "data port", __progname);
+			log_debug("fw_cfg: discarding data written to "
+			    "data port");
 			break;
 		}
 		/* fw_cfg only defines 1-byte reads via IO port */
@@ -304,6 +251,7 @@ vcpu_exit_fw_cfg(struct vm_run_params *vrp)
 			set_return_data(vei, 0);
 		break;
 	}
+	mutex_unlock(&fw_cfg_mtx);
 
 	return 0xFF;
 }
@@ -315,12 +263,14 @@ vcpu_exit_fw_cfg_dma(struct vm_run_params *vrp)
 	uint32_t data = 0;
 	struct vm_exit *vei = vrp->vrp_exit;
 
+	mutex_lock(&fw_cfg_mtx);
+
 	if (vei->vei.vei_size != 4) {
-		log_debug("%s: fw_cfg_dma: discarding data written to "
-		    "dma addr", __progname);
+		log_debug("fw_cfg_dma: discarding data written to "
+		    "dma addr");
 		if (vei->vei.vei_dir == VEI_DIR_OUT)
 			fw_cfg_dma_addr = 0;
-		return 0xFF;
+		goto unlock;
 	}
 
 	if (vei->vei.vei_dir == VEI_DIR_OUT) {
@@ -362,6 +312,8 @@ vcpu_exit_fw_cfg_dma(struct vm_run_params *vrp)
 			break;
 		}
 	}
+unlock:
+	mutex_unlock(&fw_cfg_mtx);
 	return 0xFF;
 }
 
@@ -394,7 +346,7 @@ fw_cfg_add_file(const char *name, const void *data, size_t len)
 	struct fw_cfg_file_entry *f;
 
 	if (fw_cfg_lookup_file(name))
-		fatalx("%s: fw_cfg: file %s exists", __progname, name);
+		fatalx("fw_cfg: file %s exists", name);
 
 	if ((f = calloc(1, sizeof(*f))) == NULL)
 		fatal("%s", __func__);
@@ -404,7 +356,7 @@ fw_cfg_add_file(const char *name, const void *data, size_t len)
 
 	if (strlcpy(f->file.name, name, sizeof(f->file.name)) >=
 	    sizeof(f->file.name))
-		fatalx("%s: fw_cfg: file name too long", __progname);
+		fatalx("fw_cfg: file name too long");
 
 	f->file.size = htobe32(len);
 	f->file.selector = htobe16(file_id++);
@@ -459,4 +411,5 @@ fw_cfg_file_dir(void)
 	/* XXX should sort by name but SeaBIOS does not care */
 
 	fw_cfg_set_state(data, size);
+	free(data);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: nd6.h,v 1.100 2024/07/14 18:53:39 bluhm Exp $	*/
+/*	$OpenBSD: nd6.h,v 1.106 2026/03/23 13:12:39 jsg Exp $	*/
 /*	$KAME: nd6.h,v 1.95 2002/06/08 11:31:06 itojun Exp $	*/
 
 /*
@@ -32,8 +32,6 @@
 
 #ifndef _NETINET6_ND6_H_
 #define _NETINET6_ND6_H_
-
-#include <sys/task.h>
 
 #define ND6_LLINFO_PURGE	-3
 #define ND6_LLINFO_NOSTATE	-2
@@ -81,18 +79,25 @@ struct	in6_ndireq {
 
 #include <sys/queue.h>
 
-struct	llinfo_nd6 {
-	TAILQ_ENTRY(llinfo_nd6)	 ln_list;	/* [mN] global nd6_list */
+struct llinfo_nd6 {
+	TAILQ_ENTRY(llinfo_nd6)	 ln_list;	/* [m] global nd6_list */
 	struct	rtentry		*ln_rt;		/* [I] backpointer to rtentry */
+	/* keep fields above in sync with struct llinfo_nd6_iterator */
+	struct	refcnt		 ln_refcnt;	/* entry referenced by list */
 	struct	mbuf_queue ln_mq;	/* hold packets until resolved */
 	struct	in6_addr ln_saddr6;	/* source of prompting packet */
 	long	ln_asked;	/* number of queries already sent for addr */
-	int	ln_byhint;	/* # of times we made it reachable by UL hint */
 	short	ln_state;	/* reachability state */
 	short	ln_router;	/* 2^0: ND6 router bit */
 };
 #define LN_HOLD_QUEUE 10
 #define LN_HOLD_TOTAL 100
+
+struct llinfo_nd6_iterator {
+	TAILQ_ENTRY(llinfo_nd6)	 ln_list;	/* [m] global nd6_list */
+	struct	rtentry		*ln_rt;		/* [I] always NULL */
+	/* keep fields above in sync with struct llinfo_nd6 */
+};
 
 extern unsigned int ln_hold_total;
 
@@ -110,11 +115,7 @@ extern unsigned int ln_hold_total;
 extern int nd6_delay;
 extern int nd6_umaxtries;
 extern int nd6_mmaxtries;
-extern int nd6_maxnudhint;
-extern int nd6_gctimer;
-extern int nd6_debug;
-
-#define nd6log(x)	do { if (nd6_debug) log x; } while (0)
+extern const int nd6_gctimer;
 
 struct nd_opts {
 	struct nd_opt_hdr *nd_opts_src_lladdr;
@@ -130,7 +131,6 @@ struct	rtentry *nd6_lookup(const struct in6_addr *, int, struct ifnet *,
     u_int);
 void nd6_llinfo_settimer(const struct llinfo_nd6 *, unsigned int);
 void nd6_purge(struct ifnet *);
-void nd6_nud_hint(struct rtentry *);
 void nd6_rtrequest(struct ifnet *, int, struct rtentry *);
 int nd6_ioctl(u_long, caddr_t, struct ifnet *);
 void nd6_cache_lladdr(struct ifnet *, const struct in6_addr *, char *,

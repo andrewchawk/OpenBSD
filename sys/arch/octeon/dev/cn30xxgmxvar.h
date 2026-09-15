@@ -1,4 +1,4 @@
-/*	$OpenBSD: cn30xxgmxvar.h,v 1.14 2024/05/20 23:13:33 jsg Exp $	*/
+/*	$OpenBSD: cn30xxgmxvar.h,v 1.16 2026/04/27 16:39:50 kirill Exp $	*/
 
 /*
  * Copyright (c) 2007 Internet Initiative Japan, Inc.
@@ -61,6 +61,8 @@ struct cn30xxgmx_port_softc {
 	bus_space_handle_t	sc_port_regh;
 	int			sc_port_no;	/* GMX0:0, GMX0:1, ... */
 	int			sc_port_type;
+	int			sc_port_1000x;
+	int			sc_port_disable_an;
 	uint64_t		sc_link;
 	struct mii_data		*sc_port_mii;
 	struct arpcom		*sc_port_ac;
@@ -93,6 +95,7 @@ struct cn30xxgmx_attach_args {
 	const char		*ga_name;
 	int			ga_portno;
 	int			ga_port_type;
+	int			ga_node;
 	struct cn30xxsmi_softc	*ga_smi;
 	int			ga_phy_addr;
 

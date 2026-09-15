@@ -2,7 +2,7 @@
 
 #include <sys/types.h>
 #include <sys/param.h>
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
 
 #include <linux/kernel.h>
 #include <linux/iosys-map.h>
@@ -19,6 +19,14 @@ drm_gem_ttm_mmap(struct drm_gem_object *obj,
 	if (r >= 0)
 		drm_gem_object_put(obj);
 	return r;
+}
+
+int
+drm_gem_ttm_dumb_map_offset(struct drm_file *filp, struct drm_device *dev,
+    uint32_t handle, uint64_t *offset_p)
+{
+	STUB();
+	return -ENOSYS;
 }
 
 int

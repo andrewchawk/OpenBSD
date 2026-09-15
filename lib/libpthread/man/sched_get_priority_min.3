@@ -1,4 +1,4 @@
-.\" $OpenBSD: sched_get_priority_min.3,v 1.2 2013/06/05 03:44:50 tedu Exp $
+.\" $OpenBSD: sched_get_priority_min.3,v 1.4 2026/09/10 08:06:58 jsg Exp $
 .\"
 .\" Copyright (c) 2010 Federico G. Schwindt <fgsch@openbsd.org>
 .\"
@@ -16,7 +16,7 @@
 .\" TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 .\" PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 5 2013 $
+.Dd $Mdocdate: September 10 2026 $
 .Dt SCHED_GET_PRIORITY_MIN 3
 .Os
 .Sh NAME
@@ -24,6 +24,7 @@
 .Nm sched_get_priority_min
 .Nd get priority limits
 .Sh SYNOPSIS
+.Lb libpthread
 .In sched.h
 .Ft int
 .Fn sched_get_priority_max "int policy"
@@ -50,7 +51,9 @@ Upon successful completion,
 and
 .Fn sched_get_priority_min
 return the maximum and minimum priority values, respectively.
-Otherwise, a value of \-1 is returned and errno is set to indicate the error.
+Otherwise, a value of \-1 is returned and
+.Va errno
+is set to indicate the error.
 .Sh ERRORS
 The
 .Fn sched_get_priority_max

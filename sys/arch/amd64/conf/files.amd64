@@ -1,4 +1,4 @@
-#	$OpenBSD: files.amd64,v 1.109 2023/07/08 08:01:10 tobhe Exp $
+#	$OpenBSD: files.amd64,v 1.118 2026/08/19 08:56:28 hshoexer Exp $
 
 maxpartitions 16
 maxusers 2 16 128
@@ -26,9 +26,10 @@ file	arch/amd64/amd64/sys_machdep.c
 file	arch/amd64/amd64/trap.c
 file	arch/amd64/amd64/vm_machdep.c
 file	arch/amd64/amd64/fpu.c
-file	arch/amd64/amd64/softintr.c
 file	arch/amd64/amd64/i8259.c
 file	arch/amd64/amd64/cacheinfo.c
+file	arch/amd64/amd64/ghcb.c			amdsev
+file	arch/amd64/amd64/sev_bus_space.c	amdsev
 file	arch/amd64/amd64/vector.S
 file	arch/amd64/amd64/copy.S
 file	arch/amd64/amd64/spl.S
@@ -209,6 +210,10 @@ file	arch/amd64/amd64/pctr.c		pctr needs-flag
 pseudo-device	nvram
 file	arch/amd64/amd64/nvram.c	nvram needs-flag
 
+pseudo-device	kexec
+file	arch/amd64/amd64/kexec.c	kexec needs-flag
+file	arch/amd64/amd64/kexec_subr.S	kexec needs-flag
+
 #
 # Machine-independent HID support
 #
@@ -238,6 +243,7 @@ file	arch/amd64/amd64/acpi_machdep.c		acpi
 file	arch/amd64/amd64/acpi_wakecode.S	acpi & !small_kernel
 file	dev/acpi/acpi_x86.c			acpi & suspend & !small_kernel
 file	dev/acpi/acpi_apm.c			acpi
+file	dev/acpi/acpicpu_x86.c			acpicpu needs-flag
 
 device	acpipci
 attach	acpipci at acpi
@@ -280,7 +286,6 @@ attach	ipmi at mainbus
 
 major	{vnd = 14}
 major	{sd = 4}
-major	{st = 5}
 major	{cd = 6}
 major	{rd = 17}
 major	{wd = 0}

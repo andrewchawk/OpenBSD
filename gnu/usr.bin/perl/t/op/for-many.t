@@ -12,43 +12,6 @@ use utf8;
 
 my @have;
 
-{
-    my @warnings;
-    BEGIN { $SIG{__WARN__} = sub { push @warnings, shift; }; }
-
-    # This should not warn
-    for my $q ('A', 'B', 'C', 'D') {
-        push @have, "$q";
-    }
-    is ("@have", 'A B C D', 'no list');
-
-    @have = ();
-    # This should warn
-    my $warn0 = __LINE__ + 1;
-    for my ($q) ('A', 'B', 'C', 'D') {
-        push @have, "$q";
-    }
-    is ("@have", 'A B C D', 'list of 1');
-
-    @have = ();
-
-    # Simplest case is an explicit list:
-    my $warn1 = __LINE__ + 1;
-    for my ($q, $r) ('A', 'B', 'C', 'D') {
-        push @have, "$q;$r";
-    }
-    is ("@have", 'A;B C;D', 'list of 2');
-
-    is(scalar @warnings, 2, "2 warnings");
-    is($warnings[0], "for my (...) is experimental at $0 line $warn0.\n",
-       'for my ($q) warned');
-    is($warnings[1], "for my (...) is experimental at $0 line $warn1.\n",
-       'for my ($q, $r) warned');
-    BEGIN { undef $SIG{__WARN__}; }
-}
-
-no warnings 'experimental::for_list';
-
 @have = ();
 
 # Simplest case is an explicit list:
@@ -533,6 +496,19 @@ is($continue, 'xx', 'continue reached twice');
         push @have, "$end end $orientation";
     }
     is("@have", "Pointy end Up Flamey end Down", 'for my ($one, $two)');
+}
+
+# GH #23405 - segfaults when compiling 2-var for loops
+{
+    my $dummy = sub {};
+    for my ($x, $y) (main->$dummy) {}
+    pass '2-var for does not crash on method calls';
+
+    my sub dummy {}
+    sub {
+        for my ($x, $y) (dummy) {}
+    }->();
+    pass '2-var for does not crash on lexical sub calls';
 }
 
 done_testing();

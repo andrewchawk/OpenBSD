@@ -1,4 +1,4 @@
-/*	$OpenBSD: frontend.c,v 1.35 2024/06/27 14:53:06 florian Exp $	*/
+/*	$OpenBSD: frontend.c,v 1.49 2026/08/04 12:49:04 claudio Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021 Florian Obser <florian@openbsd.org>
@@ -177,7 +177,9 @@ frontend(int debug, int verbose)
 	/* Setup pipe and event handler to the parent process. */
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = frontend_dispatch_main;
 	iev_main->events = EV_READ;
 	event_set(&iev_main->ev, iev_main->ibuf.fd, iev_main->events,
@@ -194,11 +196,11 @@ __dead void
 frontend_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_write(&iev_engine->ibuf.w);
-	msgbuf_clear(&iev_engine->ibuf.w);
+	imsgbuf_write(&iev_engine->ibuf);
+	imsgbuf_clear(&iev_engine->ibuf);
 	close(iev_engine->ibuf.fd);
-	msgbuf_write(&iev_main->ibuf.w);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_write(&iev_main->ibuf);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 #ifndef SMALL
@@ -231,35 +233,43 @@ frontend_imsg_compose_engine(int type, uint32_t peerid, pid_t pid,
 void
 frontend_dispatch_main(int fd, short event, void *bula)
 {
+#ifndef SMALL
 	static struct dhcpleased_conf	*nconf;
 	static struct iface_conf	*iface_conf;
+	struct imsg_iface_conf		 imsg_iface_conf;
+#endif /* SMALL */
 	struct imsg			 imsg;
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf = &iev->ibuf;
 	struct iface			*iface;
-	ssize_t				 n;
+	int				 n;
+	uint32_t			 type;
 	int				 shut = 0, bpfsock, if_index, udpsock;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+
+		switch (type) {
 		case IMSG_SOCKET_IPC:
 			/*
 			 * Setup pipe and event handler to the engine
@@ -278,7 +288,8 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			if (iev_engine == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_engine->ibuf, fd);
+			if (imsgbuf_init(&iev_engine->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_engine->handler = frontend_dispatch_engine;
 			iev_engine->events = EV_READ;
 
@@ -291,10 +302,10 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatalx("%s: expected to receive imsg "
 				    "bpf fd but didn't receive any",
 				    __func__);
-			if (IMSG_DATA_SIZE(imsg) != sizeof(if_index))
-				fatalx("%s: IMSG_BPFSOCK wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&if_index, imsg.data, sizeof(if_index));
+			if (imsg_get_data(&imsg, &if_index,
+			    sizeof(if_index)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			set_bpfsock(bpfsock, if_index);
 			break;
 		case IMSG_UDPSOCK:
@@ -302,12 +313,12 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatalx("%s: expected to receive imsg "
 				    "udpsocket fd but didn't receive any",
 				    __func__);
-			if (IMSG_DATA_SIZE(imsg) != sizeof(if_index))
-				fatalx("%s: IMSG_UDPSOCK wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&if_index, imsg.data, sizeof(if_index));
+			if (imsg_get_data(&imsg, &if_index,
+			    sizeof(if_index)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			if ((iface = get_iface_by_id(if_index)) == NULL) {
-				close(fd);
+				close(udpsock);
 				break;
 			}
 			if (iface->udpsock != -1)
@@ -316,10 +327,10 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			iface->udpsock = udpsock;
 			break;
 		case IMSG_CLOSE_UDPSOCK:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(if_index))
-				fatalx("%s: IMSG_UDPSOCK wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&if_index, imsg.data, sizeof(if_index));
+			if (imsg_get_data(&imsg, &if_index,
+			    sizeof(if_index)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			if ((iface = get_iface_by_id(if_index)) != NULL &&
 			    iface->udpsock != -1) {
 				close(iface->udpsock);
@@ -348,80 +359,99 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			SIMPLEQ_INIT(&nconf->iface_list);
 			break;
 		case IMSG_RECONF_IFACE:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(struct
-			    iface_conf))
-				fatalx("%s: IMSG_RECONF_IFACE wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			if ((iface_conf = malloc(sizeof(struct iface_conf)))
+			if ((iface_conf = calloc(1, sizeof(struct iface_conf)))
 			    == NULL)
 				fatal(NULL);
-			memcpy(iface_conf, imsg.data, sizeof(struct
-			    iface_conf));
-			iface_conf->vc_id = NULL;
-			iface_conf->vc_id_len = 0;
-			iface_conf->c_id = NULL;
-			iface_conf->c_id_len = 0;
-			iface_conf->h_name = NULL;
+
+			if (imsg_get_data(&imsg, &imsg_iface_conf,
+			    sizeof(imsg_iface_conf)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
+			if (imsg_iface_conf.ignore_servers_len > MAX_SERVERS)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
+			if (strlcpy(iface_conf->name, imsg_iface_conf.name,
+			    sizeof(iface_conf->name)) >=
+			    sizeof(iface_conf->name))
+				fatalx("%s: invalid %s", __func__, i2s(type));
+			iface_conf->name[sizeof(iface_conf->name) - 1] = '\0';
+			iface_conf->ignore = imsg_iface_conf.ignore;
+			memcpy(iface_conf->ignore_servers,
+			    imsg_iface_conf.ignore_servers,
+			    sizeof(iface_conf->ignore_servers));
+			iface_conf->ignore_servers_len =
+			    imsg_iface_conf.ignore_servers_len;
+			iface_conf->prefer_ipv6 = imsg_iface_conf.prefer_ipv6;
+
 			SIMPLEQ_INSERT_TAIL(&nconf->iface_list,
 			    iface_conf, entry);
 			break;
 		case IMSG_RECONF_VC_ID:
 			if (iface_conf == NULL)
-				fatal("IMSG_RECONF_VC_ID without "
-				    "IMSG_RECONF_IFACE");
-			if (IMSG_DATA_SIZE(imsg) > 255 + 2)
-				fatalx("%s: IMSG_RECONF_VC_ID wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			if ((iface_conf->vc_id = malloc(IMSG_DATA_SIZE(imsg)))
+				fatalx("%s: %s without IMSG_RECONF_IFACE",
+				    __func__, i2s(type));
+			if (iface_conf->vc_id != NULL)
+				fatalx("%s: multiple %s for the same interface",
+				    __func__, i2s(type));
+			if ((iface_conf->vc_id_len = imsg_get_len(&imsg))
+			    > 255 + 2 || iface_conf->vc_id_len == 0)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+			if ((iface_conf->vc_id = malloc(iface_conf->vc_id_len))
 			    == NULL)
 				fatal(NULL);
-			memcpy(iface_conf->vc_id, imsg.data,
-			    IMSG_DATA_SIZE(imsg));
-			iface_conf->vc_id_len = IMSG_DATA_SIZE(imsg);
+			if (imsg_get_data(&imsg, iface_conf->vc_id,
+			    iface_conf->vc_id_len) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
 			break;
 		case IMSG_RECONF_C_ID:
 			if (iface_conf == NULL)
-				fatal("IMSG_RECONF_C_ID without "
-				    "IMSG_RECONF_IFACE");
-			if (IMSG_DATA_SIZE(imsg) > 255 + 2)
-				fatalx("%s: IMSG_RECONF_C_ID wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			if ((iface_conf->c_id = malloc(IMSG_DATA_SIZE(imsg)))
+				fatalx("%s: %s without IMSG_RECONF_IFACE",
+				    __func__, i2s(type));
+			if (iface_conf->c_id != NULL)
+				fatalx("%s: multiple %s for the same interface",
+				    __func__, i2s(type));
+			if ((iface_conf->c_id_len = imsg_get_len(&imsg))
+			    > 255 + 2 || iface_conf->c_id_len == 0)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+			if ((iface_conf->c_id = malloc(iface_conf->c_id_len))
 			    == NULL)
 				fatal(NULL);
-			memcpy(iface_conf->c_id, imsg.data,
-			    IMSG_DATA_SIZE(imsg));
-			iface_conf->c_id_len = IMSG_DATA_SIZE(imsg);
+			if (imsg_get_data(&imsg, iface_conf->c_id,
+			    iface_conf->c_id_len) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
 			break;
-		case IMSG_RECONF_H_NAME:
+		case IMSG_RECONF_H_NAME: {
+			size_t	len;
+
 			if (iface_conf == NULL)
-				fatal("IMSG_RECONF_H_NAME without "
-				    "IMSG_RECONF_IFACE");
-			if (((char *)imsg.data)[IMSG_DATA_SIZE(imsg) - 1] !=
-			    '\0')
-				fatalx("Invalid hostname");
-			if (IMSG_DATA_SIZE(imsg) > 256)
-				fatalx("Invalid hostname");
-			if ((iface_conf->h_name = strdup(imsg.data)) == NULL)
+				fatalx("%s: %s without IMSG_RECONF_IFACE",
+				    __func__, i2s(type));
+			if (iface_conf->h_name != NULL)
+				fatalx("%s: multiple %s for the same interface",
+				    __func__, i2s(type));
+			if ((len = imsg_get_len(&imsg)) > 256 || len == 0)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+			if ((iface_conf->h_name = malloc(len)) == NULL)
 				fatal(NULL);
+			if (imsg_get_data(&imsg, iface_conf->h_name, len) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+			if (iface_conf->h_name[len - 1] != '\0')
+				fatalx("Invalid hostname");
 			break;
+		}
 		case IMSG_RECONF_END: {
 			int	 i;
 			int	*ifaces;
-			char	 ifnamebuf[IF_NAMESIZE], *if_name;
 
 			if (nconf == NULL)
-				fatalx("%s: IMSG_RECONF_END without "
-				    "IMSG_RECONF_CONF", __func__);
+				fatalx("%s: %s without IMSG_RECONF_CONF",
+				    __func__, i2s(type));
 
 			ifaces = changed_ifaces(frontend_conf, nconf);
 			merge_config(frontend_conf, nconf);
 			nconf = NULL;
 			for (i = 0; ifaces[i] != 0; i++) {
 				if_index = ifaces[i];
-				if_name = if_indextoname(if_index, ifnamebuf);
-				log_debug("changed iface: %s[%d]", if_name !=
-				    NULL ? if_name : "<unknown>", if_index);
 				frontend_imsg_compose_engine(
 				    IMSG_REQUEST_REBOOT, 0, 0, &if_index,
 				    sizeof(if_index));
@@ -442,8 +472,7 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			break;
 #endif	/* SMALL */
 		default:
-			log_debug("%s: error handling imsg %d", __func__,
-			    imsg.hdr.type);
+			log_debug("%s: error handling imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -464,29 +493,33 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
 	struct iface		*iface;
-	ssize_t			 n;
-	int			 shut = 0;
+	uint32_t		 type;
+	int			 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+
+		switch (type) {
 #ifndef	SMALL
 		case IMSG_CTL_END:
 		case IMSG_CTL_SHOW_INTERFACE_INFO:
@@ -495,12 +528,10 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 #endif	/* SMALL */
 		case IMSG_SEND_DISCOVER: {
 			struct imsg_req_dhcp	 imsg_req_dhcp;
-			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_req_dhcp))
-				fatalx("%s: IMSG_SEND_DISCOVER wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&imsg_req_dhcp, imsg.data,
-			    sizeof(imsg_req_dhcp));
+
+			if (imsg_get_data(&imsg, &imsg_req_dhcp,
+			    sizeof(imsg_req_dhcp)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
 
 			iface = get_iface_by_id(imsg_req_dhcp.if_index);
 
@@ -513,12 +544,10 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 		}
 		case IMSG_SEND_REQUEST: {
 			struct imsg_req_dhcp	 imsg_req_dhcp;
-			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_req_dhcp))
-				fatalx("%s: IMSG_SEND_REQUEST wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&imsg_req_dhcp, imsg.data,
-			    sizeof(imsg_req_dhcp));
+
+			if (imsg_get_data(&imsg, &imsg_req_dhcp,
+			    sizeof(imsg_req_dhcp)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
 
 			iface = get_iface_by_id(imsg_req_dhcp.if_index);
 
@@ -530,8 +559,7 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 			break;
 		}
 		default:
-			log_debug("%s: error handling imsg %d", __func__,
-			    imsg.hdr.type);
+			log_debug("%s: error handling imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -578,7 +606,6 @@ update_iface(struct if_msghdr *ifm, struct sockaddr_dl *sdl)
 	struct imsg_ifinfo	 ifinfo;
 	uint32_t		 if_index;
 	int			 flags, xflags;
-	char			 ifnamebuf[IF_NAMESIZE], *if_name;
 
 	if_index = ifm->ifm_index;
 
@@ -586,21 +613,11 @@ update_iface(struct if_msghdr *ifm, struct sockaddr_dl *sdl)
 	xflags = ifm->ifm_xflags;
 
 	iface = get_iface_by_id(if_index);
-	if_name = if_indextoname(if_index, ifnamebuf);
-
-	if (if_name == NULL) {
-		if (iface != NULL) {
-			log_debug("interface with idx %d removed", if_index);
-			frontend_imsg_compose_engine(IMSG_REMOVE_IF, 0, 0,
-			    &if_index, sizeof(if_index));
-			remove_iface(if_index);
-		}
-		return;
-	}
 
 	if (!(xflags & IFXF_AUTOCONF4)) {
 		if (iface != NULL) {
-			log_info("Removed autoconf flag from %s", if_name);
+			log_info("Removed autoconf flag from %s",
+			    iface->ifinfo.if_name);
 			frontend_imsg_compose_engine(IMSG_REMOVE_IF, 0, 0,
 			    &if_index, sizeof(if_index));
 			remove_iface(if_index);
@@ -610,6 +627,9 @@ update_iface(struct if_msghdr *ifm, struct sockaddr_dl *sdl)
 
 	memset(&ifinfo, 0, sizeof(ifinfo));
 	ifinfo.if_index = if_index;
+	if (if_indextoname(if_index, ifinfo.if_name) == NULL)
+		return; /* interface disappeared */
+
 	ifinfo.link_state = ifm->ifm_data.ifi_link_state;
 	ifinfo.rdomain = ifm->ifm_tableid;
 	ifinfo.running = (flags & (IFF_UP | IFF_RUNNING)) ==
@@ -620,7 +640,8 @@ update_iface(struct if_msghdr *ifm, struct sockaddr_dl *sdl)
 		memcpy(ifinfo.hw_address.ether_addr_octet, LLADDR(sdl),
 		    ETHER_ADDR_LEN);
 	else if (iface == NULL) {
-		log_warnx("Could not find AF_LINK address for %s.", if_name);
+		log_warnx("Could not find AF_LINK address for %s.",
+		    ifinfo.if_name);
 		return;
 	}
 
@@ -689,6 +710,7 @@ init_ifaces(void)
 
 		memset(&ifinfo, 0, sizeof(ifinfo));
 		ifinfo.if_index = if_index;
+		memcpy(&ifinfo.if_name, if_name, sizeof(ifinfo.if_name));
 		ifinfo.link_state = -1;
 		ifinfo.running = (flags & (IFF_UP | IFF_RUNNING)) ==
 		    (IFF_UP | IFF_RUNNING);
@@ -1041,7 +1063,6 @@ void
 send_packet(uint8_t message_type, struct iface *iface)
 {
 	ssize_t			 pkt_len;
-	char			 ifnamebuf[IF_NAMESIZE], *if_name;
 
 	if (!event_initialized(&iface->bpfev.ev)) {
 		iface->send_discover = 1;
@@ -1050,13 +1071,10 @@ send_packet(uint8_t message_type, struct iface *iface)
 
 	iface->send_discover = 0;
 
-	if ((if_name = if_indextoname(iface->ifinfo.if_index, ifnamebuf)) == NULL)
-		return; /* iface went away, nothing to do */
-
 	log_debug("%s on %s", message_type == DHCPDISCOVER ? "DHCPDISCOVER" :
-	    "DHCPREQUEST", if_name);
+	    "DHCPREQUEST", iface->ifinfo.if_name);
 
-	pkt_len = build_packet(message_type, if_name, iface->xid,
+	pkt_len = build_packet(message_type, iface->ifinfo.if_name, iface->xid,
 	    &iface->ifinfo.hw_address, &iface->ciaddr, &iface->requested_ip,
 	    &iface->server_identifier);
 	if (iface->dhcp_server.s_addr != INADDR_ANY) {

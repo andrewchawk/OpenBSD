@@ -15,7 +15,7 @@ BEGIN {
 
 use Config;
 
-plan tests => 151;
+plan tests => 157;
 
 # run some code N times. If the number of SVs at the end of loop N is
 # greater than (N-1)*delta at the end of loop 1, we've got a leak
@@ -644,4 +644,69 @@ my $refcount;
     print $sv->REFCNT == 1 ? "ok" : "not ok";
 }
 PERL
+}
+
+{
+    # smartmatch is deprecated and will be removed in 5.042
+    no warnings 'deprecated';
+    my $one = 1;
+    leak 2, 0, sub { 1 ~~ sub { 1 + $one } }, 'Smartmatch doesn\'t leak';
+}
+
+# the initial implementation of the require hook had some leaks
+
+sub hook::before  { $_[0] = "NoSuchFile2" if $_[0] =~/ NoSuch/;
+                        return \&hook::before2 }
+sub hook::before2 { return }
+sub hook::after   { return }
+
+{
+    local ${^HOOK}{require__before} =  \&hook::before;
+    local ${^HOOK}{require__after}  =  \&hook::after;
+
+    leak(5, 0, sub { require strict; }, "require hook");
+    leak(5, 0, sub { eval { require "NoSuchFile" } }, "require hook no file");
+}
+
+# at one point compiling this code leaked an AV and its children on
+# PERL_RC_STACK builds
+
+eleak(2, 0, '\(1..3)', 'folded const AV');
+
+# a sort block with a nested scope leaked the return value on each call
+
+leak 2, 0,  sub {
+                () = sort { for (1) {
+                                     if ($a > $b) { return -1 }
+                                     elsif ($a < $b) { return 1 }
+                                     else { return 0 }
+                                } } 1..2;
+            },
+            'sort block return';
+
+
+# Avoid leaks when overloading causes a compile-time pattern code block
+# to be recompiled at runtime.
+
+package myconcat {
+    use overload
+        '""' => sub { ${$_[0]} },
+        '.' =>  sub {
+                        my ($x, $y) = @_[ $_[2] ? (1,0) : (0,1) ];
+                        my ($xx, $yy) = ("$x", "$y");
+                        "$xx$yy";
+                    }
+        ;
+
+    ::leak(2, 0,
+        sub {
+           my $r1 = qr/(?{1})/;
+           my $r2 = qr/(?{2})/;
+           bless $r2, 'myconcat';
+           use re "eval";
+           qr/$r1$r2/;
+           1;
+        },
+        'overloaded pattern with code block'
+    );
 }

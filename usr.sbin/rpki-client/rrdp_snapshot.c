@@ -1,4 +1,4 @@
-/*	$OpenBSD: rrdp_snapshot.c,v 1.10 2024/05/30 09:54:59 job Exp $ */
+/*	$OpenBSD: rrdp_snapshot.c,v 1.13 2026/08/04 18:46:18 tb Exp $ */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
@@ -55,26 +55,24 @@ start_snapshot_elem(struct snapshot_xml *sxml, const char **attr)
 
 	if (sxml->scope != SNAPSHOT_SCOPE_NONE)
 		PARSE_FAIL(p,
-		    "parse failed - entered snapshot elem unexpectedely");
+		    "parse failed - entered snapshot elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		const char *errstr;
 		if (strcmp("xmlns", attr[i]) == 0 &&
-		    strcmp(RRDP_XMLNS, attr[i + 1]) == 0) {
-			has_xmlns = 1;
+		    strcmp(RRDP_XMLNS, attr[i + 1]) == 0 && has_xmlns++ == 0)
 			continue;
-		}
-		if (strcmp("version", attr[i]) == 0) {
+		if (strcmp("version", attr[i]) == 0 && sxml->version == 0) {
 			sxml->version = strtonum(attr[i + 1],
 			    1, MAX_VERSION, &errstr);
 			if (errstr == NULL)
 				continue;
 		}
 		if (strcmp("session_id", attr[i]) == 0 &&
-		    valid_uuid(attr[i + 1])) {
+		    valid_uuid(attr[i + 1]) && sxml->session_id == NULL) {
 			sxml->session_id = xstrdup(attr[i + 1]);
 			continue;
 		}
-		if (strcmp("serial", attr[i]) == 0) {
+		if (strcmp("serial", attr[i]) == 0 && sxml->serial == 0) {
 			sxml->serial = strtonum(attr[i + 1],
 			    1, LLONG_MAX, &errstr);
 			if (errstr == NULL)
@@ -102,7 +100,7 @@ end_snapshot_elem(struct snapshot_xml *sxml)
 
 	if (sxml->scope != SNAPSHOT_SCOPE_SNAPSHOT)
 		PARSE_FAIL(p, "parse failed - exited snapshot "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 	sxml->scope = SNAPSHOT_SCOPE_END;
 }
 
@@ -115,7 +113,7 @@ start_publish_elem(struct snapshot_xml *sxml, const char **attr)
 
 	if (sxml->scope != SNAPSHOT_SCOPE_SNAPSHOT)
 		PARSE_FAIL(p,
-		    "parse failed - entered publish elem unexpectedely");
+		    "parse failed - entered publish elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		if (strcmp("uri", attr[i]) == 0 && hasUri++ == 0) {
 			if (valid_uri(attr[i + 1], strlen(attr[i + 1]),
@@ -130,11 +128,14 @@ start_publish_elem(struct snapshot_xml *sxml, const char **attr)
 		 */
 		if (strcmp("xmlns", attr[i]) == 0)
 			continue;
+		free(uri);
 		PARSE_FAIL(p, "parse failed - non conforming"
 		    " attribute '%s' found in publish elem", attr[i]);
 	}
-	if (hasUri != 1)
+	if (hasUri != 1) {
+		free(uri);
 		PARSE_FAIL(p, "parse failed - incomplete publish attributes");
+	}
 	sxml->pxml = new_publish_xml(PUB_ADD, uri, NULL, 0);
 	sxml->scope = SNAPSHOT_SCOPE_PUBLISH;
 }
@@ -146,7 +147,7 @@ end_publish_elem(struct snapshot_xml *sxml)
 
 	if (sxml->scope != SNAPSHOT_SCOPE_PUBLISH)
 		PARSE_FAIL(p, "parse failed - exited publish "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 
 	if (publish_done(sxml->rrdp, sxml->pxml) != 0)
 		PARSE_FAIL(p, "parse failed - bad publish elem");

@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_mbuf.c,v 1.290 2024/03/05 18:52:41 bluhm Exp $	*/
+/*	$OpenBSD: uipc_mbuf.c,v 1.307 2026/07/03 11:51:57 dlg Exp $	*/
 /*	$NetBSD: uipc_mbuf.c,v 1.15.4.1 1996/06/13 17:11:44 cgd Exp $	*/
 
 /*
@@ -84,12 +84,13 @@
 
 #include <sys/socket.h>
 #include <net/if.h>
-
+#include <net/if_var.h>
 
 #include <uvm/uvm_extern.h>
 
 #ifdef DDB
 #include <machine/db_machdep.h>
+#include <ddb/db_interface.h>
 #endif
 
 #if NPF > 0
@@ -97,7 +98,7 @@
 #endif	/* NPF > 0 */
 
 /* mbuf stats */
-COUNTERS_BOOT_MEMORY(mbstat_boot, MBSTAT_COUNT);
+COUNTERS_BOOT_MEMORY(mbstat_boot, mbs_ncounters);
 struct cpumem *mbstat = COUNTERS_BOOT_INITIALIZER(mbstat_boot);
 /* mbuf pools */
 struct	pool mbpool;
@@ -109,12 +110,12 @@ u_int	mclsizes[MCLPOOLS] = {
 	MCLBYTES + 2,	/* ETHER_ALIGNED 2k mbufs */
 	4 * 1024,
 	8 * 1024,
-	9 * 1024,
+	(9 * 1024) + 128, /* use more of the pool page for ETHER_ALIGNED etc */
 	12 * 1024,
 	16 * 1024,
 	64 * 1024
 };
-static	char mclnames[MCLPOOLS][8];
+static	char mclnames[MCLPOOLS][16];
 struct	pool mclpools[MCLPOOLS];
 
 struct pool *m_clpool(u_int);
@@ -123,13 +124,25 @@ int max_linkhdr;		/* largest link-level header */
 int max_protohdr;		/* largest protocol header */
 int max_hdr;			/* largest link+protocol header */
 
-struct	mutex m_extref_mtx = MUTEX_INITIALIZER(IPL_NET);
+struct m_ext_refs {
+	void		*arg;
+	u_int		 free_fn;
+	u_int		 zero;
+	struct refcnt	 refs;
+};
 
-void	m_extfree(struct mbuf *);
+static struct pool	m_ext_refs_pool;
+
+static void		m_extfree_refs(caddr_t, u_int, void *);
+u_int			m_extfree_refs_fn;
+
+static int		m_extref(struct mbuf *, struct mbuf *, int);
+static void		m_extfree(struct mbuf *);
+
 void	m_zero(struct mbuf *);
 
-unsigned long mbuf_mem_limit;	/* how much memory can be allocated */
-unsigned long mbuf_mem_alloc;	/* how much memory has been allocated */
+unsigned long mbuf_mem_limit;	/* [a] how much memory can be allocated */
+unsigned long mbuf_mem_alloc;	/* [a] how much memory has been allocated */
 
 void	*m_pool_alloc(struct pool *, int, int *);
 void	m_pool_free(struct pool *, void *);
@@ -174,6 +187,8 @@ mbinit(void)
 
 	pool_init(&mtagpool, PACKET_TAG_MAXSIZE + sizeof(struct m_tag), 0,
 	    IPL_NET, 0, "mtagpl", NULL);
+	pool_init(&m_ext_refs_pool, sizeof(struct m_ext_refs), CACHELINESIZE,
+	    IPL_NET, 0, "mextrefs", NULL);
 
 	for (i = 0; i < nitems(mclsizes); i++) {
 		lowbits = mclsizes[i] & ((1 << 10) - 1);
@@ -193,6 +208,7 @@ mbinit(void)
 
 	(void)mextfree_register(m_extfree_pool);
 	KASSERT(num_extfree_fns == 1);
+	m_extfree_refs_fn = mextfree_register(m_extfree_refs);
 }
 
 void
@@ -200,10 +216,11 @@ mbcpuinit(void)
 {
 	int i;
 
-	mbstat = counters_alloc_ncpus(mbstat, MBSTAT_COUNT);
+	mbstat = counters_alloc_ncpus(mbstat, mbs_ncounters);
 
 	pool_cache_init(&mbpool);
 	pool_cache_init(&mtagpool);
+	pool_cache_init(&m_ext_refs_pool);
 
 	for (i = 0; i < nitems(mclsizes); i++)
 		pool_cache_init(&mclpools[i]);
@@ -217,8 +234,8 @@ nmbclust_update(long newval)
 	if (newval <= 0 || newval > LONG_MAX / MCLBYTES)
 		return ERANGE;
 	/* update the global mbuf memory limit */
-	nmbclust = newval;
-	mbuf_mem_limit = nmbclust * MCLBYTES;
+	atomic_store_long(&nmbclust, newval);
+	atomic_store_long(&mbuf_mem_limit, newval * MCLBYTES);
 
 	pool_wakeup(&mbpool);
 	for (i = 0; i < nitems(mclsizes); i++)
@@ -234,9 +251,6 @@ struct mbuf *
 m_get(int nowait, int type)
 {
 	struct mbuf *m;
-	struct counters_ref cr;
-	uint64_t *counters;
-	int s;
 
 	KASSERT(type >= 0 && type < MT_NTYPES);
 
@@ -244,11 +258,7 @@ m_get(int nowait, int type)
 	if (m == NULL)
 		return (NULL);
 
-	s = splnet();
-	counters = counters_enter(&cr, mbstat);
-	counters[type]++;
-	counters_leave(&cr, mbstat);
-	splx(s);
+	mbstat_inc(type);
 
 	m->m_type = type;
 	m->m_next = NULL;
@@ -267,9 +277,6 @@ struct mbuf *
 m_gethdr(int nowait, int type)
 {
 	struct mbuf *m;
-	struct counters_ref cr;
-	uint64_t *counters;
-	int s;
 
 	KASSERT(type >= 0 && type < MT_NTYPES);
 
@@ -277,11 +284,7 @@ m_gethdr(int nowait, int type)
 	if (m == NULL)
 		return (NULL);
 
-	s = splnet();
-	counters = counters_enter(&cr, mbstat);
-	counters[type]++;
-	counters_leave(&cr, mbstat);
-	splx(s);
+	mbstat_inc(type);
 
 	m->m_type = type;
 
@@ -413,21 +416,43 @@ m_extfree_pool(caddr_t buf, u_int size, void *pp)
 	pool_put(pp, buf);
 }
 
+int
+m_ext_refs_shared(struct mbuf *m)
+{
+	struct m_ext_refs *mrefs = m->m_ext.ext_arg;
+
+	return (refcnt_shared(&mrefs->refs));
+}
+
+static void
+m_extfree_refs(caddr_t buf, u_int size, void *arg)
+{
+	struct m_ext_refs *mrefs = arg;
+
+	if (refcnt_rele(&mrefs->refs)) {
+		if (mrefs->zero)
+			explicit_bzero(buf, size);
+
+		KASSERT(mrefs->free_fn < num_extfree_fns);
+		KASSERT(mrefs->free_fn != m_extfree_refs_fn);
+
+		mextfree_fns[mrefs->free_fn](buf, size, mrefs->arg);
+
+		pool_put(&m_ext_refs_pool, mrefs);
+	}
+}
+
 struct mbuf *
 m_free(struct mbuf *m)
 {
 	struct mbuf *n;
-	struct counters_ref cr;
-	uint64_t *counters;
 	int s;
 
 	if (m == NULL)
 		return (NULL);
 
 	s = splnet();
-	counters = counters_enter(&cr, mbstat);
-	counters[m->m_type]--;
-	counters_leave(&cr, mbstat);
+	counters_dec(mbstat, m->m_type);
 	splx(s);
 
 	n = m->m_next;
@@ -452,44 +477,33 @@ m_free(struct mbuf *m)
 	return (n);
 }
 
-void
-m_extref(struct mbuf *o, struct mbuf *n)
+static int
+m_extref(struct mbuf *m, struct mbuf *n, int how)
 {
-	int refs = MCLISREFERENCED(o);
+	struct m_ext_refs *mrefs;
 
-	n->m_flags |= o->m_flags & (M_EXT|M_EXTWR);
+	if (m->m_ext.ext_free_fn == m_extfree_refs_fn)
+		mrefs = m->m_ext.ext_arg;
+	else {
+		mrefs = pool_get(&m_ext_refs_pool, how);
+		if (mrefs == NULL)
+			return (ENOMEM);
 
-	if (refs)
-		mtx_enter(&m_extref_mtx);
-	n->m_ext.ext_nextref = o->m_ext.ext_nextref;
-	n->m_ext.ext_prevref = o;
-	o->m_ext.ext_nextref = n;
-	n->m_ext.ext_nextref->m_ext.ext_prevref = n;
-	if (refs)
-		mtx_leave(&m_extref_mtx);
+		refcnt_init(&mrefs->refs);
+		mrefs->arg = m->m_ext.ext_arg;
+		mrefs->free_fn = m->m_ext.ext_free_fn;
+		mrefs->zero = 0;
 
-	MCLREFDEBUGN((n), __FILE__, __LINE__);
-}
-
-static inline u_int
-m_extunref(struct mbuf *m)
-{
-	int refs = 0;
-
-	if (!MCLISREFERENCED(m))
-		return (0);
-
-	mtx_enter(&m_extref_mtx);
-	if (MCLISREFERENCED(m)) {
-		m->m_ext.ext_nextref->m_ext.ext_prevref =
-		    m->m_ext.ext_prevref;
-		m->m_ext.ext_prevref->m_ext.ext_nextref =
-		    m->m_ext.ext_nextref;
-		refs = 1;
+		m->m_ext.ext_arg = mrefs;
+		m->m_ext.ext_free_fn = m_extfree_refs_fn;
 	}
-	mtx_leave(&m_extref_mtx);
 
-	return (refs);
+	refcnt_take(&mrefs->refs);
+
+	MEXTADD(n, m->m_ext.ext_buf, m->m_ext.ext_size,
+	    m->m_flags & M_EXTWR, m_extfree_refs_fn, mrefs);
+
+	return (0);
 }
 
 /*
@@ -505,15 +519,13 @@ mextfree_register(void (*fn)(caddr_t, u_int, void *))
 	return num_extfree_fns++;
 }
 
-void
+static void
 m_extfree(struct mbuf *m)
 {
-	if (m_extunref(m) == 0) {
-		KASSERT(m->m_ext.ext_free_fn < num_extfree_fns);
-		mextfree_fns[m->m_ext.ext_free_fn](m->m_ext.ext_buf,
-		    m->m_ext.ext_size, m->m_ext.ext_arg);
-	}
-
+	KASSERT(m->m_ext.ext_free_fn < num_extfree_fns);
+	mextfree_fns[m->m_ext.ext_free_fn](m->m_ext.ext_buf,
+	    m->m_ext.ext_size, m->m_ext.ext_arg);
+ 
 	m->m_flags &= ~(M_EXT|M_EXTWR);
 }
 
@@ -557,6 +569,7 @@ m_defrag(struct mbuf *m, int how)
 
 	KASSERT(m->m_flags & M_PKTHDR);
 
+	mbstat_inc(mbs_defrag_alloc);
 	if ((m0 = m_gethdr(how, m->m_type)) == NULL)
 		return (ENOBUFS);
 	if (m->m_pkthdr.len > MHLEN) {
@@ -616,6 +629,7 @@ m_prepend(struct mbuf *m, int len, int how)
 		m->m_data -= len;
 		m->m_len += len;
 	} else {
+		mbstat_inc(mbs_prepend_alloc);
 		MGET(mn, how, m->m_type);
 		if (mn == NULL) {
 			m_freem(m);
@@ -672,9 +686,9 @@ m_copym(struct mbuf *m0, int off, int len, int wait)
 		}
 		n->m_len = min(len, m->m_len - off);
 		if (m->m_flags & M_EXT) {
+			if (m_extref(m, n, wait) != 0)
+				goto nospace;
 			n->m_data = m->m_data + off;
-			n->m_ext = m->m_ext;
-			MCLADDREFERENCE(m, n);
 		} else {
 			n->m_data += m->m_data -
 			    (m->m_flags & M_PKTHDR ? m->m_pktdat : m->m_dat);
@@ -956,8 +970,8 @@ m_pullup(struct mbuf *m0, int len)
 			memmove(head, mtod(m0, caddr_t), m0->m_len);
 			m0->m_data = head;
 		}
-
 		len -= m0->m_len;
+		mbstat_inc(mbs_pullup_copy);
 	} else {
 		/* the first mbuf is too small or read-only, make a new one */
 		space = adj + len;
@@ -968,6 +982,7 @@ m_pullup(struct mbuf *m0, int len)
 		m0->m_next = m;
 		m = m0;
 
+		mbstat_inc(mbs_pullup_alloc);
 		MGET(m0, M_DONTWAIT, m->m_type);
 		if (m0 == NULL)
 			goto bad;
@@ -1104,8 +1119,12 @@ m_split(struct mbuf *m0, int len0, int wait)
 			return (NULL);
 	}
 	if (m->m_flags & M_EXT) {
-		n->m_ext = m->m_ext;
-		MCLADDREFERENCE(m, n);
+		if (m_extref(m, n, wait) != 0) {
+			m_freem(n);
+			if (m0->m_flags & M_PKTHDR)
+				m0->m_pkthdr.len = olen;
+			return (NULL);
+		}
 		n->m_data = m->m_data + len;
 	} else {
 		m_align(n, remain);
@@ -1286,13 +1305,17 @@ m_devget(char *buf, int totlen, int off)
 void
 m_zero(struct mbuf *m)
 {
-	if (M_READONLY(m)) {
-		mtx_enter(&m_extref_mtx);
-		if ((m->m_flags & M_EXT) && MCLISREFERENCED(m)) {
-			m->m_ext.ext_nextref->m_flags |= M_ZEROIZE;
-			m->m_ext.ext_prevref->m_flags |= M_ZEROIZE;
-		}
-		mtx_leave(&m_extref_mtx);
+	if (ISSET(m->m_flags, M_EXT) &&
+	    m->m_ext.ext_free_fn == m_extfree_refs_fn) {
+		struct m_ext_refs *mrefs = m->m_ext.ext_arg;
+
+		/*
+		 * this variable only transitions in one direction,
+		 * so if there is a race it will be toward the same
+		 * result and therefore there is no loss.
+		 */
+
+		mrefs->zero = 1;
 		return;
 	}
 
@@ -1466,7 +1489,8 @@ m_pool_alloc(struct pool *pp, int flags, int *slowdown)
 {
 	void *v;
 
-	if (atomic_add_long_nv(&mbuf_mem_alloc, pp->pr_pgsize) > mbuf_mem_limit)
+	if (atomic_add_long_nv(&mbuf_mem_alloc, pp->pr_pgsize) >
+	    atomic_load_long(&mbuf_mem_limit))
 		goto fail;
 
 	v = (*pool_allocator_multi.pa_alloc)(pp, flags, slowdown);
@@ -1474,6 +1498,7 @@ m_pool_alloc(struct pool *pp, int flags, int *slowdown)
 		return (v);
 
  fail:
+	mbstat_inc(mbs_drops);
 	atomic_sub_long(&mbuf_mem_alloc, pp->pr_pgsize);
 	return (NULL);
 }
@@ -1493,10 +1518,39 @@ m_pool_init(struct pool *pp, u_int size, u_int align, const char *wmesg)
 	pool_set_constraints(pp, &kp_dma_contig);
 }
 
+void
+m_pool_noconstraints(void)
+{
+	int i;
+
+	pool_set_constraints(&mbpool, &kp_mbuf_contig);
+
+	for (i = 0; i < nitems(mclsizes); i++)
+		pool_set_constraints(&mclpools[i], &kp_mbuf_contig);
+}
+
 u_int
 m_pool_used(void)
 {
-	return ((mbuf_mem_alloc * 100) / mbuf_mem_limit);
+	return ((atomic_load_long(&mbuf_mem_alloc) * 100) /
+	    atomic_load_long(&mbuf_mem_limit));
+}
+
+void
+mbuf_dma_64bit_enable(void)
+{
+	struct ifnet *ifp;
+
+	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
+		if (!ISSET(ifp->if_xflags, IFXF_MBUF_64BIT)) {
+			printf("%s: restrict all mbufs to low memory\n",
+			    ifp->if_xname);
+			return;
+		}
+	}
+
+	printf("enable mbufs in high memory\n");
+	m_pool_noconstraints();
 }
 
 #ifdef DDB
@@ -1537,10 +1591,85 @@ m_print(void *v,
 		    m->m_ext.ext_buf, m->m_ext.ext_size);
 		(*pr)("m_ext.ext_free_fn: %u\tm_ext.ext_arg: %p\n",
 		    m->m_ext.ext_free_fn, m->m_ext.ext_arg);
-		(*pr)("m_ext.ext_nextref: %p\tm_ext.ext_prevref: %p\n",
-		    m->m_ext.ext_nextref, m->m_ext.ext_prevref);
-
+		/* if m_ext.ext_free_fn == m_extfree_refs_fn ? */
 	}
+}
+
+const char *m_types[MT_NTYPES] = {
+	"fre",
+	"dat",
+	"hdr",
+	"nam",
+	"opt",
+	"ftb",
+	"ctl",
+	"oob",
+};
+
+void
+m_print_chain(void *v, int deep,
+    int (*pr)(const char *, ...) __attribute__((__format__(__kprintf__,1,2))))
+{
+	struct mbuf *m;
+	const char *indent = deep ? "++-" : "-+-";
+	size_t chain = 0, len = 0, size = 0;
+
+	for (m = v; m != NULL; m = m->m_next) {
+		const char *type;
+
+		chain++;
+		len += m->m_len;
+		size += M_SIZE(m);
+		type = (m->m_type >= 0 && m->m_type < MT_NTYPES) ?
+		    m_types[m->m_type] : "???";
+		(*pr)("%s mbuf %p, %s, off %zd, len %u", indent, m, type,
+		    m->m_data - M_DATABUF(m), m->m_len);
+		if (m->m_flags & M_PKTHDR)
+			(*pr)(", pktlen %d", m->m_pkthdr.len);
+		if (m->m_flags & M_EXT)
+			(*pr)(", clsize %u", m->m_ext.ext_size);
+		else
+			(*pr)(", size %zu",
+			    m->m_flags & M_PKTHDR ? MHLEN : MLEN);
+		(*pr)("\n");
+		indent = deep ? "|+-" : " +-";
+	}
+	indent = deep ? "|\\-" : " \\-";
+	if (v != NULL) {
+		(*pr)("%s total chain %zu, len %zu, size %zu\n",
+		    indent, chain, len, size);
+	}
+}
+
+void
+m_print_packet(void *v, int deep,
+    int (*pr)(const char *, ...) __attribute__((__format__(__kprintf__,1,2))))
+{
+	struct mbuf *m, *n;
+	const char *indent = "+--";
+	size_t pkts = 0;
+
+	for (m = v; m != NULL; m = m->m_nextpkt) {
+		size_t chain = 0, len = 0, size = 0;
+
+		pkts++;
+		if (deep) {
+			m_print_chain(m, deep, pr);
+			continue;
+		}
+		for (n = m; n != NULL; n = n->m_next) {
+			chain++;
+			len += n->m_len;
+			size += M_SIZE(n);
+		}
+		(*pr)("%s mbuf %p, chain %zu", indent, m, chain);
+		if (m->m_flags & M_PKTHDR)
+			(*pr)(", pktlen %d", m->m_pkthdr.len);
+		(*pr)(", len %zu, size %zu\n", len, size);
+	}
+	indent = "\\--";
+	if (v != NULL)
+		(*pr)("%s total packets %zu\n", indent, pkts);
 }
 #endif
 
@@ -1739,18 +1868,6 @@ mq_delist(struct mbuf_queue *mq, struct mbuf_list *ml)
 	mtx_leave(&mq->mq_mtx);
 }
 
-struct mbuf *
-mq_dechain(struct mbuf_queue *mq)
-{
-	struct mbuf *m0;
-
-	mtx_enter(&mq->mq_mtx);
-	m0 = ml_dechain(&mq->mq_list);
-	mtx_leave(&mq->mq_mtx);
-
-	return (m0);
-}
-
 unsigned int
 mq_purge(struct mbuf_queue *mq)
 {
@@ -1781,11 +1898,12 @@ mq_set_maxlen(struct mbuf_queue *mq, u_int maxlen)
 	mtx_leave(&mq->mq_mtx);
 }
 
+#ifndef SMALL_KERNEL
 int
 sysctl_mq(int *name, u_int namelen, void *oldp, size_t *oldlenp,
     void *newp, size_t newlen, struct mbuf_queue *mq)
 {
-	unsigned int maxlen;
+	unsigned int oldval, newval;
 	int error;
 
 	/* All sysctl names at this level are terminal. */
@@ -1796,10 +1914,10 @@ sysctl_mq(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	case IFQCTL_LEN:
 		return (sysctl_rdint(oldp, oldlenp, newp, mq_len(mq)));
 	case IFQCTL_MAXLEN:
-		maxlen = mq->mq_maxlen;
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &maxlen);
-		if (error == 0)
-			mq_set_maxlen(mq, maxlen);
+		oldval = newval = READ_ONCE(mq->mq_maxlen);
+		error = sysctl_int(oldp, oldlenp, newp, newlen, &newval);
+		if (error == 0 && oldval != newval)
+			mq_set_maxlen(mq, newval);
 		return (error);
 	case IFQCTL_DROPS:
 		return (sysctl_rdint(oldp, oldlenp, newp, mq_drops(mq)));
@@ -1808,3 +1926,4 @@ sysctl_mq(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	}
 	/* NOTREACHED */
 }
+#endif /* SMALL_KERNEL */

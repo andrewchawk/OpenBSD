@@ -5,5 +5,13 @@
 
 #include <linux/uaccess.h>
 #include <linux/highmem.h>
+#include <linux/mm.h>
+
+struct address_space;
+
+static inline void
+mapping_clear_unevictable(struct address_space *as)
+{
+}
 
 #endif

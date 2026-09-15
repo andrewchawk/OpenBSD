@@ -1,4 +1,4 @@
-/* $OpenBSD: environ.c,v 1.27 2022/08/15 08:37:03 nicm Exp $ */
+/* $OpenBSD: environ.c,v 1.31 2026/06/13 20:07:30 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -56,6 +56,9 @@ void
 environ_free(struct environ *env)
 {
 	struct environ_entry	*envent, *envent1;
+
+	if (env == NULL)
+		return;
 
 	RB_FOREACH_SAFE(envent, environ, env, envent1) {
 		RB_REMOVE(environ, env, envent);
@@ -149,7 +152,8 @@ environ_clear(struct environ *env, const char *name)
 void
 environ_put(struct environ *env, const char *var, int flags)
 {
-	char	*name, *value;
+	char		*name;
+	const char	*value;
 
 	value = strchr(var, '=');
 	if (value == NULL)
@@ -262,6 +266,7 @@ environ_for_session(struct session *s, int no_TERM)
 		environ_set(env, "TERM", 0, "%s", value);
 		environ_set(env, "TERM_PROGRAM", 0, "%s", "tmux");
 		environ_set(env, "TERM_PROGRAM_VERSION", 0, "%s", getversion());
+		environ_set(env, "COLORTERM", 0, "truecolor");
 	}
 
 	if (s != NULL)

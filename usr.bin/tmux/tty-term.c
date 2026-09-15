@@ -1,4 +1,4 @@
-/* $OpenBSD: tty-term.c,v 1.101 2023/10/17 09:55:32 nicm Exp $ */
+/* $OpenBSD: tty-term.c,v 1.109 2026/08/25 08:37:08 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -28,6 +28,7 @@
 #include "tmux.h"
 
 static char	*tty_term_strip(const char *);
+static void	 tty_term_validate(struct tty_term *);
 
 struct tty_terms tty_terms = LIST_HEAD_INITIALIZER(tty_terms);
 
@@ -107,6 +108,7 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_ICH] = { TTYCODE_STRING, "ich" },
 	[TTYC_IL1] = { TTYCODE_STRING, "il1" },
 	[TTYC_IL] = { TTYCODE_STRING, "il" },
+	[TTYC_IND] = { TTYCODE_STRING, "ind" },
 	[TTYC_INDN] = { TTYCODE_STRING, "indn" },
 	[TTYC_INVIS] = { TTYCODE_STRING, "invis" },
 	[TTYC_KCBT] = { TTYCODE_STRING, "kcbt" },
@@ -277,6 +279,7 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_SMULX] = { TTYCODE_STRING, "Smulx" },
 	[TTYC_SMUL] = { TTYCODE_STRING, "smul" },
 	[TTYC_SMXX] =  { TTYCODE_STRING, "smxx" },
+	[TTYC_SPB] = { TTYCODE_STRING, "Spb" },
 	[TTYC_SS] = { TTYCODE_STRING, "Ss" },
 	[TTYC_SWD] = { TTYCODE_STRING, "Swd" },
 	[TTYC_SYNC] = { TTYCODE_STRING, "Sync" },
@@ -515,12 +518,33 @@ tty_term_apply_overrides(struct tty_term *term)
 		acs = "a#j+k+l+m+n+o-p-q-r-s-t+u+v+w+x|y<z>~.";
 	for (; acs[0] != '\0' && acs[1] != '\0'; acs += 2)
 		term->acs[(u_char) acs[0]][0] = acs[1];
+
+	tty_term_validate(term);
+}
+
+static void
+tty_term_validate(struct tty_term *term)
+{
+	struct tty_code	*code = &term->codes[TTYC_MS];
+
+	if (code->type != TTYCODE_STRING)
+		return;
+	if (*tty_term_string_ss(term, TTYC_MS, "c", "?") != '\0') {
+		term->flags &= ~TERM_INVALIDMS;
+		return;
+	}
+
+	log_debug("removing invalid Ms capability");
+	term->flags |= TERM_INVALIDMS;
+	free(code->value.string);
+	code->type = TTYCODE_NONE;
 }
 
 struct tty_term *
 tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
-    int *feat, char **cause)
+    char **cause)
 {
+	struct client				*c = tty->client;
 	struct tty_term				*term;
 	const struct tty_term_code_entry	*ent;
 	struct tty_code				*code;
@@ -528,9 +552,11 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 	struct options_array_item		*a;
 	union options_value			*ov;
 	u_int					 i, j;
-	const char				*s, *value;
+	const char				*s, *value, *errstr;
 	size_t					 offset, namelen;
 	char					*first;
+	int					 n;
+	struct environ_entry			*envent;
 
 	log_debug("adding term %s", name);
 
@@ -564,8 +590,13 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 				code->value.string = tty_term_strip(value);
 				break;
 			case TTYCODE_NUMBER:
-				code->type = TTYCODE_NUMBER;
-				code->value.number = atoi(value);
+				n = strtonum(value, 0, INT_MAX, &errstr);
+				if (errstr != NULL)
+					log_debug("%s: %s", ent->name, errstr);
+				else {
+					code->type = TTYCODE_NUMBER;
+					code->value.number = n;
+				}
 				break;
 			case TTYCODE_FLAG:
 				code->type = TTYCODE_FLAG;
@@ -585,8 +616,19 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 		offset = 0;
 		first = tty_term_override_next(s, &offset);
 		if (first != NULL && fnmatch(first, term->name, 0) == 0)
-			tty_add_features(feat, s + offset, ":");
+			tty_parse_client_features(c, s + offset, ":");
 		a = options_array_next(a);
+	}
+
+	/* Check for COLORTERM. */
+	envent = environ_find(c->environ, "COLORTERM");
+	if (envent != NULL) {
+		log_debug("%s COLORTERM=%s", c->name, envent->value);
+		if (strcasecmp(envent->value, "truecolor") == 0 ||
+		    strcasecmp(envent->value, "24bit") == 0)
+			tty_parse_client_features(c, "RGB", ",");
+ 		else if (strstr(envent->value, "256") != NULL)
+			tty_parse_client_features(c, "256", ",");
 	}
 
 	/* Apply overrides so any capabilities used for features are changed. */
@@ -617,17 +659,17 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 	s = tty_term_string(term, TTYC_CLEAR);
 	if (tty_term_flag(term, TTYC_XT) || strncmp(s, "\033[", 2) == 0) {
 		term->flags |= TERM_VT100LIKE;
-		tty_add_features(feat, "bpaste,focus,title", ",");
+		tty_parse_client_features(c, "bpaste,focus,title", ",");
 	}
 
 	/* Add RGB feature if terminal has RGB colours. */
 	if ((tty_term_flag(term, TTYC_TC) || tty_term_has(term, TTYC_RGB)) &&
 	    (!tty_term_has(term, TTYC_SETRGBF) ||
 	    !tty_term_has(term, TTYC_SETRGBB)))
-		tty_add_features(feat, "RGB", ",");
+		tty_parse_client_features(c, "RGB", ",");
 
 	/* Apply the features and overrides again. */
-	if (tty_apply_features(term, *feat))
+	if (tty_apply_features(term))
 		tty_term_apply_overrides(term);
 
 	/* Log the capabilities. */
@@ -744,6 +786,18 @@ int
 tty_term_has(struct tty_term *term, enum tty_code_code code)
 {
 	return (term->codes[code].type != TTYCODE_NONE);
+}
+
+int
+tty_term_has_name(struct tty_term *term, const char *name)
+{
+	u_int	i;
+
+	for (i = 0; i < tty_term_ncodes(); i++) {
+		if (strcmp(tty_term_codes[i].name, name) == 0)
+			return (tty_term_has(term, i));
+	}
+	return (0);
 }
 
 const char *

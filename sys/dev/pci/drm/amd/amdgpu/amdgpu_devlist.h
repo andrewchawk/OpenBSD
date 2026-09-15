@@ -177,6 +177,11 @@ static const struct pci_matchid amdgpu_devices[] = {
 	{0x1002, 0x7410 },
 
 	/* CYAN_SKILLFISH */
+	{0x1002, 0x13DB },
+	{0x1002, 0x13F9 },
+	{0x1002, 0x13FA },
+	{0x1002, 0x13FB },
+	{0x1002, 0x13FC },
 	{0x1002, 0x13FE },
 	{0x1002, 0x143F },
 
@@ -197,19 +202,33 @@ static const struct pci_matchid amdgpu_devices[] = {
 	{0x1002, 0x74a0 },	/* Instinct MI300A APU */
 	{0x1002, 0x74a1 },	/* Instinct MI300X dGPU */
 
+	/* GC 9.4.4, dGPU */
+	/* GC 9.5.0, dGPU, linux 6.14 */
+
 	/* GC 10.3.1, DCN 3.0.1, APU, "Van Gogh" */
 	{0x1002, 0x1435 },	/* Custom GPU 0932 */
 	{0x1002, 0x163f },	/* Custom GPU 0405 */
 
-	/* GC 10.3.6, DCN 3.1.5, APU, Ryzen 7000 "Raphael" */
+	/*
+	 * GC 10.3.6, DCN 3.1.5, APU, Ryzen 7000 "Raphael"
+	 * GC 10.3.6, DCN 3.1.5, APU, Ryzen 7045 "Dragon Range"
+	 */
 	{0x1002, 0x164e },	/* Radeon 610M */
+
+	/*
+	 * GC 10.3.6, DCN 3.1.5, APU, Ryzen 9000 "Granite Ridge"
+	 * GC 10.3.6, DCN 3.1.5, APU, Ryzen 9000 "Fire Range"
+	 */
+	{0x1002, 0x13c0 },	/* Radeon Graphics */
 
 	/* GC 10.3.7, DCN 3.1.6, APU, Ryzen 7020 "Mendocino" */
 	{0x1002, 0x1506 },	/* Radeon 610M */
 
 	/* GC 11.0.0, DCN 3.2.0, dGPU, "Navi 31" */
 	{0x1002, 0x7448 },	/* Radeon Pro W7900 */
+	{0x1002, 0x7449 },	/* Radeon Pro W7800 48GB */
 	{0x1002, 0x744a },	/* Radeon Pro W7900 Dual Slot */
+	{0x1002, 0x744b },	/* Radeon Pro W7900D */
 	{0x1002, 0x744c },	/* Radeon RX 7900 XT/XTX/GRE, 7900M */
 	{0x1002, 0x745e },	/* Radeon Pro W7800 */
 
@@ -221,27 +240,60 @@ static const struct pci_matchid amdgpu_devices[] = {
 
 	/* GC 11.0.2, DCN 3.2.1, dGPU, "Navi 33" */
 	{0x1002, 0x7480 },	/* Radeon RX 7600S, 7700S, 7600M XT,
-				   7600, 7600 XT, Pro W7600 */
+				   7600, 7600 XT, Pro W7600, 7650 GRE */
+	{0x1002, 0x7481 },	/* Steam Machine */
 	{0x1002, 0x7483 },	/* Radeon RX 7600M */
 	{0x1002, 0x7489 },	/* Radeon Pro W7500 */
+	{0x1002, 0x748b },	/* Radeon Pro W7500M */
+	{0x1002, 0x7499 },	/* Radeon RX 7300, 7400, Pro W7400 */
 
 	/* GC 11.0.3, DCN 3.2.0, dGPU, "Navi 32" */
+	{0x1002, 0x7460 },	/* Radeon Pro V710 */
+	{0x1002, 0x7461 },	/* Radeon Pro V710 */
 	{0x1002, 0x7470 },	/* Radeon Pro W7700 */
-	{0x1002, 0x747e },	/* Radeon RX 7700 XT, 7800 XT */
+	{0x1002, 0x747e },	/* Radeon RX 7700, 7700 XT, 7800 XT, 7800M */
 
-	/* GC 11.0.4, DCN 3.1.4, APU, Ryzen 7040, "Phoenix" */
+	/* GC 11.0.4, DCN 3.1.4, APU, Ryzen 7040 "Phoenix" */
 	{0x1002, 0x15c8 },	/* Radeon 740M */
 
-	/* GC 11.0.4, DCN 3.1.4, APU, Ryzen 8040, "Hawk Point" */
+	/* GC 11.0.4, DCN 3.1.4, APU, Ryzen 8040 "Hawk Point" */
 	{0x1002, 0x1901 },	/* Radeon 740M */
 
-#ifdef notyet
-	/* GC 11.5.0, DCN 3.5.0, APU, Ryzen AI 300, "Strix Point", linux 6.7 */
+	/*
+	 * GC 11.5.0, DCN 3.5.0, APU, Ryzen AI 300 "Strix Point"
+	 * GC 11.5.0, DCN 3.5.0, APU, Ryzen AI 9 465/470/475 "Gorgon Point"
+	 */
 	{0x1002, 0x150e },	/* Radeon 880M / 890M */
 
-	/* GC 11.5.1, DCN 3.5.1, APU, linux 6.9 */
+	/* GC 11.5.1, DCN 3.5.1, APU, Ryzen AI Max 300 "Strix Halo" */
+	{0x1002, 0x1586 },	/* Radeon 8040S / 8050S / 8060S */
 
-	/* GC 12.0.0, DCN 4.0.1, dGPU, linux 6.11 */
-	/* GC 12.0.1, DCN 4.0.1, dGPU, linux 6.11 */
-#endif
+	/*
+	 * GC 11.5.2, DCN 3.5.0, APU, Ryzen AI 350 "Krackan Point"
+	 * GC 11.5.2, DCN 3.5.0, APU, Ryzen AI 7 450 "Gorgon Point"
+	 */
+	{0x1002, 0x1114 },	/* Radeon 840M / 860M */
+
+	/*
+	 * GC 11.5.3, DCN 3.6.0, APU, Ryzen AI 330 "Krackan Point"
+	 * GC 11.5.3, DCN 3.6.0, APU, Ryzen AI 5 435/440 "Gorgon Point"
+	 */
+	{0x1002, 0x1902 },	/* Radeon 820M / 840M */
+
+	/* GC 11.5.4, DCN ?, APU, linux 7.0 */
+
+	/* GC 11.5.6, DCN ?, APU, linux 7.2 */
+
+	/* GC 11.7.0, DCN 4.2.0, APU, linux 7.2 */
+
+	/* GC 11.7.1, DCN 4.2.0, APU, linux 7.2 */
+
+	/* GC 12.0.0, DCN 4.0.1, dGPU, "Navi 44" */
+	{0x1002, 0x7590 },	/* Radeon RX 9050, 9060, 9060 XT */
+
+	/* GC 12.0.1, DCN 4.0.1, dGPU, "Navi 48" */
+	{0x1002, 0x7550 },	/* Radeon RX 9070, 9070 XT, 9070 GRE */
+	{0x1002, 0x7551 },	/* Radeon AI PRO R9700, R9700S, R9600D */
+
+	/* GC 12.1.0, DCN 4.0.1, dGPU, linux 7.0 */
 };

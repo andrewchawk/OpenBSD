@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_lib.c,v 1.24 2024/07/13 15:08:58 tb Exp $ */
+/* $OpenBSD: x509_lib.c,v 1.26 2026/08/07 23:58:20 kenjiro Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 1999.
  */
@@ -60,9 +60,9 @@
 #include <stdio.h>
 
 #include <openssl/conf.h>
-#include <openssl/err.h>
 #include <openssl/x509v3.h>
 
+#include "err_local.h"
 #include "x509_local.h"
 
 const X509V3_EXT_METHOD *
@@ -108,6 +108,8 @@ X509V3_EXT_get_nid(int nid)
 		return x509v3_ext_method_id_pkix_OCSP_acceptableResponses();
 	case NID_id_pkix_OCSP_archiveCutoff:
 		return x509v3_ext_method_id_pkix_OCSP_archiveCutoff();
+	case NID_id_pkix_OCSP_noCheck:
+		return x509v3_ext_method_id_pkix_OCSP_noCheck();
 	case NID_id_pkix_OCSP_serviceLocator:
 		return x509v3_ext_method_id_pkix_OCSP_serviceLocator();
 #endif

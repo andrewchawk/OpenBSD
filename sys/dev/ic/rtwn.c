@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtwn.c,v 1.58 2024/06/26 01:40:49 jsg Exp $	*/
+/*	$OpenBSD: rtwn.c,v 1.61 2025/08/20 14:24:05 kevlo Exp $	*/
 
 /*-
  * Copyright (c) 2010 Damien Bergamini <damien.bergamini@free.fr>
@@ -1461,7 +1461,7 @@ rtwn_get_rssi(struct rtwn_softc *sc, int rate, void *physt)
 
 	if (sc->chip & (RTWN_CHIP_88E | RTWN_CHIP_92E))
 		return rtwn_r88e_get_rssi(sc, rate, physt);
-	else if (sc->chip & RTWN_CHIP_88E)
+	else if (sc->chip & RTWN_CHIP_88F)
 		return rtwn_r88f_get_rssi(sc, rate, physt);
 
 	if (rate <= 3) {
@@ -2536,7 +2536,7 @@ rtwn_set_chan(struct rtwn_softc *sc, struct ieee80211_channel *c,
 				rtwn_rf_write(sc, i, 0x87, 0x65);
 				rtwn_rf_write(sc, i, 0x1c, 0);
 				rtwn_rf_write(sc, i, 0xdf, 0x0140);
-				rtwn_rf_write(sc, i, 0x1b, 0x1c6c);;
+				rtwn_rf_write(sc, i, 0x1b, 0x1c6c);
 			}
 		}
 	}
@@ -3131,7 +3131,7 @@ rtwn_enable_intr(struct rtwn_softc *sc)
 		else
 			panic("unknown chip type 0x%x", sc->chip);
 
-		/* CLear pending interrupts. */
+		/* Clear pending interrupts. */
 		rtwn_write_4(sc, R92C_HISR, 0xffffffff);
 
 		/* Enable interrupts. */

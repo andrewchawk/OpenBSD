@@ -1,4 +1,4 @@
-/*	$OpenBSD: radiusd_bsdauth.c,v 1.16 2024/02/09 07:41:32 yasuoka Exp $	*/
+/*	$OpenBSD: radiusd_bsdauth.c,v 1.22 2026/09/06 18:59:22 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -80,13 +81,12 @@ static struct module_handlers module_bsdauth_handlers = {
 int
 main(int argc, char *argv[])
 {
-	int		 ch, pairsock[2], status;
+	int		 n, ch, pairsock[2], status;
 	struct imsgbuf	 ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
 	size_t		 datalen;
 	pid_t		 pid;
-	char		*saved_argv0;
+	char		 execpath[PATH_MAX];
 
 	while ((ch = getopt(argc, argv, "M")) != -1)
 		switch (ch) {
@@ -97,9 +97,11 @@ main(int argc, char *argv[])
 		default:
 			break;
 		}
-	saved_argv0 = argv[0];
 	argc -= optind;
 	argv += optind;
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, PF_UNSPEC,
 	    pairsock) == -1)
@@ -107,22 +109,23 @@ main(int argc, char *argv[])
 
 	openlog(NULL, LOG_PID, LOG_DAEMON);
 
-	pid = start_child(saved_argv0, pairsock[1]);
+	pid = start_child(execpath, pairsock[1]);
 
 	/*
 	 * Privileged process
 	 */
 	setproctitle("[priv]");
-	imsg_init(&ibuf, pairsock[0]);
+	if (imsgbuf_init(&ibuf, pairsock[0]) == 1)
+		err(EXIT_FAILURE, "imsgbuf_init");
 
 	if (pledge("stdio getpw rpath proc exec", NULL) == -1)
 		err(EXIT_FAILURE, "pledge");
 
 	for (;;) {
-		if ((n = imsg_read(&ibuf)) <= 0 && errno != EAGAIN)
+		if (imsgbuf_read(&ibuf) != 1)
 			break;
 		for (;;) {
-			if ((n = imsg_get(&ibuf, &imsg)) == -1)
+			if ((n = imsgbuf_get(&ibuf, &imsg)) == -1)
 				break;
 			if (n == 0)
 				break;
@@ -145,6 +148,10 @@ main(int argc, char *argv[])
 				if (datalen < sizeof(struct auth_usercheck_args)
 				    + args->userlen + args->passlen) {
 					syslog(LOG_ERR, "Short message");
+					break;
+				}
+				if (args->userlen < 1 || args->passlen < 1) {
+					syslog(LOG_ERR, "Broken message");
 					break;
 				}
 				user = (char *)(args + 1);
@@ -184,6 +191,10 @@ main(int argc, char *argv[])
 					syslog(LOG_ERR, "Short message");
 					break;
 				}
+				if (args->userlen < 1 || args->grouplen < 1) {
+					syslog(LOG_ERR, "Broken message");
+					break;
+				}
 				user = (char *)(args + 1);
 				user[args->userlen - 1] = '\0';
 				group = user + args->userlen;
@@ -218,11 +229,11 @@ invalid:
 			    }
 			}
 			imsg_free(&imsg);
-			imsg_flush(&ibuf);
+			imsgbuf_flush(&ibuf);
 		}
-		imsg_flush(&ibuf);
+		imsgbuf_flush(&ibuf);
 	}
-	imsg_clear(&ibuf);
+	imsgbuf_clear(&ibuf);
 
 	while (waitpid(pid, &status, 0) == -1) {
 		if (errno != EINTR)
@@ -250,7 +261,8 @@ module_bsdauth_main(void)
 	module_drop_privilege(module_bsdauth.base, 0);
 
 	module_load(module_bsdauth.base);
-	imsg_init(&module_bsdauth.ibuf, 3);
+	if (imsgbuf_init(&module_bsdauth.ibuf, 3) == -1)
+		err(EXIT_FAILURE, "imsgbuf_init");
 
 	if (pledge("stdio proc", NULL) == -1)
 		err(EXIT_FAILURE, "pledge");
@@ -259,7 +271,7 @@ module_bsdauth_main(void)
 		;
 
 	module_destroy(module_bsdauth.base);
-	imsg_clear(&module_bsdauth.ibuf);
+	imsgbuf_clear(&module_bsdauth.ibuf);
 
 	if (module_bsdauth.okgroups) {
 		for (i = 0; module_bsdauth.okgroups[i] != NULL; i++)
@@ -330,7 +342,6 @@ module_bsdauth_userpass(void *ctx, u_int q_id, const char *user,
 	u_int			 i;
 	const char		*reason;
 	struct imsg		 imsg;
-	ssize_t			 n;
 
 	memset(&imsg, 0, sizeof(imsg));
 	if (pass == NULL)
@@ -346,11 +357,11 @@ module_bsdauth_userpass(void *ctx, u_int q_id, const char *user,
 	iov[2].iov_len = usercheck.passlen;
 
 	imsg_composev(&module->ibuf, IMSG_BSDAUTH_USERCHECK, 0, 0, -1, iov, 3);
-	imsg_flush(&module->ibuf);
-	if ((n = imsg_read(&module->ibuf)) == -1 || n == 0)
-		fatal("imsg_read() failed in module_bsdauth_userpass()");
-	if ((n = imsg_get(&module->ibuf, &imsg)) <= 0)
-		fatal("imsg_get() failed in module_bsdauth_userpass()");
+	imsgbuf_flush(&module->ibuf);
+	if (imsgbuf_read(&module->ibuf) != 1)
+		fatal("imsgbuf_read() failed in module_bsdauth_userpass()");
+	if (imsgbuf_get(&module->ibuf, &imsg) <= 0)
+		fatal("imsgbuf_get() failed in module_bsdauth_userpass()");
 
 	if (imsg.hdr.type != IMSG_BSDAUTH_OK) {
 		reason = "Authentication failed";
@@ -371,12 +382,12 @@ module_bsdauth_userpass(void *ctx, u_int q_id, const char *user,
 			iov[2].iov_len = groupcheck.grouplen;
 			imsg_composev(&module->ibuf, IMSG_BSDAUTH_GROUPCHECK,
 			    0, 0, -1, iov, 3);
-			imsg_flush(&module->ibuf);
-			if ((n = imsg_read(&module->ibuf)) == -1 || n == 0)
-				fatal("imsg_read() failed in "
+			imsgbuf_flush(&module->ibuf);
+			if (imsgbuf_read(&module->ibuf) != 1)
+				fatal("imsgbuf_read() failed in "
 				    "module_bsdauth_userpass()");
-			if ((n = imsg_get(&module->ibuf, &imsg)) <= 0)
-				fatal("imsg_get() failed in "
+			if (imsgbuf_get(&module->ibuf, &imsg) <= 0)
+				fatal("imsgbuf_get() failed in "
 				    "module_bsdauth_userpass()");
 			if (imsg.hdr.type == IMSG_BSDAUTH_OK)
 				goto group_ok;
@@ -394,7 +405,7 @@ auth_ng:
 }
 
 pid_t
-start_child(char *argv0, int fd)
+start_child(char *execpath, int fd)
 {
 	char *argv[5];
 	int argc = 0;
@@ -416,11 +427,11 @@ start_child(char *argv0, int fd)
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	argv[argc++] = "-M";	/* main proc */
 	argv[argc++] = NULL;
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 static void

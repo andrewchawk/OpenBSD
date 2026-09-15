@@ -1,4 +1,4 @@
-/*	$OpenBSD: video.c,v 1.57 2022/07/02 08:50:41 visa Exp $	*/
+/*	$OpenBSD: video.c,v 1.61 2025/04/15 06:44:37 kirill Exp $	*/
 
 /*
  * Copyright (c) 2008 Robert Nagy <robert@openbsd.org>
@@ -20,12 +20,14 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/fcntl.h>
 #include <sys/device.h>
 #include <sys/vnode.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/mutex.h>
 #include <sys/conf.h>
 #include <sys/proc.h>
 #include <sys/videoio.h>
@@ -33,6 +35,12 @@
 #include <dev/video_if.h>
 
 #include <uvm/uvm_extern.h>
+
+/*
+ * Locks used to protect struct members and global data
+ *	a	atomic
+ *	m	sc_mtx
+ */
 
 #ifdef VIDEO_DEBUG
 int video_debug = 1;
@@ -50,6 +58,7 @@ struct video_softc {
 	struct process		*sc_owner;	/* owner process */
 	uint8_t			 sc_open;	/* device opened */
 
+	struct mutex		 sc_mtx;
 	int			 sc_fsize;
 	uint8_t			*sc_fbuffer;
 	caddr_t			 sc_fbuffer_mmap;
@@ -58,9 +67,9 @@ struct video_softc {
 #define		VIDMODE_NONE	0
 #define		VIDMODE_MMAP	1
 #define		VIDMODE_READ	2
-	int			 sc_frames_ready;
+	int			 sc_frames_ready;	/* [m] */
 
-	struct selinfo		 sc_rsel;	/* read selector */
+	struct klist		 sc_rklist;		/* [m] read selector */
 };
 
 int	videoprobe(struct device *, void *, void *);
@@ -85,7 +94,7 @@ struct cfdriver video_cd = {
 /*
  * Global flag to control if video recording is enabled by kern.video.record.
  */
-int video_record_enable = 0;
+int video_record_enable = 0;	/* [a] */
 
 int
 videoprobe(struct device *parent, void *match, void *aux)
@@ -105,6 +114,8 @@ videoattach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dev = parent;
 	sc->sc_fbufferlen = 0;
 	sc->sc_owner = NULL;
+	mtx_init(&sc->sc_mtx, IPL_MPFLOOR);
+	klist_init_mutex(&sc->sc_rklist, &sc->sc_mtx);
 
 	if (sc->hw_if->get_bufsize)
 		sc->sc_fbufferlen = (sc->hw_if->get_bufsize)(sc->hw_hdl);
@@ -129,14 +140,13 @@ videoopen(dev_t dev, int flags, int fmt, struct proc *p)
 
 	KERNEL_ASSERT_LOCKED();
 
-	if (unit >= video_cd.cd_ndevs ||
-	    (sc = video_cd.cd_devs[unit]) == NULL ||
-	     sc->hw_if == NULL)
+	sc = (struct video_softc *)device_lookup(&video_cd, unit);
+	if (sc == NULL)
 		return (ENXIO);
 
 	if (sc->sc_open) {
 		DPRINTF(1, "%s: device already open\n", __func__);
-		return (0);
+		goto done;
 	}
 
 	sc->sc_vidmode = VIDMODE_NONE;
@@ -151,12 +161,15 @@ videoopen(dev_t dev, int flags, int fmt, struct proc *p)
 		DPRINTF(1, "%s: set device to open\n", __func__);
 	}
 
+done:
+	device_unref(&sc->dev);
 	return (error);
 }
 
 int
 videoclose(dev_t dev, int flags, int fmt, struct proc *p)
 {
+	int unit = VIDEOUNIT(dev);
 	struct video_softc *sc;
 	int error = 0;
 
@@ -164,11 +177,20 @@ videoclose(dev_t dev, int flags, int fmt, struct proc *p)
 
 	DPRINTF(1, "%s: last close\n", __func__);
 
-	sc = video_cd.cd_devs[VIDEOUNIT(dev)];
+	sc = (struct video_softc *)device_lookup(&video_cd, unit);
+	if (sc == NULL)
+		return (ENXIO);
+
+	if (!sc->sc_open) {
+		error = ENXIO;
+		goto done;
+	}
 
 	error = video_stop(sc);
 	sc->sc_open = 0;
 
+done:
+	device_unref(&sc->dev);
 	return (error);
 }
 
@@ -177,55 +199,68 @@ videoread(dev_t dev, struct uio *uio, int ioflag)
 {
 	int unit = VIDEOUNIT(dev);
 	struct video_softc *sc;
-	int error;
+	int error = 0;
 	size_t size;
 
 	KERNEL_ASSERT_LOCKED();
 
-	if (unit >= video_cd.cd_ndevs ||
-	    (sc = video_cd.cd_devs[unit]) == NULL)
+	sc = (struct video_softc *)device_lookup(&video_cd, unit);
+	if (sc == NULL)
 		return (ENXIO);
 
-	if (sc->sc_dying)
-		return (EIO);
+	if (sc->sc_dying) {
+		error = EIO;
+		goto done;
+	}
 
-	if (sc->sc_vidmode == VIDMODE_MMAP)
-		return (EBUSY);
+	if (sc->sc_vidmode == VIDMODE_MMAP) {
+		error = EBUSY;
+		goto done;
+	}
 
 	if ((error = video_claim(sc, curproc->p_p)))
-		return (error);
+		goto done;
 
 	/* start the stream if not already started */
 	if (sc->sc_vidmode == VIDMODE_NONE && sc->hw_if->start_read) {
  		error = sc->hw_if->start_read(sc->hw_hdl);
  		if (error)
- 			return (error);
+			goto done;
 		sc->sc_vidmode = VIDMODE_READ;
  	}
 
 	DPRINTF(1, "resid=%zu\n", uio->uio_resid);
 
+	mtx_enter(&sc->sc_mtx);
+
 	if (sc->sc_frames_ready < 1) {
 		/* block userland read until a frame is ready */
-		error = tsleep_nsec(sc, PWAIT | PCATCH, "vid_rd", INFSLP);
+		error = msleep_nsec(sc, &sc->sc_mtx, PWAIT | PCATCH,
+		    "vid_rd", INFSLP);
 		if (sc->sc_dying)
 			error = EIO;
-		if (error)
-			return (error);
+		if (error) {
+			mtx_leave(&sc->sc_mtx);
+			goto done;
+		}
 	}
+	sc->sc_frames_ready--;
+
+	mtx_leave(&sc->sc_mtx);
 
 	/* move no more than 1 frame to userland, as per specification */
 	size = ulmin(uio->uio_resid, sc->sc_fsize);
-	if (!video_record_enable)
+	if (!atomic_load_int(&video_record_enable))
 		bzero(sc->sc_fbuffer, size);
 	error = uiomove(sc->sc_fbuffer, size, uio);
-	sc->sc_frames_ready--;
 	if (error)
-		return (error);
+		goto done;
 
 	DPRINTF(1, "uiomove successfully done (%zu bytes)\n", size);
 
-	return (0);
+done:
+	device_unref(&sc->dev);
+	return (error);
 }
 
 int
@@ -238,9 +273,14 @@ videoioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 
 	KERNEL_ASSERT_LOCKED();
 
-	if (unit >= video_cd.cd_ndevs ||
-	    (sc = video_cd.cd_devs[unit]) == NULL || sc->hw_if == NULL)
+	sc = (struct video_softc *)device_lookup(&video_cd, unit);
+	if (sc == NULL)
 		return (ENXIO);
+
+	if (sc->hw_if == NULL) {
+		error = ENXIO;
+		goto done;
+	}
 
 	DPRINTF(3, "video_ioctl(%zu, '%c', %zu)\n",
 	    IOCPARM_LEN(cmd), (int) IOCGROUP(cmd), cmd & 0xff);
@@ -261,10 +301,10 @@ videoioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 		error = (ENOTTY);
 	}
 	if (error != ENOTTY)
-		return (error);
+		goto done;
 
 	if ((error = video_claim(sc, p->p_p)))
-		return (error);
+		goto done;
 
 	/*
 	 * The following IOCTLs can only be called by the device owner.
@@ -354,9 +394,11 @@ videoioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 		}
 		error = (sc->hw_if->dqbuf)(sc->hw_hdl,
 		    (struct v4l2_buffer *)data);
-		if (!video_record_enable)
+		if (!atomic_load_int(&video_record_enable))
 			bzero(sc->sc_fbuffer_mmap + vb->m.offset, vb->length);
+		mtx_enter(&sc->sc_mtx);
 		sc->sc_frames_ready--;
+		mtx_leave(&sc->sc_mtx);
 		break;
 	case VIDIOC_STREAMON:
 		if (sc->hw_if->streamon)
@@ -386,6 +428,8 @@ videoioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 		error = (ENOTTY);
 	}
 
+done:
+	device_unref(&sc->dev);
 	return (error);
 }
 
@@ -401,19 +445,19 @@ videommap(dev_t dev, off_t off, int prot)
 
 	DPRINTF(2, "%s: off=%lld, prot=%d\n", __func__, off, prot);
 
-	if (unit >= video_cd.cd_ndevs ||
-	    (sc = video_cd.cd_devs[unit]) == NULL)
+	sc = (struct video_softc *)device_lookup(&video_cd, unit);
+	if (sc == NULL)
 		return (-1);
 
 	if (sc->sc_dying)
-		return (-1);
+		goto err;
 
 	if (sc->hw_if->mappage == NULL)
-		return (-1);
+		goto err;
 
 	p = sc->hw_if->mappage(sc->hw_hdl, off, prot);
 	if (p == NULL)
-		return (-1);
+		goto err;
 	if (pmap_extract(pmap_kernel(), (vaddr_t)p, &pa) == FALSE)
 		panic("videommap: invalid page");
 	sc->sc_vidmode = VIDMODE_MMAP;
@@ -422,18 +466,20 @@ videommap(dev_t dev, off_t off, int prot)
 	if (off == 0)
 		sc->sc_fbuffer_mmap = p;
 
+	device_unref(&sc->dev);
 	return (pa);
+
+err:
+	device_unref(&sc->dev);
+	return (-1);
 }
 
 void
 filt_videodetach(struct knote *kn)
 {
 	struct video_softc *sc = kn->kn_hook;
-	int s;
 
-	s = splhigh();
-	klist_remove_locked(&sc->sc_rsel.si_note, kn);
-	splx(s);
+	klist_remove(&sc->sc_rklist, kn);
 }
 
 int
@@ -447,11 +493,39 @@ filt_videoread(struct knote *kn, long hint)
 	return (0);
 }
 
+int
+filt_videomodify(struct kevent *kev, struct knote *kn)
+{
+	struct video_softc *sc = kn->kn_hook;
+	int active;
+
+	mtx_enter(&sc->sc_mtx);
+	active = knote_modify(kev, kn); 
+	mtx_leave(&sc->sc_mtx);
+
+	return (active);
+}
+
+int
+filt_videoprocess(struct knote *kn, struct kevent *kev)
+{
+	struct video_softc *sc = kn->kn_hook;
+	int active;
+
+	mtx_enter(&sc->sc_mtx);
+	active = knote_process(kn, kev);
+	mtx_leave(&sc->sc_mtx);
+
+	return (active);
+}
+
 const struct filterops video_filtops = {
-	.f_flags	= FILTEROP_ISFD,
+	.f_flags	= FILTEROP_ISFD | FILTEROP_MPSAFE,
 	.f_attach	= NULL,
 	.f_detach	= filt_videodetach,
 	.f_event	= filt_videoread,
+	.f_modify	= filt_videomodify,
+	.f_process	= filt_videoprocess,
 };
 
 int
@@ -459,16 +533,18 @@ videokqfilter(dev_t dev, struct knote *kn)
 {
 	int unit = VIDEOUNIT(dev);
 	struct video_softc *sc;
-	int s, error;
+	int error = 0;
 
 	KERNEL_ASSERT_LOCKED();
 
-	if (unit >= video_cd.cd_ndevs ||
-	    (sc = video_cd.cd_devs[unit]) == NULL)
+	sc = (struct video_softc *)device_lookup(&video_cd, unit);
+	if (sc == NULL)
 		return (ENXIO);
 
-	if (sc->sc_dying)
-		return (ENXIO);
+	if (sc->sc_dying) {
+		error = ENXIO;
+		goto done;
+	}
 
 	switch (kn->kn_filter) {
 	case EVFILT_READ:
@@ -476,11 +552,12 @@ videokqfilter(dev_t dev, struct knote *kn)
 		kn->kn_hook = sc;
 		break;
 	default:
-		return (EINVAL);
+		error  = EINVAL;
+		goto done;
 	}
 
 	if ((error = video_claim(sc, curproc->p_p)))
-		return (error);
+		goto done;
 
 	/*
 	 * Start the stream in read() mode if not already started.  If
@@ -493,11 +570,11 @@ videokqfilter(dev_t dev, struct knote *kn)
 		sc->sc_vidmode = VIDMODE_READ;
 	}
 
-	s = splhigh();
-	klist_insert_locked(&sc->sc_rsel.si_note, kn);
-	splx(s);
+	klist_insert(&sc->sc_rklist, kn);
 
-	return (0);
+done:
+	device_unref(&sc->dev);
+	return (error);
 }
 
 int
@@ -528,13 +605,15 @@ video_intr(void *addr)
 	struct video_softc *sc = (struct video_softc *)addr;
 
 	DPRINTF(3, "video_intr sc=%p\n", sc);
+	mtx_enter(&sc->sc_mtx);
 	if (sc->sc_vidmode != VIDMODE_NONE)
 		sc->sc_frames_ready++;
 	else
 		printf("%s: interrupt but no streams!\n", __func__);
 	if (sc->sc_vidmode == VIDMODE_READ)
 		wakeup(sc);
-	selwakeup(&sc->sc_rsel);
+	knote_locked(&sc->sc_rklist, 0);
+	mtx_leave(&sc->sc_mtx);
 }
 
 int
@@ -548,7 +627,9 @@ video_stop(struct video_softc *sc)
 		error = sc->hw_if->close(sc->hw_hdl);
 
 	sc->sc_vidmode = VIDMODE_NONE;
+	mtx_enter(&sc->sc_mtx);
 	sc->sc_frames_ready = 0;
+	mtx_leave(&sc->sc_mtx);
 	sc->sc_owner = NULL;
 
 	return (error);
@@ -582,7 +663,7 @@ int
 videodetach(struct device *self, int flags)
 {
 	struct video_softc *sc = (struct video_softc *)self;
-	int s, maj, mn;
+	int maj, mn;
 
 	/* locate the major number */
 	for (maj = 0; maj < nchrdev; maj++)
@@ -593,9 +674,8 @@ videodetach(struct device *self, int flags)
 	mn = self->dv_unit;
 	vdevgone(maj, mn, mn, VCHR);
 
-	s = splhigh();
-	klist_invalidate(&sc->sc_rsel.si_note);
-	splx(s);
+	klist_invalidate(&sc->sc_rklist);
+	klist_free(&sc->sc_rklist);
 
 	free(sc->sc_fbuffer, M_DEVBUF, sc->sc_fbufferlen);
 

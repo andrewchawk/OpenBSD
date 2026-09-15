@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/MCA/CustomBehaviour.h"
+#include "llvm/MCA/Instruction.h"
 
 namespace llvm {
 namespace mca {
@@ -42,14 +43,55 @@ CustomBehaviour::getEndViews(llvm::MCInstPrinter &IP,
   return std::vector<std::unique_ptr<View>>();
 }
 
-SharedInstrument InstrumentManager::createInstrument(llvm::StringRef Desc,
-                                                     llvm::StringRef Data) {
-  return std::make_shared<Instrument>(Desc, Data);
+const llvm::StringRef LatencyInstrument::DESC_NAME = "LATENCY";
+
+bool InstrumentManager::supportsInstrumentType(StringRef Type) const {
+  return EnableInstruments && Type == LatencyInstrument::DESC_NAME;
+}
+
+bool InstrumentManager::canCustomize(const ArrayRef<Instrument *> IVec) const {
+  for (const auto I : IVec) {
+    if (I->getDesc() == LatencyInstrument::DESC_NAME) {
+      auto LatInst = static_cast<LatencyInstrument *>(I);
+      return LatInst->hasValue();
+    }
+  }
+  return false;
+}
+
+void InstrumentManager::customize(const ArrayRef<Instrument *> IVec,
+                                  InstrDesc &ID) const {
+  for (const auto I : IVec) {
+    if (I->getDesc() == LatencyInstrument::DESC_NAME) {
+      auto LatInst = static_cast<LatencyInstrument *>(I);
+      if (LatInst->hasValue()) {
+        unsigned Latency = LatInst->getLatency();
+        // TODO Allow to customize a subset of ID.Writes
+        for (auto &W : ID.Writes)
+          W.Latency = Latency;
+        ID.MaxLatency = Latency;
+      }
+    }
+  }
+}
+
+UniqueInstrument InstrumentManager::createInstrument(StringRef Desc,
+                                                     StringRef Data) {
+  if (EnableInstruments) {
+    if (Desc == LatencyInstrument::DESC_NAME)
+      return std::make_unique<LatencyInstrument>(Data);
+  }
+  return std::make_unique<Instrument>(Desc, Data);
+}
+
+SmallVector<UniqueInstrument>
+InstrumentManager::createInstruments(const MCInst &Inst) {
+  return SmallVector<UniqueInstrument>();
 }
 
 unsigned InstrumentManager::getSchedClassID(
     const MCInstrInfo &MCII, const MCInst &MCI,
-    const llvm::SmallVector<SharedInstrument> &IVec) const {
+    const llvm::SmallVector<Instrument *> &IVec) const {
   return MCII.get(MCI.getOpcode()).getSchedClass();
 }
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: exf.c,v 1.50 2024/02/15 00:55:01 jsg Exp $	*/
+/*	$OpenBSD: exf.c,v 1.52 2026/06/19 14:45:26 millert Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -272,7 +272,7 @@ file_init(SCR *sp, FREF *frp, char *rcv_name, int flags)
 		 * be read.  This isn't useful for single files from a command
 		 * line, but it's quite useful for "vi *.c", since you can skip
 		 * past files that you can't read.
-		 */ 
+		 */
 		open_err = 1;
 		goto oerr;
 	}
@@ -356,10 +356,10 @@ file_init(SCR *sp, FREF *frp, char *rcv_name, int flags)
 		}
 
 	/*
-         * Historically, the readonly edit option was set per edit buffer in
-         * vi, unless the -R command-line option was specified or the program
-         * was executed as "view".  (Well, to be truthful, if the letter 'w'
-         * occurred anywhere in the program name, but let's not get into that.)
+	 * Historically, the readonly edit option was set per edit buffer in
+	 * vi, unless the -R command-line option was specified or the program
+	 * was executed as "view".  (Well, to be truthful, if the letter 'w'
+	 * occurred anywhere in the program name, but let's not get into that.)
 	 * So, the persistent readonly state has to be stored in the screen
 	 * structure, and the edit option value toggles with the contents of
 	 * the edit buffer.  If the persistent readonly flag is set, set the
@@ -431,7 +431,7 @@ err:
 oerr:	if (F_ISSET(ep, F_RCV_ON))
 		(void)unlink(ep->rcv_path);
 	free(ep->rcv_path);
-	ep->rcv_path = NULL;
+	free(ep->c_buf);
 	if (ep->db != NULL)
 		(void)ep->db->close(ep->db);
 	free(ep);
@@ -715,6 +715,7 @@ file_end(SCR *sp, EXF *ep, int force)
 		(void)close(ep->rcv_fd);
 	free(ep->rcv_path);
 	free(ep->rcv_mpath);
+	free(ep->c_buf);
 	free(ep);
 	return (0);
 }
@@ -1084,7 +1085,7 @@ file_backup(SCR *sp, char *name, char *bname)
 		bp = NULL;
 		wfname = cmd.argv[0]->bp;
 	}
-	
+
 	/* Open the backup file, avoiding lurkers. */
 	if (stat(wfname, &sb) == 0) {
 		if (!S_ISREG(sb.st_mode)) {
@@ -1198,7 +1199,7 @@ file_comment(SCR *sp)
 
 /*
  * file_m1 --
- * 	First modification check routine.  The :next, :prev, :rewind, :tag,
+ *	First modification check routine.  The :next, :prev, :rewind, :tag,
  *	:tagpush, :tagpop, ^^ modifications check.
  *
  * PUBLIC: int file_m1(SCR *, int, int);
@@ -1237,7 +1238,7 @@ file_m1(SCR *sp, int force, int flags)
 
 /*
  * file_m2 --
- * 	Second modification check routine.  The :edit, :quit, :recover
+ *	Second modification check routine.  The :edit, :quit, :recover
  *	modifications check.
  *
  * PUBLIC: int file_m2(SCR *, int);
@@ -1268,7 +1269,7 @@ file_m2(SCR *sp, int force)
 
 /*
  * file_m3 --
- * 	Third modification check routine.
+ *	Third modification check routine.
  *
  * PUBLIC: int file_m3(SCR *, int);
  */
@@ -1386,7 +1387,7 @@ file_lock(SCR *sp, char *name, int *fdp, int fd, int iswrite)
 {
 	if (!O_ISSET(sp, O_LOCKFILES))
 		return (LOCK_SUCCESS);
-	
+
 	/* Set close-on-exec flag so locks are not inherited by shell cmd. */
 	if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
 		msgq_str(sp, M_SYSERR, name, "%s");

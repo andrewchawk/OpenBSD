@@ -1,4 +1,4 @@
-/*	$OpenBSD: tty_pty.c,v 1.114 2022/09/02 07:37:57 deraadt Exp $	*/
+/*	$OpenBSD: tty_pty.c,v 1.116 2025/09/25 08:46:50 mvs Exp $	*/
 /*	$NetBSD: tty_pty.c,v 1.33.4.1 1996/06/02 09:08:11 mrg Exp $	*/
 
 /*
@@ -294,7 +294,8 @@ again:
 			    pr->ps_flags & PS_PPWAIT)
 				return (EIO);
 			pgsignal(pr->ps_pgrp, SIGTTIN, 1);
-			error = ttysleep(tp, &lbolt, TTIPRI | PCATCH, ttybg);
+			error = ttysleep_nsec(tp, &nowake, TTIPRI | PCATCH, 
+				ttybg, SEC_TO_NSEC(1));
 			if (error)
 				return (error);
 		}
@@ -1025,7 +1026,7 @@ ptm_vn_open(struct nameidata *ndp)
 	error = VOP_OPEN(vp, FREAD|FWRITE, cred, p);
 	if (!error) {
 		/* update atime/mtime */
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		getnanotime(&vattr.va_atime);
 		vattr.va_mtime = vattr.va_atime;
 		vattr.va_vaflags |= VA_UTIMES_NULL;
@@ -1147,7 +1148,7 @@ retry:
 			/* get real uid */
 			uid = p->p_ucred->cr_ruid;
 
-			VATTR_NULL(&vattr);
+			vattr_null(&vattr);
 			vattr.va_uid = uid;
 			vattr.va_gid = gid;
 			vattr.va_mode = (S_IRUSR|S_IWUSR|S_IWGRP) & ALLPERMS;

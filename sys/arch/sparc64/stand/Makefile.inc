@@ -1,11 +1,10 @@
-#	$OpenBSD: Makefile.inc,v 1.11 2018/12/31 11:44:57 claudio Exp $
+#	$OpenBSD: Makefile.inc,v 1.13 2026/08/20 21:23:47 kirill Exp $
 #	$NetBSD: Makefile.inc,v 1.7 2000/08/20 14:57:16 mrg Exp $
 
 .ifndef __INCLUDED_STAND_MAKEFILE_INC
 __INCLUDED_STAND_MAKEFILE_INC=
 
 CEXTRAFLAGS?=-D_LP64
-AFLAGS+= -Wa,-Av9a
 
 BINDIR=		/usr/mdec
 
@@ -18,6 +17,11 @@ CPPFLAGS+=	-I.
 CFLAGS+=	-fno-stack-protector
 CFLAGS+=	-msoft-float
 CFLAGS+=	-ffreestanding
+.include <bsd.own.mk>
+.if ${COMPILER_VERSION:Mclang}
+CFLAGS+=	-mcmodel=medlow
+CFLAGS+=	-Oz
+.endif
 .endif
 
 ### Figure out what to use for libsa

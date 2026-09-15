@@ -1,4 +1,4 @@
-/*	$OpenBSD: rad.h,v 1.28 2024/05/31 16:10:42 florian Exp $	*/
+/*	$OpenBSD: rad.h,v 1.31 2026/02/26 07:17:50 florian Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -28,15 +28,12 @@
 
 #define	MAX_RTR_ADV_INTERVAL	600
 #define	MIN_RTR_ADV_INTERVAL	200
-#define	ADV_DEFAULT_LIFETIME	3 * MAX_RTR_ADV_INTERVAL
 #define	ADV_PREFERRED_LIFETIME	2700	/* 45 minutes */
-#define	ADV_VALID_LIFETIME	5400	/* 90 minutes */
+#define	ADV_VALID_LIFETIME	3600	/* 60 minutes */
+#define	ADV_DEFAULT_LIFETIME	ADV_VALID_LIFETIME
 #define	MAX_RA_DELAY_TIME	500	/* 500 milliseconds */
 #define	MIN_DELAY_BETWEEN_RAS	3	/* 3 seconds */
 #define	MAX_SEARCH		1025	/* MAXDNAME in arpa/nameser.h */
-#define	DEFAULT_RDNS_LIFETIME	600 * 1.5
-#define	PLTIME_DECAYING		1
-#define	VLTIME_DECAYING		2
 
 #define	IMSG_DATA_SIZE(imsg)	((imsg).hdr.len - IMSG_HEADER_SIZE)
 
@@ -116,7 +113,9 @@ struct ra_prefix_conf {
 	int				 prefixlen;	/* prefix length */
 	uint32_t			 vltime;	/* valid lifetime */
 	uint32_t			 pltime;	/* preferred lifetime */
-	int				 ltime_decaying;
+	uint32_t			 if_vltime;	/* valid lifetime */
+	uint32_t			 if_pltime;	/* preferred lifetime */
+	int				 autoconf;
 	int				 lflag;		/* on-link flag*/
 	int				 aflag;		/* autonom. addr flag */
 };

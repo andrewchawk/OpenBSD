@@ -1,4 +1,4 @@
-;	$OpenBSD: syscalls.master,v 1.265 2024/08/02 14:34:45 mvs Exp $
+;	$OpenBSD: syscalls.master,v 1.273 2026/08/12 15:04:45 naddy Exp $
 ;	$NetBSD: syscalls.master,v 1.32 1996/04/23 10:24:21 mycroft Exp $
 
 ;	@(#)syscalls.master	8.2 (Berkeley) 1/13/94
@@ -52,7 +52,7 @@
 3	STD NOLOCK	{ ssize_t sys_read(int fd, void *buf, size_t nbyte); }
 4	STD NOLOCK	{ ssize_t sys_write(int fd, const void *buf, \
 			    size_t nbyte); }
-5	STD		{ int sys_open(const char *path, \
+5	STD NOLOCK	{ int sys_open(const char *path, \
 			    int flags, ... mode_t mode); }
 6	STD NOLOCK	{ int sys_close(int fd); }
 7	STD NOLOCK	{ int sys_getentropy(void *buf, size_t nbyte); }
@@ -104,15 +104,14 @@
 35	STD		{ int sys_fchflags(int fd, u_int flags); }
 36	STD		{ void sys_sync(void); }
 37	OBSOL		msyscall
-38	STD		{ int sys_stat(const char *path, struct stat *ub); }
+38	STD NOLOCK	{ int sys_stat(const char *path, struct stat *ub); }
 39	STD NOLOCK	{ pid_t sys_getppid(void); }
-40	STD		{ int sys_lstat(const char *path, struct stat *ub); }
+40	STD NOLOCK	{ int sys_lstat(const char *path, struct stat *ub); }
 41	STD NOLOCK	{ int sys_dup(int fd); }
-42	STD		{ int sys_fstatat(int fd, const char *path, \
+42	STD NOLOCK	{ int sys_fstatat(int fd, const char *path, \
 			    struct stat *buf, int flag); }
 43	STD NOLOCK	{ gid_t sys_getegid(void); }
-44	STD		{ int sys_profil(caddr_t samples, size_t size, \
-			    u_long offset, u_int scale); }
+44	UNIMPL		oprofil
 #ifdef KTRACE
 45	STD		{ int sys_ktrace(const char *fname, int ops, \
 			    int facs, pid_t pid); }
@@ -133,7 +132,7 @@
 51	UNIMPL		acct
 #endif
 52	STD		{ int sys_sigpending(void); }
-53	STD		{ int sys_fstat(int fd, struct stat *sb); }
+53	STD NOLOCK	{ int sys_fstat(int fd, struct stat *sb); }
 54	STD NOLOCK	{ int sys_ioctl(int fd, \
 			    u_long com, ... void *data); }
 55	STD		{ int sys_reboot(int opt); }
@@ -240,7 +239,7 @@
 113	UNIMPL		fktrace
 114	STD 		{ int sys_unveil(const char *path, \
 			    const char *permissions); }
-115	STD		{ int sys___realpath(const char *pathname, \
+115	STD NOLOCK	{ int sys___realpath(const char *pathname, \
 			    char *resolved); }
 116	STD NOLOCK	{ int sys_recvmmsg(int s, struct mmsghdr *mmsg, \
 			    unsigned int vlen, int flags, \
@@ -257,7 +256,8 @@
 122	STD		{ int sys_kill(int pid, int signum); }
 123	STD		{ int sys_fchown(int fd, uid_t uid, gid_t gid); }
 124	STD		{ int sys_fchmod(int fd, mode_t mode); }
-125	OBSOL		orecvfrom
+125	STD NOLOCK	{ int sys___pledge_open(const char *path, \
+			    int flags, ... mode_t mode); }
 126	STD		{ int sys_setreuid(uid_t ruid, uid_t euid); }
 127	STD		{ int sys_setregid(gid_t rgid, gid_t egid); }
 128	STD		{ int sys_rename(const char *from, const char *to); }
@@ -285,7 +285,7 @@
 146	OBSOL		pinsyscall
 147	STD		{ int sys_setsid(void); }
 148	STD		{ int sys_quotactl(const char *path, int cmd, \
-			    int uid, char *arg); }
+			    int uid, void *arg); }
 149	OBSOL		oquota
 150	STD NOLOCK	{ int sys_ypconnect(int type); }
 
@@ -312,7 +312,7 @@
 161	STD		{ int sys_getfh(const char *fname, fhandle_t *fhp); }
 162	OBSOL		ogetdomainname
 163	OBSOL		osetdomainname
-164	STD		{ int sys___tmpfd(int flags); }
+164	OBSOL		__tmpfd
 165	STD		{ int sys_sysarch(int op, void *parms); }
 166	STD NOLOCK	{ off_t sys_lseek(int fd, off_t offset, int whence); }
 167	STD		{ int sys_truncate(const char *path, off_t length); }
@@ -329,7 +329,9 @@
 			    off_t offset); }
 173	OBSOL		pad_pread
 174	OBSOL		pad_pwrite
-175	UNIMPL		ntp_gettime
+175	STD		{ int sys_profil(void *buf, size_t buflen, \
+			    size_t samplesize, u_long offset, \
+			    u_int scale, int dirfd); }
 176	UNIMPL		ntp_adjtime
 177	UNIMPL
 178	UNIMPL
@@ -553,7 +555,7 @@
 			    mode_t mode); }
 320	STD		{ int sys_mknodat(int fd, const char *path, \
 			    mode_t mode, dev_t dev); }
-321	STD		{ int sys_openat(int fd, const char *path, int flags, \
+321	STD NOLOCK	{ int sys_openat(int fd, const char *path, int flags, \
 			    ... mode_t mode); }
 322	STD		{ ssize_t sys_readlinkat(int fd, const char *path, \
 			    char *buf, size_t count); }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_trunk.h,v 1.31 2024/05/13 01:15:53 jsg Exp $	*/
+/*	$OpenBSD: if_trunk.h,v 1.34 2026/05/08 03:36:04 jsg Exp $	*/
 
 /*
  * Copyright (c) 2005, 2006, 2007 Reyk Floeter <reyk@openbsd.org>
@@ -88,6 +88,17 @@ struct lacp_opreq {
 	u_int8_t		partner_state;
 };
 
+#define	LACP_STATE_BITS		\
+	"\020"			\
+	"\001ACTIVITY"		\
+	"\002TIMEOUT"		\
+	"\003AGGREGATION"	\
+	"\004SYNC"		\
+	"\005COLLECTING"	\
+	"\006DISTRIBUTING"	\
+	"\007DEFAULTED"		\
+	"\010EXPIRED"
+
 /* Trunk port settings */
 struct trunk_reqport {
 	char			rp_ifname[IFNAMSIZ];	/* name of the trunk */
@@ -159,6 +170,8 @@ struct trunk_softc;
 struct trunk_port {
 	struct ifnet			*tp_if;		/* physical interface */
 	struct trunk_softc		*tp_trunk;	/* parent trunk */
+	struct refcnt			tp_refs;
+	struct ether_port		tp_ether_port;
 	u_int8_t			tp_lladdr[ETHER_ADDR_LEN];
 	caddr_t				tp_psc;		/* protocol data */
 
@@ -172,7 +185,6 @@ struct trunk_port {
 	int	(*tp_ioctl)(struct ifnet *, u_long, caddr_t);
 	int	(*tp_output)(struct ifnet *, struct mbuf *, struct sockaddr *,
 		    struct rtentry *);
-	void	(*tp_input)(struct ifnet *, struct mbuf *);
 
 	SLIST_ENTRY(trunk_port)		tp_entries;
 };

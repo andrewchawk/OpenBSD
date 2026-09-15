@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.8 2021/03/02 04:10:07 jsg Exp $	*/
+/*	$OpenBSD: control.c,v 1.16 2026/08/04 19:06:54 claudio Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -155,7 +155,12 @@ control_accept(int listenfd, short event, void *bula)
 		return;
 	}
 
-	imsg_init(&c->iev.ibuf, connfd);
+	if (imsgbuf_init(&c->iev.ibuf, connfd) == -1) {
+		log_warn("%s: imsgbuf_init", __func__);
+		close(connfd);
+		free(c);
+		return;
+	}
 	c->iev.handler = control_dispatch_imsg;
 	c->iev.events = EV_READ;
 	event_set(&c->iev.ev, c->iev.ibuf.fd, c->iev.events,
@@ -201,7 +206,7 @@ control_close(int fd)
 		return;
 	}
 
-	msgbuf_clear(&c->iev.ibuf.w);
+	imsgbuf_clear(&c->iev.ibuf);
 	TAILQ_REMOVE(&ctl_conns, c, entry);
 
 	event_del(&c->iev.ev);
@@ -221,8 +226,7 @@ control_dispatch_imsg(int fd, short event, void *bula)
 {
 	struct ctl_conn	*c;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 verbose;
+	int		 n, verbose;
 
 	if ((c = control_connbyfd(fd)) == NULL) {
 		log_warnx("%s: fd %d: not found", __func__, fd);
@@ -230,21 +234,20 @@ control_dispatch_imsg(int fd, short event, void *bula)
 	}
 
 	if (event & EV_READ) {
-		if (((n = imsg_read(&c->iev.ibuf)) == -1 && errno != EAGAIN) ||
-		    n == 0) {
+		if (imsgbuf_read(&c->iev.ibuf) != 1) {
 			control_close(fd);
 			return;
 		}
 	}
 	if (event & EV_WRITE) {
-		if (msgbuf_write(&c->iev.ibuf.w) <= 0 && errno != EAGAIN) {
+		if (imsgbuf_write(&c->iev.ibuf) == -1) {
 			control_close(fd);
 			return;
 		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(&c->iev.ibuf, &imsg)) == -1) {
+		if ((n = imsgbuf_get(&c->iev.ibuf, &imsg)) == -1) {
 			control_close(fd);
 			return;
 		}

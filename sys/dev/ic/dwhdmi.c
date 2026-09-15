@@ -1,4 +1,4 @@
-/* $OpenBSD: dwhdmi.c,v 1.5 2024/01/16 23:37:50 jsg Exp $ */
+/* $OpenBSD: dwhdmi.c,v 1.7 2026/03/09 23:57:53 jsg Exp $ */
 /* $NetBSD: dw_hdmi.c,v 1.7 2019/12/22 23:23:32 thorpej Exp $ */
 
 /*-
@@ -249,6 +249,17 @@ enum dwhdmi_dai_mixer_ctrl {
 
 	DWHDMI_DAI_MIXER_CTRL_LAST
 };
+
+int
+dwhdmi_ddc_acquire_bus(void *priv, int flags)
+{
+	return 0;
+}
+
+void
+dwhdmi_ddc_release_bus(void *priv, int flags)
+{
+}
 
 int
 dwhdmi_ddc_exec(void *priv, i2c_op_t op, i2c_addr_t addr,
@@ -604,7 +615,7 @@ const struct drm_connector_helper_funcs dwhdmi_connector_helper_funcs = {
 };
 
 int
-dwhdmi_bridge_attach(struct drm_bridge *bridge,
+dwhdmi_bridge_attach(struct drm_bridge *bridge, struct drm_encoder *encoder,
     enum drm_bridge_attach_flags flags)
 {
 	struct dwhdmi_softc * const sc = bridge->driver_private;
@@ -622,7 +633,7 @@ dwhdmi_bridge_attach(struct drm_bridge *bridge,
 	    DRM_MODE_CONNECTOR_HDMIA);
 	drm_connector_helper_add(connector, &dwhdmi_connector_helper_funcs);
 
-	error = drm_connector_attach_encoder(connector, bridge->encoder);
+	error = drm_connector_attach_encoder(connector, encoder);
 	if (error != 0)
 		return error;
 
@@ -871,6 +882,8 @@ dwhdmi_attach(struct dwhdmi_softc *sc)
 
 		memset(ic, 0, sizeof(*ic));
 		ic->ic_cookie = sc;
+		ic->ic_acquire_bus = dwhdmi_ddc_acquire_bus;
+		ic->ic_release_bus = dwhdmi_ddc_release_bus;
 		ic->ic_exec = dwhdmi_ddc_exec;
 		sc->sc_ic = ic;
 	}

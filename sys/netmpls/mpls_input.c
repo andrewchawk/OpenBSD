@@ -1,4 +1,4 @@
-/*	$OpenBSD: mpls_input.c,v 1.79 2023/05/13 13:35:18 bluhm Exp $	*/
+/*	$OpenBSD: mpls_input.c,v 1.82 2026/06/18 08:53:32 mvs Exp $	*/
 
 /*
  * Copyright (c) 2008 Claudio Jeker <claudio@openbsd.org>
@@ -44,10 +44,11 @@
 #endif
 
 struct mbuf	*mpls_do_error(struct mbuf *, int, int, int);
-void		 mpls_input_local(struct rtentry *, struct mbuf *);
+static void	 mpls_input_local(struct rtentry *, struct mbuf *,
+		     struct netstack *);
 
 void
-mpls_input(struct ifnet *ifp, struct mbuf *m)
+mpls_input(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 {
 	struct sockaddr_mpls *smpls;
 	struct sockaddr_mpls sa_mpls;
@@ -126,7 +127,7 @@ do_v4:
 					if (m == NULL)
 						return;
 				}
-				ipv4_input(ifp, m);
+				ipv4_input(ifp, m, ns);
 				return;
 #ifdef INET6
 			case MPLS_LABEL_IPV6NULL:
@@ -136,7 +137,7 @@ do_v6:
 					if (m == NULL)
 						return;
 				}
-				ipv6_input(ifp, m);
+				ipv6_input(ifp, m, ns);
 				return;
 #endif	/* INET6 */
 			case MPLS_LABEL_IMPLNULL:
@@ -186,7 +187,7 @@ do_v6:
 	switch (rt_mpls->mpls_operation) {
 	case MPLS_OP_POP:
 		if (ISSET(rt->rt_flags, RTF_LOCAL)) {
-			mpls_input_local(rt, m);
+			mpls_input_local(rt, m, ns);
 			goto done;
 		}
 
@@ -277,8 +278,8 @@ done:
 	rtfree(rt);
 }
 
-void
-mpls_input_local(struct rtentry *rt, struct mbuf *m)
+static void
+mpls_input_local(struct rtentry *rt, struct mbuf *m, struct netstack *ns)
 {
 	struct ifnet *ifp;
 
@@ -288,12 +289,7 @@ mpls_input_local(struct rtentry *rt, struct mbuf *m)
 		return;
 	}
 
-	/* shortcut sending out the packet */
-	if (!ISSET(ifp->if_xflags, IFXF_MPLS))
-		(*ifp->if_output)(ifp, m, rt->rt_gateway, rt);
-	else
-		(*ifp->if_ll_output)(ifp, m, rt->rt_gateway, rt);
-
+	if_vinput(ifp, m, ns);
 	if_put(ifp);
 }
 
@@ -363,6 +359,11 @@ mpls_do_error(struct mbuf *m, int type, int code, int destmtu)
 		if (MPLS_BOS_ISSET(stack[nstk].shim_label))
 			break;
 	}
+	if (nstk >= MPLS_INKERNEL_LOOP_MAX) {
+		m_freem(m);
+		return (NULL);
+	}
+
 	shim = &stack[0];
 
 	if (m->m_len < sizeof(u_char) &&

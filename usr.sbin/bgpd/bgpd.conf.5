@@ -1,4 +1,4 @@
-.\" $OpenBSD: bgpd.conf.5,v 1.240 2024/04/24 10:41:34 claudio Exp $
+.\" $OpenBSD: bgpd.conf.5,v 1.256 2026/08/26 13:53:38 claudio Exp $
 .\"
 .\" Copyright (c) 2004 Claudio Jeker <claudio@openbsd.org>
 .\" Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -16,7 +16,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: April 24 2024 $
+.Dd $Mdocdate: August 26 2026 $
 .Dt BGPD.CONF 5
 .Os
 .Sh NAME
@@ -33,7 +33,7 @@ The
 config file is divided into the following main sections:
 .Bl -tag -width xxxx
 .It Sx MACROS
-User-defined variables may be defined and used later, simplifying the
+Definitions of variables that can be used later, simplifying the
 configuration file.
 .It Sx GLOBAL CONFIGURATION
 Global settings for
@@ -70,7 +70,7 @@ and extend to the end of the current line.
 Care should be taken when commenting out multi-line text:
 the comment is effective until the end of the entire block.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Additional configuration files can be included with the
@@ -80,15 +80,20 @@ keyword, for example:
 include "/etc/bgpd/bgpd-10.0.0.1.filter"
 .Ed
 .Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example,
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic AS ,
 .Ic neighbor ,
 or
 .Ic group ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
@@ -325,6 +330,13 @@ and
 .Ic Loc-RIB ,
 which are created automatically and used by default.
 .Pp
+.It Ic rde rib Loc-RIB include filtered
+Include filtered prefixes in the
+.Ic Loc-RIB .
+Filtered prefixes are not eligible by the decision process but can be
+displayed by
+.Xr bgpctl 8 .
+.Pp
 .It Xo
 .Ic rde
 .Ic route-age
@@ -351,7 +363,7 @@ attributes containing
 path segments will be rejected and
 all prefixes will be treated as withdraws.
 The default is
-.Ic no .
+.Ic yes .
 .Pp
 .It Ic router-id Ar dotted-quad
 Set the BGP router ID, which must be non-zero and should be unique
@@ -390,14 +402,26 @@ is the routing domain in which
 has been started.
 By default, no restricted socket is created.
 .Pp
+.It Ic staletime Ar seconds
+Set the upper bound in seconds stale routes are kept during graceful restart.
+The default is 180 seconds.
+.Pp
 .It Xo
 .Ic transparent-as
 .Pq Ic yes Ns | Ns Ic no
 .Xc
 If set to
 .Ic yes ,
+attribute transparency is enabled.
 .Em AS paths
 to EBGP neighbors are not prepended with the local AS.
+Additionally, the MULTI_EXIT_DISC attribute is passed transparently and
+automatic filtering based on the well-known communities
+.Ic NO_EXPORT ,
+.Ic NO_ADVERTISE ,
+and
+.Ic NO_EXPORT_SUBCONFED
+is disabled.
 The default is
 .Ic no .
 .El
@@ -579,6 +603,12 @@ Bind to the specific IP address before opening the TCP connection to the
 .Em rtr
 server.
 .Pp
+.It Ic min-version Ar number
+Require a minimal RTR version of
+.Ar number .
+To ensure that ASPA records are synchronised over RTR a minimal version
+of 2 is required.
+.Pp
 .It Ic port Ar number
 Specify the TCP destination port for the
 .Em rtr
@@ -587,6 +617,17 @@ If not specified, the default
 .Ic port
 is
 .Em 323 .
+.Pp
+.It Ic tcp md5sig password Ar secret
+.It Ic tcp md5sig key Ar secret
+Enable TCP MD5 signatures per RFC 2385.
+The shared secret can either be given as a password or hexadecimal key.
+.Bd -literal -offset indent
+tcp md5sig password mekmitasdigoat
+tcp md5sig key deadbeef
+.Ed
+.Pp
+After changing keys, a session needs to be reset to use the new keys.
 .El
 .El
 .Sh NETWORK AND FLOWSPEC ANNOUNCEMENTS
@@ -958,11 +999,18 @@ The neighbor properties are as follows:
 .Pq Ic none Ns | Ns Ic unicast Ns | Ns Ic vpn Ns | Ns Ic flowspec
 .Op Ic enforce
 .Xc
+.It Xo
+.Ic announce
+.Ic EVPN
+.Op Ic enforce
+.Xc
 For the given address family, control which
 .Em subsequent address families
 are announced during the capabilities negotiation.
 Only routes for that address family and subsequent address families will be
 announced and processed.
+.Ic EVPN
+does not require a subsequent address family.
 .Pp
 At the moment, only
 .Ic none ,
@@ -1061,7 +1109,7 @@ If
 is set, the session will only be established if the neighbor also announces
 the capability.
 The default is
-.Ic yes .
+.Ic enforce .
 .Pp
 .It Xo
 .Ic announce enhanced refresh
@@ -1076,6 +1124,55 @@ is set, the session will only be established if the neighbor also announces
 the capability.
 The default is
 .Ic no .
+.Pp
+.It Xo
+.Ic announce extended message
+.Pq Ic yes Ns | Ns Ic no Ns | Ns Ic enforce
+.Xc
+If set to
+.Ic yes ,
+the extended message capability is announced.
+If negotiated, the default maximum message size is increased from 4096 to 65535
+bytes.
+If
+.Ic enforce
+is set, the session will only be established if the neighbor also announces
+the capability.
+The default is
+.Ic no .
+.Pp
+.It Xo
+.Ic announce extended nexthop
+.Pq Ic yes Ns | Ns Ic no Ns | Ns Ic enforce
+.Xc
+If set to
+.Ic yes ,
+the extended nexthop encoding capability is announced.
+If negotiated,
+.Ic IPv4 unicast
+and
+.Ic vpn
+sessions can send paths with a IPv6 nexthop.
+If
+.Ic enforce
+is set, the session will only be established if the neighbor also announces
+the capability.
+The default is
+.Ic no .
+Currently enabling this capability requires setting
+.Ic fib-update no .
+.Pp
+.It Xo
+.Ic announce graceful notification
+.Pq Ic yes Ns | Ns Ic no
+.Xc
+If set to
+.Ic yes ,
+the graceful notification extension to graceful restart is announced.
+The default is
+.Ic no .
+.Ic announce refresh
+must be enabled to enable graceful notifications.
 .Pp
 .It Xo
 .Ic announce policy
@@ -1506,6 +1603,10 @@ and
 These sets are rewritten into filter rules and can be viewed with
 .Dq bgpd -nv .
 .Pp
+.It Ic staletime Ar seconds
+Set the upper bound stale time in seconds for graceful restart.
+Inherited from the global configuration if not given.
+.Pp
 .It Ic tcp md5sig password Ar secret
 .It Ic tcp md5sig key Ar secret
 Enable TCP MD5 signatures per RFC 2385.
@@ -1514,6 +1615,7 @@ The shared secret can either be given as a password or hexadecimal key.
 tcp md5sig password mekmitasdigoat
 tcp md5sig key deadbeef
 .Ed
+.Pp
 After changing keys, a session needs to be reset to use the new keys.
 .Pp
 .It Xo
@@ -1522,8 +1624,11 @@ After changing keys, a session needs to be reset to use the new keys.
 .Xc
 If set to
 .Ic yes ,
-.Em AS paths
-to EBGP neighbors are not prepended with the local AS.
+attribute transparency is enabled.
+See also the
+.Ic transparent-as
+setting in
+.Sx GLOBAL CONFIGURATION .
 The default is inherited from the global
 .Ic transparent-as
 setting.

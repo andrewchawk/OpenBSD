@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtable.h,v 1.30 2024/05/13 01:15:53 jsg Exp $ */
+/*	$OpenBSD: rtable.h,v 1.36 2025/07/15 09:55:49 dlg Exp $ */
 
 /*
  * Copyright (c) 2014-2016 Martin Pieuchot
@@ -18,6 +18,24 @@
 
 #ifndef	_NET_RTABLE_H_
 #define	_NET_RTABLE_H_
+
+#include <sys/rwlock.h>
+
+struct art;
+
+/*
+ *  Locks used to protect struct members in this file:
+ *	I	immutable after creation
+ *	N	net lock
+ */
+
+struct rtable {
+	struct rwlock		 r_lock;
+	struct art		*r_art;		/* [I] */
+	unsigned int		 r_off;		/* [I] Offset of key in bytes */
+
+	struct sockaddr		*r_source;	/* [N] use optional src addr */
+};
 
 /*
  * Newer routing table implementation based on ART (Allotment Routing
@@ -53,6 +71,9 @@ int		 rtable_delete(unsigned int, const struct sockaddr *,
 		     const struct sockaddr *, struct rtentry *);
 int		 rtable_walk(unsigned int, sa_family_t, struct rtentry **,
 		     int (*)(struct rtentry *, void *, unsigned int), void *);
+int		 rtable_read(unsigned int, sa_family_t,
+		     int (*)(const struct rtentry *, void *, unsigned int),
+		     void *);
 
 int		 rtable_mpath_capable(unsigned int, sa_family_t);
 int		 rtable_mpath_reprio(unsigned int, struct sockaddr *, int,

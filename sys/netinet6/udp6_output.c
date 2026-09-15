@@ -1,4 +1,4 @@
-/*	$OpenBSD: udp6_output.c,v 1.65 2024/04/17 20:48:51 bluhm Exp $	*/
+/*	$OpenBSD: udp6_output.c,v 1.67 2025/07/08 00:47:41 jsg Exp $	*/
 /*	$KAME: udp6_output.c,v 1.21 2001/02/07 11:51:54 itojun Exp $	*/
 
 /*
@@ -60,25 +60,22 @@
  */
 
 #include "pf.h"
+#include "stoeplitz.h"
 
 #include <sys/param.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/errno.h>
-#include <sys/stat.h>
 #include <sys/systm.h>
-#include <sys/syslog.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/route.h>
 #if NPF > 0
 #include <net/pfvar.h>
 #endif
 
 #include <netinet/in.h>
-#include <netinet6/in6_var.h>
 #include <netinet/ip.h>
 #include <netinet/ip_var.h>
 #include <netinet/in_pcb.h>
@@ -86,7 +83,6 @@
 #include <netinet/udp_var.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
-#include <netinet/icmp6.h>
 
 /*
  * UDP protocol implementation.
@@ -227,10 +223,15 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct mbuf *addr6,
 	/* force routing table */
 	m->m_pkthdr.ph_rtableid = inp->inp_rtableid;
 
+	if (inp->inp_socket->so_state & SS_ISCONNECTED) {
 #if NPF > 0
-	if (inp->inp_socket->so_state & SS_ISCONNECTED)
 		pf_mbuf_link_inpcb(m, inp);
 #endif
+#if NSTOEPLITZ > 0
+		m->m_pkthdr.ph_flowid = inp->inp_flowid;
+		SET(m->m_pkthdr.csum_flags, M_FLOWID);
+#endif
+	}
 
 	error = ip6_output(m, optp, &inp->inp_route,
 	    flags, inp->inp_moptions6, &inp->inp_seclevel);

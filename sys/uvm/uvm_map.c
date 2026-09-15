@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_map.c,v 1.330 2024/07/24 12:17:31 mpi Exp $	*/
+/*	$OpenBSD: uvm_map.c,v 1.356 2026/06/25 08:27:34 kettenis Exp $	*/
 /*	$NetBSD: uvm_map.c,v 1.86 2000/11/27 08:40:03 chs Exp $	*/
 
 /*
@@ -277,7 +277,7 @@ struct pool uvm_map_entry_kmem_pool;
  *
  * Note, this variable is locked by kernel_map's lock.
  */
-vaddr_t uvm_maxkaddr;
+vaddr_t uvm_maxkaddr = VM_MIN_KERNEL_ADDRESS;
 
 /*
  * Locking predicate.
@@ -461,7 +461,7 @@ void
 uvm_map_lock_entry(struct vm_map_entry *entry)
 {
 	if (entry->aref.ar_amap != NULL) {
-		amap_lock(entry->aref.ar_amap);
+		amap_lock(entry->aref.ar_amap, RW_WRITE);
 	}
 	if (UVM_ET_ISOBJ(entry)) {
 		rw_enter(entry->object.uvm_obj->vmobjlock, RW_WRITE);
@@ -657,6 +657,7 @@ uvm_map_findspace(struct vm_map *map, struct vm_map_entry**first,
 	struct uvm_addr_state *uaddr;
 	int i;
 
+retry:
 	/*
 	 * Allocation for sz bytes at any address,
 	 * using the addr selectors in order.
@@ -674,6 +675,11 @@ uvm_map_findspace(struct vm_map *map, struct vm_map_entry**first,
 	if (uvm_addr_invoke(map, uaddr, first, last,
 	    addr, sz, pmap_align, pmap_offset, prot, hint) == 0)
 		return 0;
+
+	if (hint != 0) {
+		hint = 0;
+		goto retry;
+	}
 
 	return ENOMEM;
 }
@@ -1503,7 +1509,7 @@ uvm_mapent_alloc(struct vm_map *map, int flags)
 		}
 		me = SLIST_FIRST(&uvm.kentry_free);
 		SLIST_REMOVE_HEAD(&uvm.kentry_free, daddrs.addr_kentry);
-		uvmexp.kmapent++;
+		atomic_inc_int(&uvmexp.kmapent);
 		mtx_leave(&uvm_kmapent_mtx);
 		me->flags = UVM_MAP_STATIC;
 	} else if (map == kernel_map) {
@@ -1536,7 +1542,7 @@ uvm_mapent_free(struct vm_map_entry *me)
 	if (me->flags & UVM_MAP_STATIC) {
 		mtx_enter(&uvm_kmapent_mtx);
 		SLIST_INSERT_HEAD(&uvm.kentry_free, me, daddrs.addr_kentry);
-		uvmexp.kmapent--;
+		atomic_dec_int(&uvmexp.kmapent);
 		mtx_leave(&uvm_kmapent_mtx);
 	} else if (me->flags & UVM_MAP_KMEM) {
 		splassert(IPL_NONE);
@@ -1856,10 +1862,8 @@ uvm_unmap_kill_entry_withlock(struct vm_map *map, struct vm_map_entry *entry,
 {
 	/* Unwire removed map entry. */
 	if (VM_MAPENT_ISWIRED(entry)) {
-		KERNEL_LOCK();
 		entry->wired_count = 0;
 		uvm_fault_unwire_locked(map, entry->start, entry->end);
-		KERNEL_UNLOCK();
 	}
 
 	if (needlock)
@@ -2118,14 +2122,18 @@ uvm_map_pageable_wire(struct vm_map *map, struct vm_map_entry *first,
 	vm_map_unlock(map);
 
 	error = 0;
-	for (iter = first; error == 0 && iter != end;
+	for (iter = first; iter != end;
 	    iter = RBT_NEXT(uvm_map_addr, iter)) {
 		if (UVM_ET_ISHOLE(iter) || iter->start == iter->end ||
 		    iter->protection == PROT_NONE)
 			continue;
 
-		error = uvm_fault_wire(map, iter->start, iter->end,
-		    iter->protection);
+		if (iter->wired_count == 1) {
+			error = uvm_fault_wire(map, iter->start, iter->end,
+			    iter->protection);
+			if (error)
+				break;
+		}
 	}
 
 	vm_map_lock(map);
@@ -2139,7 +2147,8 @@ uvm_map_pageable_wire(struct vm_map *map, struct vm_map_entry *first,
 
 		/*
 		 * first is no longer needed to restart loops.
-		 * Use it as iterator to unmap successful mappings.
+		 * Use it as iterator to unwire entries that were
+		 * successfully wired above.
 		 */
 		for (; first != iter;
 		    first = RBT_NEXT(uvm_map_addr, first)) {
@@ -2462,16 +2471,6 @@ uvm_map_teardown(struct vm_map *map)
 
 	vm_map_lock(map);
 
-	/* Remove address selectors. */
-	uvm_addr_destroy(map->uaddr_exe);
-	map->uaddr_exe = NULL;
-	for (i = 0; i < nitems(map->uaddr_any); i++) {
-		uvm_addr_destroy(map->uaddr_any[i]);
-		map->uaddr_any[i] = NULL;
-	}
-	uvm_addr_destroy(map->uaddr_brk_stack);
-	map->uaddr_brk_stack = NULL;
-
 	/*
 	 * Remove entries.
 	 *
@@ -2503,8 +2502,6 @@ uvm_map_teardown(struct vm_map *map)
 		entry = TAILQ_NEXT(entry, dfree.deadq);
 	}
 
-	vm_map_unlock(map);
-
 #ifdef VMMAP_DEBUG
 	numt = numq = 0;
 	RBT_FOREACH(entry, uvm_map_addr, &map->addr)
@@ -2512,11 +2509,30 @@ uvm_map_teardown(struct vm_map *map)
 	TAILQ_FOREACH(entry, &dead_entries, dfree.deadq)
 		numq++;
 	KASSERT(numt == numq);
+	/*
+	 * Let VMMAP_DEBUG checks work on an empty map if uvm_map_teardown()
+	 * is called twice.
+	 */
+	map->size = 0;
+	map->min_offset = 0;
+	map->max_offset = 0;
+	map->flags &= ~VM_MAP_ISVMSPACE;
 #endif
-	uvm_unmap_detach(&dead_entries, 0);
+	/* reinit RB tree since the above removal leaves the tree corrupted. */
+	RBT_INIT(uvm_map_addr, &map->addr);
+	vm_map_unlock(map);
 
-	pmap_destroy(map->pmap);
-	map->pmap = NULL;
+	/* Remove address selectors. */
+	uvm_addr_destroy(map->uaddr_exe);
+	map->uaddr_exe = NULL;
+	for (i = 0; i < nitems(map->uaddr_any); i++) {
+		uvm_addr_destroy(map->uaddr_any[i]);
+		map->uaddr_any[i] = NULL;
+	}
+	uvm_addr_destroy(map->uaddr_brk_stack);
+	map->uaddr_brk_stack = NULL;
+
+	uvm_unmap_detach(&dead_entries, 0);
 }
 
 /*
@@ -2746,7 +2762,7 @@ vmspace_validate(struct vm_map *map)
 		imin = imax = iter->start;
 
 		if (UVM_ET_ISHOLE(iter) || iter->object.uvm_obj != NULL ||
-		    iter->protection != PROT_NONE)
+		    iter->protection == PROT_NONE)
 			continue;
 
 		/*
@@ -2942,7 +2958,7 @@ uvm_object_printit(struct uvm_object *uobj, boolean_t full,
  */
 static const char page_flagbits[] =
 	"\20\1BUSY\2WANTED\3TABLED\4CLEAN\5CLEANCHK\6RELEASED\7FAKE\10RDONLY"
-	"\11ZERO\12DEV\15PAGER1\21FREE\22INACTIVE\23ACTIVE\25ANON\26AOBJ"
+	"\11ZERO\12DEV\21FREE\22INACTIVE\23ACTIVE\25ANON\26AOBJ"
 	"\27ENCRYPT\31PMAP0\32PMAP1\33PMAP2\34PMAP3\35PMAP4\36PMAP5";
 
 void
@@ -2956,7 +2972,7 @@ uvm_page_printit(struct vm_page *pg, boolean_t full,
 	(*pr)("PAGE %p:\n", pg);
 	(*pr)("  flags=%b, vers=%d, wire_count=%d, pa=0x%llx\n",
 	    pg->pg_flags, page_flagbits, pg->pg_version, pg->wire_count,
-	    (long long)pg->phys_addr);
+	    (long long)VM_PAGE_TO_PHYS(pg));
 	(*pr)("  uobject=%p, uanon=%p, offset=0x%llx\n",
 	    pg->uobject, pg->uanon, (long long)pg->offset);
 #if defined(UVM_PAGE_TRKOWN)
@@ -3010,7 +3026,7 @@ uvm_page_printit(struct vm_page *pg, boolean_t full,
 		pgl = &uvm.page_inactive;
 	} else if (pg->pg_flags & PQ_ACTIVE) {
 		pgl = &uvm.page_active;
- 	} else {
+	} else {
 		pgl = NULL;
 	}
 
@@ -3397,132 +3413,46 @@ uvmspace_addref(struct vmspace *vm)
 	atomic_inc_int(&vm->vm_refcnt);
 }
 
+void
+uvmspace_purge(struct vmspace *vm)
+{
+#ifdef SYSVSHM
+	/* Get rid of any SYSV shared memory segments. */
+	if (vm->vm_shm != NULL) {
+		KERNEL_LOCK();
+		shmexit(vm);
+		KERNEL_UNLOCK();
+	}
+#endif
+	/*
+	 * Lock the map, to wait out all other references to it.  delete
+	 * all of the mappings and pages they hold.
+	 */
+	uvm_map_teardown(&vm->vm_map);
+}
+
 /*
  * uvmspace_free: free a vmspace data structure
  */
 void
 uvmspace_free(struct vmspace *vm)
 {
+	if (vm == NULL)
+		return;
+
 	if (atomic_dec_int_nv(&vm->vm_refcnt) == 0) {
 		/*
-		 * lock the map, to wait out all other references to it.  delete
-		 * all of the mappings and pages they hold, then call the pmap
-		 * module to reclaim anything left.
+		 * Sanity check.  Kernel threads never end up here and
+		 * userland ones already tear down there VM space in
+		 * exit1().
 		 */
-#ifdef SYSVSHM
-		/* Get rid of any SYSV shared memory segments. */
-		if (vm->vm_shm != NULL) {
-			KERNEL_LOCK();
-			shmexit(vm);
-			KERNEL_UNLOCK();
-		}
-#endif
+		uvmspace_purge(vm);
 
-		uvm_map_teardown(&vm->vm_map);
+		pmap_destroy(vm->vm_map.pmap);
+		vm->vm_map.pmap = NULL;
+
 		pool_put(&uvm_vmspace_pool, vm);
 	}
-}
-
-/*
- * uvm_share: Map the address range [srcaddr, srcaddr + sz) in
- * srcmap to the address range [dstaddr, dstaddr + sz) in
- * dstmap.
- *
- * The whole address range in srcmap must be backed by an object
- * (no holes).
- *
- * If successful, the address ranges share memory and the destination
- * address range uses the protection flags in prot.
- *
- * This routine assumes that sz is a multiple of PAGE_SIZE and
- * that dstaddr and srcaddr are page-aligned.
- */
-int
-uvm_share(struct vm_map *dstmap, vaddr_t dstaddr, vm_prot_t prot,
-    struct vm_map *srcmap, vaddr_t srcaddr, vsize_t sz)
-{
-	int ret = 0;
-	vaddr_t unmap_end;
-	vaddr_t dstva;
-	vsize_t s_off, len, n = sz, remain;
-	struct vm_map_entry *first = NULL, *last = NULL;
-	struct vm_map_entry *src_entry, *psrc_entry = NULL;
-	struct uvm_map_deadq dead;
-
-	if (srcaddr >= srcmap->max_offset || sz > srcmap->max_offset - srcaddr)
-		return EINVAL;
-
-	TAILQ_INIT(&dead);
-	vm_map_lock(dstmap);
-	vm_map_lock_read(srcmap);
-
-	if (!uvm_map_isavail(dstmap, NULL, &first, &last, dstaddr, sz)) {
-		ret = ENOMEM;
-		goto exit_unlock;
-	}
-	if (!uvm_map_lookup_entry(srcmap, srcaddr, &src_entry)) {
-		ret = EINVAL;
-		goto exit_unlock;
-	}
-
-	dstva = dstaddr;
-	unmap_end = dstaddr;
-	for (; src_entry != NULL;
-	    psrc_entry = src_entry,
-	    src_entry = RBT_NEXT(uvm_map_addr, src_entry)) {
-		/* hole in address space, bail out */
-		if (psrc_entry != NULL && psrc_entry->end != src_entry->start)
-			break;
-		if (src_entry->start >= srcaddr + sz)
-			break;
-
-		if (UVM_ET_ISSUBMAP(src_entry))
-			panic("uvm_share: encountered a submap (illegal)");
-		if (!UVM_ET_ISCOPYONWRITE(src_entry) &&
-		    UVM_ET_ISNEEDSCOPY(src_entry))
-			panic("uvm_share: non-copy_on_write map entries "
-			    "marked needs_copy (illegal)");
-
-		/*
-		 * srcaddr > map entry start? means we are in the middle of a
-		 * map, so we calculate the offset to use in the source map.
-		 */
-		if (srcaddr > src_entry->start)
-			s_off = srcaddr - src_entry->start;
-		else if (srcaddr == src_entry->start)
-			s_off = 0;
-		else
-			panic("uvm_share: map entry start > srcaddr");
-
-		remain = src_entry->end - src_entry->start - s_off;
-
-		/* Determine how many bytes to share in this pass */
-		if (n < remain)
-			len = n;
-		else
-			len = remain;
-
-		if (uvm_mapent_share(dstmap, dstva, len, s_off, prot, prot,
-		    srcmap, src_entry, &dead) == NULL)
-			break;
-
-		n -= len;
-		dstva += len;
-		srcaddr += len;
-		unmap_end = dstva + len;
-		if (n == 0)
-			goto exit_unlock;
-	}
-
-	ret = EINVAL;
-	uvm_unmap_remove(dstmap, dstaddr, unmap_end, &dead, FALSE, TRUE, FALSE);
-
-exit_unlock:
-	vm_map_unlock_read(srcmap);
-	vm_map_unlock(dstmap);
-	uvm_unmap_detach(&dead, 0);
-
-	return ret;
 }
 
 /*
@@ -3732,8 +3662,8 @@ uvm_mapent_forkcopy(struct vmspace *new_vm, struct vm_map *new_map,
 				old_entry->etype |= UVM_ET_NEEDSCOPY;
 			}
 
-	  		/* parent must now be write-protected */
-	  		protect_child = FALSE;
+			/* parent must now be write-protected */
+			protect_child = FALSE;
 		} else {
 			/*
 			 * we only need to protect the child if the
@@ -3854,7 +3784,7 @@ uvmspace_fork(struct process *pr)
 			continue;
 		}
 
-	 	/* Update process statistics. */
+		/* Update process statistics. */
 		if (!UVM_ET_ISHOLE(new_entry))
 			new_map->size += new_entry->end - new_entry->start;
 		if (!UVM_ET_ISOBJ(new_entry) && !UVM_ET_ISHOLE(new_entry) &&
@@ -4133,7 +4063,7 @@ out:
 }
 
 #ifdef PMAP_CHECK_COPYIN
-static void inline
+static inline void
 check_copyin_add(struct vm_map *map, vaddr_t start, vaddr_t end)
 {
 	if (PMAP_CHECK_COPYIN == 0 ||
@@ -4146,7 +4076,7 @@ check_copyin_add(struct vm_map *map, vaddr_t start, vaddr_t end)
 	map->check_copyin_count++;
 }
 
-/* 
+/*
  * uvm_map_check_copyin_add: remember regions which are X-only for copyin(),
  * copyinstr(), uiomove(), and others
  *
@@ -4168,7 +4098,7 @@ uvm_map_check_copyin_add(struct vm_map *map, vaddr_t start, vaddr_t end)
 }
 #endif /* PMAP_CHECK_COPYIN */
 
-/* 
+/*
  * uvm_map_immutable: block mapping/mprotect for range of addrs in map.
  *
  * => map must be unlocked
@@ -4201,7 +4131,7 @@ uvm_map_immutable(struct vm_map *map, vaddr_t start, vaddr_t end, int imut)
 			goto out;
 		entry1 = RBT_NEXT(uvm_map_addr, entry1);
 	}
-	
+
 	while (entry != NULL && entry->start < end) {
 		UVM_MAP_CLIP_END(map, entry, end);
 		if (imut)
@@ -4213,7 +4143,7 @@ uvm_map_immutable(struct vm_map *map, vaddr_t start, vaddr_t end, int imut)
 	error = 0;
 out:
 	vm_map_unlock(map);
-	return (0);
+	return (error);
 }
 
 /*
@@ -4383,7 +4313,7 @@ uvm_map_extract(struct vm_map *srcmap, vaddr_t start, vsize_t len,
 		}
 		kernel_map->size += cp_len;
 
-		/* Figure out the best protection */ 
+		/* Figure out the best protection */
 		if ((flags & UVM_EXTRACT_FIXPROT) &&
 		    newentry->protection != PROT_NONE)
 			newentry->protection = newentry->max_protection;
@@ -4494,7 +4424,7 @@ uvm_map_clean(struct vm_map *map, vaddr_t start, vaddr_t end, int flags)
 		cp_start = MAX(entry->start, start);
 		cp_end = MIN(entry->end, end);
 
-		amap_lock(amap);
+		amap_lock(amap, RW_WRITE);
 		for (; cp_start != cp_end; cp_start += PAGE_SIZE) {
 			anon = amap_lookup(&entry->aref,
 			    cp_start - entry->start);
@@ -4510,30 +4440,14 @@ uvm_map_clean(struct vm_map *map, vaddr_t start, vaddr_t end, int flags)
 
 			switch (flags & (PGO_CLEANIT|PGO_FREE|PGO_DEACTIVATE)) {
 			/*
-			 * XXX In these first 3 cases, we always just
-			 * XXX deactivate the page.  We may want to
-			 * XXX handle the different cases more
-			 * XXX specifically, in the future.
+			 * In these first 3 cases, we just deactivate the page.
 			 */
 			case PGO_CLEANIT|PGO_FREE:
 			case PGO_CLEANIT|PGO_DEACTIVATE:
 			case PGO_DEACTIVATE:
 deactivate_it:
-				/* skip the page if it's wired */
-				if (pg->wire_count != 0)
-					break;
-
-				uvm_lock_pageq();
-
 				KASSERT(pg->uanon == anon);
-
-				/* zap all mappings for the page. */
-				pmap_page_protect(pg, PROT_NONE);
-
-				/* ...and deactivate the page. */
 				uvm_pagedeactivate(pg);
-
-				uvm_unlock_pageq();
 				break;
 			case PGO_FREE:
 				/*
@@ -4543,7 +4457,7 @@ deactivate_it:
 				if (amap_refs(amap) > 1)
 					goto deactivate_it;
 
-				/* XXX skip the page if it's wired */
+				/* skip the page if it's wired */
 				if (pg->wire_count != 0) {
 					break;
 				}
@@ -4847,7 +4761,6 @@ uvm_map_kmem_grow(struct vm_map *map, struct uvm_map_deadq *dead,
 	 * Walk forward until a gap large enough for alloc_sz shows up.
 	 *
 	 * We assume the kernel map has no boundaries.
-	 * uvm_maxkaddr may be zero.
 	 */
 	end = MAX(uvm_maxkaddr, map->min_offset);
 	entry = uvm_map_entrybyaddr(&map->addr, end);
@@ -5110,7 +5023,7 @@ uvm_map_mquery(struct vm_map *map, vaddr_t *addr_p, vsize_t sz, voff_t offset,
 
 	/* Align address to pmap_prefer unless FLAG_FIXED is set. */
 	if (!(flags & UVM_FLAG_FIXED) && offset != UVM_UNKNOWN_OFFSET) {
-	  	tmp = (addr & ~(pmap_align - 1)) | pmap_offset;
+		tmp = (addr & ~(pmap_align - 1)) | pmap_offset;
 		if (tmp < addr)
 			tmp += pmap_align;
 		addr = tmp;
@@ -5201,68 +5114,77 @@ out:
 boolean_t
 vm_map_lock_try_ln(struct vm_map *map, char *file, int line)
 {
-	boolean_t rv;
+	int rv;
 
 	if (map->flags & VM_MAP_INTRSAFE) {
-		rv = mtx_enter_try(&map->mtx);
+		if (!mtx_enter_try(&map->mtx))
+			return FALSE;
 	} else {
+		struct proc *busy;
+
 		mtx_enter(&map->flags_lock);
-		if ((map->flags & VM_MAP_BUSY) && (map->busy != curproc)) {
-			mtx_leave(&map->flags_lock);
-			return (FALSE);
-		}
+		busy = map->busy;
 		mtx_leave(&map->flags_lock);
-		rv = (rw_enter(&map->lock, RW_WRITE|RW_NOSLEEP) == 0);
-		/* check if the lock is busy and back out if we won the race */
-		if (rv) {
-			mtx_enter(&map->flags_lock);
-			if ((map->flags & VM_MAP_BUSY) &&
-			    (map->busy != curproc)) {
-				rw_exit(&map->lock);
-				rv = FALSE;
-			}
-			mtx_leave(&map->flags_lock);
+		if (busy != NULL && busy != curproc)
+			return FALSE;
+
+		rv = rw_enter(&map->lock, RW_WRITE|RW_NOSLEEP);
+		if (rv != 0)
+			return FALSE;
+
+		/* to be sure, to be sure */
+		mtx_enter(&map->flags_lock);
+		busy = map->busy;
+		mtx_leave(&map->flags_lock);
+		if (busy != NULL && busy != curproc) {
+			rw_exit(&map->lock);
+			return FALSE;
 		}
 	}
 
-	if (rv) {
-		map->timestamp++;
-		LPRINTF(("map   lock: %p (at %s %d)\n", map, file, line));
-		uvm_tree_sanity(map, file, line);
-		uvm_tree_size_chk(map, file, line);
-	}
+	map->timestamp++;
+	LPRINTF(("map   lock: %p (at %s %d)\n", map, file, line));
+	uvm_tree_sanity(map, file, line);
+	uvm_tree_size_chk(map, file, line);
 
-	return (rv);
+	return TRUE;
 }
 
 void
 vm_map_lock_ln(struct vm_map *map, char *file, int line)
 {
 	if ((map->flags & VM_MAP_INTRSAFE) == 0) {
-		do {
-			mtx_enter(&map->flags_lock);
-tryagain:
-			while ((map->flags & VM_MAP_BUSY) &&
-			    (map->busy != curproc)) {
-				map->flags |= VM_MAP_WANTLOCK;
-				msleep_nsec(&map->flags, &map->flags_lock,
+		mtx_enter(&map->flags_lock);
+		for (;;) {
+			while (map->busy != NULL && map->busy != curproc) {
+				map->nbusy++;
+				msleep_nsec(&map->busy, &map->flags_lock,
 				    PVM, vmmapbsy, INFSLP);
+				map->nbusy--;
 			}
 			mtx_leave(&map->flags_lock);
-		} while (rw_enter(&map->lock, RW_WRITE|RW_SLEEPFAIL) != 0);
-		/* check if the lock is busy and back out if we won the race */
-		mtx_enter(&map->flags_lock);
-		if ((map->flags & VM_MAP_BUSY) && (map->busy != curproc)) {
-			rw_exit(&map->lock);
-			goto tryagain;
+
+			rw_enter_write(&map->lock);
+
+			/* to be sure, to be sure */
+			mtx_enter(&map->flags_lock);
+			if (map->busy != NULL && map->busy != curproc) {
+				/* go around again */
+				rw_exit_write(&map->lock);
+			} else {
+				/* we won */
+				break;
+			}
 		}
 		mtx_leave(&map->flags_lock);
 	} else {
 		mtx_enter(&map->mtx);
 	}
 
-	if (map->busy != curproc)
+	if (map->busy != curproc) {
+		KASSERT(map->busy == NULL);
 		map->timestamp++;
+	}
 	LPRINTF(("map   lock: %p (at %s %d)\n", map, file, line));
 	uvm_tree_sanity(map, file, line);
 	uvm_tree_size_chk(map, file, line);
@@ -5305,6 +5227,51 @@ vm_map_unlock_read_ln(struct vm_map *map, char *file, int line)
 		mtx_leave(&map->mtx);
 }
 
+boolean_t
+vm_map_upgrade_ln(struct vm_map *map, char *file, int line)
+{
+	int rv;
+
+	if (map->flags & VM_MAP_INTRSAFE) {
+		MUTEX_ASSERT_LOCKED(&map->mtx);
+	} else {
+		struct proc *busy;
+
+		mtx_enter(&map->flags_lock);
+		busy = map->busy;
+		mtx_leave(&map->flags_lock);
+		if (busy != NULL && busy != curproc)
+			return FALSE;
+
+		rv = rw_enter(&map->lock, RW_UPGRADE|RW_NOSLEEP);
+		if (rv != 0)
+			return FALSE;
+	}
+
+	map->timestamp++;
+	LPRINTF(("map   upgrade: %p (at %s %d)\n", map, file, line));
+	uvm_tree_sanity(map, file, line);
+	uvm_tree_size_chk(map, file, line);
+
+	return TRUE;
+}
+
+void
+vm_map_downgrade_ln(struct vm_map *map, char *file, int line)
+{
+	int rv;
+
+	uvm_tree_sanity(map, file, line);
+	uvm_tree_size_chk(map, file, line);
+	LPRINTF(("map   downgrade: %p (at %s %d)\n", map, file, line));
+	if (map->flags & VM_MAP_INTRSAFE) {
+		MUTEX_ASSERT_LOCKED(&map->mtx);
+	} else {
+		rv = rw_enter(&map->lock, RW_DOWNGRADE);
+		KASSERT(rv == 0);
+	}
+}
+
 void
 vm_map_busy_ln(struct vm_map *map, char *file, int line)
 {
@@ -5314,25 +5281,24 @@ vm_map_busy_ln(struct vm_map *map, char *file, int line)
 
 	mtx_enter(&map->flags_lock);
 	map->busy = curproc;
-	map->flags |= VM_MAP_BUSY;
 	mtx_leave(&map->flags_lock);
 }
 
 void
 vm_map_unbusy_ln(struct vm_map *map, char *file, int line)
 {
-	int oflags;
+	unsigned int nbusy;
 
 	KASSERT((map->flags & VM_MAP_INTRSAFE) == 0);
 	KASSERT(map->busy == curproc);
 
 	mtx_enter(&map->flags_lock);
-	oflags = map->flags;
+	nbusy = map->nbusy;
 	map->busy = NULL;
-	map->flags &= ~(VM_MAP_BUSY|VM_MAP_WANTLOCK);
 	mtx_leave(&map->flags_lock);
-	if (oflags & VM_MAP_WANTLOCK)
-		wakeup(&map->flags);
+
+	if (nbusy > 0)
+		wakeup(&map->busy);
 }
 
 void
@@ -5419,37 +5385,7 @@ RBT_GENERATE_AUGMENT(uvm_map_addr, vm_map_entry, daddrs.addr_entry,
 /*
  * MD code: vmspace allocator setup.
  */
-
-#ifdef __i386__
-void
-uvm_map_setup_md(struct vm_map *map)
-{
-	vaddr_t		min, max;
-
-	min = map->min_offset;
-	max = map->max_offset;
-
-	/*
-	 * Ensure the selectors will not try to manage page 0;
-	 * it's too special.
-	 */
-	if (min < VMMAP_MIN_ADDR)
-		min = VMMAP_MIN_ADDR;
-
-#if 0	/* Cool stuff, not yet */
-	/* Executable code is special. */
-	map->uaddr_exe = uaddr_rnd_create(min, I386_MAX_EXE_ADDR);
-	/* Place normal allocations beyond executable mappings. */
-	map->uaddr_any[3] = uaddr_pivot_create(2 * I386_MAX_EXE_ADDR, max);
-#else	/* Crappy stuff, for now */
-	map->uaddr_any[0] = uaddr_rnd_create(min, max);
-#endif
-
-#ifndef SMALL_KERNEL
-	map->uaddr_brk_stack = uaddr_stack_brk_create(min, max);
-#endif /* !SMALL_KERNEL */
-}
-#elif __LP64__
+#if __LP64__
 void
 uvm_map_setup_md(struct vm_map *map)
 {
@@ -5475,7 +5411,7 @@ uvm_map_setup_md(struct vm_map *map)
 	map->uaddr_brk_stack = uaddr_stack_brk_create(min, max);
 #endif /* !SMALL_KERNEL */
 }
-#else	/* non-i386, 32 bit */
+#else	/* 32 bit */
 void
 uvm_map_setup_md(struct vm_map *map)
 {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_ipsp.c,v 1.278 2023/12/03 10:50:25 mvs Exp $	*/
+/*	$OpenBSD: ip_ipsp.c,v 1.282 2026/07/17 18:51:29 bluhm Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr),
@@ -45,20 +45,17 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/kernel.h>
 #include <sys/timeout.h>
 #include <sys/pool.h>
 #include <sys/atomic.h>
 #include <sys/mutex.h>
 
+#include <crypto/siphash.h>
+
 #include <net/if.h>
-#include <net/route.h>
 
 #include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/in_pcb.h>
-#include <netinet/ip_var.h>
-#include <netinet/ip_ipip.h>
+#include <netinet/ip_ipsp.h>
 
 #if NPF > 0
 #include <net/pfvar.h>
@@ -72,7 +69,6 @@
 #include <net/if_sec.h>
 #endif
 
-#include <netinet/ip_ipsp.h>
 #include <net/pfkeyv2.h>
 
 #ifdef DDB
@@ -83,7 +79,7 @@ void tdb_hashstats(void);
 #ifdef ENCDEBUG
 #define DPRINTF(fmt, args...)						\
 	do {								\
-		if (encdebug)						\
+		if (atomic_load_int(&encdebug))				\
 			printf("%s: " fmt "\n", __func__, ## args);	\
 	} while (0)
 #else
@@ -113,7 +109,7 @@ int ipsec_ids_idle = 100;		/* keep free ids for 100s */
 struct pool tdb_pool;
 
 /* Protected by the NET_LOCK(). */
-u_int32_t ipsec_ids_next_flow = 1;		/* [F] may not be zero */
+uint32_t ipsec_ids_next_flow = 1;		/* [F] may not be zero */
 struct ipsec_ids_tree ipsec_ids_tree;		/* [F] */
 struct ipsec_ids_flows ipsec_ids_flows;		/* [F] */
 struct ipsec_policy_head ipsec_policy_head =
@@ -256,6 +252,9 @@ reserve_spi(u_int rdomain, u_int32_t sspi, u_int32_t tspi,
 	struct tdb *tdbp, *exists;
 	u_int32_t spi;
 	int nums;
+#ifdef IPSEC
+	int keep_invalid_local = atomic_load_int(&ipsec_keep_invalid);
+#endif
 
 	/* Don't accept ranges only encompassing reserved SPIs. */
 	if (sproto != IPPROTO_IPCOMP &&
@@ -324,12 +323,12 @@ reserve_spi(u_int rdomain, u_int32_t sspi, u_int32_t tspi,
 
 #ifdef IPSEC
 		/* Setup a "silent" expiration (since TDBF_INVALID's set). */
-		if (ipsec_keep_invalid > 0) {
+		if (keep_invalid_local > 0) {
 			mtx_enter(&tdbp->tdb_mtx);
 			tdbp->tdb_flags |= TDBF_TIMER;
-			tdbp->tdb_exp_timeout = ipsec_keep_invalid;
+			tdbp->tdb_exp_timeout = keep_invalid_local;
 			if (timeout_add_sec(&tdbp->tdb_timer_tmo,
-			    ipsec_keep_invalid))
+			    keep_invalid_local))
 				tdb_ref(tdbp);
 			mtx_leave(&tdbp->tdb_mtx);
 		}
@@ -1236,7 +1235,7 @@ struct ipsec_ids *
 ipsp_ids_insert(struct ipsec_ids *ids)
 {
 	struct ipsec_ids *found;
-	u_int32_t start_flow;
+	uint32_t start_flow;
 
 	mtx_enter(&ipsec_flows_mtx);
 
@@ -1277,7 +1276,7 @@ ipsp_ids_insert(struct ipsec_ids *ids)
 }
 
 struct ipsec_ids *
-ipsp_ids_lookup(u_int32_t ipsecflowinfo)
+ipsp_ids_lookup(uint32_t ipsecflowinfo)
 {
 	struct ipsec_ids	key;
 	struct ipsec_ids	*ids;

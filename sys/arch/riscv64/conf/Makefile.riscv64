@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.riscv64,v 1.19 2023/11/20 16:11:45 miod Exp $
+#	$OpenBSD: Makefile.riscv64,v 1.24 2025/07/05 19:03:02 kn Exp $
 
 # For instructions on building kernels consult the config(8) and options(4)
 # manual pages.
@@ -48,6 +48,8 @@ COPTIMIZE?=	-O2
 CFLAGS=		${DEBUG} ${CWARNFLAGS} ${CMACHFLAGS} ${COPTIMIZE} ${COPTS} ${PIPE}
 AFLAGS=		-D_LOCORE -x assembler-with-cpp ${CWARNFLAGS} ${CMACHFLAGS}
 LINKFLAGS=	-T ld.script -X --warn-common -nopie
+# propagate failure like ENOSPC on relink
+LINKFLAGS+=	--no-mmap-output-file
 
 HOSTCC?=	${CC}
 HOSTED_CPPFLAGS=${CPPFLAGS:S/^-nostdinc$//}
@@ -154,10 +156,13 @@ locore.o trampoline.o: assym.h
 hardlink-obsd:
 	[[ ! -f /bsd ]] || cmp -s bsd /bsd || ln -f /bsd /obsd
 
+reconfig:
+	[[ ! -f /etc/bsd.re-config ]] || config -e -c /etc/bsd.re-config -f bsd
+
 newinstall:
 	install -F -m 700 bsd /bsd && sha256 -h /var/db/kernel.SHA256 /bsd
 
-install: update-link hardlink-obsd newinstall
+install: update-link hardlink-obsd reconfig newinstall
 
 # pull in the dependency information
 .ifnmake clean

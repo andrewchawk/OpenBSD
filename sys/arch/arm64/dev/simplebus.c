@@ -1,4 +1,4 @@
-/* $OpenBSD: simplebus.c,v 1.18 2023/09/22 01:10:43 jsg Exp $ */
+/* $OpenBSD: simplebus.c,v 1.25 2026/08/19 20:14:06 kettenis Exp $ */
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
  *
@@ -26,7 +26,6 @@
 #include <dev/ofw/fdt.h>
 #include <dev/ofw/ofw_misc.h>
 
-#include <machine/fdt.h>
 #include <machine/simplebusvar.h>
 
 int simplebus_match(struct device *, void *, void *);
@@ -37,7 +36,7 @@ int simplebus_bs_map(bus_space_tag_t, bus_addr_t, bus_size_t, int,
     bus_space_handle_t *);
 paddr_t simplebus_bs_mmap(bus_space_tag_t, bus_addr_t, off_t, int, int);
 int simplebus_dmamap_load_buffer(bus_dma_tag_t, bus_dmamap_t, void *,
-    bus_size_t, struct proc *, int, paddr_t *, int *, int);
+    bus_size_t, struct proc *, int, paddr_t *, int *, int *, int *, int);
 int simplebus_dmamap_load_raw(bus_dma_tag_t, bus_dmamap_t,
     bus_dma_segment_t *, int, bus_size_t, int);
 
@@ -185,7 +184,6 @@ simplebus_attach_node(struct device *self, int node)
 {
 	struct simplebus_softc	*sc = (struct simplebus_softc *)self;
 	struct fdt_attach_args	 fa;
-	char			 buf[32];
 	int			 i, len, line;
 	uint32_t		*cell, *reg;
 	struct device		*child;
@@ -193,8 +191,7 @@ simplebus_attach_node(struct device *self, int node)
 	if (OF_getproplen(node, "compatible") <= 0)
 		return;
 
-	if (OF_getprop(node, "status", buf, sizeof(buf)) > 0 &&
-	    strcmp(buf, "disabled") == 0)
+	if (!OF_is_enabled(node))
 		return;
 
 	/* Skip if already attached early. */
@@ -319,8 +316,11 @@ simplebus_bs_map(bus_space_tag_t t, bus_addr_t bpa, bus_size_t size,
 
 		/* All good, extract to address and translate. */
 		rto = range[sc->sc_acells];
-		if (sc->sc_pacells == 2)
+		if (sc->sc_pacells > 1)
 			rto = (rto << 32) + range[sc->sc_acells + 1];
+		/* Quietly drop the "flags" part of PCI addresses. */
+		if (sc->sc_pacells > 2)
+			rto = (rto << 32) + range[sc->sc_acells + 2];
 
 		addr -= rfrom;
 		addr += rto;
@@ -370,8 +370,11 @@ simplebus_bs_mmap(bus_space_tag_t t, bus_addr_t bpa, off_t off,
 
 		/* All good, extract to address and translate. */
 		rto = range[sc->sc_acells];
-		if (sc->sc_pacells == 2)
+		if (sc->sc_pacells > 1)
 			rto = (rto << 32) + range[sc->sc_acells + 1];
+		/* Quietly drop the "flags" part of PCI addresses. */
+		if (sc->sc_pacells > 2)
+			rto = (rto << 32) + range[sc->sc_acells + 2];
 
 		addr -= rfrom;
 		addr += rto;
@@ -385,20 +388,27 @@ simplebus_bs_mmap(bus_space_tag_t t, bus_addr_t bpa, off_t off,
 int
 simplebus_dmamap_load_buffer(bus_dma_tag_t t, bus_dmamap_t map, void *buf,
     bus_size_t buflen, struct proc *p, int flags, paddr_t *lastaddrp,
-    int *segp, int first)
+    int *segp, int *usedp, int *lastbouncep, int first)
 {
 	struct simplebus_softc *sc = t->_cookie;
-	int rlen, rone, seg;
+	paddr_t lastaddr = *lastaddrp;
+	bus_size_t lastlen;
 	int firstseg = *segp;
+	int rlen, rone, seg;
 	int error;
 
+	lastlen = map->dm_segs[firstseg].ds_len;
 	error = sc->sc_dmat->_dmamap_load_buffer(sc->sc_dmat, map, buf, buflen,
-	    p, flags, lastaddrp, segp, first);
+	    p, flags, lastaddrp, segp, usedp, lastbouncep, first);
 	if (error)
 		return error;
 
 	if (sc->sc_dmaranges == NULL)
 		return 0;
+
+	/* If we already translated the first segment, don't do it again! */
+	if (!first && lastaddr == map->dm_segs[firstseg]._ds_paddr + lastlen)
+		firstseg++;
 
 	rlen = sc->sc_dmarangeslen / sizeof(uint32_t);
 	rone = sc->sc_pacells + sc->sc_acells + sc->sc_scells;
@@ -416,8 +426,11 @@ simplebus_dmamap_load_buffer(bus_dma_tag_t t, bus_dmamap_t map, void *buf,
 		     rlen -= rone, range += rone) {
 			/* Extract from and size, so we can see if we fit. */
 			rfrom = range[sc->sc_acells];
-			if (sc->sc_pacells == 2)
+			if (sc->sc_pacells > 1)
 				rfrom = (rfrom << 32) + range[sc->sc_acells + 1];
+			/* Quietly drop the "flags" part of PCI addresses. */
+			if (sc->sc_pacells > 2)
+				rfrom = (rfrom << 32) + range[sc->sc_acells + 2];
 
 			rsize = range[sc->sc_acells + sc->sc_pacells];
 			if (sc->sc_scells == 2)
@@ -474,8 +487,11 @@ simplebus_dmamap_load_raw(bus_dma_tag_t t, bus_dmamap_t map,
 		     rlen -= rone, range += rone) {
 			/* Extract from and size, so we can see if we fit. */
 			rfrom = range[sc->sc_acells];
-			if (sc->sc_pacells == 2)
+			if (sc->sc_pacells > 1)
 				rfrom = (rfrom << 32) + range[sc->sc_acells + 1];
+			/* Quietly drop the "flags" part of PCI addresses. */
+			if (sc->sc_pacells > 2)
+				rfrom = (rfrom << 32) + range[sc->sc_acells + 2];
 
 			rsize = range[sc->sc_acells + sc->sc_pacells];
 			if (sc->sc_scells == 2)

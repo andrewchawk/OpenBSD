@@ -20,49 +20,94 @@
 namespace llvm {
 class VESubtarget;
 
-namespace VEISD {
-enum NodeType : unsigned {
-  FIRST_NUMBER = ISD::BUILTIN_OP_END,
+/// Convert a DAG integer condition code to a VE ICC condition.
+inline static VECC::CondCode intCondCode2Icc(ISD::CondCode CC) {
+  switch (CC) {
+  default:
+    llvm_unreachable("Unknown integer condition code!");
+  case ISD::SETEQ:
+    return VECC::CC_IEQ;
+  case ISD::SETNE:
+    return VECC::CC_INE;
+  case ISD::SETLT:
+    return VECC::CC_IL;
+  case ISD::SETGT:
+    return VECC::CC_IG;
+  case ISD::SETLE:
+    return VECC::CC_ILE;
+  case ISD::SETGE:
+    return VECC::CC_IGE;
+  case ISD::SETULT:
+    return VECC::CC_IL;
+  case ISD::SETULE:
+    return VECC::CC_ILE;
+  case ISD::SETUGT:
+    return VECC::CC_IG;
+  case ISD::SETUGE:
+    return VECC::CC_IGE;
+  }
+}
 
-  CMPI, // Compare between two signed integer values.
-  CMPU, // Compare between two unsigned integer values.
-  CMPF, // Compare between two floating-point values.
-  CMPQ, // Compare between two quad floating-point values.
-  CMOV, // Select between two values using the result of comparison.
+/// Convert a DAG floating point condition code to a VE FCC condition.
+inline static VECC::CondCode fpCondCode2Fcc(ISD::CondCode CC) {
+  switch (CC) {
+  default:
+    llvm_unreachable("Unknown fp condition code!");
+  case ISD::SETFALSE:
+    return VECC::CC_AF;
+  case ISD::SETEQ:
+  case ISD::SETOEQ:
+    return VECC::CC_EQ;
+  case ISD::SETNE:
+  case ISD::SETONE:
+    return VECC::CC_NE;
+  case ISD::SETLT:
+  case ISD::SETOLT:
+    return VECC::CC_L;
+  case ISD::SETGT:
+  case ISD::SETOGT:
+    return VECC::CC_G;
+  case ISD::SETLE:
+  case ISD::SETOLE:
+    return VECC::CC_LE;
+  case ISD::SETGE:
+  case ISD::SETOGE:
+    return VECC::CC_GE;
+  case ISD::SETO:
+    return VECC::CC_NUM;
+  case ISD::SETUO:
+    return VECC::CC_NAN;
+  case ISD::SETUEQ:
+    return VECC::CC_EQNAN;
+  case ISD::SETUNE:
+    return VECC::CC_NENAN;
+  case ISD::SETULT:
+    return VECC::CC_LNAN;
+  case ISD::SETUGT:
+    return VECC::CC_GNAN;
+  case ISD::SETULE:
+    return VECC::CC_LENAN;
+  case ISD::SETUGE:
+    return VECC::CC_GENAN;
+  case ISD::SETTRUE:
+    return VECC::CC_AT;
+  }
+}
 
-  CALL,                   // A call instruction.
-  EH_SJLJ_LONGJMP,        // SjLj exception handling longjmp.
-  EH_SJLJ_SETJMP,         // SjLj exception handling setjmp.
-  EH_SJLJ_SETUP_DISPATCH, // SjLj exception handling setup_dispatch.
-  GETFUNPLT,              // Load function address through %plt insturction.
-  GETTLSADDR,             // Load address for TLS access.
-  GETSTACKTOP,            // Retrieve address of stack top (first address of
-                          // locals and temporaries).
-  GLOBAL_BASE_REG,        // Global base reg for PIC.
-  Hi,                     // Hi/Lo operations, typically on a global address.
-  Lo,                     // Hi/Lo operations, typically on a global address.
-  RET_FLAG,               // Return with a flag operand.
-  TS1AM,                  // A TS1AM instruction used for 1/2 bytes swap.
-  VEC_UNPACK_LO,          // unpack the lo v256 slice of a packed v512 vector.
-  VEC_UNPACK_HI,          // unpack the hi v256 slice of a packed v512 vector.
-                          //    0: v512 vector, 1: AVL
-  VEC_PACK,               // pack a lo and a hi vector into one v512 vector
-                          //    0: v256 lo vector, 1: v256 hi vector, 2: AVL
+/// getImmVal - get immediate representation of integer value
+inline static uint64_t getImmVal(const ConstantSDNode *N) {
+  return N->getSExtValue();
+}
 
-  VEC_BROADCAST, // A vector broadcast instruction.
-                 //   0: scalar value, 1: VL
-  REPL_I32,
-  REPL_F32, // Replicate subregister to other half.
-
-  // Annotation as a wrapper. LEGALAVL(VL) means that VL refers to 64bit of
-  // data, whereas the raw EVL coming in from VP nodes always refers to number
-  // of elements, regardless of their size.
-  LEGALAVL,
-
-// VVP_* nodes.
-#define ADD_VVP_OP(VVP_NAME, ...) VVP_NAME,
-#include "VVPNodes.def"
-};
+/// getFpImmVal - get immediate representation of floating point value
+inline static uint64_t getFpImmVal(const ConstantFPSDNode *N) {
+  const APInt &Imm = N->getValueAPF().bitcastToAPInt();
+  uint64_t Val = Imm.getZExtValue();
+  if (Imm.getBitWidth() == 32) {
+    // Immediate value of float place places at higher bits on VE.
+    Val <<= 32;
+  }
+  return Val;
 }
 
 class VECustomDAG;
@@ -77,7 +122,6 @@ class VETargetLowering : public TargetLowering {
 public:
   VETargetLowering(const TargetMachine &TM, const VESubtarget &STI);
 
-  const char *getTargetNodeName(unsigned Opcode) const override;
   MVT getScalarShiftAmountTy(const DataLayout &, EVT) const override {
     return MVT::i32;
   }
@@ -101,7 +145,8 @@ public:
   bool CanLowerReturn(CallingConv::ID CallConv, MachineFunction &MF,
                       bool isVarArg,
                       const SmallVectorImpl<ISD::OutputArg> &ArgsFlags,
-                      LLVMContext &Context) const override;
+                      LLVMContext &Context,
+                      const Type *RetTy) const override;
   SDValue LowerReturn(SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
                       const SmallVectorImpl<ISD::OutputArg> &Outs,
                       const SmallVectorImpl<SDValue> &OutVals, const SDLoc &dl,
@@ -248,7 +293,6 @@ public:
   bool isCtlzFast() const override { return true; }
   // VE has NND instruction.
   bool hasAndNot(SDValue Y) const override;
-
   /// } Target Optimization
 };
 } // namespace llvm

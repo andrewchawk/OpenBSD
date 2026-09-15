@@ -1,4 +1,4 @@
-/*	$OpenBSD: setup.c,v 1.34 2024/07/15 13:32:50 martijn Exp $	*/
+/*	$OpenBSD: setup.c,v 1.36 2025/09/17 16:07:57 deraadt Exp $	*/
 /*	$NetBSD: setup.c,v 1.1 1997/06/11 11:22:01 bouyer Exp $	*/
 
 /*
@@ -46,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <util.h>
 #include <string.h>
 #include <ctype.h>
 #include <err.h>
@@ -60,6 +61,7 @@ void badsb(int, char *);
 int calcsb(char *, int, struct m_ext2fs *, struct disklabel *);
 static struct disklabel *getdisklabel(char *, int);
 static int readsb(int);
+static char rdevname[PATH_MAX];
 
 int
 setup(char *dev)
@@ -70,28 +72,36 @@ setup(char *dev)
 	off_t sizepb;
 	struct stat statb;
 	struct m_ext2fs proto;
+	char *realdev;
 	int doskipclean;
 	u_int64_t maxfilesize;
 
 	havesb = 0;
 	fswritefd = -1;
 	doskipclean = skipclean;
-	if (stat(dev, &statb) == -1) {
-		printf("Can't stat %s: %s\n", dev, strerror(errno));
-		return (0);
-	}
-	if (!S_ISCHR(statb.st_mode)) {
-		pfatal("%s is not a character device", dev);
-		if (reply("CONTINUE") == 0)
-			return (0);
-	}
-	if ((fsreadfd = open(dev, O_RDONLY)) == -1) {
+	if ((fsreadfd = opendev(dev, O_RDONLY, 0, &realdev)) == -1) {
 		printf("Can't open %s: %s\n", dev, strerror(errno));
 		return (0);
 	}
+	if (strncmp(dev, realdev, PATH_MAX) != 0) {
+		blockcheck(unrawname(realdev));
+		strlcpy(rdevname, realdev, sizeof(rdevname));
+		setcdevname(rdevname, dev, preen);
+	}
+	if (fstat(fsreadfd, &statb) == -1) {
+		printf("Can't stat %s: %s\n", realdev, strerror(errno));
+		return (0);
+	}
+	if (!S_ISCHR(statb.st_mode)) {
+		pfatal("%s is not a character device", realdev);
+		if (reply("CONTINUE") == 0) {
+			close(fsreadfd);
+			return (0);
+		}
+	}
 	if (preen == 0)
-		printf("** %s", dev);
-	if (nflag || (fswritefd = open(dev, O_WRONLY)) == -1) {
+		printf("** %s", realdev);
+	if (nflag || (fswritefd = opendev(dev, O_WRONLY, 0, NULL)) == -1) {
 		fswritefd = -1;
 		if (preen)
 			pfatal("NO WRITE ACCESS");
@@ -126,7 +136,7 @@ setup(char *dev)
 	 * Read in the superblock, looking for alternates if necessary
 	 */
 	if (readsb(1) == 0) {
-		if (bflag || preen || calcsb(dev, fsreadfd, &proto, lp) == 0)
+		if (bflag || preen || calcsb(realdev, fsreadfd, &proto, lp) == 0)
 			return(0);
 		if (reply("LOOK FOR ALTERNATE SUPERBLOCKS") == 0)
 			return (0);
@@ -445,7 +455,7 @@ calcsb(char *dev, int devfd, struct m_ext2fs *fs, struct disklabel *lp)
 	char *cp;
 
 	cp = strchr(dev, '\0');
-	if ((cp == NULL || (cp[-1] < 'a' || cp[-1] >= 'a' + MAXPARTITIONS)) &&
+	if ((cp == NULL || DL_PARTNAME2NUM(cp[-1]) == -1) &&
 	    !isdigit((unsigned char)cp[-1])) {
 		pfatal("%s: CANNOT FIGURE OUT FILE SYSTEM PARTITION\n", dev);
 		return (0);
@@ -456,7 +466,7 @@ calcsb(char *dev, int devfd, struct m_ext2fs *fs, struct disklabel *lp)
 	if (isdigit((unsigned char)*cp))
 		pp = &lp->d_partitions[0];
 	else
-		pp = &lp->d_partitions[*cp - 'a'];
+		pp = &lp->d_partitions[DL_PARTNAME2NUM(*cp)];
 	if (pp->p_fstype != FS_EXT2FS) {
 		pfatal("%s: NOT LABELED AS A EXT2 FILE SYSTEM (%s)\n",
 			dev, pp->p_fstype < FSMAXTYPES ?

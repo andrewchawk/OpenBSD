@@ -1,4 +1,4 @@
-/*	$OpenBSD: pci_machdep.h,v 1.31 2024/01/19 18:38:16 kettenis Exp $	*/
+/*	$OpenBSD: pci_machdep.h,v 1.33 2026/07/25 22:57:22 chris Exp $	*/
 /*	$NetBSD: pci_machdep.h,v 1.1 2003/02/26 21:26:11 fvdl Exp $	*/
 
 /*
@@ -103,7 +103,8 @@ pcireg_t	pci_min_powerstate(pci_chipset_tag_t, pcitag_t);
 void		pci_set_powerstate_md(pci_chipset_tag_t, pcitag_t, int, int);
 
 void		pci_mcfg_init(bus_space_tag_t, bus_addr_t, int, int, int);
-pci_chipset_tag_t pci_lookup_segment(int);
+pci_chipset_tag_t pci_lookup_segment(int, int);
+int		acpipci_domain_to_seg(int);
 
 #define __HAVE_PCI_MSIX
 

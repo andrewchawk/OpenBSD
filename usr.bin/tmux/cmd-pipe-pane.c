@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-pipe-pane.c,v 1.61 2024/02/13 08:03:50 nicm Exp $ */
+/* $OpenBSD: cmd-pipe-pane.c,v 1.64 2026/07/27 14:25:46 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -124,11 +124,13 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 	/* Fork the child. */
 	sigfillset(&set);
 	sigprocmask(SIG_BLOCK, &set, &oldset);
-	switch (fork()) {
+	switch ((wp->pipe_pid = fork())) {
 	case -1:
 		sigprocmask(SIG_SETMASK, &oldset, NULL);
 		cmdq_error(item, "fork error: %s", strerror(errno));
 
+		close(pipe_fd[0]);
+		close(pipe_fd[1]);
 		free(cmd);
 		return (CMD_RETURN_ERROR);
 	case 0:
@@ -136,6 +138,9 @@ cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 		proc_clear_signals(server_proc, 1);
 		sigprocmask(SIG_SETMASK, &oldset, NULL);
 		close(pipe_fd[0]);
+
+		if (setpgid(0, 0) == -1)
+			_exit(1);
 
 		null_fd = open(_PATH_DEVNULL, O_WRONLY);
 		if (out) {
@@ -190,8 +195,12 @@ static void
 cmd_pipe_pane_read_callback(__unused struct bufferevent *bufev, void *data)
 {
 	struct window_pane	*wp = data;
-	struct evbuffer		*evb = wp->pipe_event->input;
+	struct evbuffer		*evb;
 	size_t			 available;
+
+	if (wp->pipe_event == NULL)
+		return;
+	evb = wp->pipe_event->input;
 
 	available = EVBUFFER_LENGTH(evb);
 	log_debug("%%%u pipe read %zu", wp->id, available);

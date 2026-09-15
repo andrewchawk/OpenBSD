@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmctl.c,v 1.91 2024/07/09 15:51:11 mlarkin Exp $	*/
+/*	$OpenBSD: vmctl.c,v 1.98 2026/04/16 21:34:47 dv Exp $	*/
 
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
@@ -72,11 +72,10 @@ struct imsgbuf *ibuf;
  */
 int
 vm_start(uint32_t start_id, const char *name, size_t memsize, int nnics,
-    char **nics, int ndisks, char **disks, int *disktypes, char *kernel,
-    char *iso, char *instance, unsigned int bootdevice)
+    char **nics, int ndisks, char **disks, enum vm_disk_fmt *disktypes,
+    char *kernel, char *iso, char *instance, unsigned int bootdevice)
 {
-	struct vmop_create_params *vmc;
-	struct vm_create_params *vcp;
+	struct vmop_create_params vmc;
 	struct stat sb;
 	unsigned int flags = 0;
 	int i;
@@ -120,47 +119,39 @@ vm_start(uint32_t start_id, const char *name, size_t memsize, int nnics,
 			warnx("starting without network interfaces");
 	}
 
-	if ((vmc = calloc(1, sizeof(struct vmop_create_params))) == NULL)
-		return (ENOMEM);
-	vmc->vmc_kernel = -1;
-	vmc->vmc_flags = flags;
+	memset(&vmc, 0, sizeof(vmc));
+	vmc.vmc_kernel = -1;
+	vmc.vmc_flags = flags;
 
-	/* vcp includes configuration that is shared with the kernel */
-	vcp = &vmc->vmc_params;
+	vmc.vmc_nmemranges = 1;
+	vmc.vmc_memranges[0].vmr_size = memsize;
 
-	/*
-	 * XXX: vmd(8) fills in the actual memory ranges. vmctl(8)
-	 * just passes in the actual memory size here.
-	 */
-	vcp->vcp_nmemranges = 1;
-	vcp->vcp_memranges[0].vmr_size = memsize;
+	vmc.vmc_ncpus = 1;
+	vmc.vmc_id = start_id;
 
-	vcp->vcp_ncpus = 1;
-	vcp->vcp_id = start_id;
-
-	vmc->vmc_ndisks = ndisks;
-	vmc->vmc_nnics = nnics;
+	vmc.vmc_ndisks = ndisks;
+	vmc.vmc_nnics = nnics;
 
 	for (i = 0 ; i < ndisks; i++) {
-		if (strlcpy(vmc->vmc_disks[i], disks[i],
-		    sizeof(vmc->vmc_disks[i])) >=
-		    sizeof(vmc->vmc_disks[i]))
+		if (strlcpy(vmc.vmc_disks[i], disks[i],
+		    sizeof(vmc.vmc_disks[i])) >=
+		    sizeof(vmc.vmc_disks[i]))
 			errx(1, "disk path too long");
-		vmc->vmc_disktypes[i] = disktypes[i];
+		vmc.vmc_disktypes[i] = disktypes[i];
 	}
 	for (i = 0 ; i < nnics; i++) {
-		vmc->vmc_ifflags[i] = VMIFF_UP;
+		vmc.vmc_ifflags[i] = VMIFF_UP;
 
 		if (strcmp(".", nics[i]) == 0) {
 			/* Add a "local" interface */
-			(void)strlcpy(vmc->vmc_ifswitch[i], "",
-			    sizeof(vmc->vmc_ifswitch[i]));
-			vmc->vmc_ifflags[i] |= VMIFF_LOCAL;
+			(void)strlcpy(vmc.vmc_ifswitch[i], "",
+			    sizeof(vmc.vmc_ifswitch[i]));
+			vmc.vmc_ifflags[i] |= VMIFF_LOCAL;
 		} else {
 			/* Add an interface to a switch */
-			if (strlcpy(vmc->vmc_ifswitch[i], nics[i],
-			    sizeof(vmc->vmc_ifswitch[i])) >=
-			    sizeof(vmc->vmc_ifswitch[i]))
+			if (strlcpy(vmc.vmc_ifswitch[i], nics[i],
+			    sizeof(vmc.vmc_ifswitch[i])) >=
+			    sizeof(vmc.vmc_ifswitch[i]))
 				errx(1, "interface name too long");
 		}
 	}
@@ -179,36 +170,35 @@ vm_start(uint32_t start_id, const char *name, size_t memsize, int nnics,
 				errx(1, "invalid VM name");
 		}
 
-		if (strlcpy(vcp->vcp_name, name,
-		    sizeof(vcp->vcp_name)) >= sizeof(vcp->vcp_name))
+		if (strlcpy(vmc.vmc_name, name,
+		    sizeof(vmc.vmc_name)) >= sizeof(vmc.vmc_name))
 			errx(1, "vm name too long");
 	}
 	if (kernel != NULL) {
 		if (strnlen(kernel, PATH_MAX) == PATH_MAX)
 			errx(1, "kernel name too long");
-		vmc->vmc_kernel = open(kernel, O_RDONLY);
-		if (vmc->vmc_kernel == -1)
+		vmc.vmc_kernel = open(kernel, O_RDONLY);
+		if (vmc.vmc_kernel == -1)
 			err(1, "cannot open kernel '%s'", kernel);
 		memset(&sb, 0, sizeof(sb));
-		if (fstat(vmc->vmc_kernel, &sb) == -1)
+		if (fstat(vmc.vmc_kernel, &sb) == -1)
 			err(1, "fstat kernel");
 		if (!S_ISREG(sb.st_mode))
 			errx(1, "kernel must be a regular file");
 	}
 	if (iso != NULL)
-		if (strlcpy(vmc->vmc_cdrom, iso,
-		    sizeof(vmc->vmc_cdrom)) >= sizeof(vmc->vmc_cdrom))
+		if (strlcpy(vmc.vmc_cdrom, iso,
+		    sizeof(vmc.vmc_cdrom)) >= sizeof(vmc.vmc_cdrom))
 			errx(1, "cdrom name too long");
 	if (instance != NULL)
-		if (strlcpy(vmc->vmc_instance, instance,
-		    sizeof(vmc->vmc_instance)) >= sizeof(vmc->vmc_instance))
+		if (strlcpy(vmc.vmc_instance, instance,
+		    sizeof(vmc.vmc_instance)) >= sizeof(vmc.vmc_instance))
 			errx(1, "instance vm name too long");
-	vmc->vmc_bootdevice = bootdevice;
+	vmc.vmc_bootdevice = bootdevice;
 
-	imsg_compose(ibuf, IMSG_VMDOP_START_VM_REQUEST, 0, 0, vmc->vmc_kernel,
-	    vmc, sizeof(struct vmop_create_params));
+	imsg_compose(ibuf, IMSG_VMDOP_START_VM_REQUEST, 0, 0, vmc.vmc_kernel,
+	    &vmc, sizeof(vmc));
 
-	free(vmc);
 	return (0);
 }
 
@@ -238,12 +228,14 @@ vm_start(uint32_t start_id, const char *name, size_t memsize, int nnics,
 int
 vm_start_complete(struct imsg *imsg, int *ret, int autoconnect)
 {
-	struct vmop_result *vmr;
+	struct vmop_result vmr;
+	uint32_t type;
 	int res;
 
-	if (imsg->hdr.type == IMSG_VMDOP_START_VM_RESPONSE) {
-		vmr = (struct vmop_result *)imsg->data;
-		res = vmr->vmr_result;
+	type = imsg_get_type(imsg);
+	if (type == IMSG_VMDOP_START_VM_RESPONSE) {
+		vmop_result_read(imsg, &vmr);
+		res = vmr.vmr_result;
 		if (res) {
 			switch (res) {
 			case VMD_BIOS_MISSING:
@@ -274,10 +266,10 @@ vm_start_complete(struct imsg *imsg, int *ret, int autoconnect)
 			}
 		} else if (autoconnect) {
 			/* does not return */
-			ctl_openconsole(vmr->vmr_ttyname);
+			ctl_openconsole(vmr.vmr_ttyname);
 		} else {
 			warnx("started vm %d successfully, tty %s",
-			    vmr->vmr_id, vmr->vmr_ttyname);
+			    vmr.vmr_id, vmr.vmr_ttyname);
 			*ret = 0;
 		}
 	} else {
@@ -286,84 +278,6 @@ vm_start_complete(struct imsg *imsg, int *ret, int autoconnect)
 	}
 
 	return (1);
-}
-
-void
-send_vm(uint32_t id, const char *name)
-{
-	struct vmop_id vid;
-	int fds[2], readn, writen;
-	long pagesz;
-	char *buf;
-
-	pagesz = getpagesize();
-	buf = malloc(pagesz);
-	if (buf == NULL)
-		errx(1, "%s: memory allocation failure", __func__);
-
-	memset(&vid, 0, sizeof(vid));
-	vid.vid_id = id;
-	if (name != NULL)
-		strlcpy(vid.vid_name, name, sizeof(vid.vid_name));
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, fds) == -1) {
-		warnx("%s: socketpair creation failed", __func__);
-	} else {
-		imsg_compose(ibuf, IMSG_VMDOP_SEND_VM_REQUEST, 0, 0, fds[0],
-				&vid, sizeof(vid));
-		imsg_flush(ibuf);
-		while (1) {
-			readn = atomicio(read, fds[1], buf, pagesz);
-			if (!readn)
-				break;
-			writen = atomicio(vwrite, STDOUT_FILENO, buf,
-					readn);
-			if (writen != readn)
-				break;
-		}
-		if (vid.vid_id)
-			warnx("sent vm %d successfully", vid.vid_id);
-		else
-			warnx("sent vm %s successfully", vid.vid_name);
-	}
-
-	free(buf);
-}
-
-void
-vm_receive(uint32_t id, const char *name)
-{
-	struct vmop_id vid;
-	int fds[2], readn, writen;
-	long pagesz;
-	char *buf;
-
-	pagesz = getpagesize();
-	buf = malloc(pagesz);
-	if (buf == NULL)
-		errx(1, "%s: memory allocation failure", __func__);
-
-	memset(&vid, 0, sizeof(vid));
-	if (name != NULL)
-		strlcpy(vid.vid_name, name, sizeof(vid.vid_name));
-	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, fds) == -1) {
-		warnx("%s: socketpair creation failed", __func__);
-	} else {
-		imsg_compose(ibuf, IMSG_VMDOP_RECEIVE_VM_REQUEST, 0, 0, fds[0],
-		    &vid, sizeof(vid));
-		imsg_flush(ibuf);
-		while (1) {
-			readn = atomicio(read, STDIN_FILENO, buf, pagesz);
-			if (!readn) {
-				close(fds[1]);
-				break;
-			}
-			writen = atomicio(vwrite, fds[1], buf, readn);
-			if (writen != readn)
-				break;
-		}
-	}
-
-	free(buf);
 }
 
 void
@@ -383,18 +297,20 @@ pause_vm(uint32_t pause_id, const char *name)
 int
 pause_vm_complete(struct imsg *imsg, int *ret)
 {
-	struct vmop_result *vmr;
+	struct vmop_result vmr;
+	uint32_t type;
 	int res;
 
-	if (imsg->hdr.type == IMSG_VMDOP_PAUSE_VM_RESPONSE) {
-		vmr = (struct vmop_result *)imsg->data;
-		res = vmr->vmr_result;
+	type = imsg_get_type(imsg);
+	if (type == IMSG_VMDOP_PAUSE_VM_RESPONSE) {
+		vmop_result_read(imsg, &vmr);
+		res = vmr.vmr_result;
 		if (res) {
 			errno = res;
 			warn("pause vm command failed");
 			*ret = EIO;
 		} else {
-			warnx("paused vm %d successfully", vmr->vmr_id);
+			warnx("paused vm %d successfully", vmr.vmr_id);
 			*ret = 0;
 		}
 	} else {
@@ -422,18 +338,20 @@ unpause_vm(uint32_t pause_id, const char *name)
 int
 unpause_vm_complete(struct imsg *imsg, int *ret)
 {
-	struct vmop_result *vmr;
+	struct vmop_result vmr;
+	uint32_t type;
 	int res;
 
-	if (imsg->hdr.type == IMSG_VMDOP_UNPAUSE_VM_RESPONSE) {
-		vmr = (struct vmop_result *)imsg->data;
-		res = vmr->vmr_result;
+	type = imsg_get_type(imsg);
+	if (type == IMSG_VMDOP_UNPAUSE_VM_RESPONSE) {
+		vmop_result_read(imsg, &vmr);
+		res = vmr.vmr_result;
 		if (res) {
 			errno = res;
 			warn("unpause vm command failed");
 			*ret = EIO;
 		} else {
-			warnx("unpaused vm %d successfully", vmr->vmr_id);
+			warnx("unpaused vm %d successfully", vmr.vmr_id);
 			*ret = 0;
 		}
 	} else {
@@ -499,19 +417,20 @@ terminate_vm(uint32_t terminate_id, const char *name, unsigned int flags)
 int
 terminate_vm_complete(struct imsg *imsg, int *ret, unsigned int flags)
 {
-	struct vmop_result *vmr;
+	struct vmop_result vmr;
+	uint32_t type;
 	int res;
 
-	switch (imsg->hdr.type) {
+	type = imsg_get_type(imsg);
+	switch (type) {
 	case IMSG_VMDOP_TERMINATE_VM_RESPONSE:
-		IMSG_SIZE_CHECK(imsg, &vmr);
-		vmr = (struct vmop_result *)imsg->data;
-		res = vmr->vmr_result;
+		vmop_result_read(imsg, &vmr);
+		res = vmr.vmr_result;
 
 		switch (res) {
 		case 0:
 			fprintf(stderr, "requested to shutdown vm %d\n",
-			    vmr->vmr_id);
+			    vmr.vmr_id);
 			*ret = 0;
 			break;
 		case VMD_VM_STOP_INVALID:
@@ -535,13 +454,12 @@ terminate_vm_complete(struct imsg *imsg, int *ret, unsigned int flags)
 		}
 		break;
 	case IMSG_VMDOP_TERMINATE_VM_EVENT:
-		IMSG_SIZE_CHECK(imsg, &vmr);
-		vmr = (struct vmop_result *)imsg->data;
+		vmop_result_read(imsg, &vmr);
 		if (flags & VMOP_WAIT) {
-			fprintf(stderr, "terminated vm %d\n", vmr->vmr_id);
+			fprintf(stderr, "terminated vm %d\n", vmr.vmr_id);
 		} else if (flags & VMOP_FORCE) {
 			fprintf(stderr, "forced to terminate vm %d\n",
-			    vmr->vmr_id);
+			    vmr.vmr_id);
 		}
 		*ret = 0;
 		break;
@@ -567,14 +485,12 @@ terminate_vm_complete(struct imsg *imsg, int *ret, unsigned int flags)
 void
 terminate_all(struct vmop_info_result *list, size_t ct, unsigned int flags)
 {
-	struct vm_info_result *vir;
-	struct vmop_info_result *vmi;
+	struct vmop_info_result *vir;
 	struct parse_result res;
 	size_t i;
 
 	for (i = 0; i < ct; i++) {
-		vmi = &list[i];
-		vir = &vmi->vir_info;
+		vir = &list[i];
 
 		/* The VM is already stopped */
 		if (vir->vir_creator_pid == 0 || vir->vir_id == 0)
@@ -698,20 +614,22 @@ add_info(struct imsg *imsg, int *ret)
 {
 	static size_t ct = 0;
 	static struct vmop_info_result *vir = NULL;
+	uint32_t type;
 
 	*ret = 0;
 
-	if (imsg->hdr.type == IMSG_VMDOP_GET_INFO_VM_DATA) {
+	type = imsg_get_type(imsg);
+	if (type == IMSG_VMDOP_GET_INFO_VM_DATA) {
 		vir = reallocarray(vir, ct + 1,
 		    sizeof(struct vmop_info_result));
 		if (vir == NULL) {
 			*ret = ENOMEM;
 			return (1);
 		}
-		memcpy(&vir[ct], imsg->data, sizeof(struct vmop_info_result));
+		vmop_info_result_read(imsg, &vir[ct]);
 		ct++;
 		return (0);
-	} else if (imsg->hdr.type == IMSG_VMDOP_GET_INFO_VM_END_DATA) {
+	} else if (type == IMSG_VMDOP_GET_INFO_VM_END_DATA) {
 		switch (info_action) {
 		case CMD_CONSOLE:
 			vm_console(vir, ct);
@@ -775,8 +693,7 @@ vm_state(unsigned int mask)
 int
 print_vm_info(struct vmop_info_result *list, size_t ct)
 {
-	struct vm_info_result *vir;
-	struct vmop_info_result *vmi;
+	struct vmop_info_result *vir;
 	size_t i;
 	char *tty;
 	char curmem[FMT_SCALED_STRSIZE];
@@ -792,8 +709,7 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 	    "MAXMEM", "CURMEM", "TTY", "OWNER", "STATE", "NAME");
 
 	for (i = 0; i < ct; i++) {
-		vmi = &list[i];
-		vir = &vmi->vir_info;
+		vir = &list[i];
 		running = (vir->vir_creator_pid != 0 && vir->vir_id != 0);
 		if (!running && stat_rflag)
 			continue;
@@ -802,18 +718,18 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 
 		if (check_info_id(vir->vir_name, vir->vir_id)) {
 			/* get user name */
-			name = user_from_uid(vmi->vir_uid, 1);
+			name = user_from_uid(vir->vir_uid, 1);
 			if (name == NULL)
 				(void)snprintf(user, sizeof(user),
-				    "%d", vmi->vir_uid);
+				    "%d", vir->vir_uid);
 			else
 				(void)strlcpy(user, name, sizeof(user));
 			/* get group name */
-			if (vmi->vir_gid != -1) {
-				name = group_from_gid(vmi->vir_gid, 1);
+			if (vir->vir_gid != -1) {
+				name = group_from_gid(vir->vir_gid, 1);
 				if (name == NULL)
 					(void)snprintf(group, sizeof(group),
-					    ":%lld", vmi->vir_gid);
+					    ":%lld", vir->vir_gid);
 				else
 					(void)snprintf(group, sizeof(group),
 					    ":%s", name);
@@ -826,10 +742,10 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 			(void)fmt_scaled(vir->vir_memory_size, maxmem);
 
 			if (running) {
-				if (*vmi->vir_ttyname == '\0')
+				if (*vir->vir_ttyname == '\0')
 					tty = "-";
 				/* get tty - skip /dev/ path */
-				else if ((tty = strrchr(vmi->vir_ttyname,
+				else if ((tty = strrchr(vir->vir_ttyname,
 				    '/')) == NULL || *++tty == '\0')
 					tty = list[i].vir_ttyname;
 
@@ -839,14 +755,14 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 				printf("%5u %5u %5zd %7s %7s %7s %12s %8s %s\n",
 				    vir->vir_id, vir->vir_creator_pid,
 				    vir->vir_ncpus, maxmem, curmem,
-				    tty, user, vm_state(vmi->vir_state),
+				    tty, user, vm_state(vir->vir_state),
 				    vir->vir_name);
 			} else {
 				/* disabled vm */
 				printf("%5u %5s %5zd %7s %7s %7s %12s %8s %s\n",
 				    vir->vir_id, "-",
 				    vir->vir_ncpus, maxmem, curmem,
-				    "-", user, vm_state(vmi->vir_state),
+				    "-", user, vm_state(vir->vir_state),
 				    vir->vir_name);
 			}
 		}
@@ -875,9 +791,8 @@ vm_console(struct vmop_info_result *list, size_t ct)
 
 	for (i = 0; i < ct; i++) {
 		vir = &list[i];
-		if ((check_info_id(vir->vir_info.vir_name,
-		    vir->vir_info.vir_id) > 0) &&
-			(vir->vir_ttyname[0] != '\0')) {
+		if ((check_info_id(vir->vir_name, vir->vir_id) > 0) &&
+		    (vir->vir_ttyname[0] != '\0')) {
 			/* does not return */
 			ctl_openconsole(vir->vir_ttyname);
 		}
@@ -924,7 +839,8 @@ open_imagefile(int type, const char *imgfile_path, int flags,
 		for (i = 0; i < VM_MAX_BASE_PER_DISK - 1; i++, nfd++) {
 			if ((ret = virtio_qcow2_get_base(basefd[i],
 			    path, sizeof(path), imgfile_path)) == -1) {
-				log_debug("%s: failed to get base %d", __func__, i);
+				log_debug("%s: failed to get base %d",
+				    __func__, i);
 				return -1;
 			} else if (ret == 0)
 				break;
@@ -986,4 +902,34 @@ create_imagefile(int type, const char *imgfile_path, const char *base_path,
 	}
 
 	return (ret);
+}
+
+void
+vmop_result_read(struct imsg *imsg, struct vmop_result *vmr)
+{
+	if (imsg_get_data(imsg, vmr, sizeof(*vmr)))
+		fatal("%s", __func__);
+
+	vmr->vmr_ttyname[sizeof(vmr->vmr_ttyname) - 1] = '\0';
+}
+
+void
+vmop_info_result_read(struct imsg *imsg, struct vmop_info_result *vir)
+{
+	if (imsg_get_data(imsg, vir, sizeof(*vir)))
+		fatal("%s", __func__);
+
+	vir->vir_name[sizeof(vir->vir_name) - 1] = '\0';
+	vir->vir_ttyname[sizeof(vir->vir_ttyname) - 1] = '\0';
+}
+
+int
+imsg_int_read(struct imsg *imsg)
+{
+	int val;
+
+	if (imsg_get_data(imsg, &val, sizeof(val)))
+		fatal("%s", __func__);
+
+	return (val);
 }

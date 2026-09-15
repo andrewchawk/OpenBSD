@@ -109,7 +109,7 @@ BEGIN {
     # use Test::NoWarnings, if available
     my $extra = 0 ;
     $extra = 1
-        if eval { require Test::NoWarnings ;  import Test::NoWarnings; 1 };
+        if eval { require Test::NoWarnings ;  Test::NoWarnings->import; 1 };
 
     plan tests => 7 + $extra ;
 
@@ -118,6 +118,13 @@ BEGIN {
 
 }
 
+{
+    # Delete environment variables used by gzip that could impact the running of the test
+    for my $var (qw( GZIP ))
+    {
+        delete $ENV{$var};
+    }
+}
 
 {
     title "Test interop with $GZIP" ;

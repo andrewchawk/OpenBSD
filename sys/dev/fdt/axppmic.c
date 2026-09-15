@@ -1,4 +1,4 @@
-/*	$OpenBSD: axppmic.c,v 1.20 2023/08/02 11:52:18 uaa Exp $	*/
+/*	$OpenBSD: axppmic.c,v 1.22 2026/01/05 20:06:15 patrick Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -514,10 +514,6 @@ const struct cfattach axppmic_rsb_ca = {
 	NULL, axppmic_activate
 };
 
-struct cfdriver axppmic_rsb_cd = {
-	NULL, "axppmic", DV_DULL
-};
-
 uint8_t	axppmic_rsb_read(struct axppmic_softc *, uint8_t);
 void	axppmic_rsb_write(struct axppmic_softc *, uint8_t, uint8_t);
 
@@ -653,10 +649,7 @@ axppmic_attach_common(struct axppmic_softc *sc, const char *name, int node)
 void
 axppmic_attach_node(struct axppmic_softc *sc, int node)
 {
-	char status[32];
-
-	if (OF_getprop(node, "status", status, sizeof(status)) > 0 &&
-	    strcmp(status, "disabled") == 0)
+	if (!OF_is_enabled(node))
 		return;
 
 	if (OF_is_compatible(node, "x-powers,axp803-battery-power-supply"))

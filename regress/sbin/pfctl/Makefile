@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.236 2022/03/23 22:07:10 bluhm Exp $
+# $OpenBSD: Makefile,v 1.238 2026/05/17 14:41:02 jsg Exp $
 
 # TARGETS
 # pf: feed pfNN.in through pfctl and check whether the output matches pfNN.ok
@@ -18,7 +18,7 @@ PFTESTS=1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
 PFTESTS+=28 29 30 31 32 34 35 36 38 39 40 41 44 46 47 48 49 50
 PFTESTS+=52 53 54 55 56 57 60 61 65 66 67 68 69 70 71 72 73
 PFTESTS+=74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96
-PFTESTS+=97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 114
+PFTESTS+=97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 114 115
 PFFAIL=1 2 3 4 5 6 7 8 11 12 13 14 15 16 17 19 20 23 25 27
 PFFAIL+=30 37 38 39 40 41 42 43 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62
 PFFAIL+=63 64 65 66 67
@@ -43,7 +43,7 @@ PROG=	changerule
 SRCS=	changerule.c parse.y pfctl_parser.c pf_print_state.c
 SRCS+=	pfctl.c	pfctl_osfp.c pfctl_radix.c pfctl_table.c
 SRCS+=	pfctl_optimize.c pf_ruleset.c pfctl_queue.c
-CFLAGS= -Wall -Wmissing-prototypes -Wno-uninitialized -Wstrict-prototypes
+CFLAGS= -Wall -Wmissing-prototypes -Wstrict-prototypes
 CFLAGS+= -Wno-unused-variable
 CFLAGS+= -I${.CURDIR}/../../../sbin/pfctl -DREGRESS_NOMAIN
 YFLAGS=

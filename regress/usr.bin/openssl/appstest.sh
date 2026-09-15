@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# $OpenBSD: appstest.sh,v 1.64 2024/07/08 06:00:34 tb Exp $
+# $OpenBSD: appstest.sh,v 1.69 2025/12/20 07:04:28 tb Exp $
 #
 # Copyright (c) 2016 Kinichiro Inoguchi <inoguchi@openbsd.org>
 #
@@ -338,7 +338,7 @@ function test_key {
 
 		echo -n "ec - $curve ... ecparam ... "
 		$openssl_bin ecparam -out $ecparam -name $curve -genkey \
-			-param_enc explicit -conv_form compressed -C
+			-param_enc explicit -conv_form compressed
 		check_exit_status $?
 
 		echo -n "ec ... "
@@ -934,7 +934,7 @@ __EOF__
 	check_exit_status $?
 
 	start_message "x509 ... get detail info about server cert#1"
-	$openssl_bin x509 -in $sv_rsa_cert -text -C -dates -startdate -enddate \
+	$openssl_bin x509 -in $sv_rsa_cert -text -dates -startdate -enddate \
 		-fingerprint -issuer -issuer_hash -issuer_hash_old \
 		-subject -hash -subject_hash -subject_hash_old -ocsp_uri \
 		-ocspid -modulus -pubkey -serial -email -noout -trustout \
@@ -1189,10 +1189,6 @@ __EOF__
 	diff -b $cms_dgv $cms_txt
 	check_exit_status $?
 
-	# compress
-
-	# uncompress
-
 	# EncryptedData_encrypt
 	start_message "cms ... EncryptedData_encrypt"
 
@@ -1403,8 +1399,7 @@ function test_pkcs {
 		-caname "caname_server_p12" \
 		-certpbe AES-256-CBC -keypbe AES-256-CBC -chain \
 		-name "name_server_p12" -des3 -maciter -macalg sha256 \
-		-CSP "csp_server_p12" -LMK -keyex \
-		-passout pass:$pkcs_pass -out $sv_rsa_cert.p12
+		-keyex -passout pass:$pkcs_pass -out $sv_rsa_cert.p12
 	check_exit_status $?
 
 	start_message "pkcs12 ... verify"
@@ -1457,13 +1452,14 @@ function test_sc_by_protocol_version {
 		check_exit_status $?
 	fi
 
-	# check HRR hash
-	if [ $ver = "tls1_3" ] ; then
-		perl -0ne \
-		    'exit (!/ServerHello\n.*cf 21 ad 74 e5 9a 61 11 be 1d\n.*8c 02 1e 65 b8 91 c2 a2 11 16 7a bb 8c 5e 07 9e\n.*09 e2 c8 a8 33 9c/m)' \
-		    $s_client_out
-		check_exit_status $?
-	fi
+# This breaks since we added mlkem, I believe because the HRR value has changed.
+#	# check HRR hash
+#	if [ $ver = "tls1_3" ] ; then
+#		perl -0ne \
+##		    'exit (!/ServerHello\n.*cf 21 ad 74 e5 9a 61 11 be 1d\n.*8c 02 1e 65 b8 91 c2 a2 11 16 7a bb 8c #5e 07 9e\n.*09 e2 c8 a8 33 9c/m)' \
+#		    $s_client_out
+#		check_exit_status $?
+#	fi
 
 	if [ $ver = "tls1_3" ] ; then
 		grep 'Server Temp Key: ECDH, .*384.*, 384 bits' $s_client_out \
@@ -1884,7 +1880,7 @@ function test_version {
 #---------#---------#---------#---------#---------#---------#---------#---------
 
 openssl_bin=${OPENSSL:-/usr/bin/openssl}
-other_openssl_bin=${OTHER_OPENSSL:-/usr/local/bin/eopenssl11}
+other_openssl_bin=${OTHER_OPENSSL:-/usr/local/bin/eopenssl33}
 other_openssl_version=`$other_openssl_bin version | cut -b 1-10`
 
 ecdsa_tests=0

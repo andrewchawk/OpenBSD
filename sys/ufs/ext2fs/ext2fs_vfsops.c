@@ -1,4 +1,4 @@
-/*	$OpenBSD: ext2fs_vfsops.c,v 1.120 2024/06/07 09:26:37 jsg Exp $	*/
+/*	$OpenBSD: ext2fs_vfsops.c,v 1.123 2025/09/20 13:53:36 mpi Exp $	*/
 /*	$NetBSD: ext2fs_vfsops.c,v 1.1 1997/06/11 09:34:07 bouyer Exp $	*/
 
 /*
@@ -79,7 +79,6 @@ const struct vfsops ext2fs_vfsops = {
 	.vfs_fhtovp	= ext2fs_fhtovp,
 	.vfs_vptofh	= ext2fs_vptofh,
 	.vfs_init	= ext2fs_init,
-	.vfs_sysctl	= ext2fs_sysctl,
 	.vfs_checkexp	= ufs_check_export,
 };
 
@@ -981,14 +980,14 @@ ext2fs_fhtovp(struct mount *mp, struct fid *fhp, struct vnode **vpp)
 		return (ESTALE);
 
 	if ((error = VFS_VGET(mp, ufhp->ufid_ino, &nvp)) != 0) {
-		*vpp = NULLVP;
+		*vpp = NULL;
 		return (error);
 	}
 	ip = VTOI(nvp);
 	if (ip->i_e2fs_mode == 0 || ip->i_e2fs_dtime != 0 ||
 	    ip->i_e2fs_gen != ufhp->ufid_gen) {
 		vput(nvp);
-		*vpp = NULLVP;
+		*vpp = NULL;
 		return (ESTALE);
 	}
 	*vpp = nvp;
@@ -1010,17 +1009,6 @@ ext2fs_vptofh(struct vnode *vp, struct fid *fhp)
 	ufhp->ufid_ino = ip->i_number;
 	ufhp->ufid_gen = ip->i_e2fs_gen;
 	return (0);
-}
-
-/*
- * no sysctl for ext2fs
- */
-
-int
-ext2fs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
-    void *newp, size_t newlen, struct proc *p)
-{
-	return (EOPNOTSUPP);
 }
 
 /*
@@ -1066,7 +1054,7 @@ ext2fs_cgupdate(struct ufsmount *mp, int waitfor)
 	return (allerror);
 }
 
-/* This is called before the superblock is copied.  Watch out for endianity! */
+/* This is called before the superblock is copied.  Watch out for endianness! */
 static int
 e2fs_sbcheck(struct ext2fs *fs, int ronly)
 {

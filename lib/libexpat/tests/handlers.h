@@ -10,7 +10,7 @@
    Copyright (c) 2003      Greg Stein <gstein@users.sourceforge.net>
    Copyright (c) 2005-2007 Steven Solie <steven@solie.ca>
    Copyright (c) 2005-2012 Karl Waclawek <karl@waclawek.net>
-   Copyright (c) 2016-2024 Sebastian Pipping <sebastian@pipping.org>
+   Copyright (c) 2016-2026 Sebastian Pipping <sebastian@pipping.org>
    Copyright (c) 2017-2022 Rhodri James <rhodri@wildebeest.org.uk>
    Copyright (c) 2017      Joe Orton <jorton@redhat.com>
    Copyright (c) 2017      José Gutiérrez de la Concha <jose@zeroc.com>
@@ -19,6 +19,8 @@
    Copyright (c) 2020      Tim Gates <tim.gates@iress.com>
    Copyright (c) 2021      Donghee Na <donghee.na@python.org>
    Copyright (c) 2023      Sony Corporation / Snild Dolkow <snild@sony.com>
+   Copyright (c) 2026      Berkay Eren Ürün <berkay.ueruen@siemens.com>
+   Copyright (c) 2026      Kartik Kenchi <netliomax25@gmail.com>
    Licensed under the MIT license:
 
    Permission is  hereby granted,  free of charge,  to any  person obtaining
@@ -39,6 +41,8 @@
    DAMAGES OR  OTHER LIABILITY, WHETHER  IN AN  ACTION OF CONTRACT,  TORT OR
    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+   SPDX-License-Identifier: MIT
 */
 
 #ifdef __cplusplus
@@ -88,9 +92,15 @@ typedef struct attrInfo {
 typedef struct elementInfo {
   const XML_Char *name;
   int attr_count;
+  int default_attr_count;
   const XML_Char *id_name;
   AttrInfo *attributes;
 } ElementInfo;
+
+typedef struct StructParserAndElementInfo {
+  XML_Parser parser;
+  ElementInfo *info;
+} ParserAndElementInfo;
 
 extern void XMLCALL counting_start_element_handler(void *userData,
                                                    const XML_Char *name,
@@ -153,6 +163,9 @@ extern int XMLCALL MiscEncodingHandler(void *data, const XML_Char *encoding,
 extern int XMLCALL long_encoding_handler(void *userData,
                                          const XML_Char *encoding,
                                          XML_Encoding *info);
+
+extern int XMLCALL user_data_checking_unknown_encoding_handler(
+    void *userData, const XML_Char *encoding, XML_Encoding *info);
 
 /* External Entity Handlers */
 
@@ -320,6 +333,7 @@ extern int XMLCALL external_entity_devaluer(XML_Parser parser,
 typedef struct ext_hdlr_data {
   const char *parse_text;
   XML_ExternalEntityRefHandler handler;
+  CharData *storage;
 } ExtHdlrData;
 
 extern int XMLCALL external_entity_oneshot_loader(XML_Parser parser,
@@ -552,6 +566,10 @@ extern void XMLCALL suspending_comment_handler(void *userData,
 extern void XMLCALL element_decl_suspender(void *userData, const XML_Char *name,
                                            XML_Content *model);
 
+extern void XMLCALL suspend_after_element_declaration(void *userData,
+                                                      const XML_Char *name,
+                                                      XML_Content *model);
+
 extern void XMLCALL accumulate_pi_characters(void *userData,
                                              const XML_Char *target,
                                              const XML_Char *data);
@@ -564,12 +582,22 @@ extern void XMLCALL accumulate_entity_decl(
     const XML_Char *systemId, const XML_Char *publicId,
     const XML_Char *notationName);
 
-extern void XMLCALL accumulate_char_data(void *userData, const XML_Char *s,
-                                         int len);
+extern void XMLCALL accumulate_char_data_and_suspend(void *userData,
+                                                     const XML_Char *s,
+                                                     int len);
 
 extern void XMLCALL accumulate_start_element(void *userData,
                                              const XML_Char *name,
                                              const XML_Char **atts);
+
+extern void XMLCALL accumulate_characters(void *userData, const XML_Char *s,
+                                          int len);
+
+extern void XMLCALL accumulate_attribute(void *userData, const XML_Char *name,
+                                         const XML_Char **atts);
+
+extern void XMLCALL ext_accumulate_characters(void *userData, const XML_Char *s,
+                                              int len);
 
 typedef struct default_check {
   const XML_Char *expected;
@@ -587,6 +615,19 @@ typedef struct {
 
 extern void XMLCALL
 accumulate_and_suspend_comment_handler(void *userData, const XML_Char *data);
+
+extern void XMLCALL forbidden_calls_character_handler(void *userData,
+                                                      const XML_Char *s,
+                                                      int len);
+
+typedef struct {
+  XML_Parser parser;
+  int callCount;
+} ResumeFromHandlerData;
+
+extern void XMLCALL suspend_then_resume_character_handler(void *userData,
+                                                          const XML_Char *s,
+                                                          int len);
 
 #endif /* XML_HANDLERS_H */
 

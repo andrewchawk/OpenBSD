@@ -11,15 +11,25 @@ release schedules for the next, current and previous stable versions
 of Perl.  Dates with two or more question marks will only be releases if
 deemed necessary by the Steering Council.
 
-=head2 Perl 5.36
+=head2 Perl 5.44
 
-  2022-05-27  5.36.0  ✓       Ricardo Signes
-  2023-04-23  5.36.1  ✓       Steve Hay
+  2026-07-15  5.44.0  ✓       Leon Timmermans
 
-=head2 Perl 5.34
+=head2 Perl 5.42
 
-  2021-05-20  5.34.0  ✓       Sawyer X
-  2022-03-13  5.34.1  ✓       Steve Hay
+  2025-07-02  5.42.0  ✓       Philippe Bruhat
+  2026-03-08  5.42.1  ✓       Steve Hay
+  2026-03-29  5.42.2  ✓       Steve Hay
+  2026-08-02  5.42.3          Steve Hay
+
+=head2 Perl 5.40
+
+  2024-06-09  5.40.0  ✓       Graham Knop
+  2025-01-18  5.40.1  ✓       Steve Hay
+  2025-04-13  5.40.2  ✓       Steve Hay
+  2025-08-03  5.40.3  ✓       Steve Hay
+  2026-03-29  5.40.4  ✓       Steve Hay
+  2026-08-02  5.40.5          Steve Hay
 
 =head1 DEVELOPMENT RELEASE SCHEDULE
 
@@ -35,23 +45,21 @@ When shipping a release, you should include the schedule for (at least)
 the next four releases. If a stable version of Perl is released,
 you should reset the version numbers to the next blead series.
 
-=head2 Perl 5.37
+=head2 Perl 5.45
 
-  2022-05-27  5.37.0  ✓       Ricardo Signes
-  2022-06-20  5.37.1  ✓       Matthew Horsfall
-  2022-07-20  5.37.2  ✓       Nicolas R
-  2022-08-20  5.37.3  ✓       Neil Bowers
-  2022-09-20  5.37.4  ✓       Karen Etheridge
-  2022-10-20  5.37.5  ✓       Todd Rinaldo
-  2022-11-20  5.37.6  ✓       Max Maischein
-  2022-12-20  5.37.7  ✓       Richard Leach
-  2023-01-20  5.37.8  ✓       Renée Bäcker
-  2023-02-20  5.37.9  ✓       Karen Etheridge   Contentious changes freeze
-  2023-03-20  5.37.10 ✓       Yves Orton        User-visible changes to
-                                                correctly functioning
-                                                programs freeze
-  2023-04-20  5.37.11 ✓       Steve Hay         Full code freeze
-  2023-05-20  5.38.0           Ricardo Signes   New perl!
+  2026-07-15  5.45.0  ✓       Leon Timmermans   (tag only)
+  2026-07-21  5.45.1  ✓       Paul Evans
+  2026-08-20  5.45.2          
+  2026-09-20  5.45.3          
+  2026-10-20  5.45.4          
+  2026-11-20  5.45.5          
+  2026-12-20  5.45.6          
+  2027-01-20  5.45.7          
+  2027-02-20  5.45.8                            Contentious changes freeze
+  2027-03-20  5.45.9                            User-visible changes
+                                                freeze
+  2027-04-20  5.46.0-RC1                        Full program freeze
+  2027-05-20  5.46.0                            New perl!
 
 =head1 VICTIMS
 
@@ -65,26 +73,28 @@ consent of the Steering Council.)
   Abigail <abigail@abigail.be>
   Aristotle Pagaltzis <pagaltzis@gmx.de>
   Ask Bjørn Hansen <ask@perl.org>
-  Chris Williams <bingos@cpan.org>
+  Chris Williams <chris@bingosnet.co.uk>
   Dave Cross <dave@perlhacks.com>
   Dave Rolsky <autarch@urth.org>
   David Golden <dagolden@cpan.org>
   Florian Ragwitz <rafl@debian.org>
   Jesse Luehrs <doy@cpan.org>
   Jesse Vincent <jesse@cpan.org>
+  Karen Etheridge <perl@froods.org>
   Leon Brocard <acme@astray.com>
   Matt Trout <mst@shadowcat.co.uk>
   Matthew Horsfall <wolfsage@gmail.com>
   Max Maischein <corion@cpan.org>
+  Paul Evans <leonerd@leonerd.org.uk>
   Peter Martini <petercmartini@gmail.com>
   Philippe Bruhat <book@cpan.org>
   Ricardo Signes <rjbs@cpan.org>
   Stevan Little <stevan@cpan.org>
   Steve Hay <steve.m.hay@googlemail.com>
   Tatsuhiko Miyagawa <miyagawa@bulknews.net>
+  Thibault Duponchelle <thibault.duponchelle@gmail.com>
   Tony Cook <tony@develop-help.com>
   Yves Orton <demerphq@gmail.com>
-  Zefram <zefram@fysh.org>
   Ævar Arnfjörð Bjarmason <avar@cpan.org>
 
 =head1 AUTHOR

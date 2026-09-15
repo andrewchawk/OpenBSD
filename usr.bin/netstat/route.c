@@ -1,4 +1,4 @@
-/*	$OpenBSD: route.c,v 1.110 2023/11/14 10:31:22 claudio Exp $	*/
+/*	$OpenBSD: route.c,v 1.113 2025/09/19 11:27:51 jsg Exp $	*/
 /*	$NetBSD: route.c,v 1.15 1996/05/07 02:55:06 thorpej Exp $	*/
 
 /*
@@ -33,13 +33,12 @@
 #include <sys/types.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
+#include <sys/refcnt.h>
+#include <sys/rwlock.h>
+#include <sys/srp.h>
 
 #include <net/if.h>
 #include <net/if_types.h>
-#define _KERNEL
-#include <net/art.h>
-#include <net/route.h>
-#undef _KERNEL
 #include <netinet/ip_ipsp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -51,9 +50,15 @@
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <ifaddrs.h>
+
+#define _KERNEL
+#include <net/art.h>
+#include <net/route.h>
+#undef _KERNEL
 
 #include "netstat.h"
 
@@ -67,8 +72,8 @@ struct	rtentry rtentry;
 
 static struct sockaddr *kgetsa(struct sockaddr *);
 static struct sockaddr *plentosa(sa_family_t, int, struct sockaddr *);
-static struct art_node *getdefault(struct art_table *);
-static void p_table(struct art_table *);
+static struct art_node *getdefault(art_heap_entry *);
+static void p_table(art_heap_entry *);
 static void p_artnode(struct art_node *);
 static void p_krtentry(struct rtentry *);
 
@@ -78,14 +83,15 @@ static void p_krtentry(struct rtentry *);
 void
 routepr(u_long afmap, u_long af2idx, u_long af2idx_max, u_int tableid)
 {
-	struct art_root ar;
+	struct rtable tbl;
+	struct art art;
 	struct art_node *node;
 	struct srp *afm_head, *afm;
 	struct {
 		unsigned int	limit;
-		void	      **tbl;
+		struct rtable **tbl;
 	} map;
-	void **tbl;
+	struct rtable **tblmap;
 	int i;
 	uint8_t af2i[AF_MAX+1];
 	uint8_t af2i_max;
@@ -116,28 +122,30 @@ routepr(u_long afmap, u_long af2idx, u_long af2idx_max, u_int tableid)
 		if (tableid >= map.limit)
 			continue;
 
-		if ((tbl = calloc(map.limit, sizeof(*tbl))) == NULL)
+		if ((tblmap = calloc(map.limit, sizeof(*tblmap))) == NULL)
 			err(1, NULL);
 
-		kread((u_long)map.tbl, tbl, map.limit * sizeof(*tbl));
-		if (tbl[tableid] == NULL)
+		kread((u_long)map.tbl, tblmap, map.limit * sizeof(*tblmap));
+		if (tblmap[tableid] == NULL)
 			continue;
 
-		kread((u_long)tbl[tableid], &ar, sizeof(ar));
+		kread((u_long)tblmap[tableid], &tbl, sizeof(tbl));
 
-		free(tbl);
+		free(tblmap);
 
-		if (ar.ar_root.ref == NULL)
+		kread((u_long)tbl.r_art, &art, sizeof(art));
+
+		if (art.art_root == NULL)
 			continue;
 
 		pr_family(i);
 		pr_rthdr(i, Aflag);
 
-		node = getdefault(ar.ar_root.ref);
+		node = getdefault(art.art_root);
 		if (node != NULL)
 			p_artnode(node);
 
-		p_table(ar.ar_root.ref);
+		p_table(art.art_root);
 	}
 
 	free(afm);
@@ -196,64 +204,52 @@ plentosa(sa_family_t af, int plen, struct sockaddr *sa_mask)
 }
 
 static struct art_node *
-getdefault(struct art_table *at)
+getdefault(art_heap_entry *heap)
 {
-	struct art_node *node;
-	struct art_table table;
-	union {
-		struct srp		 node;
-		unsigned long		 count;
-	} *heap;
-
-	kread((u_long)at, &table, sizeof(table));
-	heap = calloc(1, AT_HEAPSIZE(table.at_bits));
-	kread((u_long)table.at_heap, heap, AT_HEAPSIZE(table.at_bits));
-
-	node = heap[1].node.ref;
-
-	free(heap);
-
-	return (node);
+	art_heap_entry entry;
+	kread((u_long)(heap + ART_HEAP_IDX_DEFAULT), &entry, sizeof(entry));
+	return (art_heap_entry_to_node(entry));
 }
 
 static void
-p_table(struct art_table *at)
+p_table(art_heap_entry *kheap)
 {
+	art_heap_entry entry, *heap, *nheap;
 	struct art_node *next, *node;
-	struct art_table *nat, table;
-	union {
-		struct srp		 node;
-		unsigned long		 count;
-	} *heap;
+	struct art_table table;
 	int i, j;
 
-	kread((u_long)at, &table, sizeof(table));
+	kread((u_long)(kheap + ART_HEAP_IDX_TABLE), &entry, sizeof(entry));
+	kread((u_long)entry, &table, sizeof(table));
 	heap = calloc(1, AT_HEAPSIZE(table.at_bits));
-	kread((u_long)table.at_heap, heap, AT_HEAPSIZE(table.at_bits));
+	kread((u_long)kheap, heap, AT_HEAPSIZE(table.at_bits));
 
 	for (j = 1; j < table.at_minfringe; j += 2) {
 		for (i = (j > 2) ? j : 2; i < table.at_minfringe; i <<= 1) {
-			next = heap[i >> 1].node.ref;
-			node = heap[i].node.ref;
+			next = art_heap_entry_to_node(heap[i >> 1]);
+			node = art_heap_entry_to_node(heap[i]);
 			if (node != NULL && node != next)
 				p_artnode(node);
 		}
 	}
 
 	for (i = table.at_minfringe; i < table.at_minfringe << 1; i++) {
-		next = heap[i >> 1].node.ref;
-		node = heap[i].node.ref;
-		if (!ISLEAF(node)) {
-			nat = SUBTABLE(node);
-			node = getdefault(nat);
-		} else
-			nat = NULL;
+		next = art_heap_entry_to_node(heap[i >> 1]);
+
+		entry = heap[i];
+		if (art_heap_entry_is_node(entry)) {
+			nheap = NULL;
+			node = art_heap_entry_to_node(entry);
+		} else {
+			nheap = art_heap_entry_to_heap(entry);
+			node = getdefault(nheap);
+		}
 
 		if (node != NULL && node != next)
 			p_artnode(node);
 
-		if (nat != NULL)
-			p_table(nat);
+		if (nheap != NULL)
+			p_table(nheap);
 	}
 
 	free(heap);
@@ -266,14 +262,14 @@ p_artnode(struct art_node *an)
 	struct rtentry *rt;
 
 	kread((u_long)an, &node, sizeof(node));
-	rt = node.an_rtlist.sl_head.ref;
+	rt = node.an_value;
 
 	while (rt != NULL) {
 		kread((u_long)rt, &rtentry, sizeof(rtentry));
 		if (Aflag)
 			printf("%-16p ", rt);
 		p_krtentry(&rtentry);
-		rt = rtentry.rt_next.se_next.ref;
+		rt = rtentry.rt_next;
 	}
 }
 

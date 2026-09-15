@@ -1,4 +1,4 @@
-/*	$OpenBSD: octeonvar.h,v 1.54 2022/08/29 02:01:18 jsg Exp $	*/
+/*	$OpenBSD: octeonvar.h,v 1.56 2026/07/13 13:41:25 kirill Exp $	*/
 /*	$NetBSD: maltavar.h,v 1.3 2002/03/18 10:10:16 simonb Exp $	*/
 
 /*-
@@ -96,7 +96,7 @@ struct octeon_config {
 
 #define	OCTEON_POOL_NELEMS_PKT		4096
 #define	OCTEON_POOL_NELEMS_WQE		4096
-#define	OCTEON_POOL_NELEMS_CMD		32
+#define	OCTEON_POOL_NELEMS_CMD		256
 #define	OCTEON_POOL_NELEMS_SG		4096
 #define	OCTEON_POOL_NELEMS_XXX_4	0
 #define	OCTEON_POOL_NELEMS_XXX_5	0
@@ -334,32 +334,6 @@ int	octeon_ioclock_speed(void);
 
 #endif /* _KERNEL */
 #endif /* _KERNEL || _STANDALONE */
-
-static inline int
-ffs64(uint64_t val)
-{
-	int ret;
-
-	__asm volatile ( \
-		_ASM_PROLOGUE_MIPS64
-		"	dclz	%0, %1			\n"
-		_ASM_EPILOGUE
-		: "=r"(ret) : "r"(val));
-	return 64 - ret;
-}
-
-static inline int
-ffs32(uint32_t val)
-{
-	int ret;
-
-	__asm volatile ( \
-		_ASM_PROLOGUE_MIPS64
-		"	clz	%0, %1			\n"
-		_ASM_EPILOGUE
-		: "=r"(ret) : "r"(val));
-	return 32 - ret;
-}
 
 static inline uint64_t
 octeon_xkphys_read_8(paddr_t address)

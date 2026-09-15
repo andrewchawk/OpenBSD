@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_malloc.c,v 1.152 2024/06/26 01:40:49 jsg Exp $	*/
+/*	$OpenBSD: kern_malloc.c,v 1.158 2026/02/11 22:34:41 deraadt Exp $	*/
 /*	$NetBSD: kern_malloc.c,v 1.15.4.2 1996/06/13 17:10:56 cgd Exp $	*/
 
 /*
@@ -50,6 +50,11 @@
 #include <ddb/db_output.h>
 #endif
 
+/*
+ * Locks used to protect data:
+ *	I	Immutable data
+ */
+ 
 static
 #ifndef SMALL_KERNEL
 __inline__
@@ -95,12 +100,11 @@ struct kmemstats kmemstats[M_LAST];
 #endif
 struct kmemusage *kmemusage;
 char *kmembase, *kmemlimit;
-char buckstring[16 * sizeof("123456,")];
+char buckstring[16 * sizeof("123456,")];	/* [I] */
 int buckstring_init = 0;
 #if defined(KMEMSTATS) || defined(DIAGNOSTIC)
 char *memname[] = INITKMEMNAMES;
-char *memall = NULL;
-struct rwlock sysctl_kmemlock = RWLOCK_INITIALIZER("sysctlklk");
+char *memall;					/* [I] */
 #endif
 
 /*
@@ -142,6 +146,7 @@ struct timeval malloc_lasterr;
 void *
 malloc(size_t size, int type, int flags)
 {
+	const struct kmem_dyn_mode *kdp;
 	struct kmembuckets *kbp;
 	struct kmemusage *kup;
 	struct kmem_freelist *freep;
@@ -171,7 +176,7 @@ malloc(size_t size, int type, int flags)
 	}
 #endif
 
-	if (size > 65535 * PAGE_SIZE) {
+	if (size > MALLOC_MAX) {
 		if (flags & M_CANFAIL) {
 #ifndef SMALL_KERNEL
 			if (ratecheck(&malloc_lasterr, &malloc_errintvl))
@@ -212,13 +217,16 @@ malloc(size_t size, int type, int flags)
 	if (XSIMPLEQ_FIRST(&kbp->kb_freelist) == NULL) {
 		mtx_leave(&malloc_mtx);
 		npg = atop(round_page(allocsize));
+		KASSERT(atomic_load_sint(&uvmexp.swpgonly) <=
+		    atomic_load_sint(&uvmexp.swpages));
+		if ((flags & M_NOWAIT) || ((flags & M_CANFAIL) &&
+		    atomic_load_sint(&uvmexp.swpages) -
+		    atomic_load_sint(&uvmexp.swpgonly) <= npg))
+			kdp = &kd_nowait;
+		else
+			kdp = &kd_waitok;
 		s = splvm();
-		va = (caddr_t)uvm_km_kmemalloc_pla(kmem_map, NULL,
-		    (vsize_t)ptoa(npg), 0,
-		    ((flags & M_NOWAIT) ? UVM_KMF_NOWAIT : 0) |
-		    ((flags & M_CANFAIL) ? UVM_KMF_CANFAIL : 0),
-		    no_constraint.ucr_low, no_constraint.ucr_high,
-		    0, 0, 0);
+		va = (caddr_t)km_alloc(ptoa(npg), &kv_intrsafe, &kp_dirty, kdp);
 		splx(s);
 		if (va == NULL) {
 			/*
@@ -424,7 +432,7 @@ free(void *addr, int type, size_t freedsize)
 		kup->ku_pagecnt = 0;
 		mtx_leave(&malloc_mtx);
 		s = splvm();
-		uvm_km_free(kmem_map, (vaddr_t)addr, ptoa(pagecnt));
+		km_free(addr, ptoa(pagecnt), &kv_intrsafe, &kp_dirty);
 		splx(s);
 #ifdef KMEMSTATS
 		mtx_enter(&malloc_mtx);
@@ -540,6 +548,10 @@ kmeminit(void)
 	vaddr_t base, limit;
 	long indx;
 
+#if defined(KMEMSTATS) || defined(DIAGNOSTIC)
+	int i, siz, totlen;
+#endif
+
 #ifdef DIAGNOSTIC
 	if (sizeof(struct kmem_freelist) > (1 << MINBUCKET))
 		panic("kmeminit: minbucket too small/struct freelist too big");
@@ -577,9 +589,42 @@ kmeminit(void)
 	for (indx = 0; indx < M_LAST; indx++)
 		kmemstats[indx].ks_limit =
 		    (long)nkmempages * PAGE_SIZE * 6 / 10;
+
+	memset(buckstring, 0, sizeof(buckstring));
+	for (siz = 0, i = MINBUCKET; i < MINBUCKET + 16; i++) {
+		snprintf(buckstring + siz, sizeof buckstring - siz,
+		    "%d,", (u_int)(1<<i));
+		siz += strlen(buckstring + siz);
+	}
+	/* Remove trailing comma */
+	if (siz)
+		buckstring[siz - 1] = '\0';
+#endif
+#if defined(KMEMSTATS) || defined(DIAGNOSTIC)
+	/* Figure out how large a buffer we need */
+	for (totlen = 0, i = 0; i < M_LAST; i++) {
+		if (memname[i])
+			totlen += strlen(memname[i]);
+		totlen++;
+	}
+	memall = malloc(totlen + M_LAST, M_SYSCTL, M_WAITOK|M_ZERO);
+	for (siz = 0, i = 0; i < M_LAST; i++) {
+		snprintf(memall + siz, totlen + M_LAST - siz, "%s,",
+		    memname[i] ? memname[i] : "");
+		siz += strlen(memall + siz);
+	}
+	/* Remove trailing comma */
+	if (siz)
+		memall[siz - 1] = '\0';
+	/* Now, convert all spaces to underscores */
+	for (i = 0; i < totlen; i++) {
+		if (memall[i] == ' ')
+			memall[i] = '_';
+	}
 #endif
 }
 
+#ifndef SMALL_KERNEL
 /*
  * Return kernel malloc statistics information.
  */
@@ -591,10 +636,6 @@ sysctl_malloc(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 #ifdef KMEMSTATS
 	struct kmemstats km;
 #endif
-#if defined(KMEMSTATS) || defined(DIAGNOSTIC)
-	int error;
-#endif
-	int i, siz;
 
 	if (namelen != 2 && name[0] != KERN_MALLOC_BUCKETS &&
 	    name[0] != KERN_MALLOC_KMEMNAMES)
@@ -602,20 +643,6 @@ sysctl_malloc(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 
 	switch (name[0]) {
 	case KERN_MALLOC_BUCKETS:
-		/* Initialize the first time */
-		if (buckstring_init == 0) {
-			buckstring_init = 1;
-			memset(buckstring, 0, sizeof(buckstring));
-			for (siz = 0, i = MINBUCKET; i < MINBUCKET + 16; i++) {
-				snprintf(buckstring + siz,
-				    sizeof buckstring - siz,
-				    "%d,", (u_int)(1<<i));
-				siz += strlen(buckstring + siz);
-			}
-			/* Remove trailing comma */
-			if (siz)
-				buckstring[siz - 1] = '\0';
-		}
 		return (sysctl_rdstring(oldp, oldlenp, newp, buckstring));
 
 	case KERN_MALLOC_BUCKET:
@@ -635,47 +662,16 @@ sysctl_malloc(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 #else
 		return (EOPNOTSUPP);
 #endif
-	case KERN_MALLOC_KMEMNAMES:
 #if defined(KMEMSTATS) || defined(DIAGNOSTIC)
-		error = rw_enter(&sysctl_kmemlock, RW_WRITE|RW_INTR);
-		if (error)
-			return (error);
-		if (memall == NULL) {
-			int totlen;
-
-			/* Figure out how large a buffer we need */
-			for (totlen = 0, i = 0; i < M_LAST; i++) {
-				if (memname[i])
-					totlen += strlen(memname[i]);
-				totlen++;
-			}
-			memall = malloc(totlen + M_LAST, M_SYSCTL,
-			    M_WAITOK|M_ZERO);
-			for (siz = 0, i = 0; i < M_LAST; i++) {
-				snprintf(memall + siz,
-				    totlen + M_LAST - siz,
-				    "%s,", memname[i] ? memname[i] : "");
-				siz += strlen(memall + siz);
-			}
-			/* Remove trailing comma */
-			if (siz)
-				memall[siz - 1] = '\0';
-
-			/* Now, convert all spaces to underscores */
-			for (i = 0; i < totlen; i++)
-				if (memall[i] == ' ')
-					memall[i] = '_';
-		}
-		rw_exit_write(&sysctl_kmemlock);
+	case KERN_MALLOC_KMEMNAMES:
 		return (sysctl_rdstring(oldp, oldlenp, newp, memall));
-#else
-		return (EOPNOTSUPP);
 #endif
 	default:
 		return (EOPNOTSUPP);
 	}
 	/* NOTREACHED */
 }
+#endif /* SMALL_KERNEL */
 
 #if defined(DDB)
 

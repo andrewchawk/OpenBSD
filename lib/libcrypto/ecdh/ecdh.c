@@ -1,4 +1,4 @@
-/* $OpenBSD: ecdh.c,v 1.10 2023/07/28 09:31:21 tb Exp $ */
+/* $OpenBSD: ecdh.c,v 1.15 2026/06/09 05:24:47 tb Exp $ */
 /* ====================================================================
  * Copyright 2002 Sun Microsystems, Inc. ALL RIGHTS RESERVED.
  *
@@ -73,10 +73,10 @@
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 
 #include "ec_local.h"
+#include "err_local.h"
 
 /*
  * Key derivation function from X9.63/SECG.
@@ -143,8 +143,8 @@ ecdh_KDF_X9_63(unsigned char *out, size_t outlen, const unsigned char *Z,
  * Based on the ECKAS-DH1 and ECSVDP-DH primitives in the IEEE 1363 standard.
  */
 int
-ecdh_compute_key(unsigned char **out, size_t *out_len, const EC_POINT *pub_key,
-    const EC_KEY *ecdh)
+ec_key_ecdh_compute_key(unsigned char **out, size_t *out_len,
+    const EC_POINT *pub_key, const EC_KEY *ecdh)
 {
 	BN_CTX *ctx;
 	BIGNUM *x;
@@ -169,8 +169,15 @@ ecdh_compute_key(unsigned char **out, size_t *out_len, const EC_POINT *pub_key,
 	if ((group = EC_KEY_get0_group(ecdh)) == NULL)
 		goto err;
 
-	if (EC_POINT_is_on_curve(group, pub_key, ctx) <= 0)
+	if (EC_POINT_is_at_infinity(group, pub_key)) {
+		ECerror(EC_R_POINT_AT_INFINITY);
 		goto err;
+	}
+
+	if (EC_POINT_is_on_curve(group, pub_key, ctx) <= 0) {
+		ECerror(EC_R_POINT_IS_NOT_ON_CURVE);
+		goto err;
+	}
 
 	if ((point = EC_POINT_new(group)) == NULL) {
 		ECerror(ERR_R_MALLOC_FAILURE);
@@ -274,8 +281,8 @@ ECDH_compute_key(void *out, size_t out_len, const EC_POINT *pub_key,
 LCRYPTO_ALIAS(ECDH_compute_key);
 
 int
-ECDH_size(const EC_KEY *d)
+ECDH_size(const EC_KEY *eckey)
 {
-	return (EC_GROUP_get_degree(EC_KEY_get0_group(d)) + 7) / 8;
+	return BN_num_bytes(eckey->group->p);
 }
 LCRYPTO_ALIAS(ECDH_size);

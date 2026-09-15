@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_pcb.c,v 1.144 2024/04/12 16:07:09 bluhm Exp $	*/
+/*	$OpenBSD: in6_pcb.c,v 1.152 2025/09/16 09:19:16 florian Exp $	*/
 
 /*
  * Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
@@ -107,7 +107,6 @@
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -116,7 +115,6 @@
 #include <netinet/in.h>
 #include <netinet6/in6_var.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
 #include <netinet6/ip6_var.h>
 #include <netinet/in_pcb.h>
 
@@ -336,9 +334,8 @@ in6_pcbconnect(struct inpcb *inp, struct mbuf *nam)
 	mtx_leave(&table->inpt_mtx);
 
 	inp->inp_flowinfo &= ~IPV6_FLOWLABEL_MASK;
-	if (ip6_auto_flowlabel)
-		inp->inp_flowinfo |=
-		    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
+	inp->inp_flowinfo |=
+	    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
 #if NSTOEPLITZ > 0
 	inp->inp_flowid = stoeplitz_ip6port(&inp->inp_faddr6,
 	    &inp->inp_laddr6, inp->inp_fport, inp->inp_lport);
@@ -427,8 +424,8 @@ in6_pcbnotify(struct inpcbtable *table, const struct sockaddr_in6 *dst,
     uint fport_arg, const struct sockaddr_in6 *src, uint lport_arg,
     u_int rtable, int cmd, void *cmdarg, void (*notify)(struct inpcb *, int))
 {
-	SIMPLEQ_HEAD(, inpcb) inpcblist;
-	struct inpcb *inp;
+	struct inpcb_iterator iter = { .inp_table = NULL };
+	struct inpcb *inp = NULL;
 	u_short fport = fport_arg, lport = lport_arg;
 	struct sockaddr_in6 sa6_src;
 	int errno;
@@ -456,8 +453,8 @@ in6_pcbnotify(struct inpcbtable *table, const struct sockaddr_in6 *dst,
 
 	/*
 	 * Redirects go to all references to the destination,
-	 * and use in_rtchange to invalidate the route cache.
-	 * Dead host indications: also use in_rtchange to invalidate
+	 * and use in_pcbrtchange to invalidate the route cache.
+	 * Dead host indications: also use in_pcbrtchange to invalidate
 	 * the cache, and deliver the error to all the sockets.
 	 * Otherwise, if we have knowledge of the local port and address,
 	 * deliver only to that socket.
@@ -468,17 +465,17 @@ in6_pcbnotify(struct inpcbtable *table, const struct sockaddr_in6 *dst,
 		sa6_src.sin6_addr = in6addr_any;
 
 		if (cmd != PRC_HOSTDEAD)
-			notify = in_rtchange;
+			notify = in_pcbrtchange;
 	}
 	errno = inet6ctlerrmap[cmd];
 	if (notify == NULL)
 		return;
 
-	SIMPLEQ_INIT(&inpcblist);
 	rdomain = rtable_l2(rtable);
-	rw_enter_write(&table->inpt_notify);
 	mtx_enter(&table->inpt_mtx);
-	TAILQ_FOREACH(inp, &table->inpt_queue, inp_queue) {
+	while ((inp = in_pcb_iterator(table, inp, &iter)) != NULL) {
+		struct socket *so;
+
 		KASSERT(ISSET(inp->inp_flags, INP_IPV6));
 
 		/*
@@ -544,17 +541,14 @@ in6_pcbnotify(struct inpcbtable *table, const struct sockaddr_in6 *dst,
 			continue;
 		}
 	  do_notify:
-		in_pcbref(inp);
-		SIMPLEQ_INSERT_TAIL(&inpcblist, inp, inp_notify);
+		mtx_leave(&table->inpt_mtx);
+		so = in_pcbsolock(inp);
+		if (so != NULL)
+			(*notify)(inp, errno);
+		in_pcbsounlock(inp, so);
+		mtx_enter(&table->inpt_mtx);
 	}
 	mtx_leave(&table->inpt_mtx);
-
-	while ((inp = SIMPLEQ_FIRST(&inpcblist)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&inpcblist, inp_notify);
-		(*notify)(inp, errno);
-		in_pcbunref(inp);
-	}
-	rw_exit_write(&table->inpt_notify);
 }
 
 struct rtentry *
@@ -705,4 +699,40 @@ in6_pcblookup_listen(struct inpcbtable *table, struct in6_addr *laddr,
 	}
 #endif
 	return (inp);
+}
+
+int
+in6_pcbset_addr(struct inpcb *inp, const struct sockaddr_in6 *fsin6,
+    const struct sockaddr_in6 *lsin6, u_int rtableid)
+{
+	struct inpcbtable *table = inp->inp_table;
+	struct inpcb *t;
+
+	mtx_enter(&table->inpt_mtx);
+
+	t = in6_pcblookup_lock(inp->inp_table, &fsin6->sin6_addr,
+	    fsin6->sin6_port, &lsin6->sin6_addr, lsin6->sin6_port,
+	    rtableid, IN_PCBLOCK_HOLD);
+	if (t != NULL) {
+		mtx_leave(&table->inpt_mtx);
+		return (EADDRINUSE);
+	}
+
+	inp->inp_rtableid = rtableid;
+	inp->inp_laddr6 = lsin6->sin6_addr;
+	inp->inp_lport = lsin6->sin6_port;
+	inp->inp_faddr6 = fsin6->sin6_addr;
+	inp->inp_fport = fsin6->sin6_port;
+	in_pcbrehash(inp);
+
+	mtx_leave(&table->inpt_mtx);
+
+	inp->inp_flowinfo &= ~IPV6_FLOWLABEL_MASK;
+	inp->inp_flowinfo |=
+	    (htonl(ip6_randomflowlabel()) & IPV6_FLOWLABEL_MASK);
+#if NSTOEPLITZ > 0
+	inp->inp_flowid = stoeplitz_ip6port(&inp->inp_faddr6,
+	    &inp->inp_laddr6, inp->inp_fport, inp->inp_lport);
+#endif
+	return (0);
 }

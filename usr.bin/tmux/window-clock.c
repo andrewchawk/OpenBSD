@@ -1,4 +1,4 @@
-/* $OpenBSD: window-clock.c,v 1.29 2020/05/16 15:34:08 nicm Exp $ */
+/* $OpenBSD: window-clock.c,v 1.35 2026/07/14 17:17:18 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -25,7 +25,8 @@
 #include "tmux.h"
 
 static struct screen *window_clock_init(struct window_mode_entry *,
-		    struct cmd_find_state *, struct args *);
+		     struct cmdq_item *, struct cmd_find_state *,
+		     struct args *);
 static void	window_clock_free(struct window_mode_entry *);
 static void	window_clock_resize(struct window_mode_entry *, u_int, u_int);
 static void	window_clock_key(struct window_mode_entry *, struct client *,
@@ -45,7 +46,7 @@ const struct window_mode window_clock_mode = {
 };
 
 struct window_clock_mode_data {
-	struct screen	        screen;
+	struct screen		screen;
 	time_t			tim;
 	struct event		timer;
 };
@@ -124,6 +125,26 @@ const char window_clock_table[14][5][5] = {
 };
 
 static void
+window_clock_start_timer(struct window_mode_entry *wme)
+{
+	struct window_clock_mode_data	*data = wme->data;
+	struct timeval			 tv;
+	struct timespec			 ts;
+	long				 delay;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	delay = 1000000 - (ts.tv_nsec / 1000);
+
+	tv.tv_sec = delay / 1000000;
+	tv.tv_usec = delay % 1000000;
+	if (tv.tv_sec < 0 || (tv.tv_sec == 0 && tv.tv_usec <= 0)) {
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+	}
+	evtimer_add(&data->timer, &tv);
+}
+
+static void
 window_clock_timer_callback(__unused int fd, __unused short events, void *arg)
 {
 	struct window_mode_entry	*wme = arg;
@@ -131,39 +152,36 @@ window_clock_timer_callback(__unused int fd, __unused short events, void *arg)
 	struct window_clock_mode_data	*data = wme->data;
 	struct tm			 now, then;
 	time_t				 t;
-	struct timeval			 tv = { .tv_sec = 1 };
 
 	evtimer_del(&data->timer);
-	evtimer_add(&data->timer, &tv);
-
-	if (TAILQ_FIRST(&wp->modes) != wme)
-		return;
 
 	t = time(NULL);
 	gmtime_r(&t, &now);
 	gmtime_r(&data->tim, &then);
-	if (now.tm_min == then.tm_min)
-		return;
-	data->tim = t;
 
-	window_clock_draw_screen(wme);
-	wp->flags |= PANE_REDRAW;
+	if (now.tm_sec != then.tm_sec) {
+		data->tim = t;
+		window_clock_draw_screen(wme);
+		wp->flags |= PANE_REDRAW;
+	}
+
+	window_clock_start_timer(wme);
 }
 
 static struct screen *
 window_clock_init(struct window_mode_entry *wme,
-    __unused struct cmd_find_state *fs, __unused struct args *args)
+    __unused struct cmdq_item *item, __unused struct cmd_find_state *fs,
+    __unused struct args *args)
 {
 	struct window_pane		*wp = wme->wp;
 	struct window_clock_mode_data	*data;
 	struct screen			*s;
-	struct timeval			 tv = { .tv_sec = 1 };
 
-	wme->data = data = xmalloc(sizeof *data);
+	wme->data = data = xcalloc(1, sizeof *data);
 	data->tim = time(NULL);
 
 	evtimer_set(&data->timer, window_clock_timer_callback, wme);
-	evtimer_add(&data->timer, &tv);
+	window_clock_start_timer(wme);
 
 	s = &data->screen;
 	screen_init(s, screen_size_x(&wp->base), screen_size_y(&wp->base), 0);
@@ -206,31 +224,46 @@ static void
 window_clock_draw_screen(struct window_mode_entry *wme)
 {
 	struct window_pane		*wp = wme->wp;
+	struct window			*w = wp->window;
 	struct window_clock_mode_data	*data = wme->data;
-	struct screen_write_ctx	 	 ctx;
+	struct screen_write_ctx		 ctx;
 	int				 colour, style;
 	struct screen			*s = &data->screen;
 	struct grid_cell		 gc;
+	struct format_tree		*ft;
 	char				 tim[64], *ptr;
+	const char			 *timeformat;
 	time_t				 t;
 	struct tm			*tm;
 	u_int				 i, j, x, y, idx;
 
-	colour = options_get_number(wp->window->options, "clock-mode-colour");
-	style = options_get_number(wp->window->options, "clock-mode-style");
+	ft = format_create_defaults(NULL, NULL, NULL, NULL, wp);
+	style_apply(&gc, w->options, "clock-mode-colour", ft);
+	format_free(ft);
+	colour = gc.fg;
+	style = options_get_number(w->options, "clock-mode-style");
 
 	screen_write_start(&ctx, s);
 
 	t = time(NULL);
 	tm = localtime(&t);
-	if (style == 0) {
-		strftime(tim, sizeof tim, "%l:%M ", localtime(&t));
+	if (style == 0 || style == 2) {
+		if (style == 2)
+			timeformat = "%l:%M:%S ";
+		else
+			timeformat = "%l:%M ";
+		strftime(tim, sizeof tim, timeformat, localtime(&t));
 		if (tm->tm_hour >= 12)
 			strlcat(tim, "PM", sizeof tim);
 		else
 			strlcat(tim, "AM", sizeof tim);
-	} else
-		strftime(tim, sizeof tim, "%H:%M", tm);
+	} else {
+		if (style == 3)
+			timeformat = "%H:%M:%S";
+		else
+			timeformat = "%H:%M";
+		strftime(tim, sizeof tim, timeformat, tm);
+	}
 
 	screen_write_clearscreen(&ctx, 8);
 
@@ -256,6 +289,7 @@ window_clock_draw_screen(struct window_mode_entry *wme)
 	memcpy(&gc, &grid_default_cell, sizeof gc);
 	gc.flags |= GRID_FLAG_NOPALETTE;
 	gc.bg = colour;
+	gc.fg = colour;
 	for (ptr = tim; *ptr != '\0'; ptr++) {
 		if (*ptr >= '0' && *ptr <= '9')
 			idx = *ptr - '0';
@@ -276,7 +310,7 @@ window_clock_draw_screen(struct window_mode_entry *wme)
 			for (i = 0; i < 5; i++) {
 				screen_write_cursormove(&ctx, x + i, y + j, 0);
 				if (window_clock_table[idx][j][i])
-					screen_write_putc(&ctx, &gc, ' ');
+					screen_write_putc(&ctx, &gc, '#');
 			}
 		}
 		x += 6;

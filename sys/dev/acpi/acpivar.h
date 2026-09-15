@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpivar.h,v 1.133 2024/08/06 17:38:56 kettenis Exp $	*/
+/*	$OpenBSD: acpivar.h,v 1.141 2026/03/11 16:18:42 kettenis Exp $	*/
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  *
@@ -43,8 +43,14 @@ extern int acpi_debug;
 #define dnprintf(n,x...)
 #endif
 
+#define ACPI_UUID(a, b, c, d, e) \
+    { (a), (a) >> 8, (a) >> 16, (a) >> 24, \
+      (b), (b) >> 8, (c), (c) >> 8, (d) >> 8, (d), \
+      (e) >> 40, (e) >> 32, (e) >> 24, (e) >> 16, (e) >> 8, (e) }
+
 extern int acpi_hasprocfvs;
 extern int acpi_haspci;
+extern int acpi_legacy_free;
 
 struct acpiec_softc;
 struct acpipwrres_softc;
@@ -248,6 +254,7 @@ struct acpi_softc {
 	}			sc_sleeptype[6];
 	int			sc_lastgpe;
 	int			sc_wakegpe;
+	int			sc_wakegpio;
 
 	struct gpe_block	*gpe_table;
 
@@ -265,7 +272,7 @@ struct acpi_softc {
 	struct aml_node		*sc_wak;
 	int			sc_state;
 	int			sc_wakeup;
-	time_t			sc_resume_time;
+	int			sc_wakeups;
 	struct acpiec_softc	*sc_ec;		/* XXX assume single EC */
 
 	struct acpi_ac_head	sc_ac;
@@ -288,6 +295,12 @@ struct acpi_softc {
 	void			(*sc_pmc_resume)(void *);
 	void			*sc_pmc_cookie;
 };
+
+#define WAKEGPE_NONE	-1
+#define WAKEGPE_PWRBTN	-2
+#define WAKEGPE_SLPBTN	-3
+#define WAKEGPE_RTC	-4
+#define WAKEGPE_GPIO	-5
 
 extern struct acpi_softc *acpi_softc;
 
@@ -312,6 +325,8 @@ int	 acpi_bus_space_map(bus_space_tag_t, bus_addr_t, bus_size_t, int,
 	     bus_space_handle_t *);
 void	 acpi_bus_space_unmap(bus_space_tag_t, bus_space_handle_t, bus_size_t);
 
+struct aml_node *acpi_pci_match(struct device *, struct pci_attach_args *);
+
 struct	 bios_attach_args;
 int	 acpi_probe(struct device *, struct cfdata *, struct bios_attach_args *);
 u_int	 acpi_checksum(const void *, size_t);
@@ -325,7 +340,6 @@ int	 acpi_sleep_cpu(struct acpi_softc *, int);
 void	 acpi_sleep_pm(struct acpi_softc *, int);
 void	 acpi_resume_pm(struct acpi_softc *, int);
 void	 acpi_resume_cpu(struct acpi_softc *, int);
-int	 acpi_resuming(struct acpi_softc *);
 
 #define ACPI_IOREAD 0
 #define ACPI_IOWRITE 1
@@ -377,7 +391,6 @@ int	acpi_record_event(struct acpi_softc *, u_int);
 void	acpi_addtask(struct acpi_softc *, void (*)(void *, int), void *, int);
 int	acpi_dotask(struct acpi_softc *);
 
-void	acpi_powerdown_task(void *, int);
 void	acpi_sleep_task(void *, int);
 
 /* Section 5.2.10.1: global lock acquire/release functions */

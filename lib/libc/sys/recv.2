@@ -1,4 +1,4 @@
-.\"	$OpenBSD: recv.2,v 1.51 2023/08/17 05:45:51 jmc Exp $
+.\"	$OpenBSD: recv.2,v 1.55 2026/08/26 00:31:26 jsg Exp $
 .\"	$NetBSD: recv.2,v 1.6 1995/02/27 12:36:08 cgd Exp $
 .\"
 .\" Copyright (c) 1983, 1990, 1991, 1993
@@ -30,7 +30,7 @@
 .\"
 .\"     @(#)recv.2	8.3 (Berkeley) 2/21/94
 .\"
-.Dd $Mdocdate: August 17 2023 $
+.Dd $Mdocdate: August 26 2026 $
 .Dt RECV 2
 .Os
 .Sh NAME
@@ -127,6 +127,8 @@ wait for full request or error
 don't block
 .It Dv MSG_CMSG_CLOEXEC
 set the close-on-exec flag on received file descriptors
+.It Dv MSG_CMSG_CLOFORK
+set the close-on-fork flag on received file descriptors
 .El
 .Pp
 The
@@ -158,12 +160,14 @@ is set to
 This flag is not available in strict ANSI or C99 compilation mode.
 The
 .Dv MSG_CMSG_CLOEXEC
-requests that any file descriptors received as ancillary data with
+and
+.Dv MSG_CMSG_CLOFORK
+flags request that any file descriptors received as ancillary data with
 .Fn recvmsg
 and
 .Fn recvmmsg
 (see below)
-have their close-on-exec flag set.
+have their close-on-exec flag or close-on-fork flag, respectively, set.
 .Pp
 The
 .Fn recvmsg
@@ -379,6 +383,8 @@ values in the
 .Fa msg_iov
 array overflowed an
 .Em ssize_t .
+.It Bq Er EPERM
+An unacceptable file descriptor type is received in ancillary data.
 .It Bq Er EMSGSIZE
 The
 .Fa msg_iovlen
@@ -412,7 +418,7 @@ The
 and
 .Fn recvmsg
 functions conform to
-.St -p1003.1-2008 .
+.St -p1003.1-2024 .
 The
 .Dv MSG_DONTWAIT ,
 .Dv MSG_BCAST ,
@@ -434,9 +440,9 @@ Calling
 with a control message having no or an empty scatter/gather array
 exposes variations in implementations.
 To avoid these, always use an
-.Fa iovec
+.Vt iovec
 with at least a one-byte buffer and set
 .Fa msg_iov
-and an
+and
 .Fa msg_iovlen
 to use this vector.

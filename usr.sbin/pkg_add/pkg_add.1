@@ -1,4 +1,4 @@
-.\"	$OpenBSD: pkg_add.1,v 1.167 2022/08/12 10:38:37 landry Exp $
+.\"	$OpenBSD: pkg_add.1,v 1.171 2026/06/24 01:33:18 afresh1 Exp $
 .\"
 .\" Documentation and design originally from FreeBSD. All the code has
 .\" been rewritten since. We keep the documentation's notice:
@@ -15,7 +15,7 @@
 .\" Jordan K. Hubbard
 .\"
 .\"
-.Dd $Mdocdate: August 12 2022 $
+.Dd $Mdocdate: June 24 2026 $
 .Dt PKG_ADD 1
 .Os
 .Sh NAME
@@ -104,12 +104,14 @@ The
 .Ar pkg-name ...
 specified on the command line are new packages that may require updating
 dependencies first.
-It is recommended to keep all packages in-synch
+It is recommended to update all packages
 with
 .Fl u
-whenever possible, but
+before installing a new package, but
 .Fl U
-can be much faster.
+can be much faster (at the risk of possibly leaving an inconsistent
+set of packages).
+Mainly for use with -current snapshots.
 .It
 Replace existing packages with explicit other versions, using option
 .Fl r .
@@ -140,9 +142,9 @@ Each package name may be specified as a filename (which normally consists of the
 package name itself plus the
 .Dq .tgz
 suffix) or a URL referring to FTP, HTTP, HTTPS, or SCP locations.
-If the given package names are not found in the current working directory,
 .Nm
-will search for them in each directory (local or remote) named by the
+will search for the given package names in each directory (local or
+remote) named by the
 .Ev TRUSTED_PKG_PATH
 environment variable,
 then the
@@ -159,13 +161,8 @@ nor
 are defined,
 .Nm
 will use
-.Sq ./:installpath
+.Sq installpath
 as a default.
-Specifying
-.Ql -
-as a package name causes
-.Nm
-to read from the standard input.
 .Pp
 .Nm
 also understands
@@ -288,7 +285,7 @@ dependencies with the list of packages left to install, then ask the
 user's opinion in interactive mode,
 then install default packages that satisfy the dependencies.
 .Pp
-.Sy Warning:
+.Sy Warning :
 Since
 .Nm
 may execute scripts or programs contained within a package file,
@@ -314,7 +311,7 @@ as the prefix to prepend to any object extracted from the package.
 .It Fl c
 While replacing packages, delete extra configuration file in the old package,
 mentioned as
-.Dl @extra file
+.Cm @extra
 in the packing-list.
 .It Fl D Ar name Ns Op = Ns Ar value
 Force installation of the package.
@@ -690,7 +687,9 @@ Dependencies from the old packages are adjusted to point to the correct new
 package.
 .El
 .Pp
-To update packages in -u mode,
+To update packages in
+.Fl u
+mode,
 .Nm
 performs the following steps.
 .Bl -enum

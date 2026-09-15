@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.6 2023/11/11 18:35:40 robert Exp $
+# $OpenBSD: Makefile,v 1.8 2026/05/29 11:18:31 robert Exp $
 
 LIB=	lldbTarget
 NOPIC=
@@ -9,6 +9,7 @@ NOPROFILE=
 SRCS=	ABI.cpp \
 	AssertFrameRecognizer.cpp \
 	DynamicRegisterInfo.cpp \
+	CoreFileMemoryRanges.cpp \
 	ExecutionContext.cpp \
 	InstrumentationRuntime.cpp \
 	InstrumentationRuntimeStopInfo.cpp \
@@ -31,10 +32,14 @@ SRCS=	ABI.cpp \
 	QueueList.cpp \
 	RegisterContext.cpp \
 	RegisterContextUnwind.cpp \
+	RegisterFlags.cpp \
 	RegisterNumber.cpp \
 	RemoteAwarePlatform.cpp \
+	ScriptedThreadPlan.cpp \
+	SyntheticFrameProvider.cpp \
 	SectionLoadHistory.cpp \
 	SectionLoadList.cpp \
+	BorrowedStackFrame.cpp \
 	StackFrame.cpp \
 	StackFrameList.cpp \
 	StackFrameRecognizer.cpp \
@@ -54,8 +59,8 @@ SRCS=	ABI.cpp \
 	ThreadPlanCallFunctionUsingABI.cpp \
 	ThreadPlanCallOnFunctionExit.cpp \
 	ThreadPlanCallUserExpression.cpp \
-	ThreadPlanPython.cpp \
 	ThreadPlanRunToAddress.cpp \
+	ThreadPlanSingleThreadTimeout.cpp \
 	ThreadPlanShouldStopHere.cpp \
 	ThreadPlanStepInRange.cpp \
 	ThreadPlanStepInstruction.cpp \

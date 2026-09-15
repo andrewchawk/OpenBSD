@@ -1,4 +1,4 @@
-/* $OpenBSD: interrupt.c,v 1.41 2022/12/10 15:02:29 cheloha Exp $ */
+/* $OpenBSD: interrupt.c,v 1.46 2026/03/08 17:07:31 deraadt Exp $ */
 /* $NetBSD: interrupt.c,v 1.46 2000/06/03 20:47:36 thorpej Exp $ */
 
 /*-
@@ -184,7 +184,7 @@ scb_free(u_long vec)
 	    (vec & (SCB_VECSIZE - 1)) != 0)
 		panic("scb_free: bad vector 0x%lx", vec);
 
-	idx = SCB_VECTOIDX(vec - SCB_IOVECBASE); 
+	idx = SCB_VECTOIDX(vec - SCB_IOVECBASE);
 
 	if (scb_iovectab[idx].scb_func == scb_stray)
 		panic("scb_free: vector 0x%lx is empty", vec);
@@ -204,7 +204,7 @@ interrupt(unsigned long a0, unsigned long a1, unsigned long a2,
 	switch (a0) {
 	case ALPHA_INTR_XPROC:	/* interprocessor interrupt */
 #if defined(MULTIPROCESSOR)
-		atomic_add_ulong(&ci->ci_intrdepth, 1);
+		atomic_add_ulong(&ci->ci_idepth, 1);
 
 		alpha_ipi_process(ci, framep);
 
@@ -216,14 +216,14 @@ interrupt(unsigned long a0, unsigned long a1, unsigned long a2,
 		    hwrpb->rpb_txrdy != 0)
 			cpu_iccb_receive();
 
-		atomic_sub_ulong(&ci->ci_intrdepth, 1);
+		atomic_sub_ulong(&ci->ci_idepth, 1);
 #else
 		printf("WARNING: received interprocessor interrupt!\n");
 #endif /* MULTIPROCESSOR */
 		break;
 		
 	case ALPHA_INTR_CLOCK:	/* clock interrupt */
-		atomic_add_int(&uvmexp.intrs, 1);
+		atomic_inc_int(&uvmexp.intrs);
 		if (CPU_IS_PRIMARY(ci))
 			clk_count.ec_count++;
 		if (platform.clockintr)
@@ -231,13 +231,13 @@ interrupt(unsigned long a0, unsigned long a1, unsigned long a2,
 		break;
 
 	case ALPHA_INTR_ERROR:	/* Machine Check or Correctable Error */
-		atomic_add_ulong(&ci->ci_intrdepth, 1);
+		atomic_add_ulong(&ci->ci_idepth, 1);
 		a0 = alpha_pal_rdmces();
 		if (platform.mcheck_handler)
 			(*platform.mcheck_handler)(a0, framep, a1, a2);
 		else
 			machine_check(a0, framep, a1, a2);
-		atomic_sub_ulong(&ci->ci_intrdepth, 1);
+		atomic_sub_ulong(&ci->ci_idepth, 1);
 		break;
 
 	case ALPHA_INTR_DEVICE:	/* I/O device interrupt */
@@ -246,11 +246,11 @@ interrupt(unsigned long a0, unsigned long a1, unsigned long a2,
 
 		KDASSERT(a1 >= SCB_IOVECBASE && a1 < SCB_SIZE);
 
-		atomic_add_ulong(&ci->ci_intrdepth, 1);
-		atomic_add_int(&uvmexp.intrs, 1);
+		atomic_add_ulong(&ci->ci_idepth, 1);
+		atomic_inc_int(&uvmexp.intrs);
 		scb = &scb_iovectab[SCB_VECTOIDX(a1 - SCB_IOVECBASE)];
 		(*scb->scb_func)(scb->scb_arg, a1);
-		atomic_sub_ulong(&ci->ci_intrdepth, 1);
+		atomic_sub_ulong(&ci->ci_idepth, 1);
 		break;
 	    }
 
@@ -312,7 +312,7 @@ machine_check(unsigned long mces, struct trapframe *framep,
 
 	/* Processor correctable errors. */
 	if (mces & ALPHA_MCES_PCE)
-		printf("Warning: received processor correctable error.\n"); 
+		printf("Warning: received processor correctable error.\n");
 
 	/* Clear pending machine checks and correctable errors */
 	alpha_pal_wrmces(mces);
@@ -422,37 +422,14 @@ badaddr_read(void *addr, size_t size, void *rptr)
 
 #endif	/* NAPECS > 0 || NCIA > 0 || NLCA > 0 || NTCASIC > 0 */
 
-struct alpha_soft_intr alpha_soft_intrs[SI_NSOFT];
-
 /*
- * softintr_init:
- *
- *	Initialize the software interrupt system.
- */
-void
-softintr_init()
-{
-	struct alpha_soft_intr *asi;
-	int i;
-
-	for (i = 0; i < SI_NSOFT; i++) {
-		asi = &alpha_soft_intrs[i];
-		TAILQ_INIT(&asi->softintr_q);
-		mtx_init(&asi->softintr_mtx, IPL_HIGH);
-		asi->softintr_siq = i;
-	}
-}
-
-/*
- * softintr_dispatch:
+ * dosoftint:
  *
  *	Process pending software interrupts.
  */
 void
-softintr_dispatch()
+dosoftint(void)
 {
-	struct alpha_soft_intr *asi;
-	struct alpha_soft_intrhand *sih;
 	u_int64_t n, i;
 
 #if defined(MULTIPROCESSOR)
@@ -460,124 +437,17 @@ softintr_dispatch()
 #endif
 
 	while ((n = atomic_loadlatch_ulong(&ssir, 0)) != 0) {
-		for (i = 0; i < SI_NSOFT; i++) {
+		for (i = 0; i < NSOFTINTR; i++) {
 			if ((n & (1 << i)) == 0)
 				continue;
-	
-			asi = &alpha_soft_intrs[i];
 
-			for (;;) {
-				mtx_enter(&asi->softintr_mtx);
-
-				sih = TAILQ_FIRST(&asi->softintr_q);
-				if (sih == NULL) {
-					mtx_leave(&asi->softintr_mtx);
-					break;
-				}
-				TAILQ_REMOVE(&asi->softintr_q, sih, sih_q);
-				sih->sih_pending = 0;
-
-				atomic_add_int(&uvmexp.softs, 1);
-
-				mtx_leave(&asi->softintr_mtx);
-
-				(*sih->sih_fn)(sih->sih_arg);
-			}
+			softintr_dispatch(i);
 		}
 	}
 
 #if defined(MULTIPROCESSOR)
 	__mp_unlock(&kernel_lock);
 #endif
-}
-
-static int
-ipl2si(int ipl)
-{
-	int si;
-
-	switch (ipl) {
-	case IPL_TTY:			/* XXX */
-	case IPL_SOFTSERIAL:
-		si = SI_SOFTSERIAL;
-		break;
-	case IPL_SOFTNET:
-		si = SI_SOFTNET;
-		break;
-	case IPL_SOFTCLOCK:
-		si = SI_SOFTCLOCK;
-		break;
-	case IPL_SOFT:
-		si = SI_SOFT;
-		break;
-	default:
-		panic("ipl2si: %d", ipl);
-	}
-	return si;
-}
-
-/*
- * softintr_establish:		[interface]
- *
- *	Register a software interrupt handler.
- */
-void *
-softintr_establish(int ipl, void (*func)(void *), void *arg)
-{
-	struct alpha_soft_intr *asi;
-	struct alpha_soft_intrhand *sih;
-	int si;
-
-	si = ipl2si(ipl);
-	asi = &alpha_soft_intrs[si];
-
-	sih = malloc(sizeof(*sih), M_DEVBUF, M_NOWAIT);
-	if (__predict_true(sih != NULL)) {
-		sih->sih_intrhead = asi;
-		sih->sih_fn = func;
-		sih->sih_arg = arg;
-		sih->sih_pending = 0;
-	}
-	return (sih);
-}
-
-/*
- * softintr_disestablish:	[interface]
- *
- *	Unregister a software interrupt handler.
- */
-void
-softintr_disestablish(void *arg)
-{
-	struct alpha_soft_intrhand *sih = arg;
-	struct alpha_soft_intr *asi = sih->sih_intrhead;
-
-	mtx_enter(&asi->softintr_mtx);
-	if (sih->sih_pending) {
-		TAILQ_REMOVE(&asi->softintr_q, sih, sih_q);
-		sih->sih_pending = 0;
-	}
-	mtx_leave(&asi->softintr_mtx);
-
-	free(sih, M_DEVBUF, sizeof *sih);
-}
-
-/*
- * Schedule a software interrupt.
-*/
-void
-softintr_schedule(void *arg)
-{
-	struct alpha_soft_intrhand *sih = arg;
-	struct alpha_soft_intr *si = sih->sih_intrhead;
-
-	mtx_enter(&si->softintr_mtx);
-	if (sih->sih_pending == 0) {
-		TAILQ_INSERT_TAIL(&si->softintr_q, sih, sih_q);
-		sih->sih_pending = 1;
-		setsoft(si->softintr_siq);
-	}
-	mtx_leave(&si->softintr_mtx);
 }
 
 void

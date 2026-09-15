@@ -1,6 +1,7 @@
-/* $OpenBSD: main.c,v 1.265 2024/03/29 01:16:30 millert Exp $ */
+/* $OpenBSD: main.c,v 1.273 2026/09/02 12:30:19 schwarze Exp $ */
 /*
- * Copyright (c) 2010-2012, 2014-2021 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010-2012, 2014-2021, 2025, 2026
+ *               Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2008-2012 Kristaps Dzonsons <kristaps@bsd.lv>
  * Copyright (c) 2010 Joerg Sonnenberger <joerg@netbsd.org>
  *
@@ -31,6 +32,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <limits.h>
+#include <paths.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -83,6 +85,8 @@ enum	outt {
 struct	outstate {
 	struct tag_files *tag_files;	/* Tagging state variables. */
 	void		 *outdata;	/* data for output */
+	char		**argv;		/* Pager and arguments. */
+	int		  argc;		/* Number of pager arguments. */
 	int		  use_pager;
 	int		  wstop;	/* stop after a file with a warning */
 	int		  had_output;	/* Some output was generated. */
@@ -92,7 +96,7 @@ struct	outstate {
 
 int			  mandocdb(int, char *[]);
 
-static	void		  check_xr(struct manpaths *);
+static	void		  check_xr(struct manpaths *, int);
 static	void		  fs_append(char **, size_t, int,
 				size_t, const char *, enum form,
 				struct manpage **, size_t *);
@@ -105,12 +109,13 @@ static	int		  fs_search(const struct mansearch *,
 static	void		  glob_esc(char **, const char *, const char *);
 static	void		  outdata_alloc(struct outstate *, struct manoutput *);
 static	void		  parse(struct mparse *, int, const char *,
-				struct outstate *, struct manconf *);
+				struct outstate *, struct manconf *, int);
 static	void		  passthrough(int, int);
 static	void		  process_onefile(struct mparse *, struct manpage *,
-				int, struct outstate *, struct manconf *);
+				struct outstate *, struct manconf *, int);
 static	void		  run_pager(struct outstate *, char *);
 static	pid_t		  spawn_pager(struct outstate *, char *);
+static	int		  unveil_pager(struct outstate *);
 static	void		  usage(enum argmode) __attribute__((__noreturn__));
 static	int		  woptions(char *, enum mandoc_os *, int *);
 
@@ -142,8 +147,8 @@ main(int argc, char *argv[])
 	size_t		 i, ib, ssz;
 	int		 options;	/* Parser options. */
 	int		 show_usage;	/* Invalid argument: give up. */
+	int		 startdir;	/* File descriptor for check_xr(). */
 	int		 prio, best_prio;
-	int		 startdir;
 	int		 c;
 	enum mandoc_os	 os_e;		/* Check base system conventions. */
 	enum outmode	 outmode;	/* According to command line. */
@@ -153,11 +158,6 @@ main(int argc, char *argv[])
 	if (strncmp(progname, "mandocdb", 8) == 0 ||
 	    strcmp(progname, BINM_MAKEWHATIS) == 0)
 		return mandocdb(argc, argv);
-
-	if (pledge("stdio rpath wpath cpath tmppath tty proc exec", NULL) == -1) {
-		mandoc_msg(MANDOCERR_PLEDGE, 0, 0, "%s", strerror(errno));
-		return mandoc_msg_getrc();
-	}
 
 	/* Search options. */
 
@@ -372,13 +372,106 @@ main(int argc, char *argv[])
 			conf.output.indent = 3;
 	}
 
-	if (outst.use_pager == 0)
+	/*
+	 * Parse the configuration file before the first unveil(2)
+	 * because it requires realpath(3) on the manpath directories.
+	 * Operating-system specific .Xr validation additionally
+	 * requires a separate base system manpath.
+	 */
+
+	manconf_parse(&conf, conf_file, defpaths, auxpaths);
+	if (mandoc_msg_getmin() < MANDOCERR_STYLE)
+		manpath_base(&conf.basepath);
+
+	/*
+	 * Figure out access to the pager executable first, before any
+	 * other unveil(2), because this requires testing with access(2).
+	 */
+	if (outst.use_pager &&
+	    conf.output.outfilename == NULL &&
+	    conf.output.tagfilename == NULL &&
+	    unveil_pager(&outst) == -1)
+		return mandoc_msg_getrc();
+
+	/*
+	 * Restrict file system access.  If using mandoc.db(5),
+	 * allow reading from all user-specified manpaths.
+	 * For operating-system specific .Xr validation, allow
+	 * reading from the base system directories even when
+	 * those aren't included in the user-specified manpath.
+	 */
+
+	if ((search.argmode != ARG_FILE ||
+	     mandoc_msg_getmin() < MANDOCERR_WARNING) &&
+	    manpath_unveil(&conf.manpath, 0) == -1)
+		return mandoc_msg_getrc();
+	if (mandoc_msg_getmin() < MANDOCERR_STYLE &&
+	    manpath_unveil(&conf.basepath, 0) == -1)
+		return mandoc_msg_getrc();
+
+	/*
+	 * For man -l and mandoc, allow read access to the whole file system.
+	 * Do not attempt to unveil command line arguments individually
+	 * because having many of them is a legitimate use case.
+	 */
+
+	if (search.argmode == ARG_FILE) {
+		if (unveil("/", "r") == -1) {
+			mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "/: %s",
+			    strerror(errno));
+			return mandoc_msg_getrc();
+		}
+	}
+
+	/*
+	 * For the -T locale and -T utf8 output formats,
+	 * setlocale(3) needs to read locale configuration files.
+	 */
+
+	if (outst.outtype == OUTT_LOCALE || outst.outtype == OUTT_UTF8) {
+		if (unveil(_PATH_LOCALE, "r") == -1) {
+			mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+			    _PATH_LOCALE, strerror(errno));
+			return mandoc_msg_getrc();
+		}
+	}
+
+	/* Set up output files, including temporary ones. */
+
+	if (outst.use_pager) {
+		if (conf.output.outfilename == NULL ||
+		    conf.output.tagfilename == NULL) {
+			if (unveil("/tmp", "rwc") == -1) {
+				mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+				    "/tmp", strerror(errno));
+				return mandoc_msg_getrc();
+			}
+		}
+		if (conf.output.outfilename != NULL) {
+			if (unveil(conf.output.outfilename, "wc") == -1) {
+				mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+				    conf.output.outfilename, strerror(errno));
+				return mandoc_msg_getrc();
+			}
+		}
+		if (conf.output.tagfilename != NULL) {
+			if (unveil(conf.output.tagfilename, "wc") == -1) {
+				mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+				    conf.output.tagfilename, strerror(errno));
+				return mandoc_msg_getrc();
+			}
+		}
+		outst.tag_files = term_tag_init(conf.output.outfilename,
+		    outst.outtype == OUTT_HTML ? ".html" : "",
+		    conf.output.tagfilename);
+	}
+
+	/* Restrict access to system calls. */
+
+	if (outst.use_pager == 0)  /* Needed to read manuals. */
 		c = pledge("stdio rpath", NULL);
-	else if (conf.output.outfilename != NULL ||
-	    conf.output.tagfilename != NULL)
-		c = pledge("stdio rpath wpath cpath", NULL);
-	else
-		c = pledge("stdio rpath tmppath tty proc exec", NULL);
+	else	/* Needed for spawn_pager() and term_tag_unlink(). */
+		c = pledge("stdio rpath cpath tty proc exec", NULL);
 	if (c == -1) {
 		mandoc_msg(MANDOCERR_PLEDGE, 0, 0, "%s", strerror(errno));
 		return mandoc_msg_getrc();
@@ -430,12 +523,6 @@ main(int argc, char *argv[])
 		conf.output.tag = tagarg == NULL ? *argv : tagarg + 1;
 	}
 
-	/* Read the configuration file. */
-
-	if (search.argmode != ARG_FILE ||
-	    mandoc_msg_getmin() == MANDOCERR_STYLE)
-		manconf_parse(&conf, conf_file, defpaths, auxpaths);
-
 	/* man(1): Resolve each name individually. */
 
 	if (search.argmode == ARG_NAME) {
@@ -459,7 +546,7 @@ main(int argc, char *argv[])
 			if (resnsz == 0)
 				(void)fs_search(&search, &conf.manpath,
 				    *argv, &resn, &resnsz);
-			if (resnsz == 0 && strchr(*argv, '/') == NULL) {
+			if (resnsz == 0) {
 				if (search.arch != NULL &&
 				    arch_valid(search.arch, OSENUM) == 0)
 					warnx("Unknown architecture \"%s\".",
@@ -473,20 +560,6 @@ main(int argc, char *argv[])
 					    "the manual.", *argv);
 				mandoc_msg_setrc(MANDOCLEVEL_BADARG);
 				continue;
-			}
-			if (resnsz == 0) {
-				if (access(*argv, R_OK) == -1) {
-					mandoc_msg_setinfilename(*argv);
-					mandoc_msg(MANDOCERR_BADARG_BAD,
-					    0, 0, "%s", strerror(errno));
-					mandoc_msg_setinfilename(NULL);
-					continue;
-				}
-				resnsz = 1;
-				resn = mandoc_calloc(resnsz, sizeof(*res));
-				resn->file = mandoc_strdup(*argv);
-				resn->ipath = SIZE_MAX;
-				resn->form = FORM_SRC;
 			}
 			if (outmode != OUTMODE_ONE || resnsz == 1) {
 				res = mandoc_reallocarray(res,
@@ -593,23 +666,39 @@ main(int argc, char *argv[])
 	mchars_alloc();
 	mp = mparse_alloc(options, os_e, os_s);
 
-	/*
-	 * Remember the original working directory, if possible.
-	 * This will be needed if some names on the command line
-	 * are page names and some are relative file names.
-	 * Do not error out if the current directory is not
-	 * readable: Maybe it won't be needed after all.
-	 */
-	startdir = open(".", O_RDONLY | O_DIRECTORY);
+	startdir = -1;
+	if (search.argmode == ARG_FILE &&
+	    mandoc_msg_getmin() < MANDOCERR_WARNING &&
+	    (startdir = open(".", O_RDONLY | O_DIRECTORY)) == -1) 
+		mandoc_msg(MANDOCERR_OPEN, 0, 0,
+		    "initial working directory: %s", strerror(errno));
+
 	for (i = 0; i < ressz; i++) {
-		process_onefile(mp, res + i, startdir, &outst, &conf);
+		if (i > 0)
+			mparse_reset(mp);
+
+		/*
+		 * Outside ARG_FILE mode, change to the manpath
+		 * such that roff(7) .so requests work.
+		 * In ARG_FILE mode, command line arguments may be
+		 * relative file names, so return to the initial
+		 * working directory if check_xr() is in use.
+		 * Do this on a best-effort basis.  Even in case
+		 * of failure, some functionality may still work.
+		 */
+
+		if (res[i].ipath != SIZE_MAX) 
+			(void)chdir(conf.manpath.paths[res[i].ipath]);
+		else if (startdir != -1)
+			(void)fchdir(startdir);
+
+		process_onefile(mp, res + i, &outst, &conf, startdir);
 		if (outst.wstop && mandoc_msg_getrc() != MANDOCLEVEL_OK)
 			break;
 	}
-	if (startdir != -1) {
-		(void)fchdir(startdir);
+	if (startdir != -1)
 		close(startdir);
-	}
+
 	if (conf.output.tag != NULL && conf.output.tag_found == 0) {
 		mandoc_msg(MANDOCERR_TAG, 0, 0, "%s", conf.output.tag);
 		conf.output.tag = NULL;
@@ -644,7 +733,8 @@ out:
 	if (outst.tag_files != NULL) {
 		if (term_tag_close() != -1 &&
 		    conf.output.outfilename == NULL &&
-		    conf.output.tagfilename == NULL)
+		    conf.output.tagfilename == NULL &&
+		    ressz > 0)
 			run_pager(&outst, conf.output.tag);
 		term_tag_unlink();
 	} else if (outst.had_output && outst.outtype != OUTT_LINT)
@@ -808,16 +898,21 @@ fs_lookup(const struct manpaths *paths, size_t ipath,
 	return globres;
 
 found:
-	warnx("outdated mandoc.db lacks %s(%s) entry, run %s %s",
-	    name, sec, BINM_MAKEWHATIS, paths->paths[ipath]);
 	if (res == NULL)
 		free(file);
 	else if (file == NULL)
 		fs_append(globinfo.gl_pathv, globinfo.gl_pathc, 1,
 		    ipath, sec, form, res, ressz);
-	else
+	else	/* Transfer ownership of file to res. */
 		fs_append(&file, 1, 0, ipath, sec, form, res, ressz);
 	globfree(&globinfo);
+
+	mandoc_asprintf(&file, "%s/%s", paths->paths[ipath], MANDOC_DB);
+	if (stat(file, &sb) != -1)
+		warnx("outdated %s lacks %s(%s) entry, run %s %s",
+		    MANDOC_DB, name, sec,
+		    BINM_MAKEWHATIS, paths->paths[ipath]);
+	free(file);
 	return 0;
 }
 
@@ -852,20 +947,10 @@ fs_search(const struct mansearch *cfg, const struct manpaths *paths,
 }
 
 static void
-process_onefile(struct mparse *mp, struct manpage *resp, int startdir,
-    struct outstate *outst, struct manconf *conf)
+process_onefile(struct mparse *mp, struct manpage *resp,
+    struct outstate *outst, struct manconf *conf, int startdir)
 {
 	int	 fd;
-
-	/*
-	 * Changing directories is not needed in ARG_FILE mode.
-	 * Do it on a best-effort basis.  Even in case of
-	 * failure, some functionality may still work.
-	 */
-	if (resp->ipath != SIZE_MAX)
-		(void)chdir(conf->manpath.paths[resp->ipath]);
-	else if (startdir != -1)
-		(void)fchdir(startdir);
 
 	mandoc_msg_setinfilename(resp->file);
 	if (resp->file != NULL) {
@@ -879,19 +964,6 @@ process_onefile(struct mparse *mp, struct manpage *resp, int startdir,
 	} else
 		fd = STDIN_FILENO;
 
-	if (outst->use_pager) {
-		outst->use_pager = 0;
-		outst->tag_files = term_tag_init(conf->output.outfilename,
-		    outst->outtype == OUTT_HTML ? ".html" : "",
-		    conf->output.tagfilename);
-		if ((conf->output.outfilename != NULL ||
-		     conf->output.tagfilename != NULL) &&
-		    pledge("stdio rpath cpath", NULL) == -1) {
-			mandoc_msg(MANDOCERR_PLEDGE, 0, 0,
-			    "%s", strerror(errno));
-			exit(mandoc_msg_getrc());
-		}
-	}
 	if (outst->had_output && outst->outtype <= OUTT_UTF8) {
 		if (outst->outdata == NULL)
 			outdata_alloc(outst, &conf->output);
@@ -899,7 +971,7 @@ process_onefile(struct mparse *mp, struct manpage *resp, int startdir,
 	}
 
 	if (resp->form == FORM_SRC)
-		parse(mp, fd, resp->file, outst, conf);
+		parse(mp, fd, resp->file, outst, conf, startdir);
 	else {
 		passthrough(fd, conf->output.synopsisonly);
 		outst->had_output = 1;
@@ -920,20 +992,13 @@ process_onefile(struct mparse *mp, struct manpage *resp, int startdir,
 
 static void
 parse(struct mparse *mp, int fd, const char *file,
-    struct outstate *outst, struct manconf *conf)
+    struct outstate *outst, struct manconf *conf, int startdir)
 {
-	static struct manpaths	 basepaths;
-	static int		 previous;
 	struct roff_meta	*meta;
 
 	assert(fd >= 0);
 	if (file == NULL)
 		file = "<stdin>";
-
-	if (previous)
-		mparse_reset(mp);
-	else
-		previous = 1;
 
 	mparse_readfd(mp, fd, file);
 	if (fd != STDIN_FILENO)
@@ -1013,15 +1078,13 @@ parse(struct mparse *mp, int fd, const char *file,
 		conf->output.tag_found = 1;
 
 	if (mandoc_msg_getmin() < MANDOCERR_STYLE) {
-		if (basepaths.sz == 0)
-			manpath_base(&basepaths);
-		check_xr(&basepaths);
+		check_xr(&conf->basepath, startdir);
 	} else if (mandoc_msg_getmin() < MANDOCERR_WARNING)
-		check_xr(&conf->manpath);
+		check_xr(&conf->manpath, startdir);
 }
 
 static void
-check_xr(struct manpaths *paths)
+check_xr(struct manpaths *paths, int startdir)
 {
 	struct mansearch	 search;
 	struct mandoc_xr	*xr;
@@ -1037,6 +1100,8 @@ check_xr(struct manpaths *paths)
 		search.firstmatch = 1;
 		if (mansearch(&search, paths, 1, &xr->name, NULL, &sz))
 			continue;
+		if (startdir != -1)
+			(void)fchdir(startdir);
 		if (fs_search(&search, paths, xr->name, NULL, &sz) != -1)
 			continue;
 		if (xr->count == 1)
@@ -1197,6 +1262,85 @@ woptions(char *arg, enum mandoc_os *os_e, int *wstop)
 	return 0;
 }
 
+static int
+unveil_pager(struct outstate *outst)
+{
+	const char	*cp, *pager;
+	char		*cmd, *dir, *path;
+	size_t		 len;
+	int		 i;
+
+	pager = getenv("MANPAGER");
+	if (pager == NULL || *pager == '\0')
+		pager = getenv("PAGER");
+	if (pager == NULL || *pager == '\0')
+		pager = "less";
+
+	/* Count the arguments on the pager command line. */
+
+	outst->argc = 0;
+	cp = pager;
+	while (*cp != '\0') {
+		len = strcspn(cp, " ");
+		outst->argc++;
+		cp += len;
+		while (*cp == ' ')
+			cp++;
+	}
+
+	/*
+	 * Allocate the pager command line.
+	 * The six additional pointers are:
+	 * -T tagfilename  -t tag_target  outfilename NULL
+	 */
+
+	outst->argv = mandoc_calloc(outst->argc + 6, sizeof(char *));
+	i = 0;
+	cp = pager;
+	while (*cp != '\0') {
+		len = strcspn(cp, " ");
+		outst->argv[i++] = mandoc_strndup(cp, len);
+		cp += len;
+		while (*cp == ' ')
+			cp++;
+	}
+	outst->argv[i] = NULL;
+	assert(i == outst->argc);
+
+	/* Use the PATH to find the pager executable. */
+
+	if (outst->argv[0][0] != '/') {
+		if ((path = getenv("PATH")) == NULL || *path == '\0') {
+			mandoc_msg(MANDOCERR_PATH, 0, 0,
+			    "cannot search for \"%s\" in empty PATH",
+			    outst->argv[0]);
+			return -1;
+		}
+		path = mandoc_strdup(path);
+		for (dir = strtok(path, ":"); dir; dir = strtok(NULL, ":")) {
+			mandoc_asprintf(&cmd, "%s/%s", dir, outst->argv[0]);
+			if (access(cmd, X_OK) == 0) {
+				free(outst->argv[0]);
+				outst->argv[0] = cmd;
+				break;
+			}
+			free(cmd);
+		}
+		free(path);
+	}
+	if (outst->argv[0][0] != '/') {
+		mandoc_msg(MANDOCERR_PATH, 0, 0,
+		    "pager \"%s\" not found in PATH", outst->argv[0]);
+		return -1;
+	}
+	if (unveil(outst->argv[0], "x") == -1) {
+		mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+		    outst->argv[0], strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 /*
  * Wait until moved to the foreground,
  * then fork the pager and wait for the user to close it.
@@ -1259,63 +1403,44 @@ static pid_t
 spawn_pager(struct outstate *outst, char *tag_target)
 {
 	const struct timespec timeout = { 0, 100000000 };  /* 0.1s */
-#define MAX_PAGER_ARGS 16
-	char		*argv[MAX_PAGER_ARGS];
-	const char	*pager;
 	char		*cp;
-	size_t		 wordlen;
 	size_t		 cmdlen;
-	int		 argc, use_ofn;
+	int		 use_ofn;
 	pid_t		 pager_pid;
 
 	assert(outst->tag_files->ofd == -1);
 	assert(outst->tag_files->tfs == NULL);
 
-	pager = getenv("MANPAGER");
-	if (pager == NULL || *pager == '\0')
-		pager = getenv("PAGER");
-	if (pager == NULL || *pager == '\0')
-		pager = "less";
-
-	/*
-	 * Parse the pager command into words.
-	 * Intentionally do not do anything fancy here.
-	 */
-
-	argc = 0;
-	while (*pager != '\0' && argc + 5 < MAX_PAGER_ARGS) {
-		wordlen = strcspn(pager, " ");
-		argv[argc++] = mandoc_strndup(pager, wordlen);
-		pager += wordlen;
-		while (*pager == ' ')
-			pager++;
-	}
-
 	/* For more(1) and less(1), use the tag file. */
 
 	use_ofn = 1;
 	if (*outst->tag_files->tfn != '\0' &&
-	    (cmdlen = strlen(argv[0])) >= 4) {
-		cp = argv[0] + cmdlen - 4;
+	    (cmdlen = strlen(outst->argv[0])) >= 4) {
+		cp = outst->argv[0] + cmdlen - 4;
 		if (strcmp(cp, "less") == 0 || strcmp(cp, "more") == 0) {
-			argv[argc++] = mandoc_strdup("-T");
-			argv[argc++] = mandoc_strdup(outst->tag_files->tfn);
+			outst->argv[outst->argc++] = mandoc_strdup("-T");
+			outst->argv[outst->argc++] =
+			    mandoc_strdup(outst->tag_files->tfn);
 			if (tag_target != NULL) {
-				argv[argc++] = mandoc_strdup("-t");
-				argv[argc++] = mandoc_strdup(tag_target);
+				outst->argv[outst->argc++] =
+				    mandoc_strdup("-t");
+				outst->argv[outst->argc++] =
+				    mandoc_strdup(tag_target);
 				use_ofn = 0;
 			}
 		}
 	}
 	if (use_ofn) {
 		if (outst->outtype == OUTT_HTML && tag_target != NULL)
-			mandoc_asprintf(&argv[argc], "file://%s#%s",
-			    outst->tag_files->ofn, tag_target);
+			mandoc_asprintf(&outst->argv[outst->argc],
+			    "file://%s#%s", outst->tag_files->ofn,
+			    tag_target);
 		else
-			argv[argc] = mandoc_strdup(outst->tag_files->ofn);
-		argc++;
+			outst->argv[outst->argc] =
+			    mandoc_strdup(outst->tag_files->ofn);
+		outst->argc++;
 	}
-	argv[argc] = NULL;
+	outst->argv[outst->argc] = NULL;
 
 	switch (pager_pid = fork()) {
 	case -1:
@@ -1324,11 +1449,13 @@ spawn_pager(struct outstate *outst, char *tag_target)
 	case 0:
 		break;
 	default:
-		while (argc > 0)
-			free(argv[--argc]);
+		while (outst->argc > 0)
+			free(outst->argv[--outst->argc]);
 		(void)setpgid(pager_pid, 0);
 		(void)tcsetpgrp(STDOUT_FILENO, pager_pid);
-		if (pledge("stdio rpath tmppath tty proc", NULL) == -1) {
+
+		/* Needed for term_tag_unlink(). */
+		if (pledge("stdio cpath tty proc", NULL) == -1) {
 			mandoc_msg(MANDOCERR_PLEDGE, 0, 0,
 			    "%s", strerror(errno));
 			exit(mandoc_msg_getrc());
@@ -1345,7 +1472,8 @@ spawn_pager(struct outstate *outst, char *tag_target)
 	while (tcgetpgrp(STDOUT_FILENO) != getpid())
 		nanosleep(&timeout, NULL);
 
-	execvp(argv[0], argv);
-	mandoc_msg(MANDOCERR_EXEC, 0, 0, "%s: %s", argv[0], strerror(errno));
+	execv(outst->argv[0], outst->argv);
+	mandoc_msg(MANDOCERR_EXEC, 0, 0, "%s: %s",
+	    outst->argv[0], strerror(errno));
 	_exit(mandoc_msg_getrc());
 }

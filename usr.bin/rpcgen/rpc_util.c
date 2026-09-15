@@ -1,4 +1,4 @@
-/*	$OpenBSD: rpc_util.c,v 1.17 2015/08/20 22:32:41 deraadt Exp $	*/
+/*	$OpenBSD: rpc_util.c,v 1.18 2026/04/17 06:24:34 renaud Exp $	*/
 /*	$NetBSD: rpc_util.c,v 1.6 1995/08/29 23:05:57 cgd Exp $	*/
 
 /*
@@ -234,6 +234,8 @@ locase(str)
 	static char buf[100];
 	char *p = buf;
 
+	if (strnlen(str, sizeof(buf)) >= sizeof(buf))
+		error("identifier too long");
 	while ((c = *str++))
 		*p++ = (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
 	*p = 0;

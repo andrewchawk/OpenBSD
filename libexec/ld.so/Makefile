@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.88 2024/04/05 13:51:47 deraadt Exp $
+#	$OpenBSD: Makefile,v 1.90 2026/06/30 19:18:53 kettenis Exp $
 
 SUBDIR=ldconfig ldd
 MAN=	ld.so.1
@@ -27,10 +27,16 @@ SRCS+=	path.c util.c sod.c strsep.c strtol.c dir.c library_subr.c
 SRCS+=	dl_uname.c dl_dirname.c strlcat.c strlen.c trace.c
 SRCS+=	malloc.c reallocarray.c tib.c ffs.c
 
+.include "${.CURDIR}/${MACHINE_CPU}/Makefile.inc"
+
 syscall=close exit fstat getdents getentropy getthrid issetugid kbind \
 	mimmutable mmap mprotect munmap open pledge \
-	pinsyscalls read __realpath sendsyslog __set_tcb sysctl thrkill \
+	pinsyscalls read __realpath __set_tcb sysctl thrkill \
 	utrace write
+.ifdef STACK_PROTECTOR
+syscall+=sendsyslog
+CFLAGS+=-DSTACK_PROTECTOR
+.endif
 
 .if (${MACHINE_ARCH} == "i386")
 syscall+=mquery
@@ -49,7 +55,6 @@ dl_${_i}.o: SYS.h
 	    ${.TARGET:R}.d -o ${.TARGET}
 .endfor
 
-.include "${.CURDIR}/${MACHINE_CPU}/Makefile.inc"
 .PATH:	${.CURDIR}/${MACHINE_CPU}
 
 .ifdef LD_SCRIPT
@@ -62,6 +67,7 @@ CFLAGS += -fno-builtin
 CFLAGS += -Wall -Werror
 CFLAGS += -I${.CURDIR} -I${.CURDIR}/${MACHINE_CPU} \
 	-D'DEF_WEAK(x)=asm("")' -D'DEF_STRONG(x)=asm("")' \
+	-D'DEF_BUILTIN(x)=asm("")' \
 	-Dstrsep=_dl_strsep -Dstrlcat=_dl_strlcat -Dstrlen=_dl_strlen
 CDIAGFLAGS=
 INSTALL_STRIP=

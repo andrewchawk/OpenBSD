@@ -1,4 +1,4 @@
-/*	$OpenBSD: gaitest.c,v 1.7 2020/02/14 19:17:33 schwarze Exp $	*/
+/*	$OpenBSD: gaitest.c,v 1.9 2026/06/27 17:33:50 jca Exp $	*/
 /*	$NetBSD: gaitest.c,v 1.3 2002/07/05 15:47:43 itojun Exp $	*/
 
 /*
@@ -55,20 +55,15 @@ int vflag = 0;
 
 static void usage(void);
 static void print1(const char *, const struct addrinfo *, char *, char *);
-int main(int, char *[]);
 
 static void
-usage()
+usage(void)
 {
 	fprintf(stderr, "usage: test [-f family] [-s socktype] [-p proto] [-DPRSv46] host serv\n");
 }
 
 static void
-print1(title, res, h, s)
-	const char *title;
-	const struct addrinfo *res;
-	char *h;
-	char *s;
+print1(const char *title, const struct addrinfo *res, char *h, char *s)
 {
 	char *start, *end;
 	int error;
@@ -112,9 +107,7 @@ print1(title, res, h, s)
 }
 
 int
-main(argc, argv)
-	int argc;
-	char *argv[];
+main(int argc, char *argv[])
 {
 	struct addrinfo *res;
 	int error, i;

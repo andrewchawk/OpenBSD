@@ -1,4 +1,4 @@
-/*	$OpenBSD: usb_subr.c,v 1.163 2024/05/23 03:21:09 jsg Exp $ */
+/*	$OpenBSD: usb_subr.c,v 1.168 2026/09/08 00:24:30 deraadt Exp $ */
 /*	$NetBSD: usb_subr.c,v 1.103 2003/01/10 11:19:13 augustss Exp $	*/
 /*	$FreeBSD: src/sys/dev/usb/usb_subr.c,v 1.18 1999/11/17 22:33:47 n_hibma Exp $	*/
 
@@ -117,7 +117,7 @@ usbd_get_string_desc(struct usbd_device *dev, int sindex, int langid,
 {
 	usb_device_request_t req;
 	usbd_status err;
-	int actlen;
+	int len, actlen;
 
 	req.bmRequestType = UT_READ_DEVICE;
 	req.bRequest = UR_GET_DESCRIPTOR;
@@ -132,7 +132,8 @@ usbd_get_string_desc(struct usbd_device *dev, int sindex, int langid,
 	if (actlen < 2)
 		return (USBD_SHORT_XFER);
 
-	USETW(req.wLength, sdesc->bLength);	/* the whole string */
+	len = MIN(sdesc->bLength, sizeof(*sdesc));
+	USETW(req.wLength, len);	/* the whole string */
 	err = usbd_do_request_flags(dev, &req, sdesc, USBD_SHORT_XFER_OK,
 	    &actlen, USBD_DEFAULT_TIMEOUT);
 	if (err)
@@ -196,16 +197,18 @@ usbd_get_string(struct usbd_device *dev, int si, char *buf, size_t buflen)
 static void
 usbd_trim_spaces(char *p)
 {
-	char *q, *e;
+	char *q, *e, c;
 
 	if (p == NULL)
 		return;
 	q = e = p;
 	while (*q == ' ')	/* skip leading spaces */
 		q++;
-	while ((*p = *q++))	/* copy string */
-		if (*p++ != ' ') /* remember last non-space */
+	while ((*p = *q++)) {	/* copy string */
+		c = *p++;
+		if (c != ' ' && c != '\n') /* remember last non-space */
 			e = p;
+	}
 	*e = 0;			/* kill trailing spaces */
 }
 
@@ -229,9 +232,11 @@ usbd_cache_devinfo(struct usbd_device *dev)
 	if (dev->vendor == NULL)
 		return (ENOMEM);
 
-	if (usbd_get_string(dev, udd->iManufacturer, dev->vendor, USB_MAX_STRING_LEN) != NULL) {
+	if (usbd_get_string(dev, udd->iManufacturer, dev->vendor, USB_MAX_STRING_LEN) != NULL)
 		usbd_trim_spaces(dev->vendor);
-	} else {
+	else
+		dev->vendor[0] = 0;
+	if (strlen(dev->vendor) == 0) {
 #ifdef USBVERBOSE
 		const struct usb_known_vendor *ukv;
 
@@ -252,9 +257,11 @@ usbd_cache_devinfo(struct usbd_device *dev)
 	if (dev->product == NULL)
 		return (ENOMEM);
 
-	if (usbd_get_string(dev, udd->iProduct, dev->product, USB_MAX_STRING_LEN) != NULL) {
+	if (usbd_get_string(dev, udd->iProduct, dev->product, USB_MAX_STRING_LEN) != NULL)
 		usbd_trim_spaces(dev->product);
-	} else {
+	else
+		dev->product[0] = 0;
+	if (strlen(dev->product) == 0) {
 #ifdef USBVERBOSE
 		const struct usb_known_product *ukp;
 
@@ -514,7 +521,8 @@ int
 usbd_parse_idesc(struct usbd_device *dev, struct usbd_interface *ifc)
 {
 #define ed ((usb_endpoint_descriptor_t *)p)
-	char *p, *end;
+#define essd ((usb_endpoint_ss_comp_descriptor_t *)pp)
+	char *p, *pp, *end;
 	int i;
 
 	p = (char *)ifc->idesc + ifc->idesc->bLength;
@@ -533,6 +541,11 @@ usbd_parse_idesc(struct usbd_device *dev, struct usbd_interface *ifc)
 
 		if (p >= end)
 			return (-1);
+
+		pp = p + ed->bLength;
+		if (pp >= end || essd->bLength == 0 ||
+		    essd->bDescriptorType != UDESC_ENDPOINT_SS_COMP)
+			pp = NULL;
 
 		if (dev->speed == USB_SPEED_HIGH) {
 			unsigned int mps;
@@ -557,6 +570,7 @@ usbd_parse_idesc(struct usbd_device *dev, struct usbd_interface *ifc)
 		}
 
 		ifc->endpoints[i].edesc = ed;
+		ifc->endpoints[i].esscd = essd;
 		ifc->endpoints[i].refcnt = 0;
 		ifc->endpoints[i].savedtoggle = 0;
 		p += ed->bLength;
@@ -564,6 +578,7 @@ usbd_parse_idesc(struct usbd_device *dev, struct usbd_interface *ifc)
 
 	return (0);
 #undef ed
+#undef essd
 }
 
 void
@@ -1283,6 +1298,7 @@ usbd_fill_deviceinfo(struct usbd_device *dev, struct usb_device_info *di)
 	struct usbd_port *p;
 	int i;
 
+	memset(di, 0, sizeof(*di));
 	di->udi_bus = dev->bus->usbctl->dv_unit;
 	di->udi_addr = dev->address;
 	strlcpy(di->udi_vendor, dev->vendor, sizeof(di->udi_vendor));
@@ -1301,16 +1317,10 @@ usbd_fill_deviceinfo(struct usbd_device *dev, struct usb_device_info *di)
 	di->udi_port = dev->powersrc ? dev->powersrc->portno : 0;
 
 	if (dev->subdevs != NULL) {
-		for (i = 0; dev->subdevs[i] && i < USB_MAX_DEVNAMES; i++) {
-			strncpy(di->udi_devnames[i],
+		for (i = 0; dev->subdevs[i] && i < USB_MAX_DEVNAMES; i++)
+			strlcpy(di->udi_devnames[i],
 			    dev->subdevs[i]->dv_xname, USB_MAX_DEVNAMELEN);
-			di->udi_devnames[i][USB_MAX_DEVNAMELEN-1] = '\0';
-		}
-	} else
-		i = 0;
-
-	for (/*i is set */; i < USB_MAX_DEVNAMES; i++)
-		di->udi_devnames[i][0] = 0; /* empty */
+	}
 
 	if (dev->hub) {
 		for (i = 0;
@@ -1320,13 +1330,10 @@ usbd_fill_deviceinfo(struct usbd_device *dev, struct usb_device_info *di)
 			    UGETW(p->status.wPortStatus);
 		}
 		di->udi_nports = dev->hub->nports;
-	} else
-		di->udi_nports = 0;
+	}
 
-	bzero(di->udi_serial, sizeof(di->udi_serial));
 	if (dev->serial != NULL)
-		strlcpy(di->udi_serial, dev->serial,
-		    sizeof(di->udi_serial));
+		strlcpy(di->udi_serial, dev->serial, sizeof(di->udi_serial));
 }
 
 int

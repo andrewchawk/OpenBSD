@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.65 2024/01/17 08:22:40 claudio Exp $	*/
+/*	$OpenBSD: config.c,v 1.77 2026/07/26 14:46:32 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -31,9 +31,10 @@
 #include <imsg.h>
 
 #include "httpd.h"
+#include "log.h"
 
 int	 config_getserver_config(struct httpd *, struct server *,
-	    struct imsg *);
+    struct imsg *);
 int	 config_getserver_auth(struct httpd *, struct server_config *);
 
 int
@@ -158,6 +159,50 @@ config_getcfg(struct httpd *env, struct imsg *imsg)
 	return (0);
 }
 
+/*
+ * struct server_config is an internal data structure
+ * in privileged compartment containing both data and
+ * pointers, which is dangerously copied as a whole.
+ *
+ * This helper function clears all the pointer
+ * fields in struct server_config while preserving
+ * other data, avoiding pointers being accidentally
+ * send to unprivileged compartments, breaking
+ * inter-compartment ASLR.
+ */
+static void
+clear_config_server_ptrs(struct server_config *cfg)
+{
+	cfg->default_type.media_encoding = NULL;
+
+	/* clear all fields expanded from RB_ENTRY */
+	memset(&cfg->default_type.media_entry, 0,
+	    sizeof(cfg->default_type.media_entry));
+
+	cfg->tls_ca = NULL;
+	cfg->tls_ca_file = NULL;
+	cfg->tls_cert = NULL;
+	cfg->tls_cert_file = NULL;
+	cfg->tls_crl = NULL;
+	cfg->tls_crl_file = NULL;
+	cfg->tls_key = NULL;
+	cfg->tls_key_file = NULL;
+	cfg->tls_ocsp_staple = NULL;
+	cfg->tls_ocsp_staple_file = NULL;
+
+	cfg->logaccess = NULL;
+	cfg->logerror = NULL;
+	cfg->auth = NULL;
+	cfg->return_uri = NULL;
+
+	/* clear TAILQ_HEAD */
+	memset(&cfg->fcgiparams, 0, sizeof(cfg->fcgiparams));
+	memset(&cfg->headers, 0, sizeof(cfg->headers));
+
+	/* clear TAILQ_ENTRY */
+	memset(&cfg->entry, 0, sizeof(cfg->entry));
+}
+
 int
 config_setserver(struct httpd *env, struct server *srv)
 {
@@ -186,6 +231,9 @@ config_setserver(struct httpd *env, struct server *srv)
 		    ps->ps_title[id], srv->srv_s);
 
 		memcpy(&s, &srv->srv_conf, sizeof(s));
+
+		/* since s is a local, it is safe to clear its pointers directly */
+		clear_config_server_ptrs(&s);
 
 		c = 0;
 		iov[c].iov_base = &s;
@@ -221,9 +269,6 @@ config_setserver(struct httpd *env, struct server *srv)
 					return (-1);
 				}
 			}
-
-			/* Configure TLS if necessary. */
-			config_setserver_tls(env, srv);
 		} else {
 			if (proc_composev(ps, id, IMSG_CFG_SERVER,
 			    iov, c) != 0) {
@@ -232,11 +277,23 @@ config_setserver(struct httpd *env, struct server *srv)
 				    __func__, srv->srv_conf.name);
 				return (-1);
 			}
-
-			/* Configure FCGI parameters if necessary. */
-			config_setserver_fcgiparams(env, srv);
 		}
 	}
+
+	if ((srv->srv_conf.flags & SRVFLAG_LOCATION) == 0) {
+		/* Configure TLS if necessary. */
+		if (config_setserver_tls(env, srv) != 0)
+			return (-1);
+	}
+
+	/* Configure FCGI parameters if necessary. */
+	if (config_setserver_fcgiparams(env, srv) != 0)
+		return (-1);
+
+	/* Configure custom headers if necessary. */
+	config_inherit_headers(env, srv);
+	if (config_setserver_headers(env, srv) == -1)
+		return (-1);
 
 	/* Close server socket early to prevent fd exhaustion in the parent. */
 	if (srv->srv_s != -1) {
@@ -301,67 +358,52 @@ config_settls(struct httpd *env, struct server *srv, enum tls_config_type type,
 int
 config_getserver_fcgiparams(struct httpd *env, struct imsg *imsg)
 {
-	struct server		*srv;
-	struct server_config	*srv_conf, *iconf;
-	struct fastcgi_param	*fp;
-	uint32_t		 id;
-	size_t			 c, nc, len;
-	uint8_t			*p = imsg->data;
+	struct server_config		*srv_conf;
+	struct fastcgi_param		*fp;
+	struct fastcgi_param_imsg	 fpmsg;
+	struct ibuf			 ibuf;
 
-	len = sizeof(nc) + sizeof(id);
-	if (IMSG_DATA_SIZE(imsg) < len) {
-		log_debug("%s: invalid message length", __func__);
+	if (imsg_get_ibuf(imsg, &ibuf) == -1 ||
+	    ibuf_get(&ibuf, &fpmsg, sizeof(fpmsg)) == -1) {
+		log_debug("%s: invalid message", __func__);
 		return (-1);
 	}
 
-	memcpy(&nc, p, sizeof(nc));	/* number of params */
-	p += sizeof(nc);
-
-	memcpy(&id, p, sizeof(id));	/* server conf id */
-	srv_conf = serverconfig_byid(id);
-	p += sizeof(id);
-
-	len += nc*sizeof(*fp);
-	if (IMSG_DATA_SIZE(imsg) < len) {
-		log_debug("%s: invalid message length", __func__);
+	if ((srv_conf = serverconfig_byid(fpmsg.id)) == NULL) {
+		log_debug("%s: invalid config id", __func__);
 		return (-1);
 	}
 
-	/* Find associated server config */
-	TAILQ_FOREACH(srv, env->sc_servers, srv_entry) {
-		if (srv->srv_conf.id == id) {
-			srv_conf = &srv->srv_conf;
-			break;
-		}
-		TAILQ_FOREACH(iconf, &srv->srv_hosts, entry) {
-			if (iconf->id == id) {
-				srv_conf = iconf;
-				break;
-			}
-		}
+	if (fpmsg.namelen > HTTPD_FCGI_NAME_MAX - 1 ||
+	    fpmsg.vallen > HTTPD_FCGI_VAL_MAX - 1) {
+		log_debug("%s: fastcgi_param too long", __func__);
+		return (-1);
 	}
 
-	/* Fetch FCGI parameters */
-	for (c = 0; c < nc; c++) {
-		if ((fp = calloc(1, sizeof(*fp))) == NULL)
-			fatalx("fcgiparams out of memory");
-		memcpy(fp, p, sizeof(*fp));
-		TAILQ_INSERT_HEAD(&srv_conf->fcgiparams, fp, entry);
+	if ((fp = calloc(1, sizeof(*fp))) == NULL)
+		fatal("fastcgi_param out of memory");
 
-		p += sizeof(*fp);
+	fp->name = ibuf_get_string(&ibuf, fpmsg.namelen);
+	fp->value = ibuf_get_string(&ibuf, fpmsg.vallen);
+	if (fp->name == NULL || fp->value == NULL) {
+		free(fp->name);
+		free(fp->value);
+		free(fp);
+		return (-1);
 	}
 
+	TAILQ_INSERT_TAIL(&srv_conf->fcgiparams, fp, entry);
 	return (0);
 }
 
 int
 config_setserver_fcgiparams(struct httpd *env, struct server *srv)
 {
-	struct privsep		*ps = env->sc_ps;
-	struct server_config	*srv_conf = &srv->srv_conf;
-	struct fastcgi_param	 *fp;
-	struct iovec		 *iov;
-	size_t			 c = 0, nc = 0;
+	struct privsep			*ps = env->sc_ps;
+	struct server_config		*srv_conf = &srv->srv_conf;
+	struct fastcgi_param		*fp;
+	struct fastcgi_param_imsg	 fpmsg;
+	struct iovec			 iov[3];
 
 	DPRINTF("%s: sending fcgiparam for \"%s[%u]\" to %s fd %d", __func__,
 	    srv_conf->name, srv_conf->id, ps->ps_title[PROC_SERVER],
@@ -371,28 +413,147 @@ config_setserver_fcgiparams(struct httpd *env, struct server *srv)
 		return (0);
 
 	TAILQ_FOREACH(fp, &srv_conf->fcgiparams, entry) {
-		nc++;
+		fpmsg.id = srv_conf->id;
+		fpmsg.namelen = strlen(fp->name);
+		fpmsg.vallen = strlen(fp->value);
+
+		iov[0].iov_base = &fpmsg;
+		iov[0].iov_len = sizeof(fpmsg);
+		iov[1].iov_base = fp->name;
+		iov[1].iov_len = fpmsg.namelen;
+		iov[2].iov_base = fp->value;
+		iov[2].iov_len = fpmsg.vallen;
+
+		if (proc_composev(ps, PROC_SERVER, IMSG_CFG_FCGI, iov, 3) !=
+		    0) {
+			log_warn("%s: failed to compose IMSG_CFG_FCGI "
+			    "for `%s'", __func__, srv_conf->name);
+			return (-1);
+		}
 	}
-	if ((iov = calloc(nc + 2, sizeof(*iov))) == NULL)
+	return (0);
+}
+
+int
+config_getserver_headers(struct httpd *env, struct imsg *imsg)
+{
+	struct server_config	*srv_conf;
+	struct custom_header	*hdr;
+	struct header_imsg	 hmsg;
+	struct ibuf		 ibuf;
+
+	if (imsg_get_ibuf(imsg, &ibuf) == -1 ||
+	    ibuf_get(&ibuf, &hmsg, sizeof(hmsg)) == -1) {
+		log_debug("%s: invalid message", __func__);
 		return (-1);
-
-	iov[c].iov_base = &nc;			/* number of params */
-	iov[c++].iov_len = sizeof(nc);
-	iov[c].iov_base = &srv_conf->id;	/* server config id */
-	iov[c++].iov_len = sizeof(srv_conf->id);
-
-	TAILQ_FOREACH(fp, &srv_conf->fcgiparams, entry) {	/* push FCGI params */
-		iov[c].iov_base = fp;
-		iov[c++].iov_len = sizeof(*fp);
 	}
-	if (proc_composev(ps, PROC_SERVER, IMSG_CFG_FCGI, iov, c) != 0) {
-		log_warn("%s: failed to compose IMSG_CFG_FCGI imsg for "
-		    "`%s'", __func__, srv_conf->name);
-		free(iov);
+
+	if ((srv_conf = serverconfig_byid(hmsg.id)) == NULL) {
+		log_debug("%s: invalid config id", __func__);
 		return (-1);
 	}
-	free(iov);
 
+	if (hmsg.namelen > HTTPD_HEADER_NAME_MAX - 1 ||
+	    hmsg.vallen > HTTPD_HEADER_VAL_MAX - 1) {
+		log_debug("%s: header too long", __func__);
+		return (-1);
+	}
+
+	if ((hdr = calloc(1, sizeof(*hdr))) == NULL)
+		fatal("headers out of memory");
+
+	hdr->name = ibuf_get_string(&ibuf, hmsg.namelen);
+	hdr->value = ibuf_get_string(&ibuf, hmsg.vallen);
+	if (hdr->name == NULL || hdr->value == NULL) {
+		free(hdr->name);
+		free(hdr->value);
+		free(hdr);
+		return (-1);
+	}
+	hdr->flags = hmsg.flags;
+
+	TAILQ_INSERT_TAIL(&srv_conf->headers, hdr, entry);
+	print_custom_header(__func__, hdr);
+	return (0);
+}
+
+/*
+ * Inherit headers from parent server, skipping those
+ * already defined in the location.
+ */
+void
+config_inherit_headers(struct httpd *env, struct server *srv)
+{
+	struct server		*parent_srv;
+	struct server_config	*srv_conf = &srv->srv_conf;
+	struct custom_header	*hdr, *nhdr;
+	struct server_headers	 inherited;
+
+	if (!(srv_conf->flags & SRVFLAG_LOCATION))
+		return;
+
+	/* Find parent server by parent_id */
+	TAILQ_FOREACH(parent_srv, env->sc_servers, srv_entry) {
+		if (parent_srv->srv_conf.id == srv_conf->parent_id)
+			break;
+	}
+
+	if (parent_srv == NULL)
+		return;
+
+	TAILQ_INIT(&inherited);
+
+	TAILQ_FOREACH(hdr, &parent_srv->srv_conf.headers, entry) {
+		if (header_exists(srv_conf, hdr->name)) {
+			DPRINTF("%s: skipping header \"%s\" from parent "
+			    "\"%s\", overridden in location \"%s\"",
+			    __func__, hdr->name,
+			    parent_srv->srv_conf.name, srv_conf->location);
+			continue;
+		}
+		nhdr = header_dup(hdr);
+		TAILQ_INSERT_TAIL(&inherited, nhdr, entry);
+		DPRINTF("%s: inheriting header \"%s\" from parent \"%s\" "
+		    "to location \"%s\"", __func__, hdr->name,
+		    parent_srv->srv_conf.name, srv_conf->location);
+	}
+
+	TAILQ_CONCAT(&srv_conf->headers, &inherited, entry);
+}
+
+int
+config_setserver_headers(struct httpd *env, struct server *srv)
+{
+	struct privsep		*ps = env->sc_ps;
+	struct server_config	*srv_conf = &srv->srv_conf;
+	struct custom_header	*hdr;
+	struct header_imsg	 hmsg;
+	struct iovec		 iov[3];
+
+	DPRINTF("%s: sending headers for \"%s[%u]\" to %s fd %d", __func__,
+	    srv_conf->name, srv_conf->id, ps->ps_title[PROC_SERVER],
+	    srv->srv_s);
+
+	TAILQ_FOREACH(hdr, &srv_conf->headers, entry) {
+		hmsg.id = srv_conf->id;
+		hmsg.flags = hdr->flags;
+		hmsg.namelen = strlen(hdr->name);
+		hmsg.vallen = strlen(hdr->value);
+
+		iov[0].iov_base = &hmsg;
+		iov[0].iov_len = sizeof(hmsg);
+		iov[1].iov_base = hdr->name;
+		iov[1].iov_len = hmsg.namelen;
+		iov[2].iov_base = hdr->value;
+		iov[2].iov_len = hmsg.vallen;
+
+		if (proc_composev(ps, PROC_SERVER, IMSG_CFG_HEADERS,
+		    iov, 3) != 0) {
+			log_warn("%s: failed to compose IMSG_CFG_HEADERS "
+			    "for `%s'", __func__, srv_conf->name);
+			return (-1);
+		}
+	}
 	return (0);
 }
 
@@ -454,7 +615,7 @@ config_getserver_config(struct httpd *env, struct server *srv,
 #endif
 	struct server_config	*srv_conf, *parent;
 	uint8_t			*p = imsg->data;
-	unsigned int		 f;
+	uint64_t		 f;
 	size_t			 s;
 
 	if ((srv_conf = calloc(1, sizeof(*srv_conf))) == NULL)
@@ -466,6 +627,11 @@ config_getserver_config(struct httpd *env, struct server *srv,
 
 	/* Reset these variables to avoid free'ing invalid pointers */
 	serverconfig_reset(srv_conf);
+
+	if ((IMSG_DATA_SIZE(imsg) - s) < (size_t)srv_conf->return_uri_len) {
+		log_debug("%s: invalid message length", __func__);
+		goto fail;
+	}
 
 	TAILQ_FOREACH(parent, &srv->srv_hosts, entry) {
 		if (strcmp(parent->name, srv_conf->name) == 0)
@@ -485,7 +651,6 @@ config_getserver_config(struct httpd *env, struct server *srv,
 		if ((srv_conf->return_uri = get_data(p + s,
 		    srv_conf->return_uri_len)) == NULL)
 			goto fail;
-		s += srv_conf->return_uri_len;
 	}
 
 	if (srv_conf->flags & SRVFLAG_LOCATION) {
@@ -509,6 +674,10 @@ config_getserver_config(struct httpd *env, struct server *srv,
 		}
 
 		f = SRVFLAG_FCGI|SRVFLAG_NO_FCGI;
+		if ((srv_conf->flags & f) == 0)
+			srv_conf->flags |= parent->flags & f;
+
+		f = SRVFLAG_GZIP_STATIC|SRVFLAG_NO_GZIP_STATIC;
 		if ((srv_conf->flags & f) == 0)
 			srv_conf->flags |= parent->flags & f;
 
@@ -560,7 +729,7 @@ config_getserver_config(struct httpd *env, struct server *srv,
 			srv_conf->return_uri_len = parent->return_uri_len;
 			if (srv_conf->return_uri_len &&
 			    (srv_conf->return_uri =
-			    strdup(parent->return_uri)) == NULL)
+			     strdup(parent->return_uri)) == NULL)
 				goto fail;
 		}
 
@@ -578,6 +747,11 @@ config_getserver_config(struct httpd *env, struct server *srv,
 			    sizeof(srv_conf->path));
 		}
 
+		f = SRVFLAG_STATIC_CACHE_CONTROL |
+		    SRVFLAG_NO_STATIC_CACHE_CONTROL;
+		if ((srv_conf->flags & f) == 0)
+			srv_conf->flags |= parent->flags & f;
+
 		f = SRVFLAG_SERVER_HSTS;
 		srv_conf->flags |= parent->flags & f;
 		srv_conf->hsts_max_age = parent->hsts_max_age;
@@ -591,6 +765,8 @@ config_getserver_config(struct httpd *env, struct server *srv,
 		srv_conf->flags |= parent->flags & SRVFLAG_ERRDOCS;
 		(void)strlcpy(srv_conf->errdocroot, parent->errdocroot,
 		    sizeof(srv_conf->errdocroot));
+
+		srv_conf->flags |= parent->flags & SRVFLAG_NO_BANNER;
 
 		DPRINTF("%s: %s %d location \"%s\", "
 		    "parent \"%s[%u]\", flags: %s",
@@ -664,6 +840,9 @@ config_getserver(struct httpd *env, struct imsg *imsg)
 
 	memcpy(&srv->srv_conf, &srv_conf, sizeof(srv->srv_conf));
 	srv->srv_s = fd;
+
+	TAILQ_INIT(&srv->srv_conf.headers);
+	TAILQ_INIT(&srv->srv_conf.fcgiparams);
 
 	if (config_getserver_auth(env, &srv->srv_conf) != 0)
 		goto fail;
@@ -805,7 +984,7 @@ config_getserver_tls(struct httpd *env, struct imsg *imsg)
 
 	default:
 		log_debug("%s: unknown tls config type %i\n",
-		     __func__, tls_conf.tls_type);
+		    __func__, tls_conf.tls_type);
 		goto fail;
 	}
 
@@ -821,6 +1000,7 @@ config_setmedia(struct httpd *env, struct media_type *media)
 	struct privsep		*ps = env->sc_ps;
 	int			 id;
 	unsigned int		 what;
+	struct media_type	 mt;
 
 	for (id = 0; id < PROC_MAX; id++) {
 		what = ps->ps_what[id];
@@ -831,7 +1011,12 @@ config_setmedia(struct httpd *env, struct media_type *media)
 		DPRINTF("%s: sending media \"%s\" to %s", __func__,
 		    media->media_name, ps->ps_title[id]);
 
-		proc_compose(ps, id, IMSG_CFG_MEDIA, media, sizeof(*media));
+		/* Send a cleaned-up copy */
+		memcpy(&mt, media, sizeof(*media));
+		mt.media_encoding = NULL;
+		memset(&mt.media_entry, 0, sizeof(mt.media_entry));
+
+		proc_compose(ps, id, IMSG_CFG_MEDIA, &mt, sizeof(mt));
 	}
 
 	return (0);
@@ -866,6 +1051,7 @@ int
 config_setauth(struct httpd *env, struct auth *auth)
 {
 	struct privsep		*ps = env->sc_ps;
+	struct auth		 auth_payload;	/* pointer-free payload */
 	int			 id;
 	unsigned int		 what;
 
@@ -878,7 +1064,15 @@ config_setauth(struct httpd *env, struct auth *auth)
 		DPRINTF("%s: sending auth \"%s[%u]\" to %s", __func__,
 		    auth->auth_htpasswd, auth->auth_id, ps->ps_title[id]);
 
-		proc_compose(ps, id, IMSG_CFG_AUTH, auth, sizeof(*auth));
+		/* memcpy to avoid modifying auth directly */
+		memcpy(&auth_payload, auth, sizeof(*auth));
+
+		/* clear pointers */
+		memset(&auth_payload.auth_entry, 0,
+		    sizeof(auth_payload.auth_entry));
+
+		proc_compose(ps, id, IMSG_CFG_AUTH, &auth_payload,
+		    sizeof(auth_payload));
 	}
 
 	return (0);

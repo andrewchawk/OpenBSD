@@ -1,4 +1,4 @@
-/*	$OpenBSD: nfs_vfsops.c,v 1.131 2024/05/12 09:09:39 jsg Exp $	*/
+/*	$OpenBSD: nfs_vfsops.c,v 1.136 2026/08/31 22:37:09 jsg Exp $	*/
 /*	$NetBSD: nfs_vfsops.c,v 1.46.4.1 1996/05/25 22:40:35 fvdl Exp $	*/
 
 /*
@@ -101,7 +101,9 @@ const struct vfsops nfs_vfsops = {
 	.vfs_fhtovp	= nfs_fhtovp,
 	.vfs_vptofh	= nfs_vptofh,
 	.vfs_init	= nfs_vfs_init,
+#ifndef SMALL_KERNEL
 	.vfs_sysctl	= nfs_sysctl,
+#endif /* SMALL_KERNEL */
 	.vfs_checkexp	= nfs_checkexp,
 };
 
@@ -114,6 +116,7 @@ nfs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
 	struct vnode *vp;
 	struct nfs_statfs *sfp = NULL;
 	struct nfsm_info	info;
+	struct mbuf *mb;
 	struct nfsmount *nmp = VFSTONFS(mp);
 	int error = 0, retattr;
 	struct ucred *cred;
@@ -130,8 +133,8 @@ nfs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
 	if (info.nmi_v3 && (nmp->nm_flag & NFSMNT_GOTFSINFO) == 0)
 		(void)nfs_fsinfo(nmp, vp, cred, p);
 	nfsstats.rpccnt[NFSPROC_FSSTAT]++;
-	info.nmi_mb = info.nmi_mreq = nfsm_reqhead(NFSX_FH(info.nmi_v3));
-	nfsm_fhtom(&info, vp, info.nmi_v3);
+	mb = info.nmi_mreq = nfsm_reqhead(NFSX_FH(info.nmi_v3));
+	nfsm_fhtom(&mb, vp, info.nmi_v3);
 
 	info.nmi_procp = p;
 	info.nmi_cred = cred;
@@ -190,12 +193,13 @@ nfs_fsinfo(struct nfsmount *nmp, struct vnode *vp, struct ucred *cred,
 {
 	struct nfsv3_fsinfo *fsp;
 	struct nfsm_info	info;
+	struct mbuf *mb;
 	u_int32_t pref, max;
 	int error = 0, retattr;
 
 	nfsstats.rpccnt[NFSPROC_FSINFO]++;
-	info.nmi_mb = info.nmi_mreq = nfsm_reqhead(NFSX_FH(1));
-	nfsm_fhtom(&info, vp, 1);
+	mb = info.nmi_mreq = nfsm_reqhead(NFSX_FH(1));
+	nfsm_fhtom(&mb, vp, 1);
 
 	info.nmi_procp = p;
 	info.nmi_cred = cred;
@@ -255,7 +259,7 @@ struct nfs_diskless nfs_diskless;
  * - Call nfs_boot_init() to fill in the nfs_diskless struct
  *   (using RARP, bootparam RPC, mountd RPC)
  * - hand craft the swap nfs vnode hanging off a fake mount point
- *	if swdevt[0].sw_dev == NODEV
+ *	if swdevt[0] == NODEV
  * - build the rootfs mount point and call mountnfs() to do the rest.
  */
 int
@@ -315,17 +319,17 @@ nfs_mountroot(void)
 	 * "Mount" the swap device.
 	 *
 	 * On a "dataless" configuration (swap on disk) we will have:
-	 *	(swdevt[0].sw_dev != NODEV) identifying the swap device.
+	 *	(swdevt[0] != NODEV) identifying the swap device.
 	 */
-	if (swdevt[0].sw_dev != NODEV) {
+	if (swdevt[0] != NODEV) {
 		if (bdevvp(swapdev, &swapdev_vp))
 			panic("nfs_mountroot: can't setup swap vp");
-		printf("swap on device 0x%x\n", swdevt[0].sw_dev);
+		printf("swap on device 0x%x\n", swdevt[0]);
 		return (0);
 	}
 
 	/*
-	 * If swapping to an nfs node:	(swdevt[0].sw_dev == NODEV)
+	 * If swapping to an nfs node:	(swdevt[0] == NODEV)
 	 * Create a fake mount point just for the swap vnode so that the
 	 * swap file can be on a different server from the rootfs.
 	 *
@@ -348,7 +352,7 @@ nfs_mountroot(void)
 		 * Next line is a hack to make swapmount() work on NFS
 		 * swap files.
 		 */
-		swdevt[0].sw_dev = NETDEV;
+		swdevt[0] = NETDEV;
 		/* end hack */
 		nfs_diskless.sw_vp = vp;
 
@@ -368,7 +372,7 @@ nfs_mountroot(void)
 	}
 
 	printf("WARNING: no swap\n");
-	swdevt[0].sw_dev = NODEV;
+	swdevt[0] = NODEV;
 	return (0);
 }
 
@@ -649,6 +653,9 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct mbuf *nam,
 	memset(mp->mnt_stat.f_mntfromspec, 0, MNAMELEN);
 	strlcpy(mp->mnt_stat.f_mntfromspec, hst, MNAMELEN);
 	bcopy(argp, &mp->mnt_stat.mount_info.nfs_args, sizeof(*argp));
+	mp->mnt_stat.mount_info.nfs_args.addr = NULL;
+	mp->mnt_stat.mount_info.nfs_args.fh = NULL;
+	mp->mnt_stat.mount_info.nfs_args.hostname = NULL;
 	nmp->nm_nam = nam;
 	nfs_decode_args(nmp, argp, &mp->mnt_stat.mount_info.nfs_args);
 
@@ -840,6 +847,7 @@ nfs_vget(struct mount *mp, ino_t ino, struct vnode **vpp)
 	return (EOPNOTSUPP);
 }
 
+#ifndef SMALL_KERNEL
 /*
  * Do that sysctl thang...
  */
@@ -891,7 +899,7 @@ nfs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return EOPNOTSUPP;
 	}
 }
-
+#endif /* SMALL_KERNEL */
 
 /*
  * At this point, this should never happen

@@ -6,7 +6,7 @@ use List::Util qw/shuffle/;
 use strict;
 use warnings;
 
-if ($] lt "5.008") {
+if ("$]" < 5.008) {
     print "1..0 # SKIP Test cannot run on perls below 5.8.0\n";
     exit 0;
 }
@@ -40,7 +40,7 @@ sub simple_capture(&) {
 require Test2::IPC::Driver::Files;
 ok(my $ipc = Test2::IPC::Driver::Files->new, "Created an IPC instance");
 ok($ipc->isa('Test2::IPC::Driver::Files'), "Correct type");
-ok($ipc->isa('Test2::IPC::Driver'), "inheritence");
+ok($ipc->isa('Test2::IPC::Driver'), "inheritance");
 
 ok(-d $ipc->tempdir, "created temp dir");
 is($ipc->pid, $$, "stored pid");

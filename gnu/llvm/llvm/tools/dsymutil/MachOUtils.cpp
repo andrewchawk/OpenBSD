@@ -10,8 +10,8 @@
 #include "BinaryHolder.h"
 #include "DebugMap.h"
 #include "LinkUtils.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/CodeGen/NonRelocatableStringpool.h"
-#include "llvm/MC/MCAsmLayout.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCMachObjectWriter.h"
 #include "llvm/MC/MCObjectStreamer.h"
@@ -29,28 +29,34 @@ namespace dsymutil {
 namespace MachOUtils {
 
 llvm::Error ArchAndFile::createTempFile() {
-  llvm::SmallString<128> TmpModel;
-  llvm::sys::path::system_temp_directory(true, TmpModel);
-  llvm::sys::path::append(TmpModel, "dsym.tmp%%%%%.dwarf");
-  Expected<sys::fs::TempFile> T = sys::fs::TempFile::create(TmpModel);
+  SmallString<256> SS;
+  std::error_code EC = sys::fs::createTemporaryFile("dsym", "dwarf", FD, SS);
 
-  if (!T)
-    return T.takeError();
+  if (EC)
+    return errorCodeToError(EC);
 
-  File = std::make_unique<sys::fs::TempFile>(std::move(*T));
+  Path = SS.str();
+
   return Error::success();
 }
 
-llvm::StringRef ArchAndFile::path() const { return File->TmpName; }
+llvm::StringRef ArchAndFile::getPath() const {
+  assert(!Path.empty() && "path called before createTempFile");
+  return Path;
+}
+
+int ArchAndFile::getFD() const {
+  assert((FD != -1) && "path called before createTempFile");
+  return FD;
+}
 
 ArchAndFile::~ArchAndFile() {
-  if (File)
-    if (auto E = File->discard())
-      llvm::consumeError(std::move(E));
+  if (!Path.empty())
+    sys::fs::remove(Path);
 }
 
 std::string getArchName(StringRef Arch) {
-  if (Arch.startswith("thumb"))
+  if (Arch.starts_with("thumb"))
     return (llvm::Twine("arm") + Arch.drop_front(5)).str();
   return std::string(Arch);
 }
@@ -78,14 +84,21 @@ static bool runLipo(StringRef SDKPath, SmallVectorImpl<StringRef> &Args) {
 
 bool generateUniversalBinary(SmallVectorImpl<ArchAndFile> &ArchFiles,
                              StringRef OutputFileName,
-                             const LinkOptions &Options, StringRef SDKPath) {
+                             const LinkOptions &Options, StringRef SDKPath,
+                             bool Fat64) {
   // No need to merge one file into a universal fat binary.
   if (ArchFiles.size() == 1) {
-    if (auto E = ArchFiles.front().File->keep(OutputFileName)) {
-      WithColor::error() << "while keeping " << ArchFiles.front().path()
-                         << " as " << OutputFileName << ": "
-                         << toString(std::move(E)) << "\n";
-      return false;
+    llvm::StringRef TmpPath = ArchFiles.front().getPath();
+    if (auto EC = sys::fs::rename(TmpPath, OutputFileName)) {
+      // If we can't rename, try to copy to work around cross-device link
+      // issues.
+      EC = sys::fs::copy_file(TmpPath, OutputFileName);
+      if (EC) {
+        WithColor::error() << "while keeping " << TmpPath << " as "
+                           << OutputFileName << ": " << EC.message() << "\n";
+        return false;
+      }
+      sys::fs::remove(TmpPath);
     }
     return true;
   }
@@ -95,15 +108,19 @@ bool generateUniversalBinary(SmallVectorImpl<ArchAndFile> &ArchFiles,
   Args.push_back("-create");
 
   for (auto &Thin : ArchFiles)
-    Args.push_back(Thin.path());
+    Args.push_back(Thin.getPath());
 
-  // Align segments to match dsymutil-classic alignment
+  // Align segments to match dsymutil-classic alignment.
   for (auto &Thin : ArchFiles) {
     Thin.Arch = getArchName(Thin.Arch);
     Args.push_back("-segalign");
     Args.push_back(Thin.Arch);
     Args.push_back("20");
   }
+
+  // Use a 64-bit fat header if requested.
+  if (Fat64)
+    Args.push_back("-fat64");
 
   Args.push_back("-output");
   Args.push_back(OutputFileName.data());
@@ -305,31 +322,40 @@ static void transferSegmentAndSections(
 }
 
 // Write the __DWARF segment load command to the output file.
-static bool createDwarfSegment(uint64_t VMAddr, uint64_t FileOffset,
-                               uint64_t FileSize, unsigned NumSections,
-                               MCAsmLayout &Layout, MachObjectWriter &Writer) {
+static bool createDwarfSegment(const MCAssembler &Asm, uint64_t VMAddr,
+                               uint64_t FileOffset, uint64_t FileSize,
+                               unsigned NumSections, MachObjectWriter &Writer,
+                               bool AllowSectionHeaderOffsetOverflow) {
   Writer.writeSegmentLoadCommand("__DWARF", NumSections, VMAddr,
                                  alignTo(FileSize, 0x1000), FileOffset,
                                  FileSize, /* MaxProt */ 7,
                                  /* InitProt =*/3);
 
-  for (unsigned int i = 0, n = Layout.getSectionOrder().size(); i != n; ++i) {
-    MCSection *Sec = Layout.getSectionOrder()[i];
-    if (Sec->begin() == Sec->end() || !Layout.getSectionFileSize(Sec))
+  for (unsigned int i = 0, n = Writer.getSectionOrder().size(); i != n; ++i) {
+    auto *Sec = static_cast<MCSectionMachO *>(Writer.getSectionOrder()[i]);
+    if (!Asm.getSectionFileSize(*Sec))
       continue;
 
     Align Alignment = Sec->getAlign();
     if (Alignment > 1) {
       VMAddr = alignTo(VMAddr, Alignment);
       FileOffset = alignTo(FileOffset, Alignment);
-      if (FileOffset > UINT32_MAX)
-        return error("section " + Sec->getName() + "'s file offset exceeds 4GB."
-            " Refusing to produce an invalid Mach-O file.");
     }
-    Writer.writeSection(Layout, *Sec, VMAddr, FileOffset, 0, 0, 0);
+    // Mach-O section headers store the file offset in a 32-bit field
+    // (section.offset). For large dSYM files, a section can start beyond 4GB
+    // (UINT32_MAX), so the on-disk offset value may wrap/truncate. Within a
+    // single slice, sections are emitted in file order. If we allow emitting
+    // such non-standard Mach-O, compatible readers can reconstruct the true
+    // 64-bit offsets by walking sections in order and accumulating the sizes of
+    // preceding sections.
+    if (FileOffset > UINT32_MAX && !AllowSectionHeaderOffsetOverflow)
+      return error("section " + Sec->getName() +
+                   "'s file offset exceeds 4GB."
+                   " Refusing to produce an invalid Mach-O file.");
+    Writer.writeSection(Asm, *Sec, VMAddr, FileOffset, 0, 0, 0);
 
-    FileOffset += Layout.getSectionAddressSize(Sec);
-    VMAddr += Layout.getSectionAddressSize(Sec);
+    FileOffset += Asm.getSectionAddressSize(*Sec);
+    VMAddr += Asm.getSectionAddressSize(*Sec);
   }
   return true;
 }
@@ -354,17 +380,16 @@ static unsigned segmentLoadCommandSize(bool Is64Bit, unsigned NumSections) {
 // \a OutFile and it must be using a MachObjectWriter object to do so.
 bool generateDsymCompanion(
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS, const DebugMap &DM,
-    SymbolMapTranslator &Translator, MCStreamer &MS, raw_fd_ostream &OutFile,
+    MCStreamer &MS, raw_fd_ostream &OutFile,
     const std::vector<MachOUtils::DwarfRelocationApplicationInfo>
-        &RelocationsToApply) {
+        &RelocationsToApply,
+    bool AllowSectionHeaderOffsetOverflow) {
   auto &ObjectStreamer = static_cast<MCObjectStreamer &>(MS);
   MCAssembler &MCAsm = ObjectStreamer.getAssembler();
   auto &Writer = static_cast<MachObjectWriter &>(MCAsm.getWriter());
 
   // Layout but don't emit.
-  ObjectStreamer.flushPendingLabels();
-  MCAsmLayout Layout(MCAsm);
-  MCAsm.layout(Layout);
+  MCAsm.layout();
 
   BinaryHolder InputBinaryHolder(VFS, false);
 
@@ -409,7 +434,7 @@ bool generateDsymCompanion(
       ++NumLoadCommands;
       LoadCommandSize += sizeof(UUIDCmd);
       break;
-   case MachO::LC_BUILD_VERSION: {
+    case MachO::LC_BUILD_VERSION: {
       MachO::build_version_command Cmd;
       memset(&Cmd, 0, sizeof(Cmd));
       Cmd = InputBinary.getBuildVersionLoadCommand(LCI);
@@ -472,12 +497,12 @@ bool generateDsymCompanion(
   unsigned NumDwarfSections = 0;
   uint64_t DwarfSegmentSize = 0;
 
-  for (unsigned int i = 0, n = Layout.getSectionOrder().size(); i != n; ++i) {
-    MCSection *Sec = Layout.getSectionOrder()[i];
+  for (unsigned int i = 0, n = Writer.getSectionOrder().size(); i != n; ++i) {
+    MCSection *Sec = Writer.getSectionOrder()[i];
     if (Sec->begin() == Sec->end())
       continue;
 
-    if (uint64_t Size = Layout.getSectionFileSize(Sec)) {
+    if (uint64_t Size = MCAsm.getSectionFileSize(*Sec)) {
       DwarfSegmentSize = alignTo(DwarfSegmentSize, Sec->getAlign());
       DwarfSegmentSize += Size;
       ++NumDwarfSections;
@@ -490,12 +515,9 @@ bool generateDsymCompanion(
   }
 
   SmallString<0> NewSymtab;
-  std::function<StringRef(StringRef)> TranslationLambda =
-      Translator ? [&](StringRef Input) { return Translator(Input); }
-                 : static_cast<std::function<StringRef(StringRef)>>(nullptr);
   // Legacy dsymutil puts an empty string at the start of the line table.
   // thus we set NonRelocatableStringpool(,PutEmptyString=true)
-  NonRelocatableStringpool NewStrings(TranslationLambda, true);
+  NonRelocatableStringpool NewStrings(true);
   unsigned NListSize = Is64Bit ? sizeof(MachO::nlist_64) : sizeof(MachO::nlist);
   unsigned NumSyms = 0;
   uint64_t NewStringsSize = 0;
@@ -510,7 +532,8 @@ bool generateDsymCompanion(
   SymtabStart = alignTo(SymtabStart, 0x1000);
 
   // We gathered all the information we need, start emitting the output file.
-  Writer.writeHeader(MachO::MH_DSYM, NumLoadCommands, LoadCommandSize, false);
+  Writer.writeHeader(MachO::MH_DSYM, NumLoadCommands, LoadCommandSize,
+                     /*SubsectionsViaSymbols=*/false);
 
   // Write the load commands.
   assert(OutFile.tell() == HeaderSize);
@@ -571,8 +594,9 @@ bool generateDsymCompanion(
   }
 
   // Write the load command for the __DWARF segment.
-  if (!createDwarfSegment(DwarfVMAddr, DwarfSegmentStart, DwarfSegmentSize,
-                          NumDwarfSections, Layout, Writer))
+  if (!createDwarfSegment(MCAsm, DwarfVMAddr, DwarfSegmentStart,
+                          DwarfSegmentSize, NumDwarfSections, Writer,
+                          AllowSectionHeaderOffsetOverflow))
     return false;
 
   assert(OutFile.tell() == LoadCommandSize + HeaderSize);
@@ -614,12 +638,9 @@ bool generateDsymCompanion(
 
   // Emit the Dwarf sections contents.
   for (const MCSection &Sec : MCAsm) {
-    if (Sec.begin() == Sec.end())
-      continue;
-
     uint64_t Pos = OutFile.tell();
     OutFile.write_zeros(alignTo(Pos, Sec.getAlign()) - Pos);
-    MCAsm.writeSectionData(OutFile, &Sec, Layout);
+    MCAsm.writeSectionData(OutFile, &Sec);
   }
 
   // Apply relocations to the contents of the DWARF segment.

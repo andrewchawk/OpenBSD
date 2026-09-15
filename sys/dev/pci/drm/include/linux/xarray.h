@@ -4,12 +4,13 @@
 #define _LINUX_XARRAY_H
 
 #include <linux/gfp.h>
+#include <linux/sched/mm.h>
 
 #include <sys/tree.h>
 
-#define XA_FLAGS_ALLOC		1
-#define XA_FLAGS_ALLOC1		2
-#define XA_FLAGS_LOCK_IRQ	4
+#define XA_FLAGS_ALLOC		(1 << 0)
+#define XA_FLAGS_ALLOC1		(1 << 1)
+#define XA_FLAGS_LOCK_IRQ	(1 << 2)
 
 /*
  * lower bits of pointer are tagged:
@@ -29,10 +30,30 @@ struct xarray {
 	SPLAY_HEAD(xarray_tree, xarray_entry) xa_tree;
 };
 
+#define DEFINE_XARRAY_FLAGS(name, flags)			\
+	struct xarray name = {					\
+		.xa_flags = flags,				\
+		.xa_lock = MUTEX_INITIALIZER(((flags) & XA_FLAGS_LOCK_IRQ) ? \
+		    IPL_TTY : IPL_NONE),			\
+		.xa_tree = SPLAY_INITIALIZER(&name.xa_tree)	\
+	}
+
+#define DEFINE_XARRAY_ALLOC(name)				\
+	DEFINE_XARRAY_FLAGS(name, XA_FLAGS_ALLOC)
+
+struct xarray_range {
+	uint32_t start;
+	uint32_t end;
+};
+
+#define XA_LIMIT(_start, _end)	(struct xarray_range){ _start, _end }
+#define xa_limit_32b		XA_LIMIT(0, UINT_MAX)
+
 void xa_init_flags(struct xarray *, gfp_t);
 void xa_destroy(struct xarray *);
-int __xa_alloc(struct xarray *, u32 *, void *, int, gfp_t);
-int __xa_alloc_cyclic(struct xarray *, u32 *, void *, int, u32 *, gfp_t);
+int __xa_alloc(struct xarray *, u32 *, void *, struct xarray_range, gfp_t);
+int __xa_alloc_cyclic(struct xarray *, u32 *, void *, struct xarray_range,
+    u32 *, gfp_t);
 void *__xa_load(struct xarray *, unsigned long);
 void *__xa_store(struct xarray *, unsigned long, void *, gfp_t);
 void *__xa_erase(struct xarray *, unsigned long);
@@ -40,8 +61,6 @@ void *xa_get_next(struct xarray *, unsigned long *);
 
 #define xa_for_each(xa, index, entry) \
 	for (index = 0; ((entry) = xa_get_next(xa, &(index))) != NULL; index++)
-
-#define xa_limit_32b	0
 
 #define xa_lock(_xa) do {				\
 		mtx_enter(&(_xa)->xa_lock);		\
@@ -112,11 +131,12 @@ xa_is_err(const void *e)
 }
 
 static inline int
-xa_alloc(struct xarray *xa, u32 *id, void *entry, int limit, gfp_t gfp)
+xa_alloc(struct xarray *xa, u32 *id, void *entry, struct xarray_range xr,
+    gfp_t gfp)
 {
 	int r;
 	mtx_enter(&xa->xa_lock);
-	r = __xa_alloc(xa, id, entry, limit, gfp);
+	r = __xa_alloc(xa, id, entry, xr, gfp);
 	mtx_leave(&xa->xa_lock);
 	return r;
 }
@@ -182,4 +202,21 @@ xa_init(struct xarray *xa)
 	xa_init_flags(xa, 0);
 }
 
+static inline int
+xa_alloc_cyclic(struct xarray *xa, u32 *id, void *entry,
+    struct xarray_range xr, u32 *next, gfp_t gfp)    
+{
+	int r;
+	mtx_enter(&xa->xa_lock);
+	r = __xa_alloc_cyclic(xa, id, entry, xr, next, gfp);
+	mtx_leave(&xa->xa_lock);
+	return r;
+}
+
+static inline int
+xa_alloc_cyclic_irq(struct xarray *xa, u32 *id, void *entry,
+    struct xarray_range xr, u32 *next, gfp_t gfp)    
+{
+	return xa_alloc_cyclic(xa, id, entry, xr, next, gfp);
+}
 #endif

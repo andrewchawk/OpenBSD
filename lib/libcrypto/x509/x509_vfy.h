@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_vfy.h,v 1.68 2024/03/02 10:57:03 tb Exp $ */
+/* $OpenBSD: x509_vfy.h,v 1.71 2025/10/24 11:33:38 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -280,7 +280,6 @@ int X509_OBJECT_idx_by_subject(STACK_OF(X509_OBJECT) *h, X509_LOOKUP_TYPE type,
 X509_OBJECT *X509_OBJECT_retrieve_by_subject(STACK_OF(X509_OBJECT) *h,
     X509_LOOKUP_TYPE type, X509_NAME *name);
 X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h, X509_OBJECT *x);
-int X509_OBJECT_up_ref_count(X509_OBJECT *a);
 X509_LOOKUP_TYPE X509_OBJECT_get_type(const X509_OBJECT *a);
 X509 *X509_OBJECT_get0_X509(const X509_OBJECT *xo);
 X509_CRL *X509_OBJECT_get0_X509_CRL(X509_OBJECT *xo);
@@ -341,11 +340,11 @@ void X509_STORE_CTX_trusted_stack(X509_STORE_CTX *ctx, STACK_OF(X509) *sk);
 void X509_STORE_CTX_set0_trusted_stack(X509_STORE_CTX *ctx, STACK_OF(X509) *sk);
 void X509_STORE_CTX_cleanup(X509_STORE_CTX *ctx);
 
-X509_LOOKUP *X509_STORE_add_lookup(X509_STORE *v, X509_LOOKUP_METHOD *m);
+X509_LOOKUP *X509_STORE_add_lookup(X509_STORE *v, const X509_LOOKUP_METHOD *m);
 
-X509_LOOKUP_METHOD *X509_LOOKUP_hash_dir(void);
-X509_LOOKUP_METHOD *X509_LOOKUP_file(void);
-X509_LOOKUP_METHOD *X509_LOOKUP_mem(void);
+const X509_LOOKUP_METHOD *X509_LOOKUP_hash_dir(void);
+const X509_LOOKUP_METHOD *X509_LOOKUP_file(void);
+const X509_LOOKUP_METHOD *X509_LOOKUP_mem(void);
 
 int X509_STORE_add_cert(X509_STORE *ctx, X509 *x);
 int X509_STORE_add_crl(X509_STORE *ctx, X509_CRL *x);
@@ -442,6 +441,7 @@ int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM *param, const char *name,
     size_t namelen);
 int X509_VERIFY_PARAM_add1_host(X509_VERIFY_PARAM *param, const char *name,
     size_t namelen);
+unsigned int X509_VERIFY_PARAM_get_hostflags(const X509_VERIFY_PARAM *param);
 void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM *param,
     unsigned int flags);
 char *X509_VERIFY_PARAM_get0_peername(X509_VERIFY_PARAM *param);

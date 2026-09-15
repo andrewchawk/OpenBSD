@@ -1,4 +1,4 @@
-/*	$OpenBSD: echo.c,v 1.69 2022/10/15 17:01:14 op Exp $	*/
+/*	$OpenBSD: echo.c,v 1.71 2026/07/19 13:31:28 op Exp $	*/
 
 /* This file is in the public domain. */
 
@@ -571,7 +571,7 @@ complt(int flags, int c, char *buf, size_t nbuf, int cpos, int *nx)
 	nxtra = HUGE;
 
 	for (; lh != NULL; lh = lh->l_next) {
-		if (memcmp(buf, lh->l_name, cpos) != 0)
+		if (strncmp(buf, lh->l_name, cpos) != 0)
 			continue;
 		if (nhits == 0)
 			lh2 = lh;
@@ -1002,19 +1002,24 @@ copy_list(struct list *lp)
 	last = NULL;
 	while (lp) {
 		current = malloc(sizeof(struct list));
-		if (current == NULL) {
-			/* Free what we have allocated so far */
-			for (current = last; current; current = nxt) {
-				nxt = current->l_next;
-				free(current->l_name);
-				free(current);
-			}
-			return (NULL);
+		if (current == NULL)
+			goto fail;
+		current->l_name = strdup(lp->l_name);
+		if (current->l_name == NULL) {
+			free(current);
+			goto fail;
 		}
 		current->l_next = last;
-		current->l_name = strdup(lp->l_name);
 		last = current;
 		lp = lp->l_next;
 	}
 	return (last);
+
+ fail:
+	for (current = last; current; current = nxt) {
+		nxt = current->l_next;
+		free(current->l_name);
+		free(current);
+	}
+	return (NULL);
 }

@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.111 2023/09/01 14:29:11 nicm Exp $
+# $OpenBSD: Makefile,v 1.123 2026/09/08 08:33:10 nicm Exp $
 
 PROG=	tmux
 SRCS=	alerts.c \
@@ -17,7 +17,6 @@ SRCS=	alerts.c \
 	cmd-detach-client.c \
 	cmd-display-menu.c \
 	cmd-display-message.c \
-	cmd-display-panes.c \
 	cmd-find-window.c \
 	cmd-find.c \
 	cmd-if-shell.c \
@@ -28,6 +27,7 @@ SRCS=	alerts.c \
 	cmd-kill-window.c \
 	cmd-list-buffers.c \
 	cmd-list-clients.c \
+	cmd-list-commands.c \
 	cmd-list-keys.c \
 	cmd-list-panes.c \
 	cmd-list-sessions.c \
@@ -75,16 +75,21 @@ SRCS=	alerts.c \
 	control-notify.c \
 	control.c \
 	environ.c \
+	events.c \
+	events-payload.c \
 	file.c \
 	format.c \
+	fuzzy.c \
 	format-draw.c \
 	grid-reader.c \
 	grid-view.c \
 	grid.c \
+	hooks.c \
 	hyperlinks.c \
 	input-keys.c \
 	input.c \
 	job.c \
+	json.c \
 	key-bindings.c \
 	key-string.c \
 	layout-custom.c \
@@ -93,14 +98,16 @@ SRCS=	alerts.c \
 	log.c \
 	menu.c \
 	mode-tree.c \
+	monitor.c \
 	names.c \
-	notify.c \
 	options-table.c \
 	options.c \
 	paste.c \
 	popup.c \
 	proc.c \
 	procname.c \
+	prompt.c \
+	prompt-history.c \
 	regsub.c \
 	resize.c \
 	screen-redraw.c \
@@ -114,20 +121,26 @@ SRCS=	alerts.c \
 	spawn.c \
 	status.c \
 	style.c \
+	sort.c \
 	tmux.c \
 	tty-acs.c \
+	tty-draw.c \
 	tty-features.c \
 	tty-keys.c \
 	tty-term.c \
 	tty.c \
 	utf8.c \
 	utf8-combined.c \
+	window-border.c \
 	window-buffer.c \
 	window-client.c \
 	window-clock.c \
 	window-copy.c \
 	window-customize.c \
+	window-panes.c \
+	window-switch.c \
 	window-tree.c \
+	window-visible.c \
 	window.c \
 	xmalloc.c
 
@@ -138,7 +151,12 @@ CDIAGFLAGS+= -Wundef -Wbad-function-cast -Winline -Wcast-align
 
 CFLAGS += -I${.CURDIR}
 
-LDADD=  -lutil -lcurses -levent -lm
-DPADD=  ${LIBUTIL} ${LIBCURSES} ${LIBEVENT} ${LIBM}
+LDADD=	-lutil -lcurses -levent -lm
+DPADD=	${LIBUTIL} ${LIBCURSES} ${LIBEVENT} ${LIBM}
+
+.if "${MACHINE_ARCH}" == "sh"
+screen-redraw.o:
+	${CC} ${CFLAGS} -fno-stack-protector ${CPPFLAGS} -c ${.IMPSRC}
+.endif
 
 .include <bsd.prog.mk>

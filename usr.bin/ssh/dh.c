@@ -1,4 +1,4 @@
-/* $OpenBSD: dh.c,v 1.74 2021/04/03 06:18:40 djm Exp $ */
+/* $OpenBSD: dh.c,v 1.76 2026/02/08 19:54:31 dtucker Exp $ */
 /*
  * Copyright (c) 2000 Niels Provos.  All rights reserved.
  *
@@ -24,6 +24,7 @@
  */
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -190,9 +191,9 @@ choose_dh(int min, int wantbits, int max)
 
 	if (bestcount == 0) {
 		fclose(f);
-		logit("WARNING: no suitable primes in %s",
-		    get_moduli_filename());
-		return (dh_new_group_fallback(max));
+		logit("WARNING: no suitable primes (size %d/%d/%d) in %s",
+		    min, wantbits, max, get_moduli_filename());
+		return NULL;
 	}
 	which = arc4random_uniform(bestcount);
 

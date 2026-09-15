@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfvar.h,v 1.538 2024/05/13 01:15:53 jsg Exp $ */
+/*	$OpenBSD: pfvar.h,v 1.548 2026/02/05 03:26:00 dlg Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -36,7 +36,6 @@
 
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/rwlock.h>
 #include <sys/syslimits.h>
 #include <sys/refcnt.h>
 #include <sys/timeout.h>
@@ -480,6 +479,13 @@ union pf_rule_ptr {
 #define	PF_ANCHOR_HIWAT		 512
 #define	PF_OPTIMIZER_TABLE_PFX	"__automatic_"
 
+enum {
+	PF_LIMITER_NOMATCH,
+	PF_LIMITER_BLOCK
+};
+
+#define	PF_LIMITER_DEFAULT	PF_LIMITER_BLOCK
+
 struct pf_rule {
 	struct pf_rule_addr	 src;
 	struct pf_rule_addr	 dst;
@@ -592,6 +598,14 @@ struct pf_rule {
 	u_int8_t		 set_prio[2];
 	sa_family_t		 naf;
 	u_int8_t		 rcvifnot;
+	struct {
+		u_int8_t	 id;
+		int		 limiter_action;
+	} 			 statelim;
+	struct {
+		u_int8_t	 id;
+		int		 limiter_action;
+	}			 sourcelim;
 
 	struct {
 		struct pf_addr		addr;
@@ -1034,10 +1048,6 @@ struct pfr_ktable {
 #define pfrkt_nomatch	pfrkt_ts.pfrts_nomatch
 #define pfrkt_tzero	pfrkt_ts.pfrts_tzero
 
-RB_HEAD(pf_state_tree_ext_gwy, pf_state_key);
-RB_PROTOTYPE(pf_state_tree_ext_gwy, pf_state_key,
-    entry_ext_gwy, pf_state_compare_ext_gwy)
-
 RB_HEAD(pfi_ifhead, pfi_kif);
 
 /* state tables */
@@ -1246,7 +1256,7 @@ struct pf_status {
 #define PF_PRIO_ZERO		0xff		/* match "prio 0" packets */
 
 struct pf_queue_bwspec {
-	u_int		absolute;
+	uint64_t	absolute;
 	u_int		percent;
 };
 
@@ -1507,6 +1517,133 @@ struct pfioc_synflwats {
 	u_int32_t	lowat;
 };
 
+#define PF_STATELIM_NAME_LEN	16	/* kstat istr */
+#define PF_STATELIM_DESCR_LEN	64
+
+struct pfioc_statelim {
+	u_int32_t	ticket;
+
+	char		name[PF_STATELIM_NAME_LEN];
+	uint32_t	id;
+#define PF_STATELIM_ID_NONE	0
+#define PF_STATELIM_ID_MIN	1
+#define PF_STATELIM_ID_MAX	255	/* fits in pf_state uint8_t */
+
+	/* limit on the total number of states */
+	unsigned int	limit;
+#define PF_STATELIM_LIMIT_MIN	1
+#define PF_STATELIM_LIMIT_MAX	(1 << 24) /* pf is pretty scalable */
+
+	/* rate limit on the creation of states */
+	struct {
+		unsigned int	limit;
+		unsigned int	seconds;
+	}		rate;
+
+	char		description[PF_STATELIM_DESCR_LEN];
+
+	/* kernel state for GET ioctls */
+	unsigned int	inuse;		/* gauge */
+	uint64_t	admitted;	/* counter */
+	uint64_t	hardlimited;	/* counter */
+	uint64_t	ratelimited;	/* counter */
+};
+
+#define PF_SOURCELIM_NAME_LEN	16	/* kstat istr */
+#define PF_SOURCELIM_DESCR_LEN	64
+
+struct pfioc_sourcelim {
+	u_int32_t	ticket;
+
+	char		name[PF_SOURCELIM_NAME_LEN];
+	uint32_t	id;
+#define PF_SOURCELIM_ID_NONE	0
+#define PF_SOURCELIM_ID_MIN	1
+#define PF_SOURCELIM_ID_MAX	255	/* fits in pf_state uint8_t */
+
+	/* limit on the total number of address entries */
+	unsigned int	entries;
+
+	/* limit on the number of states per address entry */
+	unsigned int	limit;
+
+	/* rate limit on the creation of states by an address entry */
+	struct {
+		unsigned int	limit;
+		unsigned int	seconds;
+	}		rate;
+
+	/*
+	 * when the number of states on an entry exceeds hwm, add
+	 * the address to the specified table. when the number of
+	 * states goes below lwm, remove it from the table.
+	 */
+	char		overload_tblname[PF_TABLE_NAME_SIZE];
+	unsigned int	overload_hwm;
+	unsigned int	overload_lwm;
+
+	/*
+	 * mask addresses before they're used for entries. /64s
+	 * everywhere for inet6 makes it easy to use too much memory.
+	 */ 
+	unsigned int	inet_prefix;
+	unsigned int	inet6_prefix;
+
+	char		description[PF_SOURCELIM_DESCR_LEN];
+
+	/* kernel state for GET ioctls */
+	unsigned int	nentries;	/* gauge */
+	unsigned int	inuse;		/* gauge */
+
+	uint64_t	addrallocs;	/* counter */
+	uint64_t	addrnomem;	/* counter */
+	uint64_t	admitted;	/* counter */
+	uint64_t	addrlimited;	/* counter */
+	uint64_t	hardlimited;	/* counter */
+	uint64_t	ratelimited;	/* counter */
+};
+
+struct pfioc_source_entry {
+	sa_family_t	af;
+	unsigned int	rdomain;
+	struct pf_addr	addr;
+
+	/* stats */
+
+	unsigned int	inuse;		/* gauge */
+	uint64_t	admitted;	/* counter */
+	uint64_t	hardlimited;	/* counter */
+	uint64_t	ratelimited;	/* counter */
+};
+
+struct pfioc_source {
+	char		name[PF_SOURCELIM_NAME_LEN];
+	uint32_t	id;
+
+	/* copied from the parent source limiter */
+
+	unsigned int	inet_prefix;
+	unsigned int	inet6_prefix;
+	unsigned int	limit;
+
+	/* source entries */
+	size_t		entry_size;	/* sizeof(struct pfioc_source_entry) */
+
+	struct pfioc_source_entry *key;
+	struct pfioc_source_entry *entries;
+	size_t		entrieslen;	/* bytes */
+};
+
+struct pfioc_source_kill {
+	char		name[PF_SOURCELIM_NAME_LEN];
+	uint32_t	id;
+	unsigned int	rdomain;
+	sa_family_t	af;
+	struct pf_addr	addr;
+
+	unsigned int	rmstates;	/* kill the states too? */
+};
+
 /*
  * ioctl operations
  */
@@ -1575,6 +1712,15 @@ struct pfioc_synflwats {
 #define DIOCSETSYNCOOKIES	_IOWR('D', 98, u_int8_t)
 #define DIOCGETSYNFLWATS	_IOWR('D', 99, struct pfioc_synflwats)
 #define DIOCXEND	_IOWR('D', 100, u_int32_t)
+#define DIOCADDSTATELIM		_IOW('D', 101, struct pfioc_statelim)
+#define DIOCADDSOURCELIM	_IOW('D', 102, struct pfioc_sourcelim)
+#define DIOCGETSTATELIM		_IOWR('D', 103, struct pfioc_statelim)
+#define DIOCGETSOURCELIM	_IOWR('D', 104, struct pfioc_sourcelim)
+#define DIOCGETSOURCE		_IOWR('D', 105, struct pfioc_source)
+#define DIOCGETNSTATELIM	_IOWR('D', 106, struct pfioc_statelim)
+#define DIOCGETNSOURCELIM	_IOWR('D', 107, struct pfioc_sourcelim)
+#define DIOCGETNSOURCE		_IOWR('D', 108, struct pfioc_source)
+#define DIOCCLRSOURCE		_IOWR('D', 109, struct pfioc_source_kill)
 
 #ifdef _KERNEL
 
@@ -1728,6 +1874,8 @@ int	pfr_clr_tstats(struct pfr_table *, int, int *, int);
 int	pfr_set_tflags(struct pfr_table *, int, int, int, int *, int *, int);
 int	pfr_clr_addrs(struct pfr_table *, int *, int);
 int	pfr_insert_kentry(struct pfr_ktable *, struct pfr_addr *, time_t);
+int	pfr_remove_kentry(struct pfr_ktable *, struct pfr_addr *);
+
 int	pfr_add_addrs(struct pfr_table *, struct pfr_addr *, int, int *,
 	    int);
 int	pfr_del_addrs(struct pfr_table *, struct pfr_addr *, int, int *,
@@ -1863,25 +2011,26 @@ void			 pf_mbuf_unlink_inpcb(struct mbuf *);
 u_int8_t*		 pf_find_tcpopt(u_int8_t *, u_int8_t *, size_t,
 			    u_int8_t, u_int8_t);
 u_int8_t		 pf_get_wscale(struct pf_pdesc *);
-u_int16_t		 pf_get_mss(struct pf_pdesc *);
+u_int16_t		 pf_get_mss(struct pf_pdesc *, uint16_t);
 struct mbuf *		 pf_build_tcp(const struct pf_rule *, sa_family_t,
 			    const struct pf_addr *, const struct pf_addr *,
 			    u_int16_t, u_int16_t, u_int32_t, u_int32_t,
 			    u_int8_t, u_int16_t, u_int16_t, u_int8_t, int,
-			    u_int16_t, u_int, u_int);
+			    u_int16_t, u_int, u_int, u_short *);
 void			 pf_send_tcp(const struct pf_rule *, sa_family_t,
 			    const struct pf_addr *, const struct pf_addr *,
 			    u_int16_t, u_int16_t, u_int32_t, u_int32_t,
 			    u_int8_t, u_int16_t, u_int16_t, u_int8_t, int,
-			    u_int16_t, u_int);
+			    u_int16_t, u_int, u_short *);
 void			 pf_syncookies_init(void);
 int			 pf_syncookies_setmode(u_int8_t);
 int			 pf_syncookies_setwats(u_int32_t, u_int32_t);
 int			 pf_syncookies_getwats(struct pfioc_synflwats *);
 int			 pf_synflood_check(struct pf_pdesc *);
-void			 pf_syncookie_send(struct pf_pdesc *);
+void			 pf_syncookie_send(struct pf_pdesc *, u_short *);
 u_int8_t		 pf_syncookie_validate(struct pf_pdesc *);
-struct mbuf *		 pf_syncookie_recreate_syn(struct pf_pdesc *);
+struct mbuf *		 pf_syncookie_recreate_syn(struct pf_pdesc *,
+			    u_short *);
 #endif /* _KERNEL */
 
 #endif /* _NET_PFVAR_H_ */

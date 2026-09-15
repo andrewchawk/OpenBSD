@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.17 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.19 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMCodeGen
 NOPROFILE=
@@ -16,15 +16,17 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	BranchRelaxation.cpp \
 	BreakFalseDeps.cpp \
 	BasicBlockSections.cpp \
+	BasicBlockPathCloning.cpp \
 	BasicBlockSectionsProfileReader.cpp \
+	BasicBlockMatchingAndInference.cpp \
 	CalcSpillWeights.cpp \
+	CallBrPrepare.cpp \
 	CallingConvLower.cpp \
 	CFGuardLongjmp.cpp \
 	CFIFixup.cpp \
 	CFIInstrInserter.cpp \
 	CodeGen.cpp \
 	CodeGenCommonISel.cpp \
-	CodeGenPassBuilder.cpp \
 	CodeGenPrepare.cpp \
 	CommandFlags.cpp \
 	ComplexDeinterleavingPass.cpp \
@@ -32,13 +34,13 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	DeadMachineInstructionElim.cpp \
 	DetectDeadLanes.cpp \
 	DFAPacketizer.cpp \
+	DroppedVariableStatsMIR.cpp \
 	DwarfEHPrepare.cpp \
 	EarlyIfConversion.cpp \
 	EdgeBundles.cpp \
-	EHContGuardCatchret.cpp \
+	EHContGuardTargets.cpp \
 	ExecutionDomainFix.cpp \
-	ExpandLargeDivRem.cpp \
-	ExpandLargeFpConvert.cpp \
+	ExpandIRInsts.cpp \
 	ExpandMemCmp.cpp \
 	ExpandPostRAPseudos.cpp \
 	ExpandReductions.cpp \
@@ -48,23 +50,29 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	FinalizeISel.cpp \
 	FixupStatepointCallerSaved.cpp \
 	FuncletLayout.cpp \
+	GCEmptyBasicBlocks.cpp \
 	GCMetadata.cpp \
 	GCMetadataPrinter.cpp \
 	GCRootLowering.cpp \
 	GlobalMerge.cpp \
+	GlobalMergeFunctions.cpp \
 	HardwareLoops.cpp \
 	IfConversion.cpp \
 	ImplicitNullChecks.cpp \
 	IndirectBrExpandPass.cpp \
+	InitUndef.cpp \
 	InlineSpiller.cpp \
+	InsertCodePrefetch.cpp \
 	InterferenceCache.cpp \
 	InterleavedAccessPass.cpp \
 	InterleavedLoadCombinePass.cpp \
 	IntrinsicLowering.cpp \
 	JMCInstrumenter.cpp \
+	CodeGenKCFI.cpp \
 	LatencyPriorityQueue.cpp \
 	LazyMachineBlockFrequencyInfo.cpp \
 	LexicalScopes.cpp \
+	LibcallLoweringInfo.cpp \
 	LiveDebugVariables.cpp \
 	LiveIntervals.cpp \
 	LiveInterval.cpp \
@@ -78,26 +86,30 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	LiveRegUnits.cpp \
 	LiveStacks.cpp \
 	LiveVariables.cpp \
-	LLVMTargetMachine.cpp \
+	CodeGenTargetMachineImpl.cpp \
 	LocalStackSlotAllocation.cpp \
 	LoopTraversal.cpp \
-	CodeGenLowLevelType.cpp \
+	LowLevelTypeUtils.cpp \
 	LowerEmuTLS.cpp \
 	MachineBasicBlock.cpp \
 	MachineBlockFrequencyInfo.cpp \
+	MachineBlockHashInfo.cpp \
 	MachineBlockPlacement.cpp \
 	MachineBranchProbabilityInfo.cpp \
 	MachineCFGPrinter.cpp \
 	MachineCombiner.cpp \
+	MachineConvergenceVerifier.cpp \
 	MachineCopyPropagation.cpp \
 	MachineCSE.cpp \
 	MachineCheckDebugify.cpp \
 	MachineCycleAnalysis.cpp \
 	MachineDebugify.cpp \
+	MachineDomTreeUpdater.cpp \
 	MachineDominanceFrontier.cpp \
 	MachineDominators.cpp \
 	MachineFrameInfo.cpp \
 	MachineFunction.cpp \
+	MachineFunctionAnalysis.cpp \
 	MachineFunctionPass.cpp \
 	MachineFunctionPrinterPass.cpp \
 	MachineFunctionSplitter.cpp \
@@ -130,8 +142,9 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	MIRFSDiscriminator.cpp \
 	MIRSampleProfile.cpp \
 	MIRYamlMapping.cpp \
-	MLRegallocEvictAdvisor.cpp \
-	MLRegallocPriorityAdvisor.cpp \
+	MIR2Vec.cpp \
+	MLRegAllocEvictAdvisor.cpp \
+	MLRegAllocPriorityAdvisor.cpp \
 	ModuloSchedule.cpp \
 	MultiHazardRecognizer.cpp \
 	PatchableFunction.cpp \
@@ -141,7 +154,6 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	MacroFusion.cpp \
 	NonRelocatableStringpool.cpp \
 	OptimizePHIs.cpp \
-	ParallelCG.cpp \
 	PeepholeOptimizer.cpp \
 	PHIElimination.cpp \
 	PHIEliminationUtils.cpp \
@@ -177,6 +189,7 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	RegisterUsageInfo.cpp \
 	RegUsageInfoCollector.cpp \
 	RegUsageInfoPropagate.cpp \
+	RemoveLoadsIntoFakeUses.cpp \
 	ReplaceWithVeclib.cpp \
 	ResetMachineFunctionPass.cpp \
 	ReturnProtectorLowering.cpp \
@@ -203,6 +216,8 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	StackMaps.cpp \
 	StackProtector.cpp \
 	StackSlotColoring.cpp \
+	StaticDataSplitter.cpp \
+	StaticDataAnnotator.cpp \
 	SwiftErrorValueTracking.cpp \
 	SwitchLoweringUtils.cpp \
 	TailDuplication.cpp \
@@ -223,6 +238,8 @@ SRCS+=	AggressiveAntiDepBreaker.cpp \
 	VLIWMachineScheduler.cpp \
 	VirtRegMap.cpp \
 	WasmEHPrepare.cpp \
+	WindowScheduler.cpp \
+	WindowsSecureHotPatching.cpp \
 	WinEHPrepare.cpp \
 	XRayInstrumentation.cpp
 	
@@ -234,10 +251,10 @@ SRCS+=	LiveDebugValues.cpp \
 CodeGenAnalysis.cpp:
 	ln -s ${LLVM_SRCS}/lib/CodeGen/Analysis.cpp $@
 
-CodeGenLowLevelType.cpp:
-	ln -s ${LLVM_SRCS}/lib/CodeGen/LowLevelType.cpp $@
+CodeGenKCFI.cpp:
+	ln -s ${LLVM_SRCS}/lib/CodeGen/KCFI.cpp $@
 
 .PATH:	${.CURDIR}/../../../llvm/llvm/lib/CodeGen
 .PATH:	${.CURDIR}/../../../llvm/llvm/lib/CodeGen/LiveDebugValues
 
-CLEANFILES+= CodeGenAnalysis.cpp CodeGenLowLevelType.cpp
+CLEANFILES+= CodeGenAnalysis.cpp

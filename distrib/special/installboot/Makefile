@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.18 2022/08/31 18:46:06 miod Exp $
+#	$OpenBSD: Makefile,v 1.20 2026/07/15 19:00:24 miod Exp $
 
 .PATH: ${.CURDIR}/../../../usr.sbin/installboot
 
@@ -25,8 +25,6 @@ CFLAGS += -DBOOTSTRAP
 SRCS += hppa_installboot.c
 .elif ${MACHINE} == "landisk"
 SRCS += landisk_installboot.c
-.elif ${MACHINE} == "loongson"
-SRCS += loongson_installboot.c
 .elif ${MACHINE} == "macppc"
 SRCS += macppc_installboot.c
 .elif ${MACHINE} == "powerpc64"
@@ -41,12 +39,20 @@ SRCS += sparc64_softraid.c
 SRCS += stubs.c
 .endif
 
+.if ${MACHINE} == "amd64" || ${MACHINE} == "arm64"
+CFLAGS += -DEFIBOOTMGR
+.endif
+
 .if !empty(CFLAGS:M-DBOOTSTRAP)
 SRCS += bootstrap.c
 .endif
 
 .if !empty(CFLAGS:M-DSOFTRAID)
 SRCS += softraid.c
+.endif
+
+.if !empty(CFLAGS:M-DEFIBOOTMGR)
+SRCS += efi_bootmgr.c
 .endif
 
 .include <bsd.prog.mk>

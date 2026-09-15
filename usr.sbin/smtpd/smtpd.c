@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd.c,v 1.351 2024/05/07 12:10:06 op Exp $	*/
+/*	$OpenBSD: smtpd.c,v 1.364 2026/09/09 00:34:13 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -65,6 +65,7 @@ static void setup_done(struct mproc *);
 static void setup_proc(void);
 static struct mproc *setup_peer(enum smtp_proc_type, pid_t, int);
 static int imsg_wait(struct imsgbuf *, struct imsg *, int);
+static int transform_path(char *, size_t, const char *, const char *);
 
 static void	offline_scan(int, short, void *);
 static int	offline_add(char *, uid_t, gid_t);
@@ -77,7 +78,7 @@ static void	load_pki_tree(void);
 static void	load_pki_keys(void);
 
 static void	fork_filter_processes(void);
-static void	fork_filter_process(const char *, const char *, const char *, const char *, const char *, uint32_t);
+static void	fork_filter_process(const char *, struct filter_proc *);
 
 enum child_type {
 	CHILD_DAEMON,
@@ -162,6 +163,8 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 	case IMSG_LKA_OPEN_FORWARD:
 		CHECK_IMSG_DATA_SIZE(imsg, sizeof *fwreq);
 		fwreq = imsg->data;
+		fwreq->directory[sizeof(fwreq->directory) - 1] = '\0';
+		fwreq->user[sizeof(fwreq->user) - 1] = '\0';
 		fd = parent_forward_open(fwreq->user, fwreq->directory,
 		    fwreq->uid, fwreq->gid);
 		fwreq->status = 0;
@@ -185,6 +188,9 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_string(&m, &username);
 		m_get_string(&m, &password);
 		m_end(&m);
+
+		if (username == NULL || password == NULL)
+			fatalx("parent_imsg: missing username or password");
 
 		ret = parent_auth_user(username, password);
 
@@ -210,6 +216,9 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_id(&m, &reqid);
 		m_get_string(&m, &cause);
 		m_end(&m);
+
+		if (cause == NULL)
+			fatalx("parent_imsg: missing cause");
 
 		i = NULL;
 		while ((n = tree_iter(&children, &i, NULL, (void**)&c)))
@@ -247,6 +256,9 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_msg(&m, imsg);
 		m_get_string(&m, &procname);
 		m_end(&m);
+
+		if (procname == NULL)
+			fatalx("parent_imsg: missing procname");
 
 		processor = dict_xget(env->sc_filter_processes_dict, procname);
 		m_create(p_lka, IMSG_LKA_PROCESSOR_ERRFD, 0, 0, processor->errfd);
@@ -460,6 +472,24 @@ parent_sig_handler(int sig, short event, void *p)
 }
 
 int
+transform_path(char *path, size_t pathsize, const char *from, const char *to)
+{
+	const size_t pathlen = strlen(path);
+	const size_t fromlen = strlen(from);
+	char *cp;
+
+	if (pathlen < fromlen)
+		return -1;
+	cp = &path[pathlen - fromlen];
+	if (strcmp(cp, from) != 0)
+		return -1;
+	*cp = '\0';
+	if (strlcat(path, to, pathsize) >= pathsize)
+		return -1;
+	return 0;
+}
+
+int
 main(int argc, char *argv[])
 {
 	int		 c, i;
@@ -483,7 +513,7 @@ main(int argc, char *argv[])
 
 	TAILQ_INIT(&offline_q);
 
-	while ((c = getopt(argc, argv, "B:dD:hnP:f:FT:vx:")) != -1) {
+	while ((c = getopt(argc, argv, "B:dD:hnP:f:FT:vVx:")) != -1) {
 		switch (c) {
 		case 'B':
 			if (strstr(optarg, "queue=") == optarg)
@@ -578,6 +608,8 @@ main(int argc, char *argv[])
 		case 'v':
 			tracing |=  TRACE_DEBUG;
 			break;
+		case 'V':
+			exit(0);
 		case 'x':
 			rexec = optarg;
 			break;
@@ -706,8 +738,8 @@ main(int argc, char *argv[])
 			    0, -1, env->sc_queue_key, strlen(env->sc_queue_key)
 			    + 1) == -1)
 				fatal("imsg_compose");
-			if (imsg_flush(&p_queue->imsgbuf) == -1)
-				fatal("imsg_flush");
+			if (imsgbuf_flush(&p_queue->imsgbuf) == -1)
+				fatal("imsgbuf_flush");
 		}
 
 		setup_done(p_ca);
@@ -793,7 +825,7 @@ static struct mproc *
 start_child(int save_argc, char **save_argv, char *rexec)
 {
 	struct mproc *p;
-	char *argv[SMTPD_MAXARG];
+	char *argv[SMTPD_MAXARG], *a0, execpath[PATH_MAX];
 	int sp[2], argc = 0;
 	pid_t pid;
 
@@ -805,6 +837,12 @@ start_child(int save_argc, char **save_argv, char *rexec)
 
 	io_set_nonblocking(sp[0]);
 	io_set_nonblocking(sp[1]);
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		fatal("getexecpath");
+	if (transform_path(execpath, sizeof execpath,
+	    "/sbin/smtpd", "/libexec/smtpd") == -1)
+		fatalx("getexecpath");		
 
 	switch (pid = fork()) {
 	case -1:
@@ -838,9 +876,10 @@ start_child(int save_argc, char **save_argv, char *rexec)
 	argv[argc++] = "-x";
 	argv[argc++] = rexec;
 	argv[argc++] = NULL;
+	asprintf(&a0, "%s-%s", execpath, rexec);
 
-	execvp(argv[0], argv);
-	fatal("%s: execvp", rexec);
+	execvp(a0, argv);
+	fatal("%s: execvp", a0);
 }
 
 static void
@@ -857,14 +896,14 @@ setup_peers(struct mproc *a, struct mproc *b)
 	if (imsg_compose(&a->imsgbuf, IMSG_SETUP_PEER, b->proc, b->pid, sp[0],
 	    NULL, 0) == -1)
 		fatal("imsg_compose");
-	if (imsg_flush(&a->imsgbuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(&a->imsgbuf) == -1)
+		fatal("imsgbuf_flush");
 
 	if (imsg_compose(&b->imsgbuf, IMSG_SETUP_PEER, a->proc, a->pid, sp[1],
 	    NULL, 0) == -1)
 		fatal("imsg_compose");
-	if (imsg_flush(&b->imsgbuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(&b->imsgbuf) == -1)
+		fatal("imsgbuf_flush");
 }
 
 static void
@@ -874,8 +913,8 @@ setup_done(struct mproc *p)
 
 	if (imsg_compose(&p->imsgbuf, IMSG_SETUP_DONE, 0, 0, -1, NULL, 0) == -1)
 		fatal("imsg_compose");
-	if (imsg_flush(&p->imsgbuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(&p->imsgbuf) == -1)
+		fatal("imsgbuf_flush");
 
 	if (imsg_wait(&p->imsgbuf, &imsg, 10000) == -1)
 		fatal("imsg_wait");
@@ -932,8 +971,8 @@ setup_proc(void)
 	if (imsg_compose(ibuf, IMSG_SETUP_DONE, 0, 0, -1, NULL, 0) == -1)
 		fatal("imsg_compose");
 
-	if (imsg_flush(ibuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(ibuf) == -1)
+		fatal("imsgbuf_flush");
 
 	log_debug("setup_proc: %s done", proc_title(smtpd_process));
 }
@@ -994,13 +1033,13 @@ static int
 imsg_wait(struct imsgbuf *ibuf, struct imsg *imsg, int timeout)
 {
 	struct pollfd pfd[1];
-	ssize_t n;
+	int n;
 
 	pfd[0].fd = ibuf->fd;
 	pfd[0].events = POLLIN;
 
 	while (1) {
-		if ((n = imsg_get(ibuf, imsg)) == -1)
+		if ((n = imsgbuf_get(ibuf, imsg)) == -1)
 			return -1;
 		if (n)
 			return 1;
@@ -1013,7 +1052,7 @@ imsg_wait(struct imsgbuf *ibuf, struct imsg *imsg, int timeout)
 			return -1;
 		}
 
-		if (((n = imsg_read(ibuf)) == -1 && errno != EAGAIN) || n == 0)
+		if (imsgbuf_read(ibuf) != 1)
 			return -1;
 	}
 }
@@ -1069,7 +1108,7 @@ smtpd(void) {
 
 	purge_task();
 
-	if (pledge("stdio rpath wpath cpath fattr tmppath "
+	if (pledge("stdio rpath wpath cpath fattr "
 	    "getpw sendfd proc exec id inet chown unix", NULL) == -1)
 		fatal("pledge");
 
@@ -1205,43 +1244,52 @@ static void
 purge_task(void)
 {
 	struct passwd	*pw;
-	DIR		*d;
-	int		 n;
+	DIR		*dp;
+	struct dirent	*d;
+	int		 purge;
 	uid_t		 uid;
 	gid_t		 gid;
 
-	n = 0;
-	if ((d = opendir(PATH_SPOOL PATH_PURGE))) {
-		while (readdir(d) != NULL)
-			n++;
-		closedir(d);
-	} else
+	if ((dp = opendir(PATH_SPOOL PATH_PURGE)) == NULL) {
 		log_warn("warn: purge_task: opendir");
+		return;
+	}
 
-	if (n > 2) {
-		switch (purge_pid = fork()) {
-		case -1:
-			log_warn("warn: purge_task: fork");
-			break;
-		case 0:
-			if ((pw = getpwnam(SMTPD_QUEUE_USER)) == NULL)
-				fatalx("unknown user " SMTPD_QUEUE_USER);
-			if (chroot(PATH_SPOOL PATH_PURGE) == -1)
-				fatal("smtpd: chroot");
-			if (chdir("/") == -1)
-				fatal("smtpd: chdir");
-			uid = pw->pw_uid;
-			gid = pw->pw_gid;
-			if (setgroups(1, &gid) ||
-			    setresgid(gid, gid, gid) ||
-			    setresuid(uid, uid, uid))
-				fatal("smtpd: cannot drop privileges");
-			rmtree("/", 1);
-			_exit(0);
-			break;
-		default:
-			break;
-		}
+	purge = 0;
+	while ((d = readdir(dp)) != NULL) {
+		if (strcmp(d->d_name, ".") == 0 ||
+		    strcmp(d->d_name, "..") == 0)
+			continue;
+		purge = 1;
+		break;
+	}
+	closedir(dp);
+
+	if (!purge)
+		return;
+
+	switch (purge_pid = fork()) {
+	case -1:
+		log_warn("warn: purge_task: fork");
+		break;
+	case 0:
+		if ((pw = getpwnam(SMTPD_QUEUE_USER)) == NULL)
+			fatalx("unknown user " SMTPD_QUEUE_USER);
+		if (chroot(PATH_SPOOL PATH_PURGE) == -1)
+			fatal("smtpd: chroot");
+		if (chdir("/") == -1)
+			fatal("smtpd: chdir");
+		uid = pw->pw_uid;
+		gid = pw->pw_gid;
+		if (setgroups(1, &gid) ||
+		    setresgid(gid, gid, gid) ||
+		    setresuid(uid, uid, uid))
+			fatal("smtpd: cannot drop privileges");
+		rmtree("/", 1);
+		_exit(0);
+		break;
+	default:
+		break;
 	}
 }
 
@@ -1278,11 +1326,11 @@ fork_filter_processes(void)
 
 	iter = NULL;
 	while (dict_iter(env->sc_filter_processes_dict, &iter, &name, (void **)&fp))
-		fork_filter_process(name, fp->command, fp->user, fp->group, fp->chroot, fp->filter_subsystem);
+		fork_filter_process(name, fp);
 }
 
 static void
-fork_filter_process(const char *name, const char *command, const char *user, const char *group, const char *chroot_path, uint32_t subsystems)
+fork_filter_process(const char *name, struct filter_proc *fp)
 {
 	pid_t		 pid;
 	struct filter_proc	*processor;
@@ -1292,14 +1340,14 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 	struct group	*gr;
 	char		 exec[_POSIX_ARG_MAX];
 	int		 execr;
+	const char	*user;
 
-	if (user == NULL)
-		user = SMTPD_USER;
+	user = fp->user != NULL ? fp->user : SMTPD_USER;
 	if ((pw = getpwnam(user)) == NULL)
 		fatal("getpwnam");
 
-	if (group) {
-		if ((gr = getgrnam(group)) == NULL)
+	if (fp->group) {
+		if ((gr = getgrnam(fp->group)) == NULL)
 			fatal("getgrnam");
 	}
 	else {
@@ -1324,7 +1372,8 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 		close(errfd[0]);
 		m_create(p_lka, IMSG_LKA_PROCESSOR_FORK, 0, 0, sp[1]);
 		m_add_string(p_lka, name);
-		m_add_u32(p_lka, (uint32_t)subsystems);
+		m_add_string(p_lka, fp->tag);
+		m_add_u32(p_lka, (uint32_t)fp->filter_subsystem);
 		m_close(p_lka);
 		return;
 	}
@@ -1335,9 +1384,9 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 	dup2(sp[0], STDOUT_FILENO);
 	dup2(errfd[0], STDERR_FILENO);
 
-	if (chroot_path) {
-		if (chroot(chroot_path) != 0 || chdir("/") != 0)
-			fatal("chroot: %s", chroot_path);
+	if (fp->chroot) {
+		if (chroot(fp->chroot) != 0 || chdir("/") != 0)
+			fatal("chroot: %s", fp->chroot);
 	}
 
 	if (setgroups(1, &gr->gr_gid) ||
@@ -1356,11 +1405,11 @@ fork_filter_process(const char *name, const char *command, const char *user, con
 	    signal(SIGHUP, SIG_DFL) == SIG_ERR)
 		fatal("signal");
 
-	if (command[0] == '/')
-		execr = snprintf(exec, sizeof(exec), "exec %s", command);
+	if (fp->command[0] == '/')
+		execr = snprintf(exec, sizeof(exec), "exec %s", fp->command);
 	else
 		execr = snprintf(exec, sizeof(exec), "exec %s/%s", 
-		    PATH_LIBEXEC, command);
+		    PATH_LIBEXEC, fp->command);
 	if (execr >= (int) sizeof(exec))
 		fatalx("%s: exec path too long", name);
 
@@ -1712,7 +1761,7 @@ offline_enqueue(char *name, uid_t uid, gid_t gid)
 		envp[1] = (char *)NULL;
 		environ = envp;
 
-		execvp(PATH_SMTPCTL, args.list);
+		execv(PATH_SMTPCTL, args.list);
 		_exit(1);
 	}
 
@@ -1803,7 +1852,7 @@ parent_forward_open(char *username, char *directory, uid_t uid, gid_t gid)
 	}
 
 	if (!secure_file(fd, pathname, directory, uid, 1)) {
-		log_warnx("warn: smtpd: %s: unsecure file", pathname);
+		log_warnx("warn: smtpd: %s: insecure file", pathname);
 		close(fd);
 		return -1;
 	}
@@ -1856,254 +1905,6 @@ imsg_dispatch(struct mproc *p, struct imsg *imsg)
 				return;
 			stat_set(key, stat_timespec(&dt));
 		}
-	}
-}
-
-void
-log_imsg(int to, int from, struct imsg *imsg)
-{
-
-	if (to == PROC_CONTROL && imsg->hdr.type == IMSG_STAT_SET)
-		return;
-
-	log_trace(TRACE_IMSG, "imsg: %s <- %s: %s (len=%zu)",
-	    proc_name(to),
-	    proc_name(from),
-	    imsg_to_str(imsg->hdr.type),
-	    imsg->hdr.len - IMSG_HEADER_SIZE);
-}
-
-const char *
-proc_title(enum smtp_proc_type proc)
-{
-	switch (proc) {
-	case PROC_PARENT:
-		return "[priv]";
-	case PROC_LKA:
-		return "lookup";
-	case PROC_QUEUE:
-		return "queue";
-	case PROC_CONTROL:
-		return "control";
-	case PROC_SCHEDULER:
-		return "scheduler";
-	case PROC_DISPATCHER:
-		return "dispatcher";
-	case PROC_CA:
-		return "crypto";
-	case PROC_CLIENT:
-		return "client";
-	case PROC_PROCESSOR:
-		return "processor";
-	}
-	return "unknown";
-}
-
-const char *
-proc_name(enum smtp_proc_type proc)
-{
-	switch (proc) {
-	case PROC_PARENT:
-		return "parent";
-	case PROC_LKA:
-		return "lka";
-	case PROC_QUEUE:
-		return "queue";
-	case PROC_CONTROL:
-		return "control";
-	case PROC_SCHEDULER:
-		return "scheduler";
-	case PROC_DISPATCHER:
-		return "dispatcher";
-	case PROC_CA:
-		return "ca";
-	case PROC_CLIENT:
-		return "client-proc";
-	default:
-		return "unknown";
-	}
-}
-
-#define CASE(x) case x : return #x
-
-const char *
-imsg_to_str(int type)
-{
-	static char	 buf[32];
-
-	switch (type) {
-	CASE(IMSG_NONE);
-
-	CASE(IMSG_CTL_OK);
-	CASE(IMSG_CTL_FAIL);
-
-	CASE(IMSG_CTL_GET_DIGEST);
-	CASE(IMSG_CTL_GET_STATS);
-	CASE(IMSG_CTL_LIST_MESSAGES);
-	CASE(IMSG_CTL_LIST_ENVELOPES);
-	CASE(IMSG_CTL_MTA_SHOW_HOSTS);
-	CASE(IMSG_CTL_MTA_SHOW_RELAYS);
-	CASE(IMSG_CTL_MTA_SHOW_ROUTES);
-	CASE(IMSG_CTL_MTA_SHOW_HOSTSTATS);
-	CASE(IMSG_CTL_MTA_BLOCK);
-	CASE(IMSG_CTL_MTA_UNBLOCK);
-	CASE(IMSG_CTL_MTA_SHOW_BLOCK);
-	CASE(IMSG_CTL_PAUSE_EVP);
-	CASE(IMSG_CTL_PAUSE_MDA);
-	CASE(IMSG_CTL_PAUSE_MTA);
-	CASE(IMSG_CTL_PAUSE_SMTP);
-	CASE(IMSG_CTL_PROFILE);
-	CASE(IMSG_CTL_PROFILE_DISABLE);
-	CASE(IMSG_CTL_PROFILE_ENABLE);
-	CASE(IMSG_CTL_RESUME_EVP);
-	CASE(IMSG_CTL_RESUME_MDA);
-	CASE(IMSG_CTL_RESUME_MTA);
-	CASE(IMSG_CTL_RESUME_SMTP);
-	CASE(IMSG_CTL_RESUME_ROUTE);
-	CASE(IMSG_CTL_REMOVE);
-	CASE(IMSG_CTL_SCHEDULE);
-	CASE(IMSG_CTL_SHOW_STATUS);
-	CASE(IMSG_CTL_TRACE_DISABLE);
-	CASE(IMSG_CTL_TRACE_ENABLE);
-	CASE(IMSG_CTL_UPDATE_TABLE);
-	CASE(IMSG_CTL_VERBOSE);
-	CASE(IMSG_CTL_DISCOVER_EVPID);
-	CASE(IMSG_CTL_DISCOVER_MSGID);
-
-	CASE(IMSG_CTL_SMTP_SESSION);
-
-	CASE(IMSG_GETADDRINFO);
-	CASE(IMSG_GETADDRINFO_END);
-	CASE(IMSG_GETNAMEINFO);
-	CASE(IMSG_RES_QUERY);
-
-	CASE(IMSG_SETUP_KEY);
-	CASE(IMSG_SETUP_PEER);
-	CASE(IMSG_SETUP_DONE);
-
-	CASE(IMSG_CONF_START);
-	CASE(IMSG_CONF_END);
-
-	CASE(IMSG_STAT_INCREMENT);
-	CASE(IMSG_STAT_DECREMENT);
-	CASE(IMSG_STAT_SET);
-
-	CASE(IMSG_LKA_AUTHENTICATE);
-	CASE(IMSG_LKA_OPEN_FORWARD);
-	CASE(IMSG_LKA_ENVELOPE_SUBMIT);
-	CASE(IMSG_LKA_ENVELOPE_COMMIT);
-
-	CASE(IMSG_QUEUE_DELIVER);
-	CASE(IMSG_QUEUE_DELIVERY_OK);
-	CASE(IMSG_QUEUE_DELIVERY_TEMPFAIL);
-	CASE(IMSG_QUEUE_DELIVERY_PERMFAIL);
-	CASE(IMSG_QUEUE_DELIVERY_LOOP);
-	CASE(IMSG_QUEUE_DISCOVER_EVPID);
-	CASE(IMSG_QUEUE_DISCOVER_MSGID);
-	CASE(IMSG_QUEUE_ENVELOPE_ACK);
-	CASE(IMSG_QUEUE_ENVELOPE_COMMIT);
-	CASE(IMSG_QUEUE_ENVELOPE_REMOVE);
-	CASE(IMSG_QUEUE_ENVELOPE_SCHEDULE);
-	CASE(IMSG_QUEUE_ENVELOPE_SUBMIT);
-	CASE(IMSG_QUEUE_HOLDQ_HOLD);
-	CASE(IMSG_QUEUE_HOLDQ_RELEASE);
-	CASE(IMSG_QUEUE_MESSAGE_COMMIT);
-	CASE(IMSG_QUEUE_MESSAGE_ROLLBACK);
-	CASE(IMSG_QUEUE_SMTP_SESSION);
-	CASE(IMSG_QUEUE_TRANSFER);
-
-	CASE(IMSG_MDA_DELIVERY_OK);
-	CASE(IMSG_MDA_DELIVERY_TEMPFAIL);
-	CASE(IMSG_MDA_DELIVERY_PERMFAIL);
-	CASE(IMSG_MDA_DELIVERY_LOOP);
-	CASE(IMSG_MDA_DELIVERY_HOLD);
-	CASE(IMSG_MDA_DONE);
-	CASE(IMSG_MDA_FORK);
-	CASE(IMSG_MDA_HOLDQ_RELEASE);
-	CASE(IMSG_MDA_LOOKUP_USERINFO);
-	CASE(IMSG_MDA_KILL);
-	CASE(IMSG_MDA_OPEN_MESSAGE);
-
-	CASE(IMSG_MTA_DELIVERY_OK);
-	CASE(IMSG_MTA_DELIVERY_TEMPFAIL);
-	CASE(IMSG_MTA_DELIVERY_PERMFAIL);
-	CASE(IMSG_MTA_DELIVERY_LOOP);
-	CASE(IMSG_MTA_DELIVERY_HOLD);
-	CASE(IMSG_MTA_DNS_HOST);
-	CASE(IMSG_MTA_DNS_HOST_END);
-	CASE(IMSG_MTA_DNS_MX);
-	CASE(IMSG_MTA_DNS_MX_PREFERENCE);
-	CASE(IMSG_MTA_HOLDQ_RELEASE);
-	CASE(IMSG_MTA_LOOKUP_CREDENTIALS);
-	CASE(IMSG_MTA_LOOKUP_SOURCE);
-	CASE(IMSG_MTA_LOOKUP_HELO);
-	CASE(IMSG_MTA_LOOKUP_SMARTHOST);
-	CASE(IMSG_MTA_OPEN_MESSAGE);
-	CASE(IMSG_MTA_SCHEDULE);
-
-	CASE(IMSG_SCHED_ENVELOPE_BOUNCE);
-	CASE(IMSG_SCHED_ENVELOPE_DELIVER);
-	CASE(IMSG_SCHED_ENVELOPE_EXPIRE);
-	CASE(IMSG_SCHED_ENVELOPE_INJECT);
-	CASE(IMSG_SCHED_ENVELOPE_REMOVE);
-	CASE(IMSG_SCHED_ENVELOPE_TRANSFER);
-
-	CASE(IMSG_SMTP_AUTHENTICATE);
-	CASE(IMSG_SMTP_MESSAGE_COMMIT);
-	CASE(IMSG_SMTP_MESSAGE_CREATE);
-	CASE(IMSG_SMTP_MESSAGE_ROLLBACK);
-	CASE(IMSG_SMTP_MESSAGE_OPEN);
-	CASE(IMSG_SMTP_CHECK_SENDER);
-	CASE(IMSG_SMTP_EXPAND_RCPT);
-	CASE(IMSG_SMTP_LOOKUP_HELO);
-
-	CASE(IMSG_SMTP_REQ_CONNECT);
-	CASE(IMSG_SMTP_REQ_HELO);
-	CASE(IMSG_SMTP_REQ_MAIL);
-	CASE(IMSG_SMTP_REQ_RCPT);
-	CASE(IMSG_SMTP_REQ_DATA);
-	CASE(IMSG_SMTP_REQ_EOM);
-	CASE(IMSG_SMTP_EVENT_RSET);
-	CASE(IMSG_SMTP_EVENT_COMMIT);
-	CASE(IMSG_SMTP_EVENT_ROLLBACK);
-	CASE(IMSG_SMTP_EVENT_DISCONNECT);
-
-	CASE(IMSG_LKA_PROCESSOR_FORK);
-	CASE(IMSG_LKA_PROCESSOR_ERRFD);
-
-	CASE(IMSG_REPORT_SMTP_LINK_CONNECT);
-	CASE(IMSG_REPORT_SMTP_LINK_DISCONNECT);
-	CASE(IMSG_REPORT_SMTP_LINK_GREETING);
-	CASE(IMSG_REPORT_SMTP_LINK_IDENTIFY);
-	CASE(IMSG_REPORT_SMTP_LINK_TLS);
-	CASE(IMSG_REPORT_SMTP_LINK_AUTH);
-	CASE(IMSG_REPORT_SMTP_TX_RESET);
-	CASE(IMSG_REPORT_SMTP_TX_BEGIN);
-	CASE(IMSG_REPORT_SMTP_TX_MAIL);
-	CASE(IMSG_REPORT_SMTP_TX_RCPT);
-	CASE(IMSG_REPORT_SMTP_TX_ENVELOPE);
-	CASE(IMSG_REPORT_SMTP_TX_DATA);
-	CASE(IMSG_REPORT_SMTP_TX_COMMIT);
-	CASE(IMSG_REPORT_SMTP_TX_ROLLBACK);
-	CASE(IMSG_REPORT_SMTP_PROTOCOL_CLIENT);
-	CASE(IMSG_REPORT_SMTP_PROTOCOL_SERVER);
-	CASE(IMSG_REPORT_SMTP_FILTER_RESPONSE);
-	CASE(IMSG_REPORT_SMTP_TIMEOUT);
-
-	CASE(IMSG_FILTER_SMTP_BEGIN);
-	CASE(IMSG_FILTER_SMTP_END);
-	CASE(IMSG_FILTER_SMTP_PROTOCOL);
-	CASE(IMSG_FILTER_SMTP_DATA_BEGIN);
-	CASE(IMSG_FILTER_SMTP_DATA_END);
-
-	CASE(IMSG_CA_RSA_PRIVENC);
-	CASE(IMSG_CA_RSA_PRIVDEC);
-	CASE(IMSG_CA_ECDSA_SIGN);
-
-	default:
-		(void)snprintf(buf, sizeof(buf), "IMSG_??? (%d)", type);
-
-		return buf;
 	}
 }
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: at.c,v 1.84 2023/03/08 04:43:10 guenther Exp $	*/
+/*	$OpenBSD: at.c,v 1.86 2025/05/31 14:21:07 deraadt Exp $	*/
 
 /*
  *  at.c : Put file into atrun queue
@@ -495,6 +495,8 @@ list_jobs(int argc, char **argv, int count_only, int csort)
 
 	/* Loop over every file in the directory. */
 	while ((dirent = readdir(spool)) != NULL) {
+		if (strcmp(dirent->d_name, "..") == 0)
+			continue;
 		if (fstatat(dfd, dirent->d_name, &stbuf, AT_SYMLINK_NOFOLLOW) != 0)
 			fatal("%s", dirent->d_name);
 
@@ -580,7 +582,7 @@ list_jobs(int argc, char **argv, int count_only, int csort)
 
 	if (!shortformat)
 		(void)puts(" Rank     Execution Date     Owner          "
-		    "Job       Queue");
+		    "Job        Queue");
 
 	for (i = 0; i < numjobs; i++) {
 		print_job(atjobs[i], i + 1, shortformat);
@@ -653,6 +655,8 @@ process_jobs(int argc, char **argv, int what)
 	/* Loop over every file in the directory */
 	changed = 0;
 	while ((dirent = readdir(spool)) != NULL) {
+		if (strcmp(dirent->d_name, "..") == 0)
+			continue;
 		if (fstatat(dfd, dirent->d_name, &stbuf, AT_SYMLINK_NOFOLLOW) != 0)
 			fatal("%s", dirent->d_name);
 

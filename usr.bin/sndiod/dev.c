@@ -1,4 +1,4 @@
-/*	$OpenBSD: dev.c,v 1.117 2024/06/01 09:44:10 ratchov Exp $	*/
+/*	$OpenBSD: dev.c,v 1.146 2026/08/12 08:04:16 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -28,6 +28,7 @@
 #include "utils.h"
 
 void zomb_onmove(void *);
+void zomb_onxrun(void *);
 void zomb_onvol(void *);
 void zomb_fill(void *);
 void zomb_flush(void *);
@@ -41,7 +42,6 @@ void dev_sub_bcopy(struct dev *, struct slot *);
 void dev_onmove(struct dev *, int);
 void dev_master(struct dev *, unsigned int);
 void dev_cycle(struct dev *);
-void dev_adjpar(struct dev *, int, int, int);
 int dev_allocbufs(struct dev *);
 void dev_freebufs(struct dev *);
 int dev_ref(struct dev *);
@@ -53,10 +53,7 @@ void dev_del(struct dev *);
 unsigned int dev_roundof(struct dev *, unsigned int);
 void dev_wakeup(struct dev *);
 
-void slot_ctlname(struct slot *, char *, size_t);
-void slot_log(struct slot *);
 void slot_del(struct slot *);
-void slot_setvol(struct slot *, unsigned int);
 void slot_ready(struct slot *);
 void slot_allocbufs(struct slot *);
 void slot_freebufs(struct slot *);
@@ -65,11 +62,9 @@ void slot_write(struct slot *);
 void slot_read(struct slot *);
 int slot_skip(struct slot *);
 
-void ctl_node_log(struct ctl_node *);
-void ctl_log(struct ctl *);
-
 struct slotops zomb_slotops = {
 	zomb_onmove,
+	zomb_onxrun,
 	zomb_onvol,
 	zomb_fill,
 	zomb_flush,
@@ -81,9 +76,13 @@ struct ctl *ctl_list = NULL;
 struct dev *dev_list = NULL;
 unsigned int dev_sndnum = 0;
 
+/*
+ * Preferred sample rate, buffer size, and block size
+ */
+int dev_rate, dev_bufsz, dev_round;
+
 struct ctlslot ctlslot_array[DEV_NCTLSLOT];
 struct slot slot_array[DEV_NSLOT];
-unsigned int slot_serial;		/* for slot allocation */
 
 /*
  * we support/need a single MTC clock source only
@@ -93,69 +92,12 @@ struct mtc mtc_array[1] = {
 };
 
 void
-slot_array_init(void)
-{
-	unsigned int i;
-
-	for (i = 0; i < DEV_NSLOT; i++) {
-		slot_array[i].unit = i;
-		slot_array[i].ops = NULL;
-		slot_array[i].vol = MIDI_MAXCTL;
-		slot_array[i].opt = NULL;
-		slot_array[i].serial = slot_serial++;
-		memset(slot_array[i].name, 0, SLOT_NAMEMAX);
-	}
-}
-
-void
-dev_log(struct dev *d)
-{
-#ifdef DEBUG
-	static char *pstates[] = {
-		"cfg", "ini", "run"
-	};
-#endif
-	log_puts("snd");
-	log_putu(d->num);
-#ifdef DEBUG
-	if (log_level >= 3) {
-		log_puts(" pst=");
-		log_puts(pstates[d->pstate]);
-	}
-#endif
-}
-
-void
-slot_ctlname(struct slot *s, char *name, size_t size)
-{
-	snprintf(name, size, "%s%u", s->name, s->unit);
-}
-
-void
-slot_log(struct slot *s)
-{
-	char name[CTL_NAMEMAX];
-#ifdef DEBUG
-	static char *pstates[] = {
-		"ini", "sta", "rdy", "run", "stp", "mid"
-	};
-#endif
-	slot_ctlname(s, name, CTL_NAMEMAX);
-	log_puts(name);
-#ifdef DEBUG
-	if (log_level >= 3) {
-		log_puts(" vol=");
-		log_putu(s->vol);
-		if (s->ops) {
-			log_puts(",pst=");
-			log_puts(pstates[s->pstate]);
-		}
-	}
-#endif
-}
-
-void
 zomb_onmove(void *arg)
+{
+}
+
+void
+zomb_onxrun(void *arg)
 {
 }
 
@@ -180,10 +122,7 @@ zomb_eof(void *arg)
 	struct slot *s = arg;
 
 #ifdef DEBUG
-	if (log_level >= 3) {
-		slot_log(s);
-		log_puts(": zomb_eof\n");
-	}
+	logx(3, "slot%zu: %s", s - slot_array, __func__);
 #endif
 	s->ops = NULL;
 }
@@ -194,11 +133,30 @@ zomb_exit(void *arg)
 #ifdef DEBUG
 	struct slot *s = arg;
 
-	if (log_level >= 3) {
-		slot_log(s);
-		log_puts(": zomb_exit\n");
-	}
+	logx(3, "slot%zu: %s", s - slot_array, __func__);
 #endif
+}
+
+size_t
+chans_fmt(char *buf, size_t size, int mode, int pmin, int pmax, int rmin, int rmax)
+{
+	const char *sep = "";
+	char *end = buf + size;
+	char *p = buf;
+
+	if (mode & MODE_PLAY) {
+		p += snprintf(p, p < end ? end - p : 0, "play %d:%d", pmin, pmax);
+		sep = ", ";
+	}
+	if (mode & MODE_REC) {
+		p += snprintf(p, p < end ? end - p : 0, "%srec %d:%d", sep, rmin, rmax);
+		sep = ", ";
+	}
+	if (mode & MODE_MON) {
+		p += snprintf(p, p < end ? end - p : 0, "%smon", sep);
+	}
+
+	return p - buf;
 }
 
 /*
@@ -212,7 +170,7 @@ dev_midi_send(struct dev *d, void *msg, int msglen)
 	for (o = opt_list; o != NULL; o = o->next) {
 		if (o->dev != d)
 			continue;
-		midi_send(o->midi, msg, msglen);
+		midi_in(o->midi, msg, msglen);
 	}
 }
 
@@ -307,14 +265,7 @@ mtc_midi_full(struct mtc *mtc)
 		mtc->fps = 24;
 	}
 #ifdef DEBUG
-	if (log_level >= 3) {
-		dev_log(mtc->dev);
-		log_puts(": mtc full frame at ");
-		log_puti(mtc->delta);
-		log_puts(", ");
-		log_puti(mtc->fps);
-		log_puts(" fps\n");
-	}
+	logx(3, "%s: mtc full frame at %d, %d fps", mtc->dev->path, mtc->delta, mtc->fps);
 #endif
 	fps = mtc->fps;
 	mtc->hr =  (mtc->origin / (MTC_SEC * 3600)) % 24;
@@ -334,20 +285,6 @@ mtc_midi_full(struct mtc *mtc)
 	x.u.full.end = SYSEX_END;
 	mtc->qfr = 0;
 	dev_midi_send(mtc->dev, (unsigned char *)&x, SYSEX_SIZE(full));
-}
-
-/*
- * send a volume change MIDI message
- */
-void
-dev_midi_vol(struct dev *d, struct slot *s)
-{
-	unsigned char msg[3];
-
-	msg[0] = MIDI_CTL | (s - slot_array);
-	msg[1] = MIDI_CTL_VOL;
-	msg[2] = s->vol;
-	dev_midi_send(d, msg, 3);
 }
 
 /*
@@ -390,50 +327,6 @@ dev_midi_master(struct dev *d)
 	dev_midi_send(d, (unsigned char *)&x, SYSEX_SIZE(master));
 }
 
-/*
- * send a sndiod-specific slot description MIDI message
- */
-void
-dev_midi_slotdesc(struct dev *d, struct slot *s)
-{
-	struct sysex x;
-
-	memset(&x, 0, sizeof(struct sysex));
-	x.start = SYSEX_START;
-	x.type = SYSEX_TYPE_EDU;
-	x.dev = SYSEX_DEV_ANY;
-	x.id0 = SYSEX_AUCAT;
-	x.id1 = SYSEX_AUCAT_SLOTDESC;
-	if (s->opt != NULL && s->opt->dev == d)
-		slot_ctlname(s, (char *)x.u.slotdesc.name, SYSEX_NAMELEN);
-	x.u.slotdesc.chan = (s - slot_array);
-	x.u.slotdesc.end = SYSEX_END;
-	dev_midi_send(d, (unsigned char *)&x, SYSEX_SIZE(slotdesc));
-}
-
-void
-dev_midi_dump(struct dev *d)
-{
-	struct sysex x;
-	struct slot *s;
-	int i;
-
-	dev_midi_master(d);
-	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
-		if (s->opt != NULL && s->opt->dev != d)
-			continue;
-		dev_midi_slotdesc(d, s);
-		dev_midi_vol(d, s);
-	}
-	x.start = SYSEX_START;
-	x.type = SYSEX_TYPE_EDU;
-	x.dev = SYSEX_DEV_ANY;
-	x.id0 = SYSEX_AUCAT;
-	x.id1 = SYSEX_AUCAT_DUMPEND;
-	x.u.dumpend.end = SYSEX_END;
-	dev_midi_send(d, (unsigned char *)&x, SYSEX_SIZE(dumpend));
-}
-
 int
 slot_skip(struct slot *s)
 {
@@ -452,10 +345,7 @@ slot_skip(struct slot *s)
 				break;
 		}
 #ifdef DEBUG
-		if (log_level >= 4) {
-			slot_log(s);
-			log_puts(": skipped a cycle\n");
-		}
+		logx(4, "slot%zu: skipped a cycle", s - slot_array);
 #endif
 		if (s->pstate != SLOT_STOP && (s->mode & MODE_RECMASK)) {
 			if (s->sub.encbuf)
@@ -479,16 +369,14 @@ void
 dev_mix_badd(struct dev *d, struct slot *s)
 {
 	adata_t *idata, *odata, *in;
-	int icount, i, offs, vol, nch;
+	int icount;
 
 	odata = DEV_PBUF(d);
 	idata = (adata_t *)abuf_rgetblk(&s->mix.buf, &icount);
 #ifdef DEBUG
 	if (icount < s->round * s->mix.bpf) {
-		slot_log(s);
-		log_puts(": not enough data to mix (");
-		log_putu(icount);
-		log_puts("bytes)\n");
+		logx(0, "slot%zu: not enough data to mix (%u bytes)",
+		     s - slot_array, icount);
 		panic();
 	}
 #endif
@@ -522,21 +410,9 @@ dev_mix_badd(struct dev *d, struct slot *s)
 		in = s->mix.resampbuf;
 	}
 
-	nch = s->mix.cmap.nch;
-	vol = ADATA_MUL(s->mix.weight, s->mix.vol) / s->mix.join;
-	cmap_add(&s->mix.cmap, in, odata, vol, d->round);
-
-	offs = 0;
-	for (i = s->mix.join - 1; i > 0; i--) {
-		offs += nch;
-		cmap_add(&s->mix.cmap, in + offs, odata, vol, d->round);
-	}
-
-	offs = 0;
-	for (i = s->mix.expand - 1; i > 0; i--) {
-		offs += nch;
-		cmap_add(&s->mix.cmap, in, odata + offs, vol, d->round);
-	}
+	cmap_do(&s->mix.cmap, in, odata,
+	    ADATA_MUL(s->mix.weight, s->mix.vol),
+	    d->round, 1);
 
 	abuf_rdiscard(&s->mix.buf, s->round * s->mix.bpf);
 }
@@ -577,14 +453,8 @@ dev_mix_adjvol(struct dev *d)
 		i->mix.weight = d->master_enabled ?
 		    ADATA_MUL(weight, MIDI_TO_ADATA(d->master)) : weight;
 #ifdef DEBUG
-		if (log_level >= 3) {
-			slot_log(i);
-			log_puts(": set weight: ");
-			log_puti(i->mix.weight);
-			log_puts("/");
-			log_puti(i->opt->maxweight);
-			log_puts("\n");
-		}
+		logx(3, "slot%zu: set weight: %d / %d", i - slot_array, i->mix.weight,
+		    i->opt->maxweight);
 #endif
 	}
 }
@@ -595,32 +465,25 @@ dev_mix_adjvol(struct dev *d)
 void
 dev_sub_bcopy(struct dev *d, struct slot *s)
 {
-	adata_t *idata, *enc_out, *resamp_out, *cmap_out;
+	adata_t *enc_out, *resamp_out, *cmap_out;
 	void *odata;
-	int ocount, moffs;
-
-	int i, vol, offs, nch;
-
+	int ocount, moffs, mix;
 
 	odata = (adata_t *)abuf_wgetblk(&s->sub.buf, &ocount);
 #ifdef DEBUG
 	if (ocount < s->round * s->sub.bpf) {
-		log_puts("dev_sub_bcopy: not enough space\n");
+		logx(0, "dev_sub_bcopy: not enough space");
 		panic();
 	}
 #endif
-	if (s->opt->mode & MODE_MON) {
-		moffs = d->poffs + d->round;
-		if (moffs == d->psize)
-			moffs = 0;
-		idata = d->pbuf + moffs * d->pchan;
-	} else if (s->opt->mode & MODE_REC) {
-		idata = d->rbuf;
-	} else {
+	if ((s->opt->mode & MODE_RECMASK) == 0) {
 		/*
 		 * recording not allowed in opt structure, produce silence
 		 */
-		enc_sil_do(&s->sub.enc, odata, s->round);
+		if (s->sub.encbuf)
+			enc_sil_do(&s->sub.enc, odata, s->round);
+		else
+			memset(odata, 0, s->round * s->sub.bpf);
 		abuf_wcommit(&s->sub.buf, s->round * s->sub.bpf);
 		return;
 	}
@@ -636,28 +499,23 @@ dev_sub_bcopy(struct dev *d, struct slot *s)
 	enc_out = odata;
 	resamp_out = s->sub.encbuf ? s->sub.encbuf : enc_out;
 	cmap_out = s->sub.resampbuf ? s->sub.resampbuf : resamp_out;
+	mix = 0;
 
-	nch = s->sub.cmap.nch;
-	vol = ADATA_UNIT / s->sub.join;
-	cmap_copy(&s->sub.cmap, idata, cmap_out, vol, d->round);
-
-	offs = 0;
-	for (i = s->sub.join - 1; i > 0; i--) {
-		offs += nch;
-		cmap_add(&s->sub.cmap, idata + offs, cmap_out, vol, d->round);
+	if (s->opt->mode & MODE_MON) {
+		moffs = d->poffs + d->round;
+		if (moffs == d->psize)
+			moffs = 0;
+		cmap_do(&s->sub.cmap_mon, d->pbuf + moffs * d->pchan, cmap_out,
+		    ADATA_UNIT, d->round, mix++);
 	}
-
-	offs = 0;
-	for (i = s->sub.expand - 1; i > 0; i--) {
-		offs += nch;
-		cmap_copy(&s->sub.cmap, idata, cmap_out + offs, vol, d->round);
+	if (s->opt->mode & MODE_REC) {
+		cmap_do(&s->sub.cmap_rec, d->rbuf, cmap_out,
+		    ADATA_UNIT, d->round, mix++);
 	}
-
 	if (s->sub.resampbuf) {
 		resamp_do(&s->sub.resamp,
 		    s->sub.resampbuf, resamp_out, d->round, s->round);
 	}
-
 	if (s->sub.encbuf)
 		enc_do(&s->sub.enc, s->sub.encbuf, (void *)enc_out, s->round);
 
@@ -671,7 +529,7 @@ dev_sub_bcopy(struct dev *d, struct slot *s)
 void
 dev_cycle(struct dev *d)
 {
-	struct slot *s, **ps;
+	struct slot *s, *snext;
 	unsigned char *base;
 	int nsamp;
 
@@ -681,10 +539,7 @@ dev_cycle(struct dev *d)
 	 */
 	if (d->slot_list == NULL && d->idle >= d->bufsz &&
 	    (mtc_array[0].dev != d || mtc_array[0].tstate != MTC_RUN)) {
-		if (log_level >= 2) {
-			dev_log(d);
-			log_puts(": device stopped\n");
-		}
+		logx(2, "%s: device stopped", d->path);
 		dev_sio_stop(d);
 		d->pstate = DEV_INIT;
 		if (d->refcnt == 0)
@@ -694,12 +549,7 @@ dev_cycle(struct dev *d)
 
 	if (d->prime > 0) {
 #ifdef DEBUG
-		if (log_level >= 4) {
-			dev_log(d);
-			log_puts(": empty cycle, prime = ");
-			log_putu(d->prime);
-			log_puts("\n");
-		}
+		logx(4, "%s: empty cycle, prime = %u", d->path, d->prime);
 #endif
 		base = (unsigned char *)DEV_PBUF(d);
 		nsamp = d->round * d->pchan;
@@ -714,16 +564,7 @@ dev_cycle(struct dev *d)
 
 	d->delta -= d->round;
 #ifdef DEBUG
-	if (log_level >= 4) {
-		dev_log(d);
-		log_puts(": full cycle: delta = ");
-		log_puti(d->delta);
-		if (d->mode & MODE_PLAY) {
-			log_puts(", poffs = ");
-			log_puti(d->poffs);
-		}
-		log_puts("\n");
-	}
+	logx(4, "%s: full cycle: delta = %d", d->path, d->delta);
 #endif
 	if (d->mode & MODE_PLAY) {
 		base = (unsigned char *)DEV_PBUF(d);
@@ -732,16 +573,11 @@ dev_cycle(struct dev *d)
 	}
 	if ((d->mode & MODE_REC) && d->decbuf)
 		dec_do(&d->dec, d->decbuf, (unsigned char *)d->rbuf, d->round);
-	ps = &d->slot_list;
-	while ((s = *ps) != NULL) {
+
+	for (s = d->slot_list; s != NULL; s = snext) {
+		snext = s->next;
 #ifdef DEBUG
-		if (log_level >= 4) {
-			slot_log(s);
-			log_puts(": running");
-			log_puts(", skip = ");
-			log_puti(s->skip);
-			log_puts("\n");
-		}
+		logx(4, "slot%zu: running, skip = %d", s - slot_array, s->skip);
 #endif
 		d->idle = 0;
 
@@ -751,14 +587,13 @@ dev_cycle(struct dev *d)
 		slot_skip(s);
 		if (s->skip < 0) {
 			s->skip++;
-			ps = &s->next;
 			continue;
 		}
 
 #ifdef DEBUG
 		if (s->pstate == SLOT_STOP && !(s->mode & MODE_PLAY)) {
-			slot_log(s);
-			log_puts(": rec-only slots can't be drained\n");
+			logx(0, "slot%zu: rec-only slots can't be drained",
+			    s - slot_array);
 			panic();
 		}
 #endif
@@ -772,17 +607,14 @@ dev_cycle(struct dev *d)
 			 * layer, so s->mix.buf.used == 0 and we can
 			 * destroy the buffer
 			 */
-			*ps = s->next;
+
+#ifdef DEBUG
+			logx(3, "slot%zu: drained", s - slot_array);
+#endif
+			slot_detach(s);
 			s->pstate = SLOT_INIT;
 			s->ops->eof(s->arg);
 			slot_freebufs(s);
-			dev_mix_adjvol(d);
-#ifdef DEBUG
-			if (log_level >= 3) {
-				slot_log(s);
-				log_puts(": drained\n");
-			}
-#endif
 			continue;
 		}
 
@@ -795,42 +627,43 @@ dev_cycle(struct dev *d)
 			s->sub.buf.len - s->sub.buf.used <
 			s->round * s->sub.bpf)) {
 
+			if (!s->paused) {
 #ifdef DEBUG
-			if (log_level >= 3) {
-				slot_log(s);
-				log_puts(": xrun, pause cycle\n");
-			}
+				logx(3, "slot%zu: xrun, paused", s - slot_array);
 #endif
+				s->paused = 1;
+				s->ops->onxrun(s->arg);
+			}
 			if (s->xrun == XRUN_IGNORE) {
 				s->delta -= s->round;
-				ps = &s->next;
 			} else if (s->xrun == XRUN_SYNC) {
 				s->skip++;
-				ps = &s->next;
 			} else if (s->xrun == XRUN_ERROR) {
 				s->ops->exit(s->arg);
-				*ps = s->next;
 			} else {
 #ifdef DEBUG
-				slot_log(s);
-				log_puts(": bad xrun mode\n");
+				logx(0, "slot%zu: bad xrun mode", s - slot_array);
 				panic();
 #endif
 			}
 			continue;
+		} else {
+			if (s->paused) {
+#ifdef DEBUG
+				logx(3, "slot%zu: resumed", s - slot_array);
+#endif
+				s->paused = 0;
+			}
 		}
+
 		if ((s->mode & MODE_RECMASK) && !(s->pstate == SLOT_STOP)) {
 			if (s->sub.prime == 0) {
 				dev_sub_bcopy(d, s);
 				s->ops->flush(s->arg);
 			} else {
 #ifdef DEBUG
-				if (log_level >= 3) {
-					slot_log(s);
-					log_puts(": prime = ");
-					log_puti(s->sub.prime);
-					log_puts("\n");
-				}
+				logx(3, "slot%zu: prime = %d", s - slot_array,
+				    s->sub.prime);
 #endif
 				s->sub.prime--;
 			}
@@ -840,7 +673,6 @@ dev_cycle(struct dev *d)
 			if (s->pstate != SLOT_STOP)
 				s->ops->fill(s->arg);
 		}
-		ps = &s->next;
 	}
 	if ((d->mode & MODE_PLAY) && d->encbuf) {
 		enc_do(&d->enc, (unsigned char *)DEV_PBUF(d),
@@ -890,12 +722,8 @@ dev_master(struct dev *d, unsigned int master)
 	struct ctl *c;
 	unsigned int v;
 
-	if (log_level >= 2) {
-		dev_log(d);
-		log_puts(": master volume set to ");
-		log_putu(master);
-		log_puts("\n");
-	}
+	logx(2, "%s: master volume set to %u", d->path, master);
+
 	if (d->master_enabled) {
 		d->master = master;
 		if (d->mode & MODE_PLAY)
@@ -919,15 +747,12 @@ dev_master(struct dev *d, unsigned int master)
  * Create a sndio device
  */
 struct dev *
-dev_new(char *path, struct aparams *par,
-    unsigned int mode, unsigned int bufsz, unsigned int round,
-    unsigned int rate, unsigned int hold, unsigned int autovol)
+dev_new(char *path, struct aparams *par, unsigned int hold, unsigned int autovol)
 {
 	struct dev *d, **pd;
 
 	if (dev_sndnum == DEV_NMAX) {
-		if (log_level >= 1)
-			log_puts("too many devices\n");
+		logx(1, "too many devices");
 		return NULL;
 	}
 	d = xmalloc(sizeof(struct dev));
@@ -935,11 +760,7 @@ dev_new(char *path, struct aparams *par,
 	d->num = dev_sndnum++;
 
 	d->reqpar = *par;
-	d->reqmode = mode;
 	d->reqpchan = d->reqrchan = 0;
-	d->reqbufsz = bufsz;
-	d->reqround = round;
-	d->reqrate = rate;
 	d->hold = hold;
 	d->autovol = autovol;
 	d->refcnt = 0;
@@ -947,7 +768,6 @@ dev_new(char *path, struct aparams *par,
 	d->slot_list = NULL;
 	d->master = MIDI_MAXCTL;
 	d->master_enabled = 0;
-	d->alt_next = d;
 	snprintf(d->name, CTL_NAMEMAX, "%u", d->num);
 	for (pd = &dev_list; *pd != NULL; pd = &(*pd)->next)
 		;
@@ -960,18 +780,12 @@ dev_new(char *path, struct aparams *par,
  * adjust device parameters and mode
  */
 void
-dev_adjpar(struct dev *d, int mode,
-    int pmax, int rmax)
+dev_adjpar(struct dev *d, int pmax, int rmax)
 {
-	d->reqmode |= mode & MODE_AUDIOMASK;
-	if (mode & MODE_PLAY) {
-		if (d->reqpchan < pmax + 1)
-			d->reqpchan = pmax + 1;
-	}
-	if (mode & MODE_REC) {
-		if (d->reqrchan < rmax + 1)
-			d->reqrchan = rmax + 1;
-	}
+	if (d->reqpchan < pmax + 1)
+		d->reqpchan = pmax + 1;
+	if (d->reqrchan < rmax + 1)
+		d->reqrchan = rmax + 1;
 }
 
 /*
@@ -984,6 +798,8 @@ dev_adjpar(struct dev *d, int mode,
 int
 dev_allocbufs(struct dev *d)
 {
+	char enc_str[ENCMAX], chans_str[64];
+
 	/*
 	 * Create record buffer.
 	 */
@@ -1022,29 +838,14 @@ dev_allocbufs(struct dev *d)
 	 */
 	memset(d->rbuf, 0, d->round * d->rchan * sizeof(adata_t));
 
-	if (log_level >= 2) {
-		dev_log(d);
-		log_puts(": ");
-		log_putu(d->rate);
-		log_puts("Hz, ");
-		aparams_log(&d->par);
-		if (d->mode & MODE_PLAY) {
-			log_puts(", play 0:");
-			log_puti(d->pchan - 1);
-		}
-		if (d->mode & MODE_REC) {
-			log_puts(", rec 0:");
-			log_puti(d->rchan - 1);
-		}
-		log_puts(", ");
-		log_putu(d->bufsz / d->round);
-		log_puts(" blocks of ");
-		log_putu(d->round);
-		log_puts(" frames");
-		if (d == mtc_array[0].dev)
-			log_puts(", mtc");
-		log_puts("\n");
-	}
+	logx(2, "%s: %dHz, %s, %s, %d blocks of %d frames",
+	    d->path, d->rate,
+	    (aparams_enctostr(&d->par, enc_str), enc_str),
+	    (chans_fmt(chans_str, sizeof(chans_str),
+	    d->mode & (MODE_PLAY | MODE_REC),
+	    0, d->pchan - 1, 0, d->rchan - 1), chans_str),
+	    d->bufsz / d->round, d->round);
+
 	return 1;
 }
 
@@ -1054,10 +855,10 @@ dev_allocbufs(struct dev *d)
 int
 dev_open(struct dev *d)
 {
-	d->mode = d->reqmode;
-	d->round = d->reqround;
-	d->bufsz = d->reqbufsz;
-	d->rate = d->reqrate;
+	d->mode = MODE_AUDIOMASK;
+	d->round = dev_round;
+	d->bufsz = dev_bufsz;
+	d->rate = dev_rate;
 	d->pchan = d->reqpchan;
 	d->rchan = d->reqrchan;
 	d->par = d->reqpar;
@@ -1066,10 +867,7 @@ dev_open(struct dev *d)
 	if (d->rchan == 0)
 		d->rchan = 2;
 	if (!dev_sio_open(d)) {
-		if (log_level >= 1) {
-			dev_log(d);
-			log_puts(": failed to open audio device\n");
-		}
+		logx(1, "%s: failed to open audio device", d->path);
 		return 0;
 	}
 	if (!dev_allocbufs(d))
@@ -1127,10 +925,7 @@ void
 dev_freebufs(struct dev *d)
 {
 #ifdef DEBUG
-	if (log_level >= 3) {
-		dev_log(d);
-		log_puts(": closing\n");
-	}
+	logx(3, "%s: closing", d->path);
 #endif
 	if (d->mode & MODE_PLAY) {
 		if (d->encbuf != NULL)
@@ -1164,10 +959,7 @@ int
 dev_ref(struct dev *d)
 {
 #ifdef DEBUG
-	if (log_level >= 3) {
-		dev_log(d);
-		log_puts(": device requested\n");
-	}
+	logx(3, "%s: device requested", d->path);
 #endif
 	if (d->pstate == DEV_CFG && !dev_open(d))
 		return 0;
@@ -1179,10 +971,7 @@ void
 dev_unref(struct dev *d)
 {
 #ifdef DEBUG
-	if (log_level >= 3) {
-		dev_log(d);
-		log_puts(": device released\n");
-	}
+	logx(3, "%s: device released", d->path);
 #endif
 	d->refcnt--;
 	if (d->refcnt == 0 && d->pstate == DEV_INIT)
@@ -1195,13 +984,6 @@ dev_unref(struct dev *d)
 int
 dev_init(struct dev *d)
 {
-	if ((d->reqmode & MODE_AUDIOMASK) == 0) {
-#ifdef DEBUG
-		    dev_log(d);
-		    log_puts(": has no streams\n");
-#endif
-		    return 0;
-	}
 	if (d->hold && !dev_ref(d))
 		return 0;
 	return 1;
@@ -1214,10 +996,7 @@ void
 dev_done(struct dev *d)
 {
 #ifdef DEBUG
-	if (log_level >= 3) {
-		dev_log(d);
-		log_puts(": draining\n");
-	}
+	logx(3, "%s: draining", d->path);
 #endif
 	if (mtc_array[0].dev == d && mtc_array[0].tstate != MTC_STOP)
 		mtc_stop(&mtc_array[0]);
@@ -1246,18 +1025,14 @@ dev_del(struct dev *d)
 	struct dev **p;
 
 #ifdef DEBUG
-	if (log_level >= 3) {
-		dev_log(d);
-		log_puts(": deleting\n");
-	}
+	logx(3, "%s: deleting", d->path);
 #endif
 	if (d->pstate != DEV_CFG)
 		dev_close(d);
 	for (p = &dev_list; *p != d; p = &(*p)->next) {
 #ifdef DEBUG
 		if (*p == NULL) {
-			dev_log(d);
-			log_puts(": device to delete not on the list\n");
+			logx(0, "%s: not on the list", d->path);
 			panic();
 		}
 #endif
@@ -1279,10 +1054,8 @@ void
 dev_wakeup(struct dev *d)
 {
 	if (d->pstate == DEV_INIT) {
-		if (log_level >= 2) {
-			dev_log(d);
-			log_puts(": device started\n");
-		}
+		logx(2, "%s: started", d->path);
+
 		if (d->mode & MODE_PLAY) {
 			d->prime = d->bufsz;
 		} else {
@@ -1311,12 +1084,7 @@ dev_iscompat(struct dev *o, struct dev *n)
 {
 	if (((long long)o->round * n->rate != (long long)n->round * o->rate) ||
 	    ((long long)o->bufsz * n->rate != (long long)n->bufsz * o->rate)) {
-		if (log_level >= 1) {
-			log_puts(n->name);
-			log_puts(": not compatible with ");
-			log_puts(o->name);
-			log_puts("\n");
-		}
+		logx(1, "%s: not compatible with %s", n->name, o->name);
 		return 0;
 	}
 	return 1;
@@ -1326,77 +1094,21 @@ dev_iscompat(struct dev *o, struct dev *n)
  * Close the device, but attempt to migrate everything to a new sndio
  * device.
  */
-struct dev *
+void
 dev_migrate(struct dev *odev)
 {
-	struct dev *ndev;
 	struct opt *o;
-	struct slot *s;
-	int i;
 
 	/* not opened */
 	if (odev->pstate == DEV_CFG)
-		return odev;
-
-	ndev = odev;
-	while (1) {
-		/* try next one, circulating through the list */
-		ndev = ndev->alt_next;
-		if (ndev == odev) {
-			if (log_level >= 1) {
-				dev_log(odev);
-				log_puts(": no fall-back device found\n");
-			}
-			return NULL;
-		}
-
-
-		if (!dev_ref(ndev))
-			continue;
-
-		/* check if new parameters are compatible with old ones */
-		if (!dev_iscompat(odev, ndev)) {
-			dev_unref(ndev);
-			continue;
-		}
-
-		/* found it!*/
-		break;
-	}
-
-	if (log_level >= 1) {
-		dev_log(odev);
-		log_puts(": switching to ");
-		dev_log(ndev);
-		log_puts("\n");
-	}
-
-	if (mtc_array[0].dev == odev)
-		mtc_setdev(&mtc_array[0], ndev);
+		return;
 
 	/* move opts to new device (also moves clients using the opts) */
 	for (o = opt_list; o != NULL; o = o->next) {
 		if (o->dev != odev)
 			continue;
-		if (strcmp(o->name, o->dev->name) == 0)
-			continue;
-		opt_setdev(o, ndev);
+		opt_migrate(o, odev);
 	}
-
-	/* terminate remaining clients */
-	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
-		if (s->opt == NULL || s->opt->dev != odev)
-			continue;
-		if (s->ops != NULL) {
-			s->ops->exit(s->arg);
-			s->ops = NULL;
-		}
-	}
-
-	/* slots and/or MMC hold refs, drop ours */
-	dev_unref(ndev);
-
-	return ndev;
 }
 
 /*
@@ -1410,10 +1122,7 @@ mtc_trigger(struct mtc *mtc)
 	struct slot *s;
 
 	if (mtc->tstate != MTC_START) {
-		if (log_level >= 2) {
-			dev_log(mtc->dev);
-			log_puts(": not started by mmc yet, waiting...\n");
-		}
+		logx(2, "%s: not started by mmc yet, waiting.", mtc->dev->path);
 		return;
 	}
 
@@ -1422,10 +1131,7 @@ mtc_trigger(struct mtc *mtc)
 			continue;
 		if (s->pstate != SLOT_READY) {
 #ifdef DEBUG
-			if (log_level >= 3) {
-				slot_log(s);
-				log_puts(": not ready, start delayed\n");
-			}
+			logx(3, "slot%zu: not ready, start delayed", s - slot_array);
 #endif
 			return;
 		}
@@ -1455,10 +1161,7 @@ mtc_start(struct mtc *mtc)
 		mtc_trigger(mtc);
 #ifdef DEBUG
 	} else {
-		if (log_level >= 3) {
-			dev_log(mtc->dev);
-			log_puts(": ignoring mmc start\n");
-		}
+		logx(3, "%s: ignoring mmc start", mtc->dev->path);
 #endif
 	}
 }
@@ -1479,10 +1182,7 @@ mtc_stop(struct mtc *mtc)
 		break;
 	default:
 #ifdef DEBUG
-		if (log_level >= 3) {
-			dev_log(mtc->dev);
-			log_puts(": ignored mmc stop\n");
-		}
+		logx(3, "%s: ignored mmc stop", mtc->dev->path);
 #endif
 		return;
 	}
@@ -1494,12 +1194,8 @@ mtc_stop(struct mtc *mtc)
 void
 mtc_loc(struct mtc *mtc, unsigned int origin)
 {
-	if (log_level >= 2) {
-		dev_log(mtc->dev);
-		log_puts(": relocated to ");
-		log_putu(origin);
-		log_puts("\n");
-	}
+	logx(2, "%s: relocated to %u", mtc->dev->path, origin);
+
 	if (mtc->tstate == MTC_RUN)
 		mtc_stop(mtc);
 	mtc->origin = origin;
@@ -1518,10 +1214,7 @@ mtc_setdev(struct mtc *mtc, struct dev *d)
 	if (mtc->dev == d)
 		return;
 
-	if (log_level >= 2) {
-		dev_log(d);
-		log_puts(": set to be MIDI clock source\n");
-	}
+	logx(2, "%s: set to be MIDI clock source", d->path);
 
 	/* adjust clock and ref counter, if needed */
 	if (mtc->tstate == MTC_RUN) {
@@ -1550,7 +1243,6 @@ mtc_setdev(struct mtc *mtc, struct dev *d)
 void
 slot_initconv(struct slot *s)
 {
-	unsigned int dev_nch;
 	struct dev *d = s->opt->dev;
 
 	if (s->mode & MODE_PLAY) {
@@ -1558,7 +1250,8 @@ slot_initconv(struct slot *s)
 		    s->opt->pmin, s->opt->pmin + s->mix.nch - 1,
 		    s->opt->pmin, s->opt->pmin + s->mix.nch - 1,
 		    0, d->pchan - 1,
-		    s->opt->pmin, s->opt->pmax);
+		    s->opt->pmin, s->opt->pmax,
+		    s->opt->dup);
 		s->mix.decbuf = NULL;
 		s->mix.resampbuf = NULL;
 		if (!aparams_native(&s->par)) {
@@ -1572,30 +1265,27 @@ slot_initconv(struct slot *s)
 			s->mix.resampbuf =
 			    xmalloc(d->round * s->mix.nch * sizeof(adata_t));
 		}
-		s->mix.join = 1;
-		s->mix.expand = 1;
-		if (s->opt->dup && s->mix.cmap.nch > 0) {
-			dev_nch = d->pchan < (s->opt->pmax + 1) ?
-			    d->pchan - s->opt->pmin :
-			    s->opt->pmax - s->opt->pmin + 1;
-			if (dev_nch > s->mix.nch)
-				s->mix.expand = dev_nch / s->mix.nch;
-			else if (s->mix.nch > dev_nch)
-				s->mix.join = s->mix.nch / dev_nch;
-		}
 	}
 
 	if (s->mode & MODE_RECMASK) {
-		unsigned int outchan = (s->opt->mode & MODE_MON) ?
-		    d->pchan : d->rchan;
 
 		s->sub.encbuf = NULL;
 		s->sub.resampbuf = NULL;
-		cmap_init(&s->sub.cmap,
-		    0, outchan - 1,
+
+		cmap_init(&s->sub.cmap_rec,
+		    0, d->rchan - 1,
 		    s->opt->rmin, s->opt->rmax,
 		    s->opt->rmin, s->opt->rmin + s->sub.nch - 1,
-		    s->opt->rmin, s->opt->rmin + s->sub.nch - 1);
+		    s->opt->rmin, s->opt->rmin + s->sub.nch - 1,
+		    s->opt->dup);
+
+		cmap_init(&s->sub.cmap_mon,
+		    0, d->pchan - 1,
+		    s->opt->pmin, s->opt->pmax,
+		    s->opt->pmin, s->opt->pmin + s->sub.nch - 1,
+		    s->opt->pmin, s->opt->pmin + s->sub.nch - 1,
+		    s->opt->dup);
+
 		if (s->rate != d->rate) {
 			resamp_init(&s->sub.resamp, d->round, s->round,
 			    s->sub.nch);
@@ -1607,22 +1297,11 @@ slot_initconv(struct slot *s)
 			s->sub.encbuf =
 			    xmalloc(s->round * s->sub.nch * sizeof(adata_t));
 		}
-		s->sub.join = 1;
-		s->sub.expand = 1;
-		if (s->opt->dup && s->sub.cmap.nch > 0) {
-			dev_nch = outchan < (s->opt->rmax + 1) ?
-			    outchan - s->opt->rmin :
-			    s->opt->rmax - s->opt->rmin + 1;
-			if (dev_nch > s->sub.nch)
-				s->sub.join = dev_nch / s->sub.nch;
-			else if (s->sub.nch > dev_nch)
-				s->sub.expand = s->sub.nch / dev_nch;
-		}
 
 		/*
-		 * cmap_copy() doesn't write samples in all channels,
+		 * cmap_do() doesn't write samples in all channels,
 	         * for instance when mono->stereo conversion is
-	         * disabled. So we have to prefill cmap_copy() output
+	         * disabled. So we have to prefill cmap_do() output
 	         * with silence.
 	         */
 		if (s->sub.resampbuf) {
@@ -1655,14 +1334,8 @@ slot_allocbufs(struct slot *s)
 	}
 
 #ifdef DEBUG
-	if (log_level >= 3) {
-		slot_log(s);
-		log_puts(": allocated ");
-		log_putu(s->appbufsz);
-		log_puts("/");
-		log_putu(SLOT_BUFSZ(s));
-		log_puts(" fr buffers\n");
-	}
+	logx(3, "slot%zu: allocated %u/%u fr buffers",
+	    s - slot_array, s->appbufsz, SLOT_BUFSZ(s));
 #endif
 }
 
@@ -1688,101 +1361,30 @@ struct slot *
 slot_new(struct opt *opt, unsigned int id, char *who,
     struct slotops *ops, void *arg, int mode)
 {
-	char *p;
-	char name[SLOT_NAMEMAX];
-	char ctl_name[CTL_NAMEMAX];
-	unsigned int i, ser, bestser, bestidx;
-	struct slot *unit[DEV_NSLOT];
+	struct app *a;
 	struct slot *s;
+	int i;
+
+	a = opt_mkapp(opt, who);
+	if (a == NULL)
+		return NULL;
 
 	/*
-	 * create a ``valid'' control name (lowcase, remove [^a-z], truncate)
+	 * find a free slot and assign it the smallest possible unit number
 	 */
-	for (i = 0, p = who; ; p++) {
-		if (i == SLOT_NAMEMAX - 1 || *p == '\0') {
-			name[i] = '\0';
+	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
+		if (s->ops == NULL)
 			break;
-		} else if (*p >= 'A' && *p <= 'Z') {
-			name[i++] = *p + 'a' - 'A';
-		} else if (*p >= 'a' && *p <= 'z')
-			name[i++] = *p;
 	}
-	if (i == 0)
-		strlcpy(name, "noname", SLOT_NAMEMAX);
-
-	/*
-	 * build a unit-to-slot map for this name
-	 */
-	for (i = 0; i < DEV_NSLOT; i++)
-		unit[i] = NULL;
-	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
-		if (strcmp(s->name, name) == 0)
-			unit[s->unit] = s;
-	}
-
-	/*
-	 * find the free slot with the least unit number and same id
-	 */
-	for (i = 0; i < DEV_NSLOT; i++) {
-		s = unit[i];
-		if (s != NULL && s->ops == NULL && s->id == id)
-			goto found;
-	}
-
-	/*
-	 * find the free slot with the least unit number
-	 */
-	for (i = 0; i < DEV_NSLOT; i++) {
-		s = unit[i];
-		if (s != NULL && s->ops == NULL) {
-			s->id = id;
-			goto found;
-		}
-	}
-
-	/*
-	 * couldn't find a matching slot, pick oldest free slot
-	 * and set its name/unit
-	 */
-	bestser = 0;
-	bestidx = DEV_NSLOT;
-	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
-		if (s->ops != NULL)
-			continue;
-		ser = slot_serial - s->serial;
-		if (ser > bestser) {
-			bestser = ser;
-			bestidx = i;
-		}
-	}
-
-	if (bestidx == DEV_NSLOT) {
-		if (log_level >= 1) {
-			log_puts(name);
-			log_puts(": out of sub-device slots\n");
-		}
+	if (i == DEV_NSLOT) {
+		logx(1, "%s: too many connections", a->name);
 		return NULL;
 	}
 
-	s = slot_array + bestidx;
-	ctl_del(CTL_SLOT_LEVEL, s, NULL);
-	s->vol = MIDI_MAXCTL;
-	strlcpy(s->name, name, SLOT_NAMEMAX);
-	s->serial = slot_serial++;
-	for (i = 0; unit[i] != NULL; i++)
-		; /* nothing */
-	s->unit = i;
-	s->id = id;
-	s->opt = opt;
-	slot_ctlname(s, ctl_name, CTL_NAMEMAX);
-	ctl_new(CTL_SLOT_LEVEL, s, NULL,
-	    CTL_NUM, "", "app", ctl_name, -1, "level",
-	    NULL, -1, 127, s->vol);
-
-found:
-	/* open device, this may change opt's device */
 	if (!opt_ref(opt))
 		return NULL;
+
+	s->app = a;
 	s->opt = opt;
 	s->ops = ops;
 	s->arg = arg;
@@ -1797,17 +1399,8 @@ found:
 	s->appbufsz = s->opt->dev->bufsz;
 	s->round = s->opt->dev->round;
 	s->rate = s->opt->dev->rate;
-	dev_midi_slotdesc(s->opt->dev, s);
-	dev_midi_vol(s->opt->dev, s);
 #ifdef DEBUG
-	if (log_level >= 3) {
-		slot_log(s);
-		log_puts(": using ");
-		log_puts(s->opt->name);
-		log_puts(", mode = ");
-		log_putx(mode);
-		log_puts("\n");
-	}
+	logx(3, "slot%zu: %s/%s", s - slot_array, s->opt->name, s->app->name);
 #endif
 	return s;
 }
@@ -1835,76 +1428,21 @@ slot_del(struct slot *s)
 }
 
 /*
- * change the slot play volume; called either by the slot or by MIDI
+ * change the slot play volume; called by the client
  */
 void
 slot_setvol(struct slot *s, unsigned int vol)
 {
+	struct opt *o = s->opt;
+	struct app *a = s->app;
+
 #ifdef DEBUG
-	if (log_level >= 3) {
-		slot_log(s);
-		log_puts(": setting volume ");
-		log_putu(vol);
-		log_puts("\n");
-	}
+	logx(3, "slot%zu: setting volume %u", s - slot_array, vol);
 #endif
-	s->vol = vol;
-	s->mix.vol = MIDI_TO_ADATA(s->vol);
-}
-
-/*
- * set device for this slot
- */
-void
-slot_setopt(struct slot *s, struct opt *o)
-{
-	struct opt *t;
-	struct dev *odev, *ndev;
-	struct ctl *c;
-
-	if (s->opt == NULL || s->opt == o)
-		return;
-
-	if (log_level >= 2) {
-		slot_log(s);
-		log_puts(": moving to opt ");
-		log_puts(o->name);
-		log_puts("\n");
-	}
-
-	odev = s->opt->dev;
-	if (s->ops != NULL) {
-		ndev = opt_ref(o);
-		if (ndev == NULL)
-			return;
-
-		if (!dev_iscompat(odev, ndev)) {
-			opt_unref(o);
-			return;
-		}
-	}
-
-	if (s->pstate == SLOT_RUN || s->pstate == SLOT_STOP)
-		slot_detach(s);
-
-	t = s->opt;
-	s->opt = o;
-
-	c = ctl_find(CTL_SLOT_LEVEL, s, NULL);
-	ctl_update(c);
-
-	if (o->dev != t->dev) {
-		dev_midi_slotdesc(odev, s);
-		dev_midi_slotdesc(ndev, s);
-		dev_midi_vol(ndev, s);
-	}
-
-	if (s->pstate == SLOT_RUN || s->pstate == SLOT_STOP)
-		slot_attach(s);
-
-	if (s->ops != NULL) {
-		opt_unref(t);
-		return;
+	if (a->vol != vol) {
+		opt_appvol(o, a, vol);
+		opt_midi_vol(o, a);
+		ctl_onval(CTL_APP_LEVEL, o, a, vol);
 	}
 }
 
@@ -1916,16 +1454,6 @@ slot_attach(struct slot *s)
 {
 	struct dev *d = s->opt->dev;
 	long long pos;
-
-	if (((s->mode & MODE_PLAY) && !(s->opt->mode & MODE_PLAY)) ||
-	    ((s->mode & MODE_RECMASK) && !(s->opt->mode & MODE_RECMASK))) {
-		if (log_level >= 1) {
-			slot_log(s);
-			log_puts(" at ");
-			log_puts(s->opt->name);
-			log_puts(": mode not allowed on this sub-device\n");
-		}
-	}
 
 	/*
 	 * setup conversions layer
@@ -1951,16 +1479,8 @@ slot_attach(struct slot *s)
 	}
 
 #ifdef DEBUG
-	if (log_level >= 2) {
-		slot_log(s);
-		log_puts(": attached at ");
-		log_puti(s->delta);
-		log_puts(" + ");
-		log_puti(s->delta_rem);
-		log_puts("/");
-		log_puti(s->round);
-		log_puts("\n");
-	}
+	logx(2, "slot%zu: attached at %d + %d / %d",
+	    s - slot_array, s->delta, s->delta_rem, s->round);
 #endif
 
 	/*
@@ -1972,7 +1492,7 @@ slot_attach(struct slot *s)
 	s->next = d->slot_list;
 	d->slot_list = s;
 	if (s->mode & MODE_PLAY) {
-		s->mix.vol = MIDI_TO_ADATA(s->vol);
+		s->mix.vol = MIDI_TO_ADATA(s->app->vol);
 		dev_mix_adjvol(d);
 	}
 }
@@ -2006,31 +1526,20 @@ slot_start(struct slot *s)
 {
 	struct dev *d = s->opt->dev;
 #ifdef DEBUG
+	char enc_str[ENCMAX], chans_str[64];
+
 	if (s->pstate != SLOT_INIT) {
-		slot_log(s);
-		log_puts(": slot_start: wrong state\n");
+		logx(0, "slot%zu: slot_start: wrong state", s - slot_array);
 		panic();
 	}
-	if (s->mode & MODE_PLAY) {
-		if (log_level >= 3) {
-			slot_log(s);
-			log_puts(": playing ");
-			aparams_log(&s->par);
-			log_puts(" -> ");
-			aparams_log(&d->par);
-			log_puts("\n");
-		}
-	}
-	if (s->mode & MODE_RECMASK) {
-		if (log_level >= 3) {
-			slot_log(s);
-			log_puts(": recording ");
-			aparams_log(&s->par);
-			log_puts(" <- ");
-			aparams_log(&d->par);
-			log_puts("\n");
-		}
-	}
+
+	logx(2, "slot%zu: %dHz, %s, %s, %d blocks of %d frames",
+	    s - slot_array, s->rate,
+	    (aparams_enctostr(&s->par, enc_str), enc_str),
+	    (chans_fmt(chans_str, sizeof(chans_str), s->mode,
+	    s->opt->pmin, s->opt->pmin + s->mix.nch - 1,
+	    s->opt->rmin, s->opt->rmin + s->sub.nch - 1), chans_str),
+	    s->appbufsz / s->round, s->round);
 #endif
 	slot_allocbufs(s);
 
@@ -2041,6 +1550,7 @@ slot_start(struct slot *s)
 		s->sub.prime = d->bufsz / d->round;
 	}
 	s->skip = 0;
+	s->paused = 0;
 
 	/*
 	 * get the current position, the origin is when the first sample
@@ -2070,8 +1580,7 @@ slot_detach(struct slot *s)
 	for (ps = &d->slot_list; *ps != s; ps = &(*ps)->next) {
 #ifdef DEBUG
 		if (*ps == NULL) {
-			slot_log(s);
-			log_puts(": can't detach, not on list\n");
+			logx(0, "slot%zu: can't detach, not on list", s - slot_array);
 			panic();
 		}
 #endif
@@ -2093,16 +1602,8 @@ slot_detach(struct slot *s)
 	}
 
 #ifdef DEBUG
-	if (log_level >= 2) {
-		slot_log(s);
-		log_puts(": detached at ");
-		log_puti(s->delta);
-		log_puts(" + ");
-		log_puti(s->delta_rem);
-		log_puts("/");
-		log_puti(d->round);
-		log_puts("\n");
-	}
+	logx(2, "slot%zu: detached at %d + %d / %d",
+	    s - slot_array, s->delta, s->delta_rem, d->round);
 #endif
 	if (s->mode & MODE_PLAY)
 		dev_mix_adjvol(d);
@@ -2113,6 +1614,7 @@ slot_detach(struct slot *s)
 			s->sub.encbuf = NULL;
 		}
 		if (s->sub.resampbuf) {
+			resamp_done(&s->sub.resamp);
 			xfree(s->sub.resampbuf);
 			s->sub.resampbuf = NULL;
 		}
@@ -2124,6 +1626,7 @@ slot_detach(struct slot *s)
 			s->mix.decbuf = NULL;
 		}
 		if (s->mix.resampbuf) {
+			resamp_done(&s->mix.resamp);
 			xfree(s->mix.resampbuf);
 			s->mix.resampbuf = NULL;
 		}
@@ -2138,10 +1641,7 @@ void
 slot_stop(struct slot *s, int drain)
 {
 #ifdef DEBUG
-	if (log_level >= 3) {
-		slot_log(s);
-		log_puts(": stopping\n");
-	}
+	logx(3, "slot%zu: stopping (drain = %d)", s - slot_array, drain);
 #endif
 	if (s->pstate == SLOT_START) {
 		/*
@@ -2167,10 +1667,7 @@ slot_stop(struct slot *s, int drain)
 		slot_detach(s);
 	} else {
 #ifdef DEBUG
-		if (log_level >= 3) {
-			slot_log(s);
-			log_puts(": not drained (blocked by mmc)\n");
-		}
+		logx(3, "slot%zu: not drained (blocked by mmc)", s - slot_array);
 #endif
 	}
 
@@ -2187,10 +1684,7 @@ slot_skip_update(struct slot *s)
 	skip = slot_skip(s);
 	while (skip > 0) {
 #ifdef DEBUG
-		if (log_level >= 4) {
-			slot_log(s);
-			log_puts(": catching skipped block\n");
-		}
+		logx(4, "slot%zu: catching skipped block", s - slot_array);
 #endif
 		if (s->mode & MODE_RECMASK)
 			s->ops->flush(s->arg);
@@ -2209,10 +1703,7 @@ slot_write(struct slot *s)
 {
 	if (s->pstate == SLOT_START && s->mix.buf.used == s->mix.buf.len) {
 #ifdef DEBUG
-		if (log_level >= 4) {
-			slot_log(s);
-			log_puts(": switching to READY state\n");
-		}
+		logx(4, "slot%zu: switching to READY state", s - slot_array);
 #endif
 		s->pstate = SLOT_READY;
 		slot_ready(s);
@@ -2233,7 +1724,7 @@ slot_read(struct slot *s)
  * allocate at control slot
  */
 struct ctlslot *
-ctlslot_new(struct opt *o, struct ctlops *ops, void *arg)
+ctlslot_new(struct opt *o, struct midithru *t, struct ctlops *ops, void *arg)
 {
 	struct ctlslot *s;
 	struct ctl *c;
@@ -2249,8 +1740,11 @@ ctlslot_new(struct opt *o, struct ctlops *ops, void *arg)
 		i++;
 	}
 	s->opt = o;
+	s->midithru = t;
 	s->self = 1 << i;
-	if (!opt_ref(o))
+	if (s->opt != NULL && !opt_ref(s->opt))
+		return NULL;
+	if (s->midithru != NULL && !midithru_ref(s->midithru))
 		return NULL;
 	s->ops = ops;
 	s->arg = arg;
@@ -2280,14 +1774,15 @@ ctlslot_del(struct ctlslot *s)
 			pc = &c->next;
 	}
 	s->ops = NULL;
-	opt_unref(s->opt);
+	if (s->opt != NULL)
+		opt_unref(s->opt);
+	if (s->midithru)
+		midithru_unref(s->midithru);
 }
 
 int
 ctlslot_visible(struct ctlslot *s, struct ctl *c)
 {
-	if (s->opt == NULL)
-		return 1;
 	switch (c->scope) {
 	case CTL_HW:
 		/*
@@ -2297,13 +1792,17 @@ ctlslot_visible(struct ctlslot *s, struct ctl *c)
 		if (strcmp(c->node0.name, "server") == 0 &&
 		    strcmp(c->func, "device") == 0)
 			return 0;
-		/* FALLTHROUHG */
+		/* FALLTHROUGH */
 	case CTL_DEV_MASTER:
-		return (s->opt->dev == c->u.any.arg0);
+		return (s->opt != NULL && s->opt->dev == c->u.any.arg0);
 	case CTL_OPT_DEV:
-		return (s->opt == c->u.any.arg0);
-	case CTL_SLOT_LEVEL:
-		return (s->opt->dev == c->u.slot_level.slot->opt->dev);
+	case CTL_OPT_MODE:
+		return (s->opt != NULL && s->opt == c->u.any.arg0);
+	case CTL_APP_LEVEL:
+		return (s->opt != NULL && s->opt == c->u.app_level.opt);
+	case CTL_MIDI_PORT:
+	case CTL_MIDI_THRU:
+		return (s->midithru == c->u.midi.midithru);
 	default:
 		return 0;
 	}
@@ -2351,99 +1850,90 @@ ctlslot_update(struct ctlslot *s)
 		s->ops->sync(s->arg);
 }
 
-void
-ctl_node_log(struct ctl_node *c)
+size_t
+ctl_node_fmt(char *buf, size_t size, struct ctl_node *c)
 {
-	log_puts(c->name);
+	char *end = buf + size;
+	char *p = buf;
+
+	p += snprintf(buf, size, "%s", c->name);
+
 	if (c->unit >= 0)
-		log_putu(c->unit);
+		p += snprintf(p, p < end ? end - p : 0, "%d", c->unit);
+
+	return p - buf;
 }
 
-void
-ctl_log(struct ctl *c)
+size_t
+ctl_scope_fmt(char *buf, size_t size, struct ctl *c)
 {
-	if (c->group[0] != 0) {
-		log_puts(c->group);
-		log_puts("/");
+	switch (c->scope) {
+	case CTL_HW:
+		return snprintf(buf, size, "hw:%s/%u",
+		    c->u.hw.dev->name, c->u.hw.addr);
+	case CTL_DEV_MASTER:
+		return snprintf(buf, size, "dev_master:%s",
+		    c->u.dev_master.dev->name);
+	case CTL_APP_LEVEL:
+		return snprintf(buf, size, "app_level:%s/%s",
+		    c->u.app_level.opt->name, c->u.app_level.app->name);
+	case CTL_OPT_DEV:
+		return snprintf(buf, size, "opt_dev:%s/%s",
+		    c->u.opt_dev.opt->name, c->u.opt_dev.dev->name);
+	case CTL_OPT_MODE:
+		return snprintf(buf, size, "opt_mode:%s/%s",
+		    c->u.opt_mode.opt->name, opt_modes[c->u.opt_mode.idx].name);
+	case CTL_MIDI_PORT:
+		return snprintf(buf, size, "midi_port:%s/%u",
+		    c->u.midi.midithru->name, c->u.midi.port->num);
+	case CTL_MIDI_THRU:
+		return snprintf(buf, size, "midi_thru:%s",
+		    c->u.midi.midithru->name);
+	default:
+		return snprintf(buf, size, "unknown");
 	}
-	ctl_node_log(&c->node0);
-	log_puts(".");
-	log_puts(c->func);
-	log_puts("=");
+}
+
+size_t
+ctl_fmt(char *buf, size_t size, struct ctl *c)
+{
+	char *end = buf + size;
+	char *p = buf;
+
+	p += snprintf(p, size, "%s/", c->group);
+	p += ctl_node_fmt(p, p < end ? end - p : 0, &c->node0);
+	p += snprintf(p, p < end ? end - p : 0, ".%s", c->func);
+
 	switch (c->type) {
-	case CTL_NONE:
-		log_puts("none");
-		break;
-	case CTL_NUM:
-	case CTL_SW:
-		log_putu(c->curval);
-		break;
 	case CTL_VEC:
 	case CTL_LIST:
 	case CTL_SEL:
-		ctl_node_log(&c->node1);
-		log_puts(":");
-		log_putu(c->curval);
+		p += snprintf(p, p < end ? end - p : 0, "[");
+		p += ctl_node_fmt(p, p < end ? end - p : 0, &c->node1);
+		p += snprintf(p, p < end ? end - p : 0, "]");
 	}
-	log_puts(" at ");
-	log_putu(c->addr);
-	log_puts(" -> ");
-	switch (c->scope) {
-	case CTL_HW:
-		log_puts("hw:");
-		log_puts(c->u.hw.dev->name);
-		log_puts("/");
-		log_putu(c->u.hw.addr);
-		break;
-	case CTL_DEV_MASTER:
-		log_puts("dev_master:");
-		log_puts(c->u.dev_master.dev->name);
-		break;
-	case CTL_SLOT_LEVEL:
-		log_puts("slot_level:");
-		log_puts(c->u.slot_level.slot->name);
-		log_putu(c->u.slot_level.slot->unit);
-		break;
-	case CTL_OPT_DEV:
-		log_puts("opt_dev:");
-		log_puts(c->u.opt_dev.opt->name);
-		log_puts("/");
-		log_puts(c->u.opt_dev.dev->name);
-		break;
-	default:
-		log_puts("unknown");
-	}
-	if (c->display[0] != 0) {
-		log_puts(" (");
-		log_puts(c->display);
-		log_puts(")");
-	}
+
+	if (c->display[0] != 0)
+		p += snprintf(p, size, " (%s)", c->display);
+
+	return p - buf;
 }
 
 int
 ctl_setval(struct ctl *c, int val)
 {
 	if (c->curval == val) {
-		if (log_level >= 3) {
-			ctl_log(c);
-			log_puts(": already set\n");
-		}
+		logx(3, "ctl%u: already set", c->addr);
 		return 1;
 	}
 	if (val < 0 || val > c->maxval) {
-		if (log_level >= 3) {
-			log_putu(val);
-			log_puts(": ctl val out of bounds\n");
-		}
+		logx(3, "ctl%u: %d: out of range", c->addr, val);
 		return 0;
 	}
 
 	switch (c->scope) {
 	case CTL_HW:
-		if (log_level >= 3) {
-			ctl_log(c);
-			log_puts(": marked as dirty\n");
-		}
+		logx(3, "ctl%u: marked as dirty", c->addr);
 		c->curval = val;
 		c->dirty = 1;
 		return dev_ref(c->u.hw.dev);
@@ -2455,22 +1945,37 @@ ctl_setval(struct ctl *c, int val)
 		c->val_mask = ~0U;
 		c->curval = val;
 		return 1;
-	case CTL_SLOT_LEVEL:
-		slot_setvol(c->u.slot_level.slot, val);
-		// XXX change dev_midi_vol() into slot_midi_vol()
-		dev_midi_vol(c->u.slot_level.slot->opt->dev, c->u.slot_level.slot);
+	case CTL_APP_LEVEL:
+		opt_appvol(c->u.app_level.opt, c->u.app_level.app, val);
+		opt_midi_vol(c->u.app_level.opt, c->u.app_level.app);
 		c->val_mask = ~0U;
 		c->curval = val;
 		return 1;
 	case CTL_OPT_DEV:
-		if (opt_setdev(c->u.opt_dev.opt, c->u.opt_dev.dev))
-			c->u.opt_dev.opt->alt_first = c->u.opt_dev.dev;
+		if (opt_setdev(c->u.opt_dev.opt, c->u.opt_dev.dev)) {
+			/* make this the prefered device */
+			opt_setalt(c->u.opt_dev.opt, c->u.opt_dev.dev);
+		}
+		return 1;
+	case CTL_OPT_MODE:
+		opt_setmode(c->u.opt_mode.opt, c->u.opt_mode.idx, val);
+		c->val_mask = ~0U;
+		c->curval = val;
+		return 1;
+	case CTL_MIDI_PORT:
+		if (midithru_setport(c->u.midi.midithru, c->u.midi.port, val)) {
+			c->val_mask = ~0U;
+			c->curval = val;
+		}
+		return 1;
+	case CTL_MIDI_THRU:
+		if (midithru_setthru(c->u.midi.midithru, val)) {
+			c->val_mask = ~0U;
+			c->curval = val;
+		}
 		return 1;
 	default:
-		if (log_level >= 2) {
-			ctl_log(c);
-			log_puts(": not writable\n");
-		}
+		logx(2, "ctl%u: not writable", c->addr);
 		return 1;
 	}
 }
@@ -2484,6 +1989,9 @@ ctl_new(int scope, void *arg0, void *arg1,
     char *str0, int unit0, char *func,
     char *str1, int unit1, int maxval, int val)
 {
+#ifdef DEBUG
+	char ctl_str[64], scope_str[32];
+#endif
 	struct ctl *c, **pc;
 	struct ctlslot *s;
 	int addr;
@@ -2519,7 +2027,12 @@ ctl_new(int scope, void *arg0, void *arg1,
 		c->u.hw.addr = *(unsigned int *)arg1;
 		break;
 	case CTL_OPT_DEV:
+	case CTL_APP_LEVEL:
+	case CTL_MIDI_PORT:
 		c->u.any.arg1 = arg1;
+		break;
+	case CTL_OPT_MODE:
+		c->u.opt_mode.idx = *(int *)arg1;
 		break;
 	default:
 		c->u.any.arg1 = NULL;
@@ -2540,10 +2053,9 @@ ctl_new(int scope, void *arg0, void *arg1,
 	c->next = *pc;
 	*pc = c;
 #ifdef DEBUG
-	if (log_level >= 2) {
-		ctl_log(c);
-		log_puts(": added\n");
-	}
+	logx(2, "ctl%u: %s = %d at %s: added", c->addr,
+	    (ctl_fmt(ctl_str, sizeof(ctl_str), c), ctl_str), c->curval,
+	    (ctl_scope_fmt(scope_str, sizeof(scope_str), c), scope_str));
 #endif
 	return c;
 }
@@ -2575,7 +2087,7 @@ ctl_update(struct ctl *c)
 int
 ctl_match(struct ctl *c, int scope, void *arg0, void *arg1)
 {
-	if (c->type == CTL_NONE || c->scope != scope || c->u.any.arg0 != arg0)
+	if (c->type == CTL_NONE || c->scope != scope)
 		return 0;
 	if (arg0 != NULL && c->u.any.arg0 != arg0)
 		return 0;
@@ -2585,7 +2097,13 @@ ctl_match(struct ctl *c, int scope, void *arg0, void *arg1)
 			return 0;
 		break;
 	case CTL_OPT_DEV:
+	case CTL_APP_LEVEL:
+	case CTL_MIDI_PORT:
 		if (arg1 != NULL && c->u.any.arg1 != arg1)
+			return 0;
+		break;
+	case CTL_OPT_MODE:
+		if (arg1 != NULL && c->u.opt_mode.idx != *(int *)arg1)
 			return 0;
 		break;
 	}
@@ -2620,6 +2138,9 @@ ctl_onval(int scope, void *arg0, void *arg1, int val)
 int
 ctl_del(int scope, void *arg0, void *arg1)
 {
+#ifdef DEBUG
+	char str[64];
+#endif
 	struct ctl *c, **pc;
 	int found;
 
@@ -2631,10 +2152,8 @@ ctl_del(int scope, void *arg0, void *arg1)
 			return found;
 		if (ctl_match(c, scope, arg0, arg1)) {
 #ifdef DEBUG
-			if (log_level >= 2) {
-				ctl_log(c);
-				log_puts(": removed\n");
-			}
+			logx(2, "ctl%u: %s: removed", c->addr,
+			    (ctl_fmt(str, sizeof(str), c), str));
 #endif
 			found++;
 			c->refs_mask &= ~CTL_DEVMASK;
@@ -2690,17 +2209,11 @@ dev_ctlsync(struct dev *d)
 	}
 
 	if (d->master_enabled && found) {
-		if (log_level >= 2) {
-			dev_log(d);
-			log_puts(": software master level control disabled\n");
-		}
+		logx(2, "%s: software master level control disabled", d->path);
 		d->master_enabled = 0;
 		ctl_del(CTL_DEV_MASTER, d, NULL);
 	} else if (!d->master_enabled && !found) {
-		if (log_level >= 2) {
-			dev_log(d);
-			log_puts(": software master level control enabled\n");
-		}
+		logx(2, "%s: software master level control enabled", d->path);
 		d->master_enabled = 1;
 		ctl_new(CTL_DEV_MASTER, d, NULL,
 		    CTL_NUM, "", d->name, "output", -1, "level",
@@ -2723,7 +2236,7 @@ dev_ctlsync(struct dev *d)
 	for (s = ctlslot_array, i = 0; i < DEV_NCTLSLOT; i++, s++) {
 		if (s->ops == NULL)
 			continue;
-		if (s->opt->dev == d)
+		if (s->opt != NULL && s->opt->dev == d)
 			s->ops->sync(s->arg);
 	}
 }

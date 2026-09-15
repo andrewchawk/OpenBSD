@@ -1,4 +1,4 @@
-/*	$OpenBSD: locore.s,v 1.205 2024/06/06 00:36:46 bluhm Exp $	*/
+/*	$OpenBSD: locore.s,v 1.209 2025/09/28 20:51:38 cludwig Exp $	*/
 /*	$NetBSD: locore.s,v 1.145 1996/05/03 19:41:19 christos Exp $	*/
 
 /*-
@@ -38,22 +38,17 @@
 
 #include "npx.h"
 #include "assym.h"
-#include "apm.h"
 #include "lapic.h"
-#include "ksyms.h"
 
 #include <sys/errno.h>
 #include <sys/syscall.h>
 
 #include <machine/codepatch.h>
-#include <machine/cputypes.h>
 #include <machine/param.h>
 #include <machine/pte.h>
 #include <machine/segments.h>
 #include <machine/specialreg.h>
 #include <machine/trap.h>
-
-#include <dev/isa/isareg.h>
 
 #if NLAPIC > 0
 #include <machine/i82489reg.h>
@@ -459,7 +454,8 @@ ENTRY(copyout)
 #endif
 	pushl	%esi
 	pushl	%edi
-	pushl	$0
+	GET_CURPCB(%eax)
+	pushl	PCB_ONFAULT(%eax)
 
 	movl	16+FPADD(%esp),%esi
 	movl	20+FPADD(%esp),%edi
@@ -514,7 +510,7 @@ ENTRY(_copyin)
 	pushl	%esi
 	pushl	%edi
 	GET_CURPCB(%eax)
-	pushl	$0
+	pushl	PCB_ONFAULT(%eax)
 	movl	$copy_fault,PCB_ONFAULT(%eax)
 	SMAP_STAC
 
@@ -582,13 +578,15 @@ ENTRY(copyoutstr)
 	pushl	%esi
 	pushl	%edi
 
-	movl	12+FPADD(%esp),%esi		# esi = from
-	movl	16+FPADD(%esp),%edi		# edi = to
-	movl	20+FPADD(%esp),%edx		# edx = maxlen
-
-5:	GET_CURPCB(%eax)
+	GET_CURPCB(%eax)
+	pushl	PCB_ONFAULT(%eax)
 	movl	$copystr_fault,PCB_ONFAULT(%eax)
 	SMAP_STAC
+
+	movl	16+FPADD(%esp),%esi		# esi = from
+	movl	20+FPADD(%esp),%edi		# edi = to
+	movl	24+FPADD(%esp),%edx		# edx = maxlen
+
 	/*
 	 * Get min(%edx, VM_MAXUSER_ADDRESS-%edi).
 	 */
@@ -601,7 +599,7 @@ ENTRY(copyoutstr)
 	cmpl	%edx,%eax
 	jae	1f
 	movl	%eax,%edx
-	movl	%eax,20+FPADD(%esp)
+	movl	%eax,24+FPADD(%esp)
 
 1:	incl	%edx
 
@@ -637,13 +635,15 @@ ENTRY(_copyinstr)
 #endif
 	pushl	%esi
 	pushl	%edi
+
 	GET_CURPCB(%ecx)
+	pushl	PCB_ONFAULT(%ecx)
 	movl	$copystr_fault,PCB_ONFAULT(%ecx)
 	SMAP_STAC
 
-	movl	12+FPADD(%esp),%esi		# %esi = from
-	movl	16+FPADD(%esp),%edi		# %edi = to
-	movl	20+FPADD(%esp),%edx		# %edx = maxlen
+	movl	16+FPADD(%esp),%esi		# %esi = from
+	movl	20+FPADD(%esp),%edi		# %edi = to
+	movl	24+FPADD(%esp),%edx		# %edx = maxlen
 
 	/*
 	 * Get min(%edx, VM_MAXUSER_ADDRESS-%esi).
@@ -656,7 +656,7 @@ ENTRY(_copyinstr)
 	cmpl	%edx,%eax
 	jae	1f
 	movl	%eax,%edx
-	movl	%eax,20+FPADD(%esp)
+	movl	%eax,24+FPADD(%esp)
 
 1:	incl	%edx
 
@@ -684,16 +684,16 @@ ENTRY(copystr_fault)
 copystr_return:
 	SMAP_CLAC
 	/* Set *lencopied and return %eax. */
-	GET_CURPCB(%ecx)
-	movl	$0,PCB_ONFAULT(%ecx)
-	movl	20+FPADD(%esp),%ecx
+	movl	24+FPADD(%esp),%ecx
 	subl	%edx,%ecx
-	movl	24+FPADD(%esp),%edx
+	movl	28+FPADD(%esp),%edx
 	testl	%edx,%edx
 	jz	8f
 	movl	%ecx,(%edx)
 
-8:	popl	%edi
+8:	GET_CURPCB(%ecx)
+	popl	PCB_ONFAULT(%ecx)
+	popl	%edi
 	popl	%esi
 #ifdef DDB
 	leave

@@ -1,4 +1,4 @@
-/*	$OpenBSD: bpf.h,v 1.72 2024/01/26 21:14:08 jan Exp $	*/
+/*	$OpenBSD: bpf.h,v 1.78 2026/09/10 18:31:39 claudio Exp $	*/
 /*	$NetBSD: bpf.h,v 1.15 1996/12/13 07:57:33 mikel Exp $	*/
 
 /*
@@ -52,7 +52,10 @@ typedef u_int32_t	bpf_u_int32;
 #define BPF_ALIGNMENT sizeof(u_int32_t)
 #define BPF_WORDALIGN(x) (((x) + (BPF_ALIGNMENT - 1)) & ~(BPF_ALIGNMENT - 1))
 
+#ifdef _KERNEL
 #define BPF_MAXINSNS 512
+#endif
+
 #define BPF_MAXBUFSIZE (2 * 1024 * 1024)
 #define BPF_MINBUFSIZE 32
 
@@ -122,6 +125,7 @@ struct bpf_version {
 #define BIOCSWTIMEOUT	_IOW('B',126, struct timeval)
 #define BIOCGWTIMEOUT	_IOR('B',126, struct timeval)
 #define BIOCDWTIMEOUT	_IO('B',126)
+#define BIOCSETFNR	_IOW('B',127, struct bpf_program)
 
 /*
  * Direction filters for BIOCSDIRFILT/BIOCGDIRFILT
@@ -254,6 +258,8 @@ struct bpf_hdr {
 #define		BPF_LSH		0x60
 #define		BPF_RSH		0x70
 #define		BPF_NEG		0x80
+#define		BPF_MOD		0x90
+#define		BPF_XOR		0xa0
 #define		BPF_JA		0x00
 #define		BPF_JEQ		0x10
 #define		BPF_JGT		0x20
@@ -306,18 +312,20 @@ struct bpf_ops {
 #define BPF_JUMP(code, k, jt, jf) { (u_int16_t)(code), jt, jf, k }
 
 __BEGIN_DECLS
+#ifndef _KERNEL
 u_int	 bpf_filter(const struct bpf_insn *, const u_char *, u_int, u_int)
 	    __bounded((__buffer__, 2, 4));
 
 u_int	 _bpf_filter(const struct bpf_insn *, const struct bpf_ops *,
 	     const void *, u_int);
+#endif /* _KERNEL */
 __END_DECLS
 
 #ifdef _KERNEL
 struct ifnet;
 struct mbuf;
 
-int	 bpf_validate(struct bpf_insn *, int);
+int	 bpf_validate(struct bpf_insn *, u_int);
 int	 bpf_mtap(caddr_t, const struct mbuf *, u_int);
 int	 bpf_mtap_hdr(caddr_t, const void *, u_int, const struct mbuf *, u_int);
 int	 bpf_mtap_af(caddr_t, u_int32_t, const struct mbuf *, u_int);
@@ -326,10 +334,14 @@ int	 bpf_tap_hdr(caddr_t, const void *, u_int, const void *, u_int, u_int);
 void	 bpfattach(caddr_t *, struct ifnet *, u_int, u_int);
 void	 bpfdetach(struct ifnet *);
 void	*bpfsattach(caddr_t *, const char *, u_int, u_int);
+void	*bpfxattach(caddr_t *, const char *, struct ifnet *, u_int, u_int);
 void	 bpfsdetach(void *);
 void	 bpfilterattach(int);
 
-u_int	 bpf_mfilter(const struct bpf_insn *, const struct mbuf *, u_int);
+u_int	 _bpf_lfilter(const struct bpf_insn *, u_int, const struct bpf_ops *,
+	    const void *, u_int);
+
+u_int	 bpf_mfilter(const struct bpf_program *, const struct mbuf *, u_int);
 #endif /* _KERNEL */
 
 /*

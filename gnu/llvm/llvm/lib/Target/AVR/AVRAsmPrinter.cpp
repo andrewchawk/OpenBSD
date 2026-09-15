@@ -16,10 +16,9 @@
 #include "AVRSubtarget.h"
 #include "AVRTargetMachine.h"
 #include "MCTargetDesc/AVRInstPrinter.h"
-#include "MCTargetDesc/AVRMCExpr.h"
+#include "MCTargetDesc/AVRMCAsmInfo.h"
 #include "TargetInfo/AVRTargetInfo.h"
 
-#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -27,25 +26,29 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/Mangler.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 
 #define DEBUG_TYPE "avr-asm-printer"
 
-namespace llvm {
+using namespace llvm;
+
+namespace {
 
 /// An AVR assembly code printer.
 class AVRAsmPrinter : public AsmPrinter {
 public:
   AVRAsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
-      : AsmPrinter(TM, std::move(Streamer)), MRI(*TM.getMCRegisterInfo()) {}
+      : AsmPrinter(TM, std::move(Streamer), ID), MRI(*TM.getMCRegisterInfo()) {}
 
   StringRef getPassName() const override { return "AVR Assembly Printer"; }
 
@@ -59,7 +62,8 @@ public:
 
   void emitInstruction(const MachineInstr *MI) override;
 
-  const MCExpr *lowerConstant(const Constant *CV) override;
+  const MCExpr *lowerConstant(const Constant *CV, const Constant *BaseCV,
+                              uint64_t Offset) override;
 
   void emitXXStructor(const DataLayout &DL, const Constant *CV) override;
 
@@ -67,10 +71,14 @@ public:
 
   void emitStartOfAsmFile(Module &M) override;
 
+  static char ID;
+
 private:
   const MCRegisterInfo &MRI;
   bool EmittedStructorSymbolAttrs = false;
 };
+
+} // namespace
 
 void AVRAsmPrinter::printOperand(const MachineInstr *MI, unsigned OpNo,
                                  raw_ostream &O) {
@@ -101,56 +109,51 @@ bool AVRAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNum,
                                     const char *ExtraCode, raw_ostream &O) {
   // Default asm printer can only deal with some extra codes,
   // so try it first.
-  bool Error = AsmPrinter::PrintAsmOperand(MI, OpNum, ExtraCode, O);
+  if (!AsmPrinter::PrintAsmOperand(MI, OpNum, ExtraCode, O))
+    return false;
 
-  if (Error && ExtraCode && ExtraCode[0]) {
-    if (ExtraCode[1] != 0)
-      return true; // Unknown modifier.
+  const MachineOperand &MO = MI->getOperand(OpNum);
 
-    if (ExtraCode[0] >= 'A' && ExtraCode[0] <= 'Z') {
-      const MachineOperand &RegOp = MI->getOperand(OpNum);
+  if (ExtraCode && ExtraCode[0]) {
+    // Unknown extra code.
+    if (ExtraCode[1] != 0 || ExtraCode[0] < 'A' || ExtraCode[0] > 'Z')
+      return true;
 
-      assert(RegOp.isReg() && "Operand must be a register when you're"
-                              "using 'A'..'Z' operand extracodes.");
-      Register Reg = RegOp.getReg();
+    // Operand must be a register when using 'A' ~ 'Z' extra code.
+    if (!MO.isReg())
+      return true;
 
-      unsigned ByteNumber = ExtraCode[0] - 'A';
+    Register Reg = MO.getReg();
 
-      unsigned OpFlags = MI->getOperand(OpNum - 1).getImm();
-      unsigned NumOpRegs = InlineAsm::getNumOperandRegisters(OpFlags);
-      (void)NumOpRegs;
+    unsigned ByteNumber = ExtraCode[0] - 'A';
+    const InlineAsm::Flag OpFlags(MI->getOperand(OpNum - 1).getImm());
+    const unsigned NumOpRegs = OpFlags.getNumOperandRegisters();
 
-      const AVRSubtarget &STI = MF->getSubtarget<AVRSubtarget>();
-      const TargetRegisterInfo &TRI = *STI.getRegisterInfo();
+    const AVRSubtarget &STI = MF->getSubtarget<AVRSubtarget>();
+    const TargetRegisterInfo &TRI = *STI.getRegisterInfo();
 
-      const TargetRegisterClass *RC = TRI.getMinimalPhysRegClass(Reg);
-      unsigned BytesPerReg = TRI.getRegSizeInBits(*RC) / 8;
-      assert(BytesPerReg <= 2 && "Only 8 and 16 bit regs are supported.");
+    const TargetRegisterClass *RC = TRI.getMinimalPhysRegClass(Reg);
+    unsigned BytesPerReg = TRI.getRegSizeInBits(*RC) / 8;
+    assert(BytesPerReg <= 2 && "Only 8 and 16 bit regs are supported.");
 
-      unsigned RegIdx = ByteNumber / BytesPerReg;
-      if (RegIdx >= NumOpRegs)
-        return true;
-      Reg = MI->getOperand(OpNum + RegIdx).getReg();
+    unsigned RegIdx = ByteNumber / BytesPerReg;
+    if (RegIdx >= NumOpRegs)
+      return true;
+    Reg = MI->getOperand(OpNum + RegIdx).getReg();
 
-      if (BytesPerReg == 2) {
-        Reg = TRI.getSubReg(Reg, ByteNumber % BytesPerReg ? AVR::sub_hi
+    if (BytesPerReg == 2) {
+      Reg = TRI.getSubReg(Reg, (ByteNumber % BytesPerReg) ? AVR::sub_hi
                                                           : AVR::sub_lo);
-      }
-
-      O << AVRInstPrinter::getPrettyRegisterName(Reg, MRI);
-      return false;
     }
-  }
 
-  // Print global symbols.
-  const auto &MO = MI->getOperand(OpNum);
-  if (Error && MO.getType() == MachineOperand::MO_GlobalAddress) {
-    PrintSymbolOperand(MO, O);
+    O << AVRInstPrinter::getPrettyRegisterName(Reg, MRI);
     return false;
   }
 
-  if (Error)
-    printOperand(MI, OpNum, O);
+  if (MO.getType() == MachineOperand::MO_GlobalAddress)
+    PrintSymbolOperand(MO, O); // Print global symbols.
+  else
+    printOperand(MI, OpNum, O); // Fallback to ordinary cases.
 
   return false;
 }
@@ -181,8 +184,8 @@ bool AVRAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI,
 
   // If NumOpRegs == 2, then we assume it is product of a FrameIndex expansion
   // and the second operand is an Imm.
-  unsigned OpFlags = MI->getOperand(OpNum - 1).getImm();
-  unsigned NumOpRegs = InlineAsm::getNumOperandRegisters(OpFlags);
+  const InlineAsm::Flag OpFlags(MI->getOperand(OpNum - 1).getImm());
+  const unsigned NumOpRegs = OpFlags.getNumOperandRegisters();
 
   if (NumOpRegs == 2) {
     assert(MI->getOperand(OpNum).getReg() != AVR::R27R26 &&
@@ -194,9 +197,8 @@ bool AVRAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI,
 }
 
 void AVRAsmPrinter::emitInstruction(const MachineInstr *MI) {
-  // FIXME: Enable feature predicate checks once all the test pass.
-  // AVR_MC::verifyInstructionPredicates(MI->getOpcode(),
-  //                                     getSubtargetInfo().getFeatureBits());
+  AVR_MC::verifyInstructionPredicates(MI->getOpcode(),
+                                      getSubtargetInfo().getFeatureBits());
 
   AVRMCInstLower MCInstLowering(OutContext, *this);
 
@@ -205,18 +207,20 @@ void AVRAsmPrinter::emitInstruction(const MachineInstr *MI) {
   EmitToStreamer(*OutStreamer, I);
 }
 
-const MCExpr *AVRAsmPrinter::lowerConstant(const Constant *CV) {
+const MCExpr *AVRAsmPrinter::lowerConstant(const Constant *CV,
+                                           const Constant *BaseCV,
+                                           uint64_t Offset) {
   MCContext &Ctx = OutContext;
 
   if (const GlobalValue *GV = dyn_cast<GlobalValue>(CV)) {
     bool IsProgMem = GV->getAddressSpace() == AVR::ProgramMemory;
     if (IsProgMem) {
       const MCExpr *Expr = MCSymbolRefExpr::create(getSymbol(GV), Ctx);
-      return AVRMCExpr::create(AVRMCExpr::VK_AVR_PM, Expr, false, Ctx);
+      return AVRMCExpr::create(AVR::S_PM, Expr, false, Ctx);
     }
   }
 
-  return AsmPrinter::lowerConstant(CV);
+  return AsmPrinter::lowerConstant(CV, BaseCV, Offset);
 }
 
 void AVRAsmPrinter::emitXXStructor(const DataLayout &DL, const Constant *CV) {
@@ -241,7 +245,7 @@ void AVRAsmPrinter::emitXXStructor(const DataLayout &DL, const Constant *CV) {
 bool AVRAsmPrinter::doFinalization(Module &M) {
   const TargetLoweringObjectFile &TLOF = getObjFileLowering();
   const AVRTargetMachine &TM = (const AVRTargetMachine &)MMI->getTarget();
-  const AVRSubtarget *SubTM = (const AVRSubtarget *)TM.getSubtargetImpl();
+  const AVRSubtarget *SubTM = TM.getSubtargetImpl();
 
   bool NeedsCopyData = false;
   bool NeedsClearBSS = false;
@@ -256,14 +260,14 @@ bool AVRAsmPrinter::doFinalization(Module &M) {
       continue;
     }
 
-    auto *Section = cast<MCSectionELF>(TLOF.SectionForGlobal(&GO, TM));
-    if (Section->getName().startswith(".data"))
+    auto *Section = static_cast<MCSectionELF *>(TLOF.SectionForGlobal(&GO, TM));
+    if (Section->getName().starts_with(".data"))
       NeedsCopyData = true;
-    else if (Section->getName().startswith(".rodata") && SubTM->hasPROGMEM())
-      // AVRs that have a separate PROGMEM (that's most AVRs) store .rodata
-      // sections in RAM.
+    else if (Section->getName().starts_with(".rodata") && SubTM->hasLPM())
+      // AVRs that have a separate program memory (that's most AVRs) store
+      // .rodata sections in RAM.
       NeedsCopyData = true;
-    else if (Section->getName().startswith(".bss"))
+    else if (Section->getName().starts_with(".bss"))
       NeedsClearBSS = true;
   }
 
@@ -290,7 +294,7 @@ bool AVRAsmPrinter::doFinalization(Module &M) {
 
 void AVRAsmPrinter::emitStartOfAsmFile(Module &M) {
   const AVRTargetMachine &TM = (const AVRTargetMachine &)MMI->getTarget();
-  const AVRSubtarget *SubTM = (const AVRSubtarget *)TM.getSubtargetImpl();
+  const AVRSubtarget *SubTM = TM.getSubtargetImpl();
   if (!SubTM)
     return;
 
@@ -327,8 +331,12 @@ void AVRAsmPrinter::emitStartOfAsmFile(Module &M) {
         MCConstantExpr::create(SubTM->getIORegRAMPZ(), MMI->getContext()));
 }
 
-} // end of namespace llvm
+char AVRAsmPrinter::ID = 0;
 
-extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAVRAsmPrinter() {
-  llvm::RegisterAsmPrinter<llvm::AVRAsmPrinter> X(llvm::getTheAVRTarget());
+INITIALIZE_PASS(AVRAsmPrinter, "avr-asm-printer", "AVR Assembly Printer", false,
+                false)
+
+extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
+LLVMInitializeAVRAsmPrinter() {
+  llvm::RegisterAsmPrinter<AVRAsmPrinter> X(getTheAVRTarget());
 }

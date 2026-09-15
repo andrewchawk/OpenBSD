@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_parser.c,v 1.351 2024/04/22 13:30:22 bluhm Exp $ */
+/*	$OpenBSD: pfctl_parser.c,v 1.359 2026/03/20 09:37:23 sthen Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -717,7 +717,40 @@ print_src_node(struct pf_src_node *sn, int opts)
 }
 
 void
-print_rule(struct pf_rule *r, const char *anchor_call, int opts)
+print_statelim(const struct pfioc_statelim *ioc)
+{
+	printf("state limiter \"%s\" id %u limit %u",
+	    ioc->name, ioc->id, ioc->limit);
+	if (ioc->rate.limit != 0)
+		printf(" rate %u/%u", ioc->rate.limit, ioc->rate.seconds);
+
+	printf("\n");
+}
+
+void
+print_sourcelim(const struct pfioc_sourcelim *ioc)
+{
+	printf("source limiter \"%s\" id %u entries %u limit %u",
+	    ioc->name, ioc->id, ioc->entries, ioc->limit);
+	if (ioc->rate.limit != 0)
+		printf(" rate %u/%u", ioc->rate.limit, ioc->rate.seconds);
+	if (ioc->overload_tblname[0] != '\0') {
+		printf(" table <%s> above %u",
+		    ioc->overload_tblname, ioc->overload_hwm);
+		if (ioc->overload_lwm)
+			printf(" below %u", ioc->overload_lwm); 
+	}
+	if (ioc->inet_prefix < 32)
+		printf(" inet mask %u", ioc->inet_prefix);
+	if (ioc->inet6_prefix < 128)
+		printf(" inet6 mask %u", ioc->inet6_prefix);
+
+	printf("\n");
+}
+
+void
+print_rule(struct pfctl *pf, struct pf_rule *r, const char *anchor_call,
+    int opts)
 {
 	static const char *actiontypes[] = { "pass", "block", "scrub",
 	    "no scrub", "nat", "no nat", "binat", "no binat", "rdr", "no rdr",
@@ -849,7 +882,7 @@ print_rule(struct pf_rule *r, const char *anchor_call, int opts)
 			printf(" proto %u", r->proto);
 	}
 	print_fromto(&r->src, r->os_fingerprint, &r->dst, r->af, r->proto,
-	    opts);
+	    pf->opts | opts);
 	if (r->rcv_ifname[0])
 		printf(" %sreceived-on %s", r->rcvifnot ? "!" : "",
 		    r->rcv_ifname);
@@ -967,6 +1000,28 @@ print_rule(struct pf_rule *r, const char *anchor_call, int opts)
 			}
 		}
 		printf(" probability %s%%", buf);
+	}
+	if (r->statelim.id != PF_STATELIM_ID_NONE) {
+		const char *nm = pfctl_statelim_id2name(pf, r->statelim.id);
+		printf(" state limiter");
+		if (nm[0] != '\0')
+			printf(" \"%s\"", nm);
+		else
+			printf(" id %u", r->statelim.id);
+		printf(" (%s)",
+		    (r->statelim.limiter_action == PF_LIMITER_BLOCK) ?
+			"block" : "no-match");
+	}
+	if (r->sourcelim.id != PF_SOURCELIM_ID_NONE) {
+		const char *nm = pfctl_sourcelim_id2name(pf, r->sourcelim.id);
+		printf(" source limiter");
+		if (nm[0] != '\0')
+			printf(" \"%s\"", nm);
+		else
+			printf(" id %u", r->sourcelim.id);
+		printf(" (%s)",
+		    (r->sourcelim.limiter_action == PF_LIMITER_BLOCK) ?
+			"block" : "no-match");
 	}
 	if (ropts) {
 		printf(" (");
@@ -1145,15 +1200,18 @@ print_rule(struct pf_rule *r, const char *anchor_call, int opts)
 			    r->rdr.proxy_port[1], r->naf ? r->naf : r->af,
 			    PF_POOL_RDR, verbose);
 		}
-	} else if (!anchor_call[0] && r->nat.addr.type != PF_ADDR_NONE) {
-		printf (" nat-to ");
-		print_pool(&r->nat, r->nat.proxy_port[0],
-		    r->nat.proxy_port[1], r->naf ? r->naf : r->af,
-		    PF_POOL_NAT, verbose);
-	} else if (!anchor_call[0] && r->rdr.addr.type != PF_ADDR_NONE) {
-		printf (" rdr-to ");
-		print_pool(&r->rdr, r->rdr.proxy_port[0],
-		    r->rdr.proxy_port[1], r->af, PF_POOL_RDR, verbose);
+	} else {
+		if (!anchor_call[0] && r->nat.addr.type != PF_ADDR_NONE) {
+			printf (" nat-to ");
+			print_pool(&r->nat, r->nat.proxy_port[0],
+			    r->nat.proxy_port[1], r->naf ? r->naf : r->af,
+			    PF_POOL_NAT, verbose);
+		}
+		if (!anchor_call[0] && r->rdr.addr.type != PF_ADDR_NONE) {
+			printf (" rdr-to ");
+			print_pool(&r->rdr, r->rdr.proxy_port[0],
+			    r->rdr.proxy_port[1], r->af, PF_POOL_RDR, verbose);
+		}
 	}
 	if (r->rt) {
 		if (r->rt == PF_ROUTETO)
@@ -1213,7 +1271,7 @@ print_tabledef(const char *name, int flags, int addrs,
 void
 print_bwspec(const char *prefix, struct pf_queue_bwspec *bw)
 {
-	u_int	rate;
+	uint64_t rate;
 	int	i;
 	static const char unit[] = " KMG";
 
@@ -1221,9 +1279,9 @@ print_bwspec(const char *prefix, struct pf_queue_bwspec *bw)
 		printf("%s%u%%", prefix, bw->percent);
 	else if (bw->absolute) {
 		rate = bw->absolute;
-		for (i = 0; rate >= 1000 && i <= 3 && (rate % 1000 == 0); i++)
+		for (i = 0; rate >= 1000 && i < 3 && (rate % 1000 == 0); i++)
 			rate /= 1000;
-		printf("%s%u%c", prefix, rate, unit[i]);
+		printf("%s%llu%c", prefix, rate, unit[i]);
 	}
 }
 
@@ -1405,12 +1463,17 @@ ifa_load(void)
 			copy_satopfaddr(&n->addr.v.a.addr, ifa->ifa_addr);
 			ifa->ifa_netmask->sa_family = ifa->ifa_addr->sa_family;
 			copy_satopfaddr(&n->addr.v.a.mask, ifa->ifa_netmask);
-			if (ifa->ifa_broadaddr != NULL) {
-				ifa->ifa_broadaddr->sa_family = ifa->ifa_addr->sa_family;
+			if (ifa->ifa_flags & IFF_BROADCAST &&
+			    ifa->ifa_broadaddr != NULL &&
+			    ifa->ifa_broadaddr->sa_len != 0) {
+				ifa->ifa_broadaddr->sa_family =
+				    ifa->ifa_addr->sa_family;
 				copy_satopfaddr(&n->bcast, ifa->ifa_broadaddr);
-			}
-			if (ifa->ifa_dstaddr != NULL) {
-				ifa->ifa_dstaddr->sa_family = ifa->ifa_addr->sa_family;
+			} else if (ifa->ifa_flags & IFF_POINTOPOINT &&
+			    ifa->ifa_dstaddr != NULL &&
+			    ifa->ifa_dstaddr->sa_len != 0) {
+				ifa->ifa_dstaddr->sa_family =
+				    ifa->ifa_addr->sa_family;
 				copy_satopfaddr(&n->peer, ifa->ifa_dstaddr);
 			}
 			if (n->af == AF_INET6)

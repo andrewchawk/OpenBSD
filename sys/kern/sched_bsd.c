@@ -1,4 +1,4 @@
-/*	$OpenBSD: sched_bsd.c,v 1.94 2024/07/08 13:17:12 claudio Exp $	*/
+/*	$OpenBSD: sched_bsd.c,v 1.105 2025/09/25 08:46:50 mvs Exp $	*/
 /*	$NetBSD: kern_synch.c,v 1.37 1996/04/22 01:38:37 christos Exp $	*/
 
 /*-
@@ -55,7 +55,6 @@
 #endif
 
 uint64_t roundrobin_period;	/* [I] roundrobin period (ns) */
-int	lbolt;			/* once a second sleep address */
 
 struct mutex sched_lock;
 
@@ -64,6 +63,7 @@ void			schedcpu(void *);
 uint32_t		decay_aftersleep(uint32_t, uint32_t);
 
 extern struct cpuset sched_idle_cpus;
+extern struct cpuset sched_all_cpus;
 
 /*
  * constants for averages over 1, 5, and 15 minutes when sampling at
@@ -120,11 +120,12 @@ update_loadavg(void *unused)
 	static struct timeout to = TIMEOUT_INITIALIZER(update_loadavg, NULL);
 	CPU_INFO_ITERATOR cii;
 	struct cpu_info *ci;
-	u_int i, nrun = 0;
+	struct cpuset set;
+	u_int i, nrun;
 
+	cpuset_complement(&set, &sched_idle_cpus, &sched_all_cpus);
+	nrun = cpuset_cardinality(&set);
 	CPU_INFO_FOREACH(cii, ci) {
-		if (!cpuset_isset(&sched_idle_cpus, ci))
-			nrun++;
 		nrun += ci->ci_schedstate.spc_nrun;
 	}
 
@@ -143,7 +144,7 @@ update_loadavg(void *unused)
  *          Note that, as ps(1) mentions, this can let percentages
  *          total over 100% (I've seen 137.9% for 3 processes).
  *
- * Note that hardclock updates p_estcpu and p_cpticks independently.
+ * Note that p_estcpu and p_cpticks are updated independently.
  *
  * We wish to decay away 90% of p_estcpu in (5 * loadavg) seconds.
  * That is, the system wants to compute a value of decay such
@@ -228,9 +229,9 @@ void
 schedcpu(void *unused)
 {
 	static struct timeout to = TIMEOUT_INITIALIZER(schedcpu, NULL);
-	fixpt_t loadfac = loadfactor(averunnable.ldavg[0]);
+	fixpt_t loadfac = loadfactor(averunnable.ldavg[0]), pctcpu;
 	struct proc *p;
-	unsigned int newcpu;
+	unsigned int newcpu, cpt;
 
 	LIST_FOREACH(p, &allproc, p_list) {
 		/*
@@ -245,27 +246,31 @@ schedcpu(void *unused)
 		 */
 		if (p->p_stat == SSLEEP || p->p_stat == SSTOP)
 			p->p_slptime++;
-		p->p_pctcpu = (p->p_pctcpu * ccpu) >> FSHIFT;
+		pctcpu = (p->p_pctcpu * ccpu) >> FSHIFT;
 		/*
 		 * If the process has slept the entire second,
 		 * stop recalculating its priority until it wakes up.
 		 */
-		if (p->p_slptime > 1)
+		if (p->p_slptime > 1) {
+			p->p_pctcpu = pctcpu;
 			continue;
+		}
 		SCHED_LOCK();
 		/*
 		 * p_pctcpu is only for diagnostic tools such as ps.
 		 */
+		cpt = READ_ONCE(p->p_cpticks);
 #if	(FSHIFT >= CCPU_SHIFT)
-		p->p_pctcpu += (stathz == 100)?
-			((fixpt_t) p->p_cpticks) << (FSHIFT - CCPU_SHIFT):
-                	100 * (((fixpt_t) p->p_cpticks)
+		pctcpu += (stathz == 100) ?
+		    (cpt - p->p_cpticks2) << (FSHIFT - CCPU_SHIFT) :
+		    100 * ((cpt - p->p_cpticks2)
 				<< (FSHIFT - CCPU_SHIFT)) / stathz;
 #else
-		p->p_pctcpu += ((FSCALE - ccpu) *
-			(p->p_cpticks * FSCALE / stathz)) >> FSHIFT;
+		pctcpu += ((FSCALE - ccpu) *
+		    ((cpt - p->p_cpticks2) * FSCALE / stathz)) >> FSHIFT;
 #endif
-		p->p_cpticks = 0;
+		p->p_pctcpu = pctcpu;
+		p->p_cpticks2 = cpt;
 		newcpu = (u_int) decay_cpu(loadfac, p->p_estcpu);
 		setpriority(p, newcpu, p->p_p->ps_nice);
 
@@ -276,7 +281,6 @@ schedcpu(void *unused)
 		}
 		SCHED_UNLOCK();
 	}
-	wakeup(&lbolt);
 	timeout_add_sec(&to, 1);
 }
 
@@ -317,7 +321,6 @@ yield(void)
 	setrunqueue(p->p_cpu, p, p->p_usrpri);
 	p->p_ru.ru_nvcsw++;
 	mi_switch();
-	SCHED_UNLOCK();
 }
 
 /*
@@ -335,7 +338,6 @@ preempt(void)
 	setrunqueue(p->p_cpu, p, p->p_usrpri);
 	p->p_ru.ru_nivcsw++;
 	mi_switch();
-	SCHED_UNLOCK();
 }
 
 void
@@ -344,7 +346,6 @@ mi_switch(void)
 	struct schedstate_percpu *spc = &curcpu()->ci_schedstate;
 	struct proc *p = curproc;
 	struct proc *nextproc;
-	struct timespec ts;
 	int oldipl;
 #ifdef MULTIPROCESSOR
 	int hold_count;
@@ -364,26 +365,8 @@ mi_switch(void)
 		hold_count = 0;
 #endif
 
-	/*
-	 * Compute the amount of time during which the current
-	 * process was running, and add that to its total so far.
-	 */
-	nanouptime(&ts);
-	if (timespeccmp(&ts, &spc->spc_runtime, <)) {
-#if 0
-		printf("uptime is not monotonic! "
-		    "ts=%lld.%09lu, runtime=%lld.%09lu\n",
-		    (long long)tv.tv_sec, tv.tv_nsec,
-		    (long long)spc->spc_runtime.tv_sec,
-		    spc->spc_runtime.tv_nsec);
-#endif
-		timespecclear(&ts);
-	} else {
-		timespecsub(&ts, &spc->spc_runtime, &ts);
-	}
-	tu_enter(&p->p_tu);
-	timespecadd(&p->p_tu.tu_runtime, &ts, &p->p_tu.tu_runtime);
-	tu_leave(&p->p_tu);
+	/* Update thread runtime */
+	tuagg_add_runtime();
 
 	/* Stop any optional clock interrupts. */
 	if (ISSET(spc->spc_schedflags, SPCF_ITIMER)) {
@@ -459,7 +442,6 @@ mi_switch(void)
 	if (hold_count)
 		__mp_acquire_count(&kernel_lock, hold_count);
 #endif
-	SCHED_LOCK();
 }
 
 /*
@@ -483,24 +465,29 @@ setrunnable(struct proc *p)
 	default:
 		panic("setrunnable");
 	case SSTOP:
-		/*
-		 * If we're being traced (possibly because someone attached us
-		 * while we were stopped), check for a signal from the debugger.
-		 */
-		if ((pr->ps_flags & PS_TRACED) != 0 && pr->ps_xsig != 0)
-			atomic_setbits_int(&p->p_siglist, sigmask(pr->ps_xsig));
 		prio = p->p_usrpri;
+		TRACEPOINT(sched, unstop, p->p_tid + THREAD_PID_OFFSET,
+		    p->p_p->ps_pid, CPU_INFO_UNIT(p->p_cpu));
+
+		/* If not yet stopped or asleep, unstop but don't add to runq */
+		if (ISSET(p->p_flag, P_INSCHED)) {
+			if (p->p_wchan != NULL)
+				p->p_stat = SSLEEP;
+			else
+				p->p_stat = SONPROC;
+			return;
+		}
 		setrunqueue(NULL, p, prio);
 		break;
 	case SSLEEP:
 		prio = p->p_slppri;
 
-		/* if not yet asleep, don't add to runqueue */
-		if (ISSET(p->p_flag, P_WSLEEP))
-			return;
-		setrunqueue(NULL, p, prio);
 		TRACEPOINT(sched, wakeup, p->p_tid + THREAD_PID_OFFSET,
 		    p->p_p->ps_pid, CPU_INFO_UNIT(p->p_cpu));
+		/* if not yet asleep, don't add to runqueue */
+		if (ISSET(p->p_flag, P_INSCHED))
+			return;
+		setrunqueue(NULL, p, prio);
 		break;
 	}
 	if (p->p_slptime > 1) {
@@ -563,7 +550,8 @@ void (*cpu_setperf)(int);
 #define PERFPOL_AUTO 1
 #define PERFPOL_HIGH 2
 int perflevel = 100;
-int perfpolicy = PERFPOL_AUTO;
+int perfpolicy_on_ac = PERFPOL_HIGH;
+int perfpolicy_on_battery = PERFPOL_AUTO;
 
 #ifndef SMALL_KERNEL
 /*
@@ -575,6 +563,19 @@ void setperf_auto(void *);
 struct timeout setperf_to = TIMEOUT_INITIALIZER(setperf_auto, NULL);
 extern int hw_power;
 
+static inline int
+perfpolicy_dynamic(void)
+{
+	return (perfpolicy_on_ac == PERFPOL_AUTO ||
+	    perfpolicy_on_battery == PERFPOL_AUTO);
+}
+
+static inline int
+current_perfpolicy(void)
+{
+	return (hw_power) ? perfpolicy_on_ac : perfpolicy_on_battery;
+}
+
 void
 setperf_auto(void *v)
 {
@@ -585,14 +586,15 @@ setperf_auto(void *v)
 	CPU_INFO_ITERATOR cii;
 	struct cpu_info *ci;
 	uint64_t idle, total, allidle = 0, alltotal = 0;
+	unsigned int gen;
 
-	if (perfpolicy != PERFPOL_AUTO)
+	if (!perfpolicy_dynamic())
 		return;
 
 	if (cpu_setperf == NULL)
 		return;
 
-	if (hw_power) {
+	if (current_perfpolicy() == PERFPOL_HIGH) {
 		speedup = 1;
 		goto faster;
 	}
@@ -609,14 +611,23 @@ setperf_auto(void *v)
 			return;
 		}
 	CPU_INFO_FOREACH(cii, ci) {
+		struct schedstate_percpu *spc;
+
 		if (!cpu_is_online(ci))
 			continue;
-		total = 0;
-		for (i = 0; i < CPUSTATES; i++) {
-			total += ci->ci_schedstate.spc_cp_time[i];
-		}
+
+		spc = &ci->ci_schedstate;
+		pc_cons_enter(&spc->spc_cp_time_lock, &gen);
+		do {
+			total = 0;
+			for (i = 0; i < CPUSTATES; i++) {
+				total += spc->spc_cp_time[i];
+			}
+			idle = spc->spc_cp_time[CP_IDLE];
+		} while (pc_cons_leave(&spc->spc_cp_time_lock, &gen) != 0);
+
 		total -= totalticks[j];
-		idle = ci->ci_schedstate.spc_cp_time[CP_IDLE] - idleticks[j];
+		idle -= idleticks[j];
 		if (idle < total / 3)
 			speedup = 1;
 		alltotal += total;
@@ -650,7 +661,7 @@ sysctl_hwsetperf(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 	if (!cpu_setperf)
 		return EOPNOTSUPP;
 
-	if (perfpolicy != PERFPOL_MANUAL)
+	if (perfpolicy_on_ac != PERFPOL_MANUAL)
 		return sysctl_rdint(oldp, oldlenp, newp, perflevel);
 
 	err = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
@@ -668,12 +679,13 @@ int
 sysctl_hwperfpolicy(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
 	char policy[32];
-	int err;
+	char *policy_on_battery;
+	int err, perfpolicy;
 
 	if (!cpu_setperf)
 		return EOPNOTSUPP;
 
-	switch (perfpolicy) {
+	switch (current_perfpolicy()) {
 	case PERFPOL_MANUAL:
 		strlcpy(policy, "manual", sizeof(policy));
 		break;
@@ -694,6 +706,13 @@ sysctl_hwperfpolicy(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 	err = sysctl_string(oldp, oldlenp, newp, newlen, policy, sizeof(policy));
 	if (err)
 		return err;
+
+	policy_on_battery = strchr(policy, ',');
+	if (policy_on_battery != NULL) {
+		*policy_on_battery = '\0';
+		policy_on_battery++;
+	}
+
 	if (strcmp(policy, "manual") == 0)
 		perfpolicy = PERFPOL_MANUAL;
 	else if (strcmp(policy, "auto") == 0)
@@ -703,12 +722,31 @@ sysctl_hwperfpolicy(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 	else
 		return EINVAL;
 
-	if (perfpolicy == PERFPOL_AUTO) {
-		timeout_add_msec(&setperf_to, 200);
-	} else if (perfpolicy == PERFPOL_HIGH) {
+	if (policy_on_battery == NULL)
+		perfpolicy_on_battery = perfpolicy_on_ac = perfpolicy;
+	else {
+		if (strcmp(policy_on_battery, "manual") == 0 ||
+		    perfpolicy == PERFPOL_MANUAL) {
+			/* Not handled */
+			return EINVAL;
+		}
+		if (strcmp(policy_on_battery, "auto") == 0)
+			perfpolicy_on_battery = PERFPOL_AUTO;
+		else if (strcmp(policy_on_battery, "high") == 0)
+			perfpolicy_on_battery = PERFPOL_HIGH;
+		else
+			return EINVAL;
+		perfpolicy_on_ac = perfpolicy;
+	}
+
+	if (current_perfpolicy() == PERFPOL_HIGH) {
 		perflevel = 100;
 		cpu_setperf(perflevel);
 	}
+
+	if (perfpolicy_dynamic())
+		timeout_add_msec(&setperf_to, 200);
+
 	return 0;
 }
 #endif
@@ -723,7 +761,7 @@ scheduler_start(void)
 	update_loadavg(NULL);
 
 #ifndef SMALL_KERNEL
-	if (perfpolicy == PERFPOL_AUTO)
+	if (perfpolicy_dynamic())
 		timeout_add_msec(&setperf_to, 200);
 #endif
 }

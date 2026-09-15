@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.75 2024/02/05 21:58:09 dv Exp $	*/
+/*	$OpenBSD: config.c,v 1.84 2026/08/30 23:23:18 jsg Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -19,24 +19,20 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/time.h>
-#include <sys/uio.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
 
 #include <net/if.h>
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <termios.h>
 #include <unistd.h>
 #include <limits.h>
 #include <string.h>
 #include <fcntl.h>
-#include <util.h>
 #include <errno.h>
 #include <imsg.h>
 
 #include "proc.h"
+#include "virtio.h"
 #include "vmd.h"
 
 /* Supported bridge types */
@@ -159,9 +155,7 @@ config_getconfig(struct vmd *env, struct imsg *imsg)
 
 	log_debug("%s: %s retrieving config",
 	    __func__, ps->ps_title[privsep_process]);
-
-	IMSG_SIZE_CHECK(imsg, &env->vmd_cfg);
-	memcpy(&env->vmd_cfg, imsg->data, sizeof(env->vmd_cfg));
+	vmop_config_read(imsg, &env->vmd_cfg);
 
 	return (0);
 }
@@ -184,22 +178,6 @@ config_setreset(struct vmd *env, unsigned int reset)
 	return (0);
 }
 
-int
-config_getreset(struct vmd *env, struct imsg *imsg)
-{
-	unsigned int	 mode;
-
-	IMSG_SIZE_CHECK(imsg, &mode);
-	memcpy(&mode, imsg->data, sizeof(mode));
-
-	log_debug("%s: %s resetting state",
-	    __func__, env->vmd_ps.ps_title[privsep_process]);
-
-	config_purge(env, mode);
-
-	return (0);
-}
-
 /*
  * config_setvm
  *
@@ -213,11 +191,12 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 	int diskfds[VM_MAX_DISKS_PER_VM][VM_MAX_BASE_PER_DISK];
 	struct vmd_if		*vif;
 	struct vmop_create_params *vmc = &vm->vm_params;
-	struct vm_create_params	*vcp = &vmc->vmc_params;
+	enum vm_disk_fmt	 type;
 	unsigned int		 i, j;
 	int			 fd = -1, cdromfd = -1, kernfd = -1;
 	int			*tapfds = NULL;
-	int			 n = 0, aflags, oflags, ret = -1;
+	int			 aflags, oflags, ret = -1;
+	ssize_t			 n = 0;
 	char			 ifname[IF_NAMESIZE], *s;
 	char			 path[PATH_MAX], base[PATH_MAX];
 	unsigned int		 unit;
@@ -234,7 +213,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 	 * Rate-limit the VM so that it cannot restart in a loop:
 	 * if the VM restarts after less than VM_START_RATE_SEC seconds,
 	 * we increment the limit counter.  After VM_START_RATE_LIMIT
-	 * of suchs fast reboots the VM is stopped.
+	 * of these fast reboots the VM is stopped.
 	 */
 	getmonotime(&tv);
 	if (vm->vm_start_tv.tv_sec) {
@@ -250,13 +229,13 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		}
 
 		log_debug("%s: vm %u restarted after %lld.%ld seconds,"
-		    " limit %d/%d", __func__, vcp->vcp_id, since_last.tv_sec,
+		    " limit %d/%d", __func__, vm->vm_vmid, since_last.tv_sec,
 		    since_last.tv_usec, vm->vm_start_limit,
 		    VM_START_RATE_LIMIT);
 
 		if (vm->vm_start_limit >= VM_START_RATE_LIMIT) {
-			log_warnx("%s: vm %u restarted too quickly",
-			    __func__, vcp->vcp_id);
+			log_warnx("%s: vm %u restarted too quickly", __func__,
+			    vm->vm_vmid);
 			return (EPERM);
 		}
 	}
@@ -281,7 +260,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 	/*
 	 * From here onward, all failures need cleanup and use goto fail
 	 */
-	if (!(vm->vm_state & VM_STATE_RECEIVED) && vm->vm_kernel == -1) {
+	if (vm->vm_kernel == -1) {
 		if (vm->vm_kernel_path != NULL) {
 			/* Open external kernel for child */
 			kernfd = open(vm->vm_kernel_path, O_RDONLY | O_CLOEXEC);
@@ -313,13 +292,14 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		    vmc->vmc_checkaccess & VMOP_CREATE_KERNEL,
 		    uid, R_OK) == -1) {
 			log_warnx("vm \"%s\" no read access to kernel "
-			    "%s", vcp->vcp_name, vm->vm_kernel_path);
+			    "%s", vmc->vmc_name, vm->vm_kernel_path);
 			ret = EPERM;
 			goto fail;
 		}
 
 		vm->vm_kernel = kernfd;
 		vmc->vmc_kernel = kernfd;
+		kernfd = -1;
 	}
 
 	/* Open CDROM image for child */
@@ -336,7 +316,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		    vmc->vmc_checkaccess & VMOP_CREATE_CDROM,
 		    uid, R_OK) == -1) {
 			log_warnx("vm \"%s\" no read access to cdrom %s",
-			    vcp->vcp_name, vmc->vmc_cdrom);
+			    vmc->vmc_name, vmc->vmc_cdrom);
 			ret = EPERM;
 			goto fail;
 		}
@@ -354,7 +334,6 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		oflags = O_RDWR | O_EXLOCK | O_NONBLOCK;
 		aflags = R_OK | W_OK;
 		for (j = 0; j < VM_MAX_BASE_PER_DISK; j++) {
-			/* Stat disk[i] to ensure it is a regular file */
 			if ((diskfds[i][j] = open(path, oflags)) == -1) {
 				log_warn("can't open disk %s",
 				    vmc->vmc_disks[i]);
@@ -362,14 +341,35 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 				goto fail;
 			}
 
+			/*
+			 * Check if it's a regular file and accessible to
+			 * the user starting the vm.
+			 */
 			if (vm_checkaccess(diskfds[i][j],
 			    vmc->vmc_checkaccess & VMOP_CREATE_DISK,
 			    uid, aflags) == -1) {
 				log_warnx("vm \"%s\" unable to access "
-				    "disk %s", vcp->vcp_name, path);
+				    "disk %s", vmc->vmc_name, path);
 				errno = EPERM;
 				goto fail;
 			}
+
+			/* Identify the disk type if unknown. */
+			type = vmc->vmc_disktypes[i];
+			if (type == VMDF_AUTO) {
+				type = virtio_get_disktype(diskfds[i][j]);
+				vmc->vmc_disktypes[i] = type;
+			}
+			if (type != VMDF_RAW && type != VMDF_QCOW2) {
+				log_warnx("vm \"%s\" invalid disk format",
+				    vmc->vmc_name);
+				ret = EINVAL;
+				goto fail;
+			}
+
+			/* We're done if it's not a QCOW disk image. */
+			if (type != VMDF_QCOW2)
+				break;
 
 			/*
 			 * Clear the write and exclusive flags for base images.
@@ -378,16 +378,20 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 			 */
 			oflags = O_RDONLY | O_NONBLOCK;
 			aflags = R_OK;
-			n = virtio_get_base(diskfds[i][j], base, sizeof(base),
-			    vmc->vmc_disktypes[i], path);
-			if (n == 0)
-				break;
+
+			/* Resolve the path of the next base image, if any. */
+			n = virtio_qcow2_get_base(diskfds[i][j], base,
+			    sizeof(base), path);
 			if (n == -1) {
 				log_warnx("vm \"%s\" unable to read "
-				    "base for disk %s", vcp->vcp_name,
+				    "base for disk %s", vmc->vmc_name,
 				    vmc->vmc_disks[i]);
 				goto fail;
 			}
+			/* Are we at the last base image layer? */
+			if (n == 0)
+				break;
+
 			(void)strlcpy(path, base, sizeof(path));
 		}
 	}
@@ -477,63 +481,58 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 	}
 
 	/* Send VM information */
+	if ((kernfd = dup(vm->vm_kernel)) == -1) {
+		ret = errno;
+		goto fail;
+	}
 	/* XXX check proc_compose_imsg return values */
-	if (vm->vm_state & VM_STATE_RECEIVED)
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_RECEIVE_VM_REQUEST, vm->vm_vmid, fd, vmc,
-		    sizeof(struct vmop_create_params));
-	else
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_START_VM_REQUEST, vm->vm_vmid, vm->vm_kernel,
-		    vmc, sizeof(*vmc));
+	proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_REQUEST,
+	    vm->vm_vmid, kernfd, vmc, sizeof(*vmc));
 
 	if (strlen(vmc->vmc_cdrom))
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_START_VM_CDROM, vm->vm_vmid, cdromfd,
-		    NULL, 0);
+		proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_CDROM,
+		    vm->vm_vmid, cdromfd, NULL, 0);
 
 	for (i = 0; i < vmc->vmc_ndisks; i++) {
 		for (j = 0; j < VM_MAX_BASE_PER_DISK; j++) {
 			if (diskfds[i][j] == -1)
 				break;
-			proc_compose_imsg(ps, PROC_VMM, -1,
+			proc_compose_imsg(ps, PROC_VMM,
 			    IMSG_VMDOP_START_VM_DISK, vm->vm_vmid,
 			    diskfds[i][j], &i, sizeof(i));
 		}
 	}
 	for (i = 0; i < vmc->vmc_nnics; i++) {
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_START_VM_IF, vm->vm_vmid, tapfds[i],
-		    &i, sizeof(i));
+		proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_IF,
+		    vm->vm_vmid, tapfds[i], &i, sizeof(i));
 
 		memset(&var, 0, sizeof(var));
 		var.var_vmid = vm->vm_vmid;
 		var.var_nic_idx = i;
-		proc_compose_imsg(ps, PROC_PRIV, -1, IMSG_VMDOP_PRIV_GET_ADDR,
+		proc_compose_imsg(ps, PROC_PRIV, IMSG_VMDOP_PRIV_GET_ADDR,
 		    vm->vm_vmid, dup(tapfds[i]), &var, sizeof(var));
 	}
 
-	if (!(vm->vm_state & VM_STATE_RECEIVED))
-		proc_compose_imsg(ps, PROC_VMM, -1,
-		    IMSG_VMDOP_START_VM_END, vm->vm_vmid, fd, NULL, 0);
+	proc_compose_imsg(ps, PROC_VMM, IMSG_VMDOP_START_VM_END,
+	    vm->vm_vmid, fd, NULL, 0);
 
 	free(tapfds);
 
 	/* Collapse any memranges after the vm was sent to PROC_VMM */
-	if (vcp->vcp_nmemranges > 0) {
-		for (i = 0; i < vcp->vcp_nmemranges; i++)
-			bytes += vcp->vcp_memranges[i].vmr_size;
-		memset(&vcp->vcp_memranges, 0, sizeof(vcp->vcp_memranges));
-		vcp->vcp_nmemranges = 0;
-		vcp->vcp_memranges[0].vmr_size = bytes;
+	if (vmc->vmc_nmemranges > 0) {
+		for (i = 0; i < vmc->vmc_nmemranges; i++)
+			bytes += vmc->vmc_memranges[i].vmr_size;
+		memset(&vmc->vmc_memranges, 0, sizeof(vmc->vmc_memranges));
+		vmc->vmc_nmemranges = 0;
+		vmc->vmc_memranges[0].vmr_size = bytes;
 	}
 	vm->vm_state |= VM_STATE_RUNNING;
 	return (0);
 
  fail:
-	log_warnx("failed to start vm %s", vcp->vcp_name);
+	log_warnx("failed to start vm %s", vmc->vmc_name);
 
-	if (vm->vm_kernel != -1)
+	if (kernfd != -1)
 		close(kernfd);
 	if (cdromfd != -1)
 		close(cdromfd);
@@ -547,6 +546,7 @@ config_setvm(struct privsep *ps, struct vmd_vm *vm, uint32_t peerid, uid_t uid)
 		free(tapfds);
 	}
 
+	/* Both vm_stop() and vm_remove() will close vm->vm_kernel. */
 	if (vm->vm_from_config) {
 		vm_stop(vm, 0, __func__);
 	} else {
@@ -561,15 +561,18 @@ config_getvm(struct privsep *ps, struct imsg *imsg)
 {
 	struct vmop_create_params	 vmc;
 	struct vmd_vm			*vm = NULL;
+	uint32_t			 peer_id;
 	int				 fd;
 
-	IMSG_SIZE_CHECK(imsg, &vmc);
-	memcpy(&vmc, imsg->data, sizeof(vmc));
+	vmop_create_params_read(imsg, &vmc);
+
 	fd = imsg_get_fd(imsg);
+	peer_id = imsg_get_id(imsg);
+
 	vmc.vmc_kernel = fd;
 
 	errno = 0;
-	if (vm_register(ps, &vmc, &vm, imsg->hdr.peerid, 0) == -1)
+	if (vm_register(ps, &vmc, &vm, peer_id, 0) == -1)
 		goto fail;
 
 	vm->vm_state |= VM_STATE_RUNNING;
@@ -594,15 +597,16 @@ config_getdisk(struct privsep *ps, struct imsg *imsg)
 	struct vmd_vm	*vm;
 	unsigned int	 n, idx;
 	int		 fd;
+	uint32_t	 peer_id;
 
+	peer_id = imsg_get_id(imsg);
 	errno = 0;
-	if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
+	if ((vm = vm_getbyvmid(peer_id)) == NULL) {
 		errno = ENOENT;
 		return (-1);
 	}
 
-	IMSG_SIZE_CHECK(imsg, &n);
-	memcpy(&n, imsg->data, sizeof(n));
+	n = imsg_uint_read(imsg);
 	fd = imsg_get_fd(imsg);
 
 	if (n >= vm->vm_params.vmc_ndisks || fd == -1) {
@@ -626,15 +630,16 @@ config_getif(struct privsep *ps, struct imsg *imsg)
 	struct vmd_vm	*vm;
 	unsigned int	 n;
 	int		 fd;
+	uint32_t	 peer_id;
 
+	peer_id = imsg_get_id(imsg);
 	errno = 0;
-	if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
+	if ((vm = vm_getbyvmid(peer_id)) == NULL) {
 		errno = ENOENT;
 		return (-1);
 	}
 
-	IMSG_SIZE_CHECK(imsg, &n);
-	memcpy(&n, imsg->data, sizeof(n));
+	n = imsg_uint_read(imsg);
 	fd = imsg_get_fd(imsg);
 
 	if (n >= vm->vm_params.vmc_nnics ||
@@ -656,9 +661,11 @@ config_getcdrom(struct privsep *ps, struct imsg *imsg)
 {
 	struct vmd_vm	*vm;
 	int		 fd;
+	uint32_t	 peer_id;
 
+	peer_id = imsg_get_id(imsg);
 	errno = 0;
-	if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
+	if ((vm = vm_getbyvmid(peer_id)) == NULL) {
 		errno = ENOENT;
 		return (-1);
 	}

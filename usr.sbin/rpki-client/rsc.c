@@ -1,4 +1,4 @@
-/*	$OpenBSD: rsc.c,v 1.35 2024/06/11 10:38:40 tb Exp $ */
+/*	$OpenBSD: rsc.c,v 1.50 2026/09/14 09:21:41 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2022 Job Snijders <job@fastly.com>
@@ -17,6 +17,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <assert.h>
 #include <err.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,87 +31,18 @@
 #include <openssl/x509v3.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*rsc_oid;
+#include "rpki-asn1.h"
 
 /*
- * Types and templates for RSC eContent - RFC 9323
+ * RSC eContent definition in RFC 9323, section 4.
  */
 
-ASN1_ITEM_EXP ConstrainedASIdentifiers_it;
-ASN1_ITEM_EXP ConstrainedIPAddressFamily_it;
-ASN1_ITEM_EXP ConstrainedIPAddrBlocks_it;
+ASN1_ITEM_EXP RpkiSignedChecklist_it;
 ASN1_ITEM_EXP FileNameAndHash_it;
 ASN1_ITEM_EXP ResourceBlock_it;
-ASN1_ITEM_EXP RpkiSignedChecklist_it;
-
-typedef struct {
-	ASIdOrRanges		*asnum;
-} ConstrainedASIdentifiers;
-
-ASN1_SEQUENCE(ConstrainedASIdentifiers) = {
-	ASN1_EXP_SEQUENCE_OF(ConstrainedASIdentifiers, asnum, ASIdOrRange, 0),
-} ASN1_SEQUENCE_END(ConstrainedASIdentifiers);
-
-typedef struct {
-	ASN1_OCTET_STRING		*addressFamily;
-	STACK_OF(IPAddressOrRange)	*addressesOrRanges;
-} ConstrainedIPAddressFamily;
-
-ASN1_SEQUENCE(ConstrainedIPAddressFamily) = {
-	ASN1_SIMPLE(ConstrainedIPAddressFamily, addressFamily,
-	    ASN1_OCTET_STRING),
-	ASN1_SEQUENCE_OF(ConstrainedIPAddressFamily, addressesOrRanges,
-	    IPAddressOrRange),
-} ASN1_SEQUENCE_END(ConstrainedIPAddressFamily);
-
-typedef STACK_OF(ConstrainedIPAddressFamily) ConstrainedIPAddrBlocks;
-DECLARE_STACK_OF(ConstrainedIPAddressFamily);
-
-ASN1_ITEM_TEMPLATE(ConstrainedIPAddrBlocks) =
-	ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SEQUENCE_OF, 0, ConstrainedIPAddrBlocks,
-	    ConstrainedIPAddressFamily)
-ASN1_ITEM_TEMPLATE_END(ConstrainedIPAddrBlocks);
-
-typedef struct {
-	ConstrainedASIdentifiers	*asID;
-	ConstrainedIPAddrBlocks		*ipAddrBlocks;
-} ResourceBlock;
-
-ASN1_SEQUENCE(ResourceBlock) = {
-	ASN1_EXP_OPT(ResourceBlock, asID, ConstrainedASIdentifiers, 0),
-	ASN1_EXP_SEQUENCE_OF_OPT(ResourceBlock, ipAddrBlocks,
-	    ConstrainedIPAddressFamily, 1)
-} ASN1_SEQUENCE_END(ResourceBlock);
-
-typedef struct {
-	ASN1_IA5STRING		*fileName;
-	ASN1_OCTET_STRING	*hash;
-} FileNameAndHash;
-
-DECLARE_STACK_OF(FileNameAndHash);
-
-#ifndef DEFINE_STACK_OF
-#define sk_ConstrainedIPAddressFamily_num(sk) \
-    SKM_sk_num(ConstrainedIPAddressFamily, (sk))
-#define sk_ConstrainedIPAddressFamily_value(sk, i) \
-    SKM_sk_value(ConstrainedIPAddressFamily, (sk), (i))
-
-#define sk_FileNameAndHash_num(sk)	SKM_sk_num(FileNameAndHash, (sk))
-#define sk_FileNameAndHash_value(sk, i)	SKM_sk_value(FileNameAndHash, (sk), (i))
-#endif
-
-ASN1_SEQUENCE(FileNameAndHash) = {
-	ASN1_OPT(FileNameAndHash, fileName, ASN1_IA5STRING),
-	ASN1_SIMPLE(FileNameAndHash, hash, ASN1_OCTET_STRING),
-} ASN1_SEQUENCE_END(FileNameAndHash);
-
-typedef struct {
-	ASN1_INTEGER			*version;
-	ResourceBlock			*resources;
-	X509_ALGOR			*digestAlgorithm;
-	STACK_OF(FileNameAndHash)	*checkList;
-} RpkiSignedChecklist;
+ASN1_ITEM_EXP ConstrainedIPAddrBlocks_it;
+ASN1_ITEM_EXP ConstrainedIPAddressFamily_it;
+ASN1_ITEM_EXP ConstrainedASIdentifiers_it;
 
 ASN1_SEQUENCE(RpkiSignedChecklist) = {
 	ASN1_EXP_OPT(RpkiSignedChecklist, version, ASN1_INTEGER, 0),
@@ -119,8 +51,34 @@ ASN1_SEQUENCE(RpkiSignedChecklist) = {
 	ASN1_SEQUENCE_OF(RpkiSignedChecklist, checkList, FileNameAndHash),
 } ASN1_SEQUENCE_END(RpkiSignedChecklist);
 
-DECLARE_ASN1_FUNCTIONS(RpkiSignedChecklist);
 IMPLEMENT_ASN1_FUNCTIONS(RpkiSignedChecklist);
+
+ASN1_SEQUENCE(FileNameAndHash) = {
+	ASN1_OPT(FileNameAndHash, fileName, ASN1_IA5STRING),
+	ASN1_SIMPLE(FileNameAndHash, hash, ASN1_OCTET_STRING),
+} ASN1_SEQUENCE_END(FileNameAndHash);
+
+ASN1_SEQUENCE(ResourceBlock) = {
+	ASN1_EXP_OPT(ResourceBlock, asID, ConstrainedASIdentifiers, 0),
+	ASN1_EXP_SEQUENCE_OF_OPT(ResourceBlock, ipAddrBlocks,
+	    ConstrainedIPAddressFamily, 1)
+} ASN1_SEQUENCE_END(ResourceBlock);
+
+ASN1_ITEM_TEMPLATE(ConstrainedIPAddrBlocks) =
+	ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SEQUENCE_OF, 0, ConstrainedIPAddrBlocks,
+	    ConstrainedIPAddressFamily)
+ASN1_ITEM_TEMPLATE_END(ConstrainedIPAddrBlocks);
+
+ASN1_SEQUENCE(ConstrainedIPAddressFamily) = {
+	ASN1_SIMPLE(ConstrainedIPAddressFamily, addressFamily,
+	    ASN1_OCTET_STRING),
+	ASN1_SEQUENCE_OF(ConstrainedIPAddressFamily, addressesOrRanges,
+	    IPAddressOrRange),
+} ASN1_SEQUENCE_END(ConstrainedIPAddressFamily);
+
+ASN1_SEQUENCE(ConstrainedASIdentifiers) = {
+	ASN1_EXP_SEQUENCE_OF(ConstrainedASIdentifiers, asnum, ASIdOrRange, 0),
+} ASN1_SEQUENCE_END(ConstrainedASIdentifiers);
 
 /*
  * Parse asID (inside ResourceBlock)
@@ -130,38 +88,38 @@ static int
 rsc_parse_aslist(const char *fn, struct rsc *rsc,
     const ConstrainedASIdentifiers *asids)
 {
-	int	 i, asz;
+	int	 i, num_ases;
 
 	if (asids == NULL)
 		return 1;
 
-	if ((asz = sk_ASIdOrRange_num(asids->asnum)) == 0) {
+	if ((num_ases = sk_ASIdOrRange_num(asids->asnum)) == 0) {
 		warnx("%s: RSC asID empty", fn);
 		return 0;
 	}
 
-	if (asz >= MAX_AS_SIZE) {
+	if (num_ases >= MAX_AS_SIZE) {
 		warnx("%s: too many AS number entries: limit %d",
 		    fn, MAX_AS_SIZE);
 		return 0;
 	}
 
-	rsc->as = calloc(asz, sizeof(struct cert_as));
-	if (rsc->as == NULL)
+	if ((rsc->ases = calloc(num_ases, sizeof(struct cert_as))) == NULL)
 		err(1, NULL);
 
-	for (i = 0; i < asz; i++) {
+	for (i = 0; i < num_ases; i++) {
 		const ASIdOrRange *aor;
 
 		aor = sk_ASIdOrRange_value(asids->asnum, i);
 
 		switch (aor->type) {
 		case ASIdOrRange_id:
-			if (!sbgp_as_id(fn, rsc->as, &rsc->asz, aor->u.id))
+			if (!sbgp_as_id(fn, rsc->ases, &rsc->num_ases,
+			    aor->u.id))
 				return 0;
 			break;
 		case ASIdOrRange_range:
-			if (!sbgp_as_range(fn, rsc->as, &rsc->asz,
+			if (!sbgp_as_range(fn, rsc->ases, &rsc->num_ases,
 			    aor->u.range))
 				return 0;
 			break;
@@ -181,7 +139,7 @@ rsc_parse_iplist(const char *fn, struct rsc *rsc,
 	const ConstrainedIPAddressFamily	*af;
 	const IPAddressOrRanges			*aors;
 	const IPAddressOrRange			*aor;
-	size_t					 ipsz;
+	size_t					 num_ips;
 	enum afi				 afi;
 	int					 i, j;
 
@@ -197,14 +155,14 @@ rsc_parse_iplist(const char *fn, struct rsc *rsc,
 		af = sk_ConstrainedIPAddressFamily_value(ipAddrBlocks, i);
 		aors = af->addressesOrRanges;
 
-		ipsz = rsc->ipsz + sk_IPAddressOrRange_num(aors);
-		if (ipsz >= MAX_IP_SIZE) {
+		num_ips = rsc->num_ips + sk_IPAddressOrRange_num(aors);
+		if (num_ips >= MAX_IP_SIZE) {
 			warnx("%s: too many IP address entries: limit %d",
 			    fn, MAX_IP_SIZE);
 			return 0;
 		}
 
-		rsc->ips = recallocarray(rsc->ips, rsc->ipsz, ipsz,
+		rsc->ips = recallocarray(rsc->ips, rsc->num_ips, num_ips,
 		    sizeof(struct cert_ip));
 		if (rsc->ips == NULL)
 			err(1, NULL);
@@ -219,12 +177,12 @@ rsc_parse_iplist(const char *fn, struct rsc *rsc,
 			switch (aor->type) {
 			case IPAddressOrRange_addressPrefix:
 				if (!sbgp_addr(fn, rsc->ips,
-				    &rsc->ipsz, afi, aor->u.addressPrefix))
+				    &rsc->num_ips, afi, aor->u.addressPrefix))
 					return 0;
 				break;
 			case IPAddressOrRange_addressRange:
 				if (!sbgp_addr_range(fn, rsc->ips,
-				    &rsc->ipsz, afi, aor->u.addressRange))
+				    &rsc->num_ips, afi, aor->u.addressRange))
 					return 0;
 				break;
 			default:
@@ -270,46 +228,53 @@ rsc_parse_checklist(const char *fn, struct rsc *rsc,
     const STACK_OF(FileNameAndHash) *checkList)
 {
 	FileNameAndHash		*fh;
-	ASN1_IA5STRING		*fileName;
 	struct rscfile		*file;
-	size_t			 sz, i;
+	size_t			 num_files, i;
 
-	if ((sz = sk_FileNameAndHash_num(checkList)) == 0) {
+	if ((num_files = sk_FileNameAndHash_num(checkList)) == 0) {
 		warnx("%s: RSC checkList needs at least one entry", fn);
 		return 0;
 	}
 
-	if (sz >= MAX_CHECKLIST_ENTRIES) {
-		warnx("%s: %zu exceeds checklist entry limit (%d)", fn, sz,
-		    MAX_CHECKLIST_ENTRIES);
+	if (num_files >= MAX_CHECKLIST_ENTRIES) {
+		warnx("%s: %zu exceeds checklist entry limit (%d)", fn,
+		    num_files, MAX_CHECKLIST_ENTRIES);
 		return 0;
 	}
 
-	rsc->files = calloc(sz, sizeof(struct rscfile));
+	rsc->files = calloc(num_files, sizeof(struct rscfile));
 	if (rsc->files == NULL)
 		err(1, NULL);
-	rsc->filesz = sz;
+	rsc->num_files = num_files;
 
-	for (i = 0; i < sz; i++) {
+	for (i = 0; i < num_files; i++) {
+		const unsigned char *data;
+		int length;
+
 		fh = sk_FileNameAndHash_value(checkList, i);
 
 		file = &rsc->files[i];
 
-		if (fh->hash->length != SHA256_DIGEST_LENGTH) {
+		data = ASN1_STRING_get0_data(fh->hash);
+		length = ASN1_STRING_length(fh->hash);
+		if (length != SHA256_DIGEST_LENGTH) {
 			warnx("%s: RSC Digest: invalid SHA256 length", fn);
 			return 0;
 		}
-		memcpy(file->hash, fh->hash->data, SHA256_DIGEST_LENGTH);
+		memcpy(file->hash, data, length);
 
-		if ((fileName = fh->fileName) == NULL)
+		if (fh->fileName == NULL)
 			continue;
 
-		if (!valid_filename(fileName->data, fileName->length)) {
-			warnx("%s: RSC FileNameAndHash: bad filename", fn);
+		data = ASN1_STRING_get0_data(fh->fileName);
+		length = ASN1_STRING_length(fh->fileName);
+
+		if (!valid_filename(data, length)) {
+			warnx("%s: RSC FileNameAndHash: invalid filename", fn);
 			return 0;
 		}
 
-		file->filename = strndup(fileName->data, fileName->length);
+		file->filename = strndup(data, length);
 		if (file->filename == NULL)
 			err(1, NULL);
 	}
@@ -323,9 +288,10 @@ rsc_parse_checklist(const char *fn, struct rsc *rsc,
  * Returns zero on failure, non-zero on success.
  */
 static int
-rsc_parse_econtent(const char *fn, struct rsc *rsc, const unsigned char *d,
+rsc_parse_econtent(const char *fn, void *obj, const unsigned char *d,
     size_t dsz)
 {
+	struct rsc		*rsc = obj;
 	const unsigned char	*oder;
 	RpkiSignedChecklist	*rsc_asn1;
 	ResourceBlock		*resources;
@@ -374,76 +340,72 @@ rsc_parse_econtent(const char *fn, struct rsc *rsc, const unsigned char *d,
 	return rc;
 }
 
-/*
- * Parse a full RFC 9323 file.
- * Returns the RSC or NULL if the object was malformed.
- */
-struct rsc *
-rsc_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
-    size_t len)
+static int
+rsc_cert_info(const char *fn, void *obj, const struct cert *cert)
 {
-	struct rsc		*rsc;
-	unsigned char		*cms;
-	size_t			 cmsz;
-	struct cert		*cert = NULL;
-	time_t			 signtime = 0;
-	int			 rc = 0;
-
-	cms = cms_parse_validate(x509, fn, der, len, rsc_oid, &cmsz,
-	    &signtime);
-	if (cms == NULL)
-		return NULL;
-
-	if ((rsc = calloc(1, sizeof(struct rsc))) == NULL)
-		err(1, NULL);
-	rsc->signtime = signtime;
-
-	if (!x509_get_aia(*x509, fn, &rsc->aia))
-		goto out;
-	if (!x509_get_aki(*x509, fn, &rsc->aki))
-		goto out;
-	if (!x509_get_ski(*x509, fn, &rsc->ski))
-		goto out;
-	if (rsc->aia == NULL || rsc->aki == NULL || rsc->ski == NULL) {
-		warnx("%s: RFC 6487 section 4.8: "
-		    "missing AIA, AKI or SKI X509 extension", fn);
-		goto out;
-	}
-
-	if (!x509_get_notbefore(*x509, fn, &rsc->notbefore))
-		goto out;
-	if (!x509_get_notafter(*x509, fn, &rsc->notafter))
-		goto out;
-
-	if (X509_get_ext_by_NID(*x509, NID_sinfo_access, -1) != -1) {
-		warnx("%s: RSC: EE cert must not have an SIA extension", fn);
-		goto out;
-	}
-
-	if (x509_any_inherits(*x509)) {
+	if (x509_any_inherits(cert->x509)) {
 		warnx("%s: inherit elements not allowed in EE cert", fn);
-		goto out;
+		return 0;
 	}
 
-	if (!rsc_parse_econtent(fn, rsc, cms, cmsz))
-		goto out;
+	if (cert->signedobj != NULL) {
+		warnx("%s: RSC: EE cert must not have an SIA extension", fn);
+		return 0;
+	}
 
-	if ((cert = cert_parse_ee_cert(fn, talid, *x509)) == NULL)
-		goto out;
+	return 1;
+}
+
+static int
+rsc_validate(const char *fn, void *obj, struct cert *cert)
+{
+	struct rsc *rsc = obj;
 
 	rsc->valid = valid_rsc(fn, cert, rsc);
 
-	rc = 1;
- out:
-	if (rc == 0) {
-		rsc_free(rsc);
-		rsc = NULL;
-		X509_free(*x509);
-		*x509 = NULL;
-	}
-	cert_free(cert);
-	free(cms);
+	return 1; /* XXX */
+}
+
+static const ASN1_OBJECT *
+rsc_obj_oid(void)
+{
+	return rsc_oid;
+}
+
+static void *
+rsc_obj_new(size_t der_len, time_t signtime)
+{
+	struct rsc *rsc;
+
+	if ((rsc = calloc(1, sizeof(*rsc))) == NULL)
+		err(1, NULL);
+	rsc->signtime = signtime;
+
 	return rsc;
+}
+
+static void
+rsc_obj_free(void *obj)
+{
+	rsc_free(obj);
+}
+
+static const struct signed_obj rsc_signed_obj = {
+	.rtype = RTYPE_RSC,
+
+	.new = rsc_obj_new,
+	.free = rsc_obj_free,
+	.cert_info = rsc_cert_info,
+	.parse_econtent = rsc_parse_econtent,
+	.validate = rsc_validate,
+
+	.oid = rsc_obj_oid,
+};
+
+const struct signed_obj *
+rsc_obj(void)
+{
+	return &rsc_signed_obj;
 }
 
 /*
@@ -451,21 +413,18 @@ rsc_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
  * Safe to call with NULL.
  */
 void
-rsc_free(struct rsc *p)
+rsc_free(struct rsc *rsc)
 {
 	size_t	i;
 
-	if (p == NULL)
+	if (rsc == NULL)
 		return;
 
-	for (i = 0; i < p->filesz; i++)
-		free(p->files[i].filename);
+	for (i = 0; i < rsc->num_files; i++)
+		free(rsc->files[i].filename);
 
-	free(p->aia);
-	free(p->aki);
-	free(p->ski);
-	free(p->ips);
-	free(p->as);
-	free(p->files);
-	free(p);
+	free(rsc->ips);
+	free(rsc->ases);
+	free(rsc->files);
+	free(rsc);
 }

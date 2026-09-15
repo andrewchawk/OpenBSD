@@ -1,6 +1,7 @@
-/* $OpenBSD: manpath.c,v 1.31 2021/11/05 18:03:00 schwarze Exp $ */
+/* $OpenBSD: manpath.c,v 1.35 2026/08/17 12:54:43 schwarze Exp $ */
 /*
- * Copyright (c) 2011,2014,2015,2017-2021 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2011, 2014, 2015, 2017-2021, 2026
+ *               Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2011 Kristaps Dzonsons <kristaps@bsd.lv>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -24,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "mandoc_aux.h"
 #include "mandoc.h"
@@ -41,34 +43,37 @@ static	void	 manpath_parseline(struct manpaths *, char *, char);
 void
 manconf_parse(struct manconf *conf, const char *file, char *pend, char *pbeg)
 {
-	int use_path_from_file = 1;
+	const char	*penv, *cp;
+	size_t		 len;
+	int		 use_path_from_file = 1;
 
 	/* Always prepend -m. */
 	manpath_parseline(&conf->manpath, pbeg, 'm');
+	pbeg = NULL;
 
 	if (pend != NULL && *pend != '\0') {
 		/* If -M is given, it overrides everything else. */
 		manpath_parseline(&conf->manpath, pend, 'M');
 		use_path_from_file = 0;
-		pbeg = pend = NULL;
-	} else if ((pbeg = getenv("MANPATH")) == NULL || *pbeg == '\0') {
+		pend = NULL;
+	} else if ((penv = getenv("MANPATH")) == NULL || *penv == '\0') {
 		/* No MANPATH; use man.conf(5) only. */
-		pbeg = pend = NULL;
-	} else if (*pbeg == ':') {
+		pend = NULL;
+	} else if (*penv == ':') {
 		/* Prepend man.conf(5) to MANPATH. */
-		pend = pbeg + 1;
-		pbeg = NULL;
-	} else if ((pend = strstr(pbeg, "::")) != NULL) {
+		pend = mandoc_strdup(penv + 1);
+	} else if ((cp = strstr(penv, "::")) != NULL) {
 		/* Insert man.conf(5) into MANPATH. */
-		*pend = '\0';
-		pend += 2;
-	} else if (pbeg[strlen(pbeg) - 1] == ':') {
-		/* Append man.conf(5) to MANPATH. */
-		pend = NULL;
+		pbeg = mandoc_strndup(penv, cp - penv);
+		pend = mandoc_strdup(cp + 2);
 	} else {
-		/* MANPATH overrides man.conf(5) completely. */
-		use_path_from_file = 0;
+		len = strlen(penv);
+		pbeg = mandoc_strdup(penv);
 		pend = NULL;
+		if (pbeg[len - 1] == ':') /* Append man.conf(5) to MANPATH. */
+			pbeg[len - 1] = '\0';
+		else	/* MANPATH overrides man.conf(5) completely. */
+			use_path_from_file = 0;
 	}
 
 	manpath_parseline(&conf->manpath, pbeg, '\0');
@@ -78,6 +83,9 @@ manconf_parse(struct manconf *conf, const char *file, char *pend, char *pbeg)
 	manconf_file(conf, file, use_path_from_file);
 
 	manpath_parseline(&conf->manpath, pend, '\0');
+
+	free(pbeg);
+	free(pend);
 }
 
 void
@@ -85,6 +93,40 @@ manpath_base(struct manpaths *dirs)
 {
 	char path_base[] = MANPATH_BASE;
 	manpath_parseline(dirs, path_base, '\0');
+}
+
+int
+manpath_unveil(struct manpaths *dirs, int writeable)
+{
+	char	*file;
+	size_t	 i;
+	int	 len;
+
+	for (i = 0; i < dirs->sz; i++) {
+		if (unveil(dirs->paths[i], "r") == -1) {
+			mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+			    dirs->paths[i], strerror(errno));
+			return -1;
+		}
+		if (writeable == 0)
+			continue;
+		len = mandoc_asprintf(&file, "%s/mandoc.db~", dirs->paths[i]);
+		if (unveil(file, "rwc") == -1) {
+			mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+			    file, strerror(errno));
+			free(file);
+			return -1;
+		}
+		file[len - 1] = '\0';
+		if (unveil(file, "rwc") == -1) {
+			mandoc_msg(MANDOCERR_UNVEIL, 0, 0, "%s: %s",
+			    file, strerror(errno));
+			free(file);
+			return -1;
+		}
+		free(file);
+	}
+	return 0;
 }
 
 /*
@@ -130,9 +172,13 @@ manpath_add(struct manpaths *dirs, const char *dir, char option)
 	return;
 
 fail:
-	if (option != '\0')
-		mandoc_msg(MANDOCERR_BADARG_BAD, 0, 0,
-		    "-%c %s: %s", option, dir, strerror(errno));
+	if (option == '\0')
+		return;
+	if (option == 'm' && (strcmp(dir, "andoc") == 0 ||
+	    strcmp(dir, "an") == 0 || strcmp(dir, "doc") == 0))
+		return;
+	mandoc_msg(MANDOCERR_BADARG_BAD, 0, 0, "-%c %s: %s",
+	    option, dir, strerror(errno));
 }
 
 void
@@ -220,7 +266,7 @@ manconf_output(struct manoutput *conf, const char *cp, int fromfile)
 	    /* Token taking an optional argument. */
 	    "tag",
 	    /* Tokens not taking arguments. */
-	    "fragment", "mdoc", "noval", "toc"
+	    "fragment", "noval", "toc"
 	};
 	const size_t ntoks = sizeof(toks) / sizeof(toks[0]);
 
@@ -330,12 +376,9 @@ manconf_output(struct manoutput *conf, const char *cp, int fromfile)
 		conf->fragment = 1;
 		return 0;
 	case 10:
-		conf->mdoc = 1;
-		return 0;
-	case 11:
 		conf->noval = 1;
 		return 0;
-	case 12:
+	case 11:
 		conf->toc = 1;
 		return 0;
 	default:

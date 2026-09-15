@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ether.c,v 1.267 2023/12/18 13:30:44 bluhm Exp $	*/
+/*	$OpenBSD: if_ether.c,v 1.278 2026/03/23 13:12:39 jsg Exp $	*/
 /*	$NetBSD: if_ether.c,v 1.31 1996/05/11 12:59:58 mycroft Exp $	*/
 
 /*
@@ -45,7 +45,6 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/timeout.h>
-#include <sys/kernel.h>
 #include <sys/syslog.h>
 #include <sys/queue.h>
 #include <sys/pool.h>
@@ -58,7 +57,6 @@
 #include <net/netisr.h>
 
 #include <netinet/in.h>
-#include <netinet/in_var.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip_var.h>
 #if NCARP > 0
@@ -75,8 +73,10 @@
  */
 
 struct llinfo_arp {
-	LIST_ENTRY(llinfo_arp)	 la_list;	/* [mN] global arp_list */
+	LIST_ENTRY(llinfo_arp)	 la_list;	/* [m] global arp_list */
 	struct rtentry		*la_rt;		/* [I] backpointer to rtentry */
+	/* keep fields above in sync with struct llinfo_arp_iterator */
+	struct refcnt		 la_refcnt;	/* entry referenced by list */
 	struct mbuf_queue	 la_mq;		/* packet hold queue */
 	time_t			 la_refreshed;	/* when was refresh sent */
 	int			 la_asked;	/* number of queries sent */
@@ -84,10 +84,16 @@ struct llinfo_arp {
 #define LA_HOLD_QUEUE 10
 #define LA_HOLD_TOTAL 100
 
+struct llinfo_arp_iterator {
+	LIST_ENTRY(llinfo_arp)   la_list;       /* [m] global arp_list */
+	struct rtentry          *la_rt;         /* [I] always NULL */
+	/* keep fields above in sync with struct llinfo_arp */
+};
+
 /* timer values */
-int 	arpt_prune = (5 * 60);	/* [I] walk list every 5 minutes */
-int 	arpt_keep = (20 * 60);	/* [a] once resolved, cache for 20 minutes */
-int 	arpt_down = 20;	/* [a] once declared down, don't send for 20 secs */
+int	arpt_prune = (5 * 60);	/* [I] walk list every 5 minutes */
+int	arpt_keep = (20 * 60);	/* [a] once resolved, cache for 20 minutes */
+int	arpt_down = 20;	/* [a] once declared down, don't send for 20 secs */
 
 struct mbuf *arppullup(struct mbuf *m);
 void arpinvalidate(struct rtentry *);
@@ -105,8 +111,8 @@ struct niqueue arpinq = NIQUEUE_INITIALIZER(50, NETISR_ARP);
 /* llinfo_arp live time, rt_llinfo and RTF_LLINFO are protected by arp_mtx */
 struct mutex arp_mtx = MUTEX_INITIALIZER(IPL_SOFTNET);
 
-LIST_HEAD(, llinfo_arp) arp_list =
-    LIST_HEAD_INITIALIZER(arp_list);	/* [mN] list of llinfo_arp structures */
+LIST_HEAD(, llinfo_arp) arp_list = LIST_HEAD_INITIALIZER(arp_list);
+				/* [m] list of llinfo_arp structures */
 struct	pool arp_pool;		/* [I] pool for llinfo_arp structures */
 int	arp_maxtries = 5;	/* [I] arp requests before set to rejected */
 unsigned int	la_hold_total;	/* [a] packets currently in the arp queue */
@@ -118,27 +124,63 @@ int revarp_finished;
 unsigned int revarp_ifidx;
 #endif /* NFSCLIENT */
 
+static struct llinfo_arp *
+arpiterator(struct llinfo_arp *la, struct llinfo_arp_iterator *iter)
+{
+	struct llinfo_arp *tmp;
+
+	MUTEX_ASSERT_LOCKED(&arp_mtx);
+
+	if (la)
+		tmp = LIST_NEXT((struct llinfo_arp *)iter, la_list);
+	else
+		tmp = LIST_FIRST(&arp_list);
+
+	while (tmp && tmp->la_rt == NULL)
+		tmp = LIST_NEXT(tmp, la_list);
+
+	if (la) {
+		LIST_REMOVE((struct llinfo_arp *)iter, la_list);
+		if (refcnt_rele(&la->la_refcnt))
+			pool_put(&arp_pool, la);
+	}
+	if (tmp) {
+		LIST_INSERT_AFTER(tmp, (struct llinfo_arp *)iter, la_list);
+		refcnt_take(&tmp->la_refcnt);
+	}
+
+	return tmp;
+}
+
 /*
- * Timeout routine.  Age arp_tab entries periodically.
+ * Timeout routine.  Age arp table entries periodically.
  */
 void
 arptimer(void *arg)
 {
 	struct timeout *to = arg;
-	struct llinfo_arp *la, *nla;
+	struct llinfo_arp_iterator iter = { .la_rt = NULL };
+	struct llinfo_arp *la = NULL;
 	time_t uptime;
 
-	NET_LOCK();
 	uptime = getuptime();
 	timeout_add_sec(to, arpt_prune);
-	/* Net lock is exclusive, no arp mutex needed for arp_list here. */
-	LIST_FOREACH_SAFE(la, &arp_list, la_list, nla) {
+
+	mtx_enter(&arp_mtx);
+	while ((la = arpiterator(la, &iter)) != NULL) {
 		struct rtentry *rt = la->la_rt;
 
-		if (rt->rt_expire && rt->rt_expire < uptime)
+		if (rt->rt_expire && rt->rt_expire < uptime) {
+			rtref(rt);
+			mtx_leave(&arp_mtx);
+			NET_LOCK();
 			arptfree(rt); /* timer has expired; clear */
+			NET_UNLOCK();
+			rtfree(rt);
+			mtx_enter(&arp_mtx);
+		}
 	}
-	NET_UNLOCK();
+	mtx_leave(&arp_mtx);
 }
 
 void
@@ -212,6 +254,7 @@ arp_rtrequest(struct ifnet *ifp, int req, struct rtentry *rt)
 			pool_put(&arp_pool, la);
 			break;
 		}
+		refcnt_init(&la->la_refcnt);
 		mq_init(&la->la_mq, LA_HOLD_QUEUE, IPL_SOFTNET);
 		rt->rt_llinfo = (caddr_t)la;
 		la->la_rt = rt;
@@ -237,7 +280,8 @@ arp_rtrequest(struct ifnet *ifp, int req, struct rtentry *rt)
 		atomic_sub_int(&la_hold_total, mq_purge(&la->la_mq));
 		mtx_leave(&arp_mtx);
 
-		pool_put(&arp_pool, la);
+		if (refcnt_rele(&la->la_refcnt))
+			pool_put(&arp_pool, la);
 		break;
 
 	case RTM_INVALIDATE:
@@ -354,8 +398,8 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 	uptime = getuptime();
 	rt = rt_getll(rt0);
 
-	if (ISSET(rt->rt_flags, RTF_REJECT) &&
-	    (rt->rt_expire == 0 || rt->rt_expire > uptime)) {
+	if (rt == NULL || (ISSET(rt->rt_flags, RTF_REJECT) &&
+	    (rt->rt_expire == 0 || rt->rt_expire > uptime))) {
 		m_freem(m);
 		return (rt == rt0 ? EHOSTDOWN : EHOSTUNREACH);
 	}
@@ -386,7 +430,7 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 
 		/* refresh ARP entry when timeout gets close */
 		if (rt->rt_expire != 0 &&
-		    rt->rt_expire - arpt_keep / 8 < uptime) {
+		    rt->rt_expire - atomic_load_int(&arpt_keep) / 8 < uptime) {
 
 			mtx_enter(&arp_mtx);
 			la = (struct llinfo_arp *)rt->rt_llinfo;
@@ -449,7 +493,7 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 				refresh = 1;
 			else {
 				reject = RTF_REJECT;
-				rt->rt_expire += arpt_down;
+				rt->rt_expire += atomic_load_int(&arpt_down);
 				la->la_asked = 0;
 				la->la_refreshed = 0;
 				atomic_sub_int(&la_hold_total,
@@ -515,7 +559,7 @@ arppullup(struct mbuf *m)
  * then the protocol-specific routine is called.
  */
 void
-arpinput(struct ifnet *ifp, struct mbuf *m)
+arpinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 {
 	if ((m = arppullup(m)) == NULL)
 		return;
@@ -711,7 +755,7 @@ arpcache(struct ifnet *ifp, struct ether_arp *ea, struct rtentry *rt)
 	sdl->sdl_alen = sizeof(ea->arp_sha);
 	memcpy(LLADDR(sdl), ea->arp_sha, sizeof(ea->arp_sha));
 	if (rt->rt_expire)
-		rt->rt_expire = uptime + arpt_keep;
+		rt->rt_expire = uptime + atomic_load_int(&arpt_keep);
 	rt->rt_flags &= ~RTF_REJECT;
 
 	/* Notify userland that an ARP resolution has been done. */
@@ -751,6 +795,12 @@ void
 arptfree(struct rtentry *rt)
 {
 	struct ifnet *ifp;
+
+	NET_ASSERT_LOCKED_EXCLUSIVE();
+
+	/* might have been freed between leave arp_mtx and enter net lock */
+	if (!ISSET(rt->rt_flags, RTF_LLINFO))
+		return;
 
 	KASSERT(!ISSET(rt->rt_flags, RTF_LOCAL));
 	arpinvalidate(rt);
@@ -844,7 +894,7 @@ arpproxy(struct in_addr in, unsigned int rtableid)
  * then the protocol-specific routine is called.
  */
 void
-revarpinput(struct ifnet *ifp, struct mbuf *m)
+revarpinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 {
 	if ((m = arppullup(m)) == NULL)
 		return;
@@ -901,6 +951,7 @@ out:
 	m_freem(m);
 }
 
+#ifdef NFSCLIENT
 /*
  * Send a RARP request for the ip address of the specified interface.
  * The request should be RFC 903-compliant.
@@ -940,7 +991,6 @@ revarprequest(struct ifnet *ifp)
 	ifp->if_output(ifp, m, &sa, NULL);
 }
 
-#ifdef NFSCLIENT
 /*
  * RARP for the ip address of the specified interface, but also
  * save the ip address of the server that sent the answer.

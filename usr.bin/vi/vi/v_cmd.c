@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_cmd.c,v 1.5 2016/03/13 18:30:43 martijn Exp $	*/
+/*	$OpenBSD: v_cmd.c,v 1.6 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -481,7 +481,7 @@ VIKEYS const vikeys [MAXVIKEY + 1] = {
 	 * DON'T set the V_CHAR flag, the char isn't required,
 	 * so it's handled specially in getcmd().
 	 */
-	{v_z, 		V_ABS_L|V_CNT|VM_RCM_SETFNB,
+	{v_z,		V_ABS_L|V_CNT|VM_RCM_SETFNB,
 	    "[line]z[window_size][-|.|+|^|<CR>]",
 	    " z reposition the screen"},
 /* 173   { */

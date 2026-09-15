@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_loop.c,v 1.98 2023/12/29 11:43:04 bluhm Exp $	*/
+/*	$OpenBSD: if_loop.c,v 1.103 2025/09/09 09:16:18 bluhm Exp $	*/
 /*	$NetBSD: if_loop.c,v 1.15 1996/05/07 02:40:33 thorpej Exp $	*/
 
 /*
@@ -109,30 +109,16 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/kernel.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/errno.h>
 #include <sys/ioctl.h>
-#include <sys/time.h>
-
 
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_types.h>
-#include <net/netisr.h>
 #include <net/rtable.h>
 #include <net/route.h>
-
-#include <netinet/in.h>
-
-#ifdef INET6
-#include <netinet/ip6.h>
-#endif
-
-#ifdef MPLS
-#include <netmpls/mpls.h>
-#endif
 
 #if NBPFILTER > 0
 #include <net/bpf.h>
@@ -143,7 +129,7 @@
 int	loioctl(struct ifnet *, u_long, caddr_t);
 void	loopattach(int);
 void	lortrequest(struct ifnet *, int, struct rtentry *);
-void	loinput(struct ifnet *, struct mbuf *);
+void	loinput(struct ifnet *, struct mbuf *, struct netstack *);
 int	looutput(struct ifnet *,
 	    struct mbuf *, struct sockaddr *, struct rtentry *);
 int	lo_bpf_mtap(caddr_t, const struct mbuf *, u_int);
@@ -192,6 +178,8 @@ loop_clone_create(struct if_clone *ifc, int unit)
 		rtable_l2set(0, 0, ifp->if_index);
 	} else
 		if_attach(ifp);
+	if_attach_queues(ifp, softnet_count());
+	if_attach_iqueues(ifp, softnet_count());
 	if_alloc_sadl(ifp);
 #if NBPFILTER > 0
 	bpfattach(&ifp->if_bpf, ifp, DLT_LOOP, sizeof(u_int32_t));
@@ -242,14 +230,14 @@ lo_bpf_mtap(caddr_t if_bpf, const struct mbuf *m, u_int dir)
 }
 
 void
-loinput(struct ifnet *ifp, struct mbuf *m)
+loinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 {
 	int error;
 
 	if ((m->m_flags & M_PKTHDR) == 0)
 		panic("%s: no header mbuf", __func__);
 
-	error = if_input_local(ifp, m, m->m_pkthdr.ph_family);
+	error = if_input_local(ifp, m, m->m_pkthdr.ph_family, ns);
 	if (error)
 		counters_inc(ifp->if_counters, ifc_ierrors);
 }
@@ -277,8 +265,8 @@ looutput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 void
 lortrequest(struct ifnet *ifp, int cmd, struct rtentry *rt)
 {
-	if (rt && rt->rt_mtu == 0)
-		rt->rt_mtu = LOMTU;
+	if (rt != NULL)
+		atomic_cas_uint(&rt->rt_mtu, 0, LOMTU);
 }
 
 /*

@@ -1,4 +1,4 @@
-/* $OpenBSD: cms_kari.c,v 1.16 2024/02/02 14:11:45 tb Exp $ */
+/* $OpenBSD: cms_kari.c,v 1.19 2026/08/27 07:13:34 tb Exp $ */
 /*
  * Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project.
@@ -52,17 +52,15 @@
  * ====================================================================
  */
 
+#include <stdlib.h>
 #include <string.h>
 
-#include "cryptlib.h"
-#include <openssl/asn1t.h>
-#include <openssl/pem.h>
-#include <openssl/x509v3.h>
-#include <openssl/err.h>
+#include <openssl/asn1.h>
 #include <openssl/cms.h>
-#include <openssl/aes.h>
+#include <openssl/evp.h>
+
 #include "cms_local.h"
-#include "asn1/asn1_local.h"
+#include "err_local.h"
 
 /* Key Agreement Recipient Info (KARI) routines */
 
@@ -252,6 +250,7 @@ cms_kek_cipher(unsigned char **pout, size_t *poutlen, const unsigned char *in,
 	size_t keklen;
 	int rv = 0;
 	unsigned char *out = NULL;
+	size_t outsize = 0;
 	int outlen;
 
 	keklen = EVP_CIPHER_CTX_key_length(kari->ctx);
@@ -266,7 +265,11 @@ cms_kek_cipher(unsigned char **pout, size_t *poutlen, const unsigned char *in,
 	/* obtain output length of ciphered key */
 	if (!EVP_CipherUpdate(kari->ctx, NULL, &outlen, in, inlen))
 		goto err;
-	out = malloc(outlen);
+
+	outsize = outlen;
+	if (outsize < inlen)
+		outsize = inlen;
+	out = malloc(outsize);
 	if (out == NULL)
 		goto err;
 	if (!EVP_CipherUpdate(kari->ctx, out, &outlen, in, inlen))
@@ -278,7 +281,7 @@ cms_kek_cipher(unsigned char **pout, size_t *poutlen, const unsigned char *in,
  err:
 	explicit_bzero(kek, keklen);
 	if (!rv)
-		free(out);
+		freezero(out, outsize);
 	(void)EVP_CIPHER_CTX_reset(kari->ctx);
 	/* FIXME: WHY IS kari->pctx freed here?  /RL */
 	EVP_PKEY_CTX_free(kari->pctx);

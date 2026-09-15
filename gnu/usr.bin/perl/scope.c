@@ -36,7 +36,7 @@ Perl_stack_grow(pTHX_ SV **sp, SV **p, SSize_t n)
     PERL_ARGS_ASSERT_STACK_GROW;
 
     if (UNLIKELY(n < 0))
-        Perl_croak(aTHX_
+        croak(
             "panic: stack_grow() negative count (%" IVdf ")", (IV)n);
 
     PL_stack_sp = sp;
@@ -47,16 +47,16 @@ Perl_stack_grow(pTHX_ SV **sp, SV **p, SSize_t n)
         128;
 #endif
     /* If the total might wrap, panic instead. This is really testing
-     * that (current + n + extra < SSize_t_MAX), but done in a way that
+     * that (current + n + extra < Stack_off_t_MAX), but done in a way that
      * can't wrap */
-    if (UNLIKELY(   current         > SSize_t_MAX - extra
-                 || current + extra > SSize_t_MAX - n
+    if (UNLIKELY(   current         > Stack_off_t_MAX - extra
+                 || current + extra > Stack_off_t_MAX - n
     ))
         /* diag_listed_as: Out of memory during %s extend */
-        Perl_croak(aTHX_ "Out of memory during stack extend");
+        croak("Out of memory during stack extend");
 
     av_extend(PL_curstack, current + n + extra);
-#ifdef DEBUGGING
+#ifdef PERL_USE_HWM
         PL_curstackinfo->si_stack_hwm = current + n + extra;
 #endif
 
@@ -69,16 +69,31 @@ Perl_stack_grow(pTHX_ SV **sp, SV **p, SSize_t n)
 #define GROW(old) ((old) * 3 / 2)
 #endif
 
+/* for backcomp */
 PERL_SI *
 Perl_new_stackinfo(pTHX_ I32 stitems, I32 cxitems)
+{
+    return new_stackinfo_flags(stitems, cxitems, 0);
+}
+
+/* current flag meanings:
+ *   1 make the new arg stack AvREAL
+ */
+
+PERL_SI *
+Perl_new_stackinfo_flags(pTHX_ I32 stitems, I32 cxitems, UV flags)
 {
     PERL_SI *si;
     Newx(si, 1, PERL_SI);
     si->si_stack = newAV();
-    AvREAL_off(si->si_stack);
+    if (!(flags & 1))
+        AvREAL_off(si->si_stack);
     av_extend(si->si_stack, stitems > 0 ? stitems-1 : 0);
     AvALLOC(si->si_stack)[0] = &PL_sv_undef;
     AvFILLp(si->si_stack) = 0;
+#ifdef PERL_RC_STACK
+    si->si_stack_nonrc_base = 0;
+#endif
     si->si_prev = 0;
     si->si_next = 0;
     si->si_cxmax = cxitems - 1;
@@ -148,13 +163,13 @@ Perl_pop_scope(pTHX)
     LEAVE_SCOPE(oldsave);
 }
 
-I32 *
+Stack_off_t *
 Perl_markstack_grow(pTHX)
 {
     const I32 oldmax = PL_markstack_max - PL_markstack;
     const I32 newmax = GROW(oldmax);
 
-    Renew(PL_markstack, newmax, I32);
+    Renew(PL_markstack, newmax, Stack_off_t);
     PL_markstack_max = PL_markstack + newmax;
     PL_markstack_ptr = PL_markstack + oldmax;
     DEBUG_s(DEBUG_v(PerlIO_printf(Perl_debug_log,
@@ -190,7 +205,7 @@ Perl_savestack_grow_cnt(pTHX_ I32 need)
      * and we have rolled over from I32_MAX to a small value */
     if (new_max > I32_MAX || new_max < PL_savestack_max) {
         if (new_floor > I32_MAX || new_floor < PL_savestack_max) {
-            Perl_croak(aTHX_ "panic: savestack overflows I32_MAX");
+            croak("panic: savestack overflows I32_MAX");
         }
         new_max = new_floor;
     }
@@ -231,8 +246,12 @@ Perl_tmps_grow_p(pTHX_ SSize_t ix)
 {
     SSize_t extend_to = ix;
 #ifndef STRESS_REALLOC
-    if (ix - PL_tmps_max < 128)
-        extend_to += (PL_tmps_max < 512) ? 128 : 512;
+    SSize_t grow_size = PL_tmps_max < 512 ? 128 : PL_tmps_max / 2;
+    if (extend_to > SSize_t_MAX - grow_size - 1)
+        /* trigger memwrap message or fail allocation */
+        extend_to = SSize_t_MAX-1;
+    else
+        extend_to += grow_size;
 #endif
     Renew(PL_tmps_stack, extend_to + 1, SV*);
     PL_tmps_max = extend_to + 1;
@@ -784,7 +803,7 @@ Perl_save_clearsv(pTHX_ SV **svp)
     assert(*svp);
     SvPADSTALE_off(*svp); /* mark lexical as active */
     if (UNLIKELY((offset_shifted >> SAVE_TIGHT_SHIFT) != offset)) {
-        Perl_croak(aTHX_ "panic: pad offset %" UVuf " out of range (%p-%p)",
+        croak("panic: pad offset %" UVuf " out of range (%p-%p)",
                    offset, svp, PL_curpad);
     }
 
@@ -1059,7 +1078,7 @@ Perl_save_alloc(pTHX_ SSize_t size, I32 pad)
     const UV elems_shifted = elems << SAVE_TIGHT_SHIFT;
 
     if (UNLIKELY((elems_shifted >> SAVE_TIGHT_SHIFT) != elems))
-        Perl_croak(aTHX_
+        croak(
             "panic: save_alloc elems %" UVuf " out of range (%" IVdf "-%" IVdf ")",
                    elems, (IV)size, (IV)pad);
 
@@ -1088,7 +1107,7 @@ Perl_leave_scope(pTHX_ I32 base)
     bool was = TAINT_get;
 
     if (UNLIKELY(base < -1))
-        Perl_croak(aTHX_ "panic: corrupt saved stack index %ld", (long) base);
+        croak("panic: corrupt saved stack index %ld", (long) base);
     DEBUG_l(Perl_deb(aTHX_ "savestack: releasing items %ld -> %ld\n",
                         (long)PL_savestack_ix, (long)base));
     while (PL_savestack_ix > base) {
@@ -1372,6 +1391,12 @@ Perl_leave_scope(pTHX_ I32 base)
             Safefree(a0.any_ptr);
             break;
 
+        case SAVEt_FREE_REXC_STATE:
+            a0 = ap[0];
+            if (a0.any_ptr)
+                release_RExC_state(a0.any_ptr);
+            break;
+
         case SAVEt_CLEARPADRANGE:
         {
             I32 i;
@@ -1525,6 +1550,14 @@ Perl_leave_scope(pTHX_ I32 base)
             break;
 
         case SAVEt_STACK_POS:		/* Position on Perl stack */
+#ifdef PERL_RC_STACK
+            /* DAPM Jan 2023. I don't think this save type is used any
+             * more, but if some XS code uses it, fail it for now, as
+             * it's not clear to me what perl should be doing to stack ref
+             * counts when arbitrarily resetting the stack pointer.
+             */
+            assert(0);
+#endif
             a0 = ap[0];
             PL_stack_sp = PL_stack_base + a0.any_i32;
             break;
@@ -1657,11 +1690,6 @@ Perl_leave_scope(pTHX_ I32 base)
             (void)sv_clear(a0.any_sv);
             break;
 
-        case SAVEt_LONG:			/* long reference */
-            a0 = ap[0]; a1 = ap[1];
-            *(long*)a1.any_ptr = a0.any_long;
-            break;
-
         case SAVEt_IV:				/* IV reference */
             a0 = ap[0]; a1 = ap[1];
             *(IV*)a1.any_ptr = a0.any_iv;
@@ -1709,7 +1737,7 @@ Perl_leave_scope(pTHX_ I32 base)
             break;
 
         default:
-            Perl_croak(aTHX_ "panic: leave_scope inconsistency %u",
+            croak("panic: leave_scope inconsistency %u",
                     (U8)uv & SAVE_MASK);
         }
     }
@@ -1872,14 +1900,14 @@ the code reference.
 
 When operating in a C callback mode the C<args> parameter will be passed
 directly to the C function as a C<void *> pointer. No additional
-processing of the argument will be peformed, and it is the callers
+processing of the argument will be performed, and it is the callers
 responsibility to free the C<args> parameter if necessary.
 
-Be aware that there is a signficant difference in timing between the
+Be aware that there is a significant difference in timing between the
 I<end of the current statement> and the I<end of the current pseudo
 block>. If you are looking for a mechanism to trigger a function at the
 end of the B<current pseudo block> you should look at
-C<SAVEDESTRUCTORX()> instead of this function.
+L<perlapi/C<SAVEDESTRUCTOR_X>> instead of this function.
 
 =for apidoc mortal_svfunc_x
 
@@ -1888,17 +1916,17 @@ B<end of the current statement> with the arguments provided. It is a
 wrapper around C<mortal_destructor_sv()> which ensures that the latter
 function is called appropriately.
 
-Be aware that there is a signficant difference in timing between the
+Be aware that there is a significant difference in timing between the
 I<end of the current statement> and the I<end of the current pseudo
 block>. If you are looking for a mechanism to trigger a function at the
 end of the B<current pseudo block> you should look at
-C<SAVEDESTRUCTORX()> instead of this function.
+L<perlapi/C<SAVEDESTRUCTOR_X>> instead of this function.
 
 =for apidoc magic_freedestruct
 
 This function is called via magic to implement the
 C<mortal_destructor_sv()> and C<mortal_destructor_x()> functions. It
-should not be called directly and has no user servicable parts.
+should not be called directly and has no user serviceable parts.
 
 =cut
 */
@@ -1938,7 +1966,7 @@ Perl_magic_freedestruct(pTHX_ SV* sv, MAGIC* mg) {
 
     IV nargs = 0;
     if (PL_phase == PERL_PHASE_DESTRUCT) {
-        Perl_warn(aTHX_ "Can't call destructor for 0x%p in global destruction\n", sv);
+        warn("Can't call destructor for 0x%p in global destruction\n", sv);
         return 1;
     }
 

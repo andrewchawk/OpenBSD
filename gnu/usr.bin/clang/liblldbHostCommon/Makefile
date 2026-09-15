@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.5 2023/11/11 18:35:39 robert Exp $
+# $OpenBSD: Makefile,v 1.7 2026/05/29 11:18:31 robert Exp $
 
 LIB=	lldbHostCommon
 NOPIC=
@@ -6,7 +6,8 @@ NOPROFILE=
 
 .include <bsd.own.mk>
 
-SRCS=	Editline.cpp \
+SRCS=	DiagnosticsRendering.cpp \
+	Editline.cpp \
 	FileAction.cpp \
 	FileCache.cpp \
 	File.cpp \
@@ -17,9 +18,11 @@ SRCS=	Editline.cpp \
 	HostNativeThreadBase.cpp \
 	HostProcess.cpp \
 	HostThread.cpp \
-	LockFileBase.cpp \
+	JSONTransport.cpp \
 	LZMA.cpp \
+	LockFileBase.cpp \
 	MainLoopBase.cpp \
+	MemoryMonitor.cpp \
 	MonitoringProcessLauncher.cpp \
 	NativeProcessProtocol.cpp \
 	NativeRegisterContext.cpp \
@@ -30,13 +33,15 @@ SRCS=	Editline.cpp \
 	ProcessLaunchInfo.cpp \
 	ProcessRunLock.cpp \
 	PseudoTerminal.cpp \
+	StreamFile.cpp \
 	SocketAddress.cpp \
 	Socket.cpp \
 	TCPSocket.cpp \
 	Terminal.cpp \
 	ThreadLauncher.cpp \
 	UDPSocket.cpp \
-	XML.cpp
+	XML.cpp \
+	ZipFileResolver.cpp
 
 .PATH:	${.CURDIR}/../../../llvm/lldb/source/Host/common
 

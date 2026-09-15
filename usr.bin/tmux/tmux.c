@@ -1,4 +1,4 @@
-/* $OpenBSD: tmux.c,v 1.212 2024/05/15 09:59:12 nicm Exp $ */
+/* $OpenBSD: tmux.c,v 1.223 2026/08/17 14:47:41 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -34,6 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <util.h>
+#include <vis.h>
 
 #include "tmux.h"
 
@@ -47,20 +48,20 @@ const char	*socket_path;
 int		 ptm_fd = -1;
 const char	*shell_command;
 
-static __dead void	 usage(void);
+static __dead void	 usage(int);
 static char		*make_label(const char *, char **);
 
 static int		 areshell(const char *);
 static const char	*getshell(void);
 
 static __dead void
-usage(void)
+usage(int status)
 {
-	fprintf(stderr,
-	    "usage: %s [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n"
+	fprintf(status ? stderr : stdout,
+	    "usage: %s [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n"
 	    "            [-S socket-path] [-T features] [command [flags]]\n",
 	    getprogname());
-	exit(1);
+	exit(status);
 }
 
 static const char *
@@ -143,7 +144,7 @@ expand_path(const char *path, const char *home)
 }
 
 static void
-expand_paths(const char *s, char ***paths, u_int *n, int ignore_errors)
+expand_paths(const char *s, char ***paths, u_int *n, int no_realpath)
 {
 	const char	*home = find_home();
 	char		*copy, *next, *tmp, resolved[PATH_MAX], *expanded;
@@ -160,15 +161,15 @@ expand_paths(const char *s, char ***paths, u_int *n, int ignore_errors)
 			log_debug("%s: invalid path: %s", __func__, next);
 			continue;
 		}
-		if (realpath(expanded, resolved) == NULL) {
-			log_debug("%s: realpath(\"%s\") failed: %s", __func__,
-			    expanded, strerror(errno));
-			if (ignore_errors) {
+		if (no_realpath)
+			path = expanded;
+		else {
+			if (realpath(expanded, resolved) == NULL) {
+				log_debug("%s: realpath(\"%s\") failed: %s", __func__,
+			  expanded, strerror(errno));
 				free(expanded);
 				continue;
 			}
-			path = expanded;
-		} else {
 			path = xstrdup(resolved);
 			free(expanded);
 		}
@@ -200,7 +201,7 @@ make_label(const char *label, char **cause)
 		label = "default";
 	uid = getuid();
 
-	expand_paths(TMUX_SOCK, &paths, &n, 1);
+	expand_paths(TMUX_SOCK, &paths, &n, 0);
 	if (n == 0) {
 		xasprintf(cause, "no suitable socket path");
 		return (NULL);
@@ -226,7 +227,7 @@ make_label(const char *label, char **cause)
 		xasprintf(cause, "%s is not a directory", base);
 		goto fail;
 	}
-	if (sb.st_uid != uid || (sb.st_mode & S_IRWXO) != 0) {
+	if (sb.st_uid != uid || (sb.st_mode & TMUX_SOCK_PERM) != 0) {
 		xasprintf(cause, "directory %s has unsafe permissions", base);
 		goto fail;
 	}
@@ -285,6 +286,31 @@ get_timer(void)
 	return ((ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000ULL));
 }
 
+char *
+clean_name(const char *name, int untrusted)
+{
+	char	*copy, *cp, *new_name;
+
+	if (!utf8_isvalid(name))
+		return (NULL);
+	copy = xstrdup(name);
+	for (cp = copy; *cp != '\0'; cp++) {
+		if (untrusted && cp[0] == '#' && cp[1] == '(')
+			*cp = '_';
+	}
+	utf8_stravis(&new_name, copy, VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
+	free(copy);
+	return (new_name);
+}
+
+int
+check_name(const char *name)
+{
+	if (!utf8_isvalid(name))
+		return (0);
+	return (1);
+}
+
 const char *
 sig2name(int signo)
 {
@@ -334,7 +360,7 @@ find_home(void)
 	if (home == NULL || *home == '\0') {
 		pw = getpwuid(getuid());
 		if (pw != NULL)
-			home = pw->pw_dir;
+			home = xstrdup(pw->pw_dir);
 		else
 			home = NULL;
 	}
@@ -389,10 +415,10 @@ main(int argc, char **argv)
 		environ_set(global_environ, "PWD", 0, "%s", cwd);
 	expand_paths(TMUX_CONF, &cfg_files, &cfg_nfiles, 1);
 
-	while ((opt = getopt(argc, argv, "2c:CDdf:lL:NqS:T:uUvV")) != -1) {
+	while ((opt = getopt(argc, argv, "2c:CDdf:hlL:NqS:T:uUvV")) != -1) {
 		switch (opt) {
 		case '2':
-			tty_add_features(&feat, "256", ":,");
+			tty_parse_features("256", ":,", &feat, NULL);
 			break;
 		case 'c':
 			shell_command = optarg;
@@ -418,9 +444,11 @@ main(int argc, char **argv)
 			cfg_files[cfg_nfiles++] = xstrdup(optarg);
 			cfg_quiet = 0;
 			break;
- 		case 'V':
+		case 'h':
+			usage(0);
+		case 'V':
 			printf("tmux %s\n", getversion());
- 			exit(0);
+			exit(0);
 		case 'l':
 			flags |= CLIENT_LOGIN;
 			break;
@@ -438,7 +466,7 @@ main(int argc, char **argv)
 			path = xstrdup(optarg);
 			break;
 		case 'T':
-			tty_add_features(&feat, optarg, ":,");
+			tty_parse_features(optarg, ":,", &feat, NULL);
 			break;
 		case 'u':
 			flags |= CLIENT_UTF8;
@@ -447,16 +475,16 @@ main(int argc, char **argv)
 			log_add_level();
 			break;
 		default:
-			usage();
+			usage(1);
 		}
 	}
 	argc -= optind;
 	argv += optind;
 
 	if (shell_command != NULL && argc != 0)
-		usage();
+		usage(1);
 	if ((flags & CLIENT_NOFORK) && argc != 0)
-		usage();
+		usage(1);
 
 	if ((ptm_fd = getptmfd()) == -1)
 		err(1, "getptmfd");

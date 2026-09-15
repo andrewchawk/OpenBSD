@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.43 2024/02/06 15:36:11 martijn Exp $	*/
+/*	$OpenBSD: trap.c,v 1.45 2025/12/24 13:36:38 martijn Exp $	*/
 
 /*
  * Copyright (c) 2008 Reyk Floeter <reyk@openbsd.org>
@@ -24,9 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "application.h"
 #include "log.h"
 #include "mib.h"
-#include "smi.h"
 #include "snmp.h"
 #include "snmpd.h"
 
@@ -60,7 +60,7 @@ trap_send(struct ber_oid *oid, struct ber_element *elm)
 	/* Add mandatory varbind elements */
 	trap = ober_add_sequence(NULL);
 	vblist = ober_printf_elements(trap, "{Odt}{OO}",
-	    &uptime, smi_getticks(),
+	    &uptime, appl_sysuptime(NULL),
 	    BER_CLASS_APPLICATION, SNMP_T_TIMETICKS,
 	    &trapoid, oid);
 	if (elm != NULL)
@@ -109,10 +109,7 @@ trap_send(struct ber_oid *oid, struct ber_element *elm)
 			msg->sm_secmodel = SNMP_SEC_USM;
 			msg->sm_engine_time = snmpd_engine_time();
 			msg->sm_engine_boots = snmpd_env->sc_engine_boots;
-			memcpy(msg->sm_ctxengineid, snmpd_env->sc_engineid,
-			    snmpd_env->sc_engineid_len);
-			msg->sm_ctxengineid_len =
-			    snmpd_env->sc_engineid_len;
+			msg->sm_ctxengineid = snmpd_env->sc_engineid;
 			(void)strlcpy(msg->sm_username, tr->ta_usmusername,
 			    sizeof(msg->sm_username));
 			msg->sm_user = tr->ta_usmuser;

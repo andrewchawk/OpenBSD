@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_tag.c,v 1.26 2021/10/24 21:24:17 deraadt Exp $	*/
+/*	$OpenBSD: ex_tag.c,v 1.27 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -213,7 +213,7 @@ alloc_err:
 	return (1);
 }
 
-/* 
+/*
  * ex_tag_next --
  *	Switch context to the next TAG.
  *
@@ -244,7 +244,7 @@ ex_tag_next(SCR *sp, EXCMD *cmdp)
 	return (0);
 }
 
-/* 
+/*
  * ex_tag_prev --
  *	Switch context to the next TAG.
  *
@@ -1146,34 +1146,34 @@ ctag_file(SCR *sp, TAGF *tfp, char *name, char **dirp, size_t *dlenp)
  * this way simplifies the algorithm.
  *
  * Invariants:
- * 	front points to the beginning of a line at or before the first
+ *	front points to the beginning of a line at or before the first
  *	matching string.
  *
- * 	back points to the beginning of a line at or after the first
+ *	back points to the beginning of a line at or after the first
  *	matching line.
  *
  * Base of the Invariants.
- * 	front = NULL;
+ *	front = NULL;
  *	back = EOF;
  *
  * Advancing the Invariants:
  *
- * 	p = first newline after halfway point from front to back.
+ *	p = first newline after halfway point from front to back.
  *
- * 	If the string at "p" is not greater than the string to match,
+ *	If the string at "p" is not greater than the string to match,
  *	p is the new front.  Otherwise it is the new back.
  *
  * Termination:
  *
- * 	The definition of the routine allows it return at any point,
+ *	The definition of the routine allows it return at any point,
  *	since front is always at or before the line to print.
  *
- * 	In fact, it returns when the chosen "p" equals "back".  This
+ *	In fact, it returns when the chosen "p" equals "back".  This
  *	implies that there exists a string is least half as long as
  *	(back - front), which in turn implies that a linear search will
  *	be no more expensive than the cost of simply printing a string or two.
  *
- * 	Trying to continue with binary search at this point would be
+ *	Trying to continue with binary search at this point would be
  *	more trouble than it's worth.
  */
 #define	EQUAL		0
@@ -1209,7 +1209,7 @@ binary_search(char *string, char *front, char *back)
  *
  * This routine assumes:
  *
- * 	o front points at the first character in a line.
+ *	o front points at the first character in a line.
  *	o front is before or at the first line to be printed.
  */
 static char *
@@ -1233,7 +1233,7 @@ linear_search(char *string, char *front, char *back)
  * Return LESS, GREATER, or EQUAL depending on how the string1 compares
  * with string2 (s1 ??? s2).
  *
- * 	o Matches up to len(s1) are EQUAL.
+ *	o Matches up to len(s1) are EQUAL.
  *	o Matches up to len(s2) are GREATER.
  *
  * The string "s1" is null terminated.  The string s2 is '\t', space, (or

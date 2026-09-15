@@ -1,4 +1,4 @@
-/*	$OpenBSD: output_ometric.c,v 1.13 2024/01/23 15:55:20 claudio Exp $ */
+/*	$OpenBSD: output_ometric.c,v 1.28 2026/06/24 06:02:48 claudio Exp $ */
 
 /*
  * Copyright (c) 2022 Claudio Jeker <claudio@openbsd.org>
@@ -27,7 +27,6 @@
 #include <unistd.h>
 
 #include "bgpd.h"
-#include "session.h"
 #include "rde.h"
 #include "version.h"
 
@@ -47,8 +46,11 @@ struct ometric *peer_withdraw_transmit, *peer_withdraw_pending,
 struct ometric *peer_rr_req_transmit, *peer_rr_req_receive;
 struct ometric *peer_rr_borr_transmit, *peer_rr_borr_receive;
 struct ometric *peer_rr_eorr_transmit, *peer_rr_eorr_receive;
+struct ometric *peer_queue_count, *peer_queue_size;
 struct ometric *rde_mem_size, *rde_mem_count, *rde_mem_ref_count;
 struct ometric *rde_set_size, *rde_set_count, *rde_table_count;
+struct ometric *rde_queue_size, *rde_queue_count;
+struct ometric *rde_evloop_count, *rde_evloop_time;
 
 struct timespec start_time, end_time;
 
@@ -87,9 +89,8 @@ ometric_head(struct parse_result *arg)
 	 */
 	peer_info = ometric_new(OMT_INFO, "bgpd_peer",
 	    "peer information");
-	peer_state = ometric_new_state(statenames,
-	    sizeof(statenames) / sizeof(statenames[0]), "bgpd_peer_state",
-	    "peer session state");
+	peer_state = ometric_new_state(statenames, nitems(statenames),
+	    "bgpd_peer_state", "peer session state");
 	peer_state_raw = ometric_new(OMT_GAUGE, "bgpd_peer_state_raw",
 	    "peer session state raw int value");
 	peer_last_change = ometric_new(OMT_GAUGE,
@@ -152,6 +153,11 @@ ometric_head(struct parse_result *arg)
 	peer_rr_eorr_receive = ometric_new(OMT_COUNTER,
 	    "bgpd_peer_route_refresh_eorr_receive",
 	    "number of ext. route-refresh EORR messages received from peer");
+	peer_queue_count = ometric_new(OMT_GAUGE,
+	    "bgpd_peer_queue_usage_objects", "number of object on queue");
+	peer_queue_size = ometric_new(OMT_GAUGE,
+	    "bgpd_peer_queue_memory_usage_bytes",
+	    "memory usage of queue in bytes");
 
 	/* RDE memory statistics */
 	rde_mem_size = ometric_new(OMT_GAUGE,
@@ -167,23 +173,37 @@ ometric_head(struct parse_result *arg)
 	    "bgpd_rde_set_usage_objects", "number of object in set");
 	rde_table_count = ometric_new(OMT_GAUGE,
 	    "bgpd_rde_set_usage_tables", "number of as_set tables");
+
+	rde_queue_size = ometric_new(OMT_GAUGE,
+	    "bgpd_rde_queue_bytes", "memory usage of queued objects in bytes");
+	rde_queue_count = ometric_new(OMT_GAUGE,
+	    "bgpd_rde_queue_objects", "number of object in queue");
+
+	rde_evloop_count = ometric_new(OMT_COUNTER,
+	    "bgpd_rde_evloop", "number of times the evloop ran");
+	rde_evloop_time = ometric_new(OMT_COUNTER,
+	    "bgpd_rde_evloop_seconds", "RDE evloop time usage");
 }
 
 static void
-ometric_neighbor_stats(struct peer *p, struct parse_result *arg)
+ometric_neighbor_stats(struct ctl_peer *p, struct parse_result *arg)
 {
 	struct olabels *ol = NULL;
 	const char *keys[5] = {
 	    "remote_addr", "remote_as", "description", "group", NULL };
 	const char *values[5];
+	char *descr;
 
 	/* skip neighbor templates */
 	if (p->conf.template)
 		return;
 
+	descr = fmt_peer(p->conf.descr, &p->conf.remote_addr,
+	    p->conf.remote_masklen);
+
 	values[0] = log_addr(&p->conf.remote_addr);
 	values[1] = log_as(p->conf.remote_as);
-	values[2] = p->conf.descr;
+	values[2] = descr;
 	values[3] = p->conf.group;
 	values[4] = NULL;
 
@@ -193,18 +213,19 @@ ometric_neighbor_stats(struct peer *p, struct parse_result *arg)
 	ometric_set_state(peer_state, statenames[p->state], ol);
 	ometric_set_int(peer_state_raw, p->state, ol);
 
-	ometric_set_int(peer_last_change, get_monotime(p->stats.last_updown),
-	    ol);
+	ometric_set_int(peer_last_change,
+	    get_rel_monotime(p->stats.last_updown), ol);
 
 	if (p->state == STATE_ESTABLISHED) {
 		ometric_set_int(peer_last_read,
-		    get_monotime(p->stats.last_read), ol);
+		    get_rel_monotime(p->stats.last_read), ol);
 		ometric_set_int(peer_last_write,
-		    get_monotime(p->stats.last_write), ol);
+		    get_rel_monotime(p->stats.last_write), ol);
 	}
 
-	ometric_set_int(peer_prefixes_transmit, p->stats.prefix_out_cnt, ol);
-	ometric_set_int(peer_prefixes_receive, p->stats.prefix_cnt, ol);
+	ometric_set_int(peer_prefixes_transmit, p->rde_stats.prefix_out_cnt,
+	    ol);
+	ometric_set_int(peer_prefixes_receive, p->rde_stats.prefix_cnt, ol);
 
 	ometric_set_int_with_labels(peer_message_transmit,
 	    p->stats.msg_sent_open, OKV("messages"), OKV("open"), ol);
@@ -232,14 +253,18 @@ ometric_neighbor_stats(struct peer *p, struct parse_result *arg)
 	    p->stats.msg_rcvd_rrefresh, OKV("messages"), OKV("route_refresh"),
 	    ol);
 
-	ometric_set_int(peer_update_transmit, p->stats.prefix_sent_update, ol);
-	ometric_set_int(peer_update_pending, p->stats.pending_update, ol);
-	ometric_set_int(peer_update_receive, p->stats.prefix_rcvd_update, ol);
-	ometric_set_int(peer_withdraw_transmit, p->stats.prefix_sent_withdraw,
-	    ol);
-	ometric_set_int(peer_withdraw_pending, p->stats.pending_withdraw, ol);
-	ometric_set_int(peer_withdraw_receive, p->stats.prefix_rcvd_withdraw,
-	    ol);
+	ometric_set_int(peer_update_transmit,
+	    p->rde_stats.prefix_sent_update, ol);
+	ometric_set_int(peer_update_pending,
+	    p->rde_stats.pending_update, ol);
+	ometric_set_int(peer_update_receive,
+	    p->rde_stats.prefix_rcvd_update, ol);
+	ometric_set_int(peer_withdraw_transmit,
+	    p->rde_stats.prefix_sent_withdraw, ol);
+	ometric_set_int(peer_withdraw_pending,
+	    p->rde_stats.pending_withdraw, ol);
+	ometric_set_int(peer_withdraw_receive,
+	    p->rde_stats.prefix_rcvd_withdraw, ol);
 
 	ometric_set_int(peer_rr_req_transmit, p->stats.refresh_sent_req, ol);
 	ometric_set_int(peer_rr_req_receive, p->stats.refresh_rcvd_req, ol);
@@ -248,7 +273,16 @@ ometric_neighbor_stats(struct peer *p, struct parse_result *arg)
 	ometric_set_int(peer_rr_eorr_transmit, p->stats.refresh_sent_eorr, ol);
 	ometric_set_int(peer_rr_eorr_receive, p->stats.refresh_rcvd_eorr, ol);
 
+	ometric_set_int_with_labels(peer_queue_count,
+	    p->rde_stats.ibufq_msg_count, OKV("type"), OKV("ibuf_queue"), ol);
+	ometric_set_int_with_labels(peer_queue_count,
+	    p->rde_stats.rib_entry_count, OKV("type"), OKV("rib_entry"), ol);
+	ometric_set_int_with_labels(peer_queue_size,
+	    p->rde_stats.ibufq_payload_size, OKV("type"), OKV("ibuf_queue"),
+	    ol);
+
 	olabels_free(ol);
+	free(descr);
 }
 
 static void
@@ -283,6 +317,15 @@ ometric_rib_mem(struct rde_memstats *stats)
 	    stats->rib_cnt * sizeof(struct rib_entry), UINT64_MAX);
 	ometric_rib_mem_element("prefix", stats->prefix_cnt,
 	    stats->prefix_cnt * sizeof(struct prefix), UINT64_MAX);
+	ometric_rib_mem_element("adjout_prefix", stats->adjout_prefix_cnt,
+	    stats->adjout_prefix_size, UINT64_MAX);
+	ometric_rib_mem_element("pend_attr", stats->pend_attr_cnt,
+	    stats->pend_attr_cnt * sizeof(struct pend_attr), UINT64_MAX);
+	ometric_rib_mem_element("pend_prefix", stats->pend_prefix_cnt,
+	    stats->pend_prefix_cnt * sizeof(struct pend_prefix), UINT64_MAX);
+	ometric_rib_mem_element("adjout_attr", stats->adjout_attr_cnt,
+	    stats->adjout_attr_cnt * sizeof(struct adjout_attr),
+	    stats->adjout_attr_refs);
 	ometric_rib_mem_element("rde_aspath", stats->path_cnt,
 	    stats->path_cnt * sizeof(struct rde_aspath),
 	    stats->path_refs);
@@ -296,13 +339,29 @@ ometric_rib_mem(struct rde_memstats *stats)
 	    stats->attr_cnt * sizeof(struct attr), stats->attr_refs);
 	ometric_rib_mem_element("attributes", stats->attr_dcnt,
 	    stats->attr_data, UINT64_MAX);
+	ometric_rib_mem_element("bitmap", stats->bitmap_cnt,
+	    stats->bitmap_size, UINT64_MAX);
+	ometric_rib_mem_element("hashtable", stats->hash_cnt,
+	    stats->hash_size, stats->hash_refs);
 
 	ometric_rib_mem_element("total", UINT64_MAX,
 	    pts + stats->prefix_cnt * sizeof(struct prefix) +
+	    stats->adjout_prefix_cnt * sizeof(struct adjout_prefix) +
+	    stats->adjout_attr_cnt * sizeof(struct adjout_attr) +
+	    stats->pend_prefix_cnt * sizeof(struct pend_prefix) +
+	    stats->pend_attr_cnt * sizeof(struct pend_attr) +
 	    stats->rib_cnt * sizeof(struct rib_entry) +
 	    stats->path_cnt * sizeof(struct rde_aspath) +
 	    stats->aspath_size + stats->attr_cnt * sizeof(struct attr) +
-	    stats->attr_data, UINT64_MAX);
+	    stats->attr_data + stats->bitmap_size + stats->hash_size,
+	    UINT64_MAX);
+
+	ometric_rib_mem_element("filter", stats->filter_cnt,
+	    stats->filter_size, stats->filter_refs);
+	ometric_rib_mem_element("filter_set", stats->filter_set_cnt,
+	    stats->filter_set_size, stats->filter_set_refs);
+	ometric_rib_mem_element("filter_total", UINT64_MAX,
+	    stats->filter_size + stats->filter_set_size, UINT64_MAX);
 
 	ometric_set_int(rde_table_count, stats->aset_cnt, NULL);
 
@@ -312,10 +371,45 @@ ometric_rib_mem(struct rde_memstats *stats)
 	    OKV("type"), OKV("as_set"), NULL);
 	ometric_set_int_with_labels(rde_set_size, stats->pset_size,
 	    OKV("type"), OKV("prefix_set"), NULL);
+	ometric_set_int_with_labels(rde_set_size, stats->aspa_size,
+	    OKV("type"), OKV("aspa_set"), NULL);
 	ometric_set_int_with_labels(rde_set_count, stats->pset_cnt,
 	    OKV("type"), OKV("prefix_set"), NULL);
+	ometric_set_int_with_labels(rde_set_count, stats->aspa_cnt,
+	    OKV("type"), OKV("aspa_set"), NULL);
 	ometric_rib_mem_element("set_total", UINT64_MAX,
-	    stats->aset_size + stats->pset_size, UINT64_MAX);
+	    stats->aset_size + stats->pset_size + stats->aspa_size, UINT64_MAX);
+
+	ometric_set_int_with_labels(rde_queue_count, stats->rde_ibufq_msg_count,
+	    OKV("type"), OKV("ibuf_queue"), NULL);
+	ometric_set_int_with_labels(rde_queue_count, stats->rde_rib_entry_count,
+	    OKV("type"), OKV("rib_entry"), NULL);
+	ometric_set_int_with_labels(rde_queue_size,
+	    stats->rde_ibufq_payload_size, OKV("type"), OKV("ibuf_queue"),
+	    NULL);
+
+	ometric_set_int(rde_evloop_count, stats->rde_event_loop_count, NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_loop_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("main"), NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_io_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("io"), NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_peer_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("peer"), NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_adjout_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("adjout"), NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_ribdump_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("ribdumps"), NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_nexthop_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("nexthop"), NULL);
+	ometric_set_float_with_labels(rde_evloop_time,
+	    (double)stats->rde_event_update_usec / (1000.0 * 1000.0) ,
+	    OKV("stage"), OKV("update"), NULL);
 }
 
 static void

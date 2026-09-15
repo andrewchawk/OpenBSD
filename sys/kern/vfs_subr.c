@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_subr.c,v 1.322 2024/07/13 14:37:55 beck Exp $	*/
+/*	$OpenBSD: vfs_subr.c,v 1.335 2026/06/30 14:04:03 kirill Exp $	*/
 /*	$NetBSD: vfs_subr.c,v 1.53 1996/04/22 01:39:13 christos Exp $	*/
 
 /*
@@ -67,10 +67,14 @@
 
 #include <netinet/in.h>
 
-#include <uvm/uvm_extern.h>
 #include <uvm/uvm_vnode.h>
 
 #include "softraid.h"
+
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
 
 void sr_quiesce(void);
 
@@ -84,8 +88,7 @@ int	vttoif_tab[9] = {
 	S_IFSOCK, S_IFIFO, S_IFMT,
 };
 
-int prtactive = 0;		/* 1 => print out reclaim of active vnodes */
-int suid_clear = 1;		/* 1 => clear SUID / SGID on owner change */
+int prtactive = 0;	/* 1 => print out reclaim of active vnodes */
 
 /*
  * Insq/Remq for the vnode usage lists.
@@ -125,7 +128,6 @@ void printlockedvnodes(void);
 #endif
 
 struct pool vnode_pool;
-struct pool uvm_vnode_pool;
 
 static inline int rb_buf_compare(const struct buf *b1, const struct buf *b2);
 RBT_GENERATE(buf_rb_bufs, buf, b_rbbufs, rb_buf_compare);
@@ -150,8 +152,6 @@ vntblinit(void)
 	maxvnodes = 2 * initialvnodes;
 	pool_init(&vnode_pool, sizeof(struct vnode), 0, IPL_NONE,
 	    PR_WAITOK, "vnodes", NULL);
-	pool_init(&uvm_vnode_pool, sizeof(struct uvm_vnode), 0, IPL_NONE,
-	    PR_WAITOK, "uvmvnodes", NULL);
 	TAILQ_INIT(&vnode_hold_list);
 	TAILQ_INIT(&vnode_free_list);
 	TAILQ_INIT(&mountlist);
@@ -176,6 +176,7 @@ vfs_mount_alloc(struct vnode *vp, struct vfsconf *vfsp)
 	struct mount *mp;
 
 	mp = malloc(sizeof(*mp), M_MOUNT, M_WAITOK|M_ZERO);
+	refcnt_init(&mp->mnt_refs);
 	rw_init_flags(&mp->mnt_lock, "vfslock", RWL_IS_VNODE);
 	(void)vfs_busy(mp, VB_READ|VB_NOWAIT);
 
@@ -191,14 +192,29 @@ vfs_mount_alloc(struct vnode *vp, struct vfsconf *vfsp)
 	return (mp);
 }
 
+struct mount *
+vfs_mount_take(struct mount *mp)
+{
+	refcnt_take(&mp->mnt_refs);
+	return (mp);
+}
+
+static void
+vfs_mount_rele(struct mount *mp)
+{
+	if (refcnt_rele(&mp->mnt_refs))
+		free(mp, M_MOUNT, sizeof(*mp));
+}
+
 /*
  * Release a mount point.
  */
 void
 vfs_mount_free(struct mount *mp)
 {
+	SET(mp->mnt_flag, MNT_UNMOUNT);
 	atomic_dec_int(&mp->mnt_vfc->vfc_refcount);
-	free(mp, M_MOUNT, sizeof(*mp));
+	vfs_mount_rele(mp);
 }
 
 /*
@@ -211,27 +227,27 @@ vfs_mount_free(struct mount *mp)
 int
 vfs_busy(struct mount *mp, int flags)
 {
-	int rwflags = 0;
+	int rwflags = ISSET(flags, VB_WRITE) ? RW_WRITE : RW_READ;
+	int error = 0;
 
-	if (flags & VB_WRITE)
-		rwflags |= RW_WRITE;
-	else
-		rwflags |= RW_READ;
-
-	if (flags & VB_WAIT)
-		rwflags |= RW_SLEEPFAIL;
-	else
+	if (!ISSET(flags, VB_WAIT))
 		rwflags |= RW_NOSLEEP;
 
 #ifdef WITNESS
-	if (flags & VB_DUPOK)
+	if (ISSET(flags, VB_DUPOK))
 		rwflags |= RW_DUPOK;
 #endif
 
-	if (rw_enter(&mp->mnt_lock, rwflags))
-		return (EBUSY);
+	vfs_mount_take(mp);
+	if (rw_enter(&mp->mnt_lock, rwflags) != 0)
+		error = EBUSY;
+	else if (ISSET(mp->mnt_flag, MNT_UNMOUNT)) {
+		rw_exit(&mp->mnt_lock);
+		error = EBUSY;
+	}
+	vfs_mount_rele(mp);
 
-	return (0);
+	return (error);
 }
 
 /*
@@ -246,10 +262,7 @@ vfs_unbusy(struct mount *mp)
 int
 vfs_isbusy(struct mount *mp)
 {
-	if (RWLOCK_OWNER(&mp->mnt_lock) > 0)
-		return (1);
-	else
-		return (0);
+	return (rw_status(&mp->mnt_lock) != 0);
 }
 
 /*
@@ -267,7 +280,7 @@ vfs_rootmountalloc(char *fstypename, char *devname, struct mount **mpp)
 	vfsp = vfs_byname(fstypename);
 	if (vfsp == NULL)
 		return (ENODEV);
-	mp = vfs_mount_alloc(NULLVP, vfsp);
+	mp = vfs_mount_alloc(NULL, vfsp);
 	mp->mnt_flag |= MNT_RDONLY;
 	mp->mnt_stat.f_mntonname[0] = '/';
 	strlcpy(mp->mnt_stat.f_mntfromname, devname, MNAMELEN);
@@ -407,9 +420,6 @@ getnewvnode(enum vtagtype tag, struct mount *mp, const struct vops *vops,
 	    ((TAILQ_FIRST(listhd = &vnode_hold_list) == NULL) || toggle))) {
 		splx(s);
 		vp = pool_get(&vnode_pool, PR_WAITOK | PR_ZERO);
-		vp->v_uvm = pool_get(&uvm_vnode_pool, PR_WAITOK | PR_ZERO);
-		vp->v_uvm->u_vnode = vp;
-		uvm_obj_init(&vp->v_uvm->u_obj, &uvm_vnodeops, 0);
 		RBT_INIT(buf_rb_bufs, &vp->v_bufs_tree);
 		cache_tree_init(&vp->v_nc_tree);
 		TAILQ_INIT(&vp->v_cache_dst);
@@ -520,12 +530,12 @@ getdevvp(dev_t dev, struct vnode **vpp, enum vtype type)
 	int error;
 
 	if (dev == NODEV) {
-		*vpp = NULLVP;
+		*vpp = NULL;
 		return (0);
 	}
 	error = getnewvnode(VT_NON, NULL, &spec_vops, &nvp);
 	if (error) {
-		*vpp = NULLVP;
+		*vpp = NULL;
 		return (error);
 	}
 	vp = nvp;
@@ -554,9 +564,10 @@ checkalias(struct vnode *nvp, dev_t nvp_rdev, struct mount *mp)
 	struct proc *p = curproc;
 	struct vnode *vp;
 	struct vnodechain *vchain;
+	u_int vpid;
 
 	if (nvp->v_type != VBLK && nvp->v_type != VCHR)
-		return (NULLVP);
+		return (NULL);
 
 	vchain = &speclisth[SPECHASH(nvp_rdev)];
 loop:
@@ -571,7 +582,12 @@ loop:
 			vgonel(vp, p);
 			goto loop;
 		}
+		vpid = vp->v_id;
 		if (vget(vp, LK_EXCLUSIVE)) {
+			goto loop;
+		}
+		if (vpid != vp->v_id) {
+			vput(vp);
 			goto loop;
 		}
 		break;
@@ -591,19 +607,19 @@ loop:
 		if (nvp->v_type == VCHR &&
 		    (cdevsw[major(nvp_rdev)].d_flags & D_CLONE) &&
 		    (minor(nvp_rdev) >> CLONE_SHIFT == 0)) {
-			if (vp != NULLVP)
+			if (vp != NULL)
 				nvp->v_specbitmap = vp->v_specbitmap;
 			else
 				nvp->v_specbitmap = malloc(CLONE_MAPSZ,
 				    M_VNODE, M_WAITOK | M_ZERO);
 		}
 		SLIST_INSERT_HEAD(vchain, nvp, v_specnext);
-		if (vp != NULLVP) {
+		if (vp != NULL) {
 			nvp->v_flag |= VALIASED;
 			vp->v_flag |= VALIASED;
 			vput(vp);
 		}
-		return (NULLVP);
+		return (NULL);
 	}
 
 	/*
@@ -982,7 +998,7 @@ vflush_vnode(struct vnode *vp, void *arg)
 	if (empty)
 		return (0);
 
-#ifdef DEBUG_SYSCTL
+#if defined(DEBUG_SYSCTL) && (defined(DEBUG) || defined(DIAGNOSTIC))
 	if (busyprt)
 		vprint("vflush: busy vnode", vp);
 #endif
@@ -1011,7 +1027,7 @@ vflush(struct mount *mp, struct vnode *skipvp, int flags)
 void
 vclean(struct vnode *vp, int flags, struct proc *p)
 {
-	int active, do_wakeup = 0;
+	int active, do_wakeup = 0, error;
 	int s;
 
 	/*
@@ -1060,8 +1076,18 @@ vclean(struct vnode *vp, int flags, struct proc *p)
 	/*
 	 * Clean out any buffers associated with the vnode.
 	 */
-	if (flags & DOCLOSE)
-		vinvalbuf(vp, V_SAVE, NOCRED, p, 0, INFSLP);
+	if (flags & DOCLOSE) {
+		error = vinvalbuf(vp, V_SAVE, NOCRED, p, 0, INFSLP);
+		if (error) {
+			printf("vclean: failed to flush buffers, error %d; "
+			    "discarding dirty buffers", error);
+			if (vp->v_mount != NULL)
+				printf("; mounted on: %s",
+				    vp->v_mount->mnt_stat.f_mntonname);
+			printf("\n");
+			vinvalbuf(vp, 0, NOCRED, p, 0, INFSLP);
+		}
+	}
 	/*
 	 * If purging an active vnode, it must be closed and
 	 * deactivated before being reclaimed. Note that the
@@ -1365,6 +1391,7 @@ printlockedvnodes(void)
 }
 #endif
 
+#ifndef SMALL_KERNEL
 /*
  * Top level filesystem related information gathering.
  */
@@ -1417,6 +1444,7 @@ vfs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	}
 	return (EOPNOTSUPP);
 }
+#endif /* SMALL_KERNEL */
 
 /*
  * Check to see if a filesystem is mounted on a block device.
@@ -1826,7 +1854,7 @@ vfs_syncwait(struct proc *p, int verbose)
 			 */
 			if (bp->b_flags & B_DELWRI) {
 				s = splbio();
-				bremfree(bp);
+				bufcache_take(bp);
 				buf_acquire(bp);
 				splx(s);
 				nbusy++;
@@ -1856,46 +1884,6 @@ vfs_syncwait(struct proc *p, int verbose)
 	}
 
 	return nbusy;
-}
-
-/*
- * posix file system related system variables.
- */
-int
-fs_posix_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
-    void *newp, size_t newlen, struct proc *p)
-{
-	/* all sysctl names at this level are terminal */
-	if (namelen != 1)
-		return (ENOTDIR);
-
-	switch (name[0]) {
-	case FS_POSIX_SETUID:
-		return (sysctl_securelevel_int(oldp, oldlenp, newp, newlen,
-		    &suid_clear));
-	default:
-		return (EOPNOTSUPP);
-	}
-	/* NOTREACHED */
-}
-
-/*
- * file system related system variables.
- */
-int
-fs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
-    size_t newlen, struct proc *p)
-{
-	sysctlfn *fn;
-
-	switch (name[0]) {
-	case FS_POSIX:
-		fn = fs_posix_sysctl;
-		break;
-	default:
-		return (EOPNOTSUPP);
-	}
-	return (*fn)(name + 1, namelen - 1, oldp, oldlenp, newp, newlen, p);
 }
 
 
@@ -2007,7 +1995,7 @@ loop:
 				}
 				break;
 			}
-			bremfree(bp);
+			bufcache_take(bp);
 			/*
 			 * XXX Since there are no node locks for NFS, I believe
 			 * there is a slight chance that a delayed write will
@@ -2060,7 +2048,7 @@ loop:
 			continue;
 		if ((bp->b_flags & B_DELWRI) == 0)
 			panic("vflushbuf: not dirty");
-		bremfree(bp);
+		bufcache_take(bp);
 		buf_acquire(bp);
 		splx(s);
 		/*

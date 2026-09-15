@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.1 2024/07/09 17:26:14 yasuoka Exp $ */
+/*	$OpenBSD: control.c,v 1.8 2026/08/04 13:24:44 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -165,10 +165,15 @@ control_accept(int listenfd, short event, void *bula)
 		return;
 	}
 
+	if (imsgbuf_init(&c->iev.ibuf, connfd) == -1) {
+		log_warn("control_accept");
+		close(connfd);
+		free(c);
+		return;
+	}
 	if (idseq == 0)	/* don't use zero.  See radiusd_module_imsg */
 		++idseq;
 	c->id = idseq++;
-	imsg_init(&c->iev.ibuf, connfd);
 	c->iev.handler = control_dispatch_imsg;
 	c->iev.events = EV_READ;
 	event_set(&c->iev.ev, c->iev.ibuf.fd, c->iev.events, c->iev.handler, c);
@@ -222,7 +227,7 @@ control_close(int fd)
 void
 control_connfree(struct ctl_conn *c)
 {
-	msgbuf_clear(&c->iev.ibuf.w);
+	imsgbuf_clear(&c->iev.ibuf);
 	TAILQ_REMOVE(&ctl_conns, c, entry);
 
 	event_del(&c->iev.ev);
@@ -243,7 +248,8 @@ control_dispatch_imsg(int fd, short event, void *bula)
 {
 	struct ctl_conn	*c;
 	struct imsg	 imsg;
-	ssize_t		 n, datalen;
+	int		 n;
+	size_t		 datalen;
 	char		 modulename[RADIUSD_MODULE_NAME_LEN + 1], msg[128];
 
 	if ((c = control_connbyfd(fd)) == NULL) {
@@ -252,29 +258,27 @@ control_dispatch_imsg(int fd, short event, void *bula)
 	}
 
 	if (event & EV_READ) {
-		if (((n = imsg_read(&c->iev.ibuf)) == -1 && errno != EAGAIN) ||
-		    n == 0) {
+		if (imsgbuf_read(&c->iev.ibuf) != 1) {
 			control_close(fd);
 			return;
 		}
 	}
 	if (event & EV_WRITE) {
-		if (msgbuf_write(&c->iev.ibuf.w) <= 0 && errno != EAGAIN) {
+		if (imsgbuf_write(&c->iev.ibuf) == -1) {
 			control_close(fd);
 			return;
 		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(&c->iev.ibuf, &imsg)) == -1) {
+		if ((n = imsgbuf_get(&c->iev.ibuf, &imsg)) == -1) {
 			control_close(fd);
 			return;
 		}
-
 		if (n == 0)
 			break;
 
-		datalen = imsg.hdr.len - IMSG_HEADER_SIZE;
+		datalen = imsg_get_len(&imsg);
 		switch (imsg.hdr.type) {
 		default:
 			if (imsg.hdr.type >= IMSG_RADIUSD_MODULE_MIN) {

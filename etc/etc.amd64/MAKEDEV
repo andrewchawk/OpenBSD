@@ -3,9 +3,9 @@
 # THIS FILE AUTOMATICALLY GENERATED.  DO NOT EDIT.
 # generated from:
 #
-#	OpenBSD: etc.amd64/MAKEDEV.md,v 1.82 2023/01/14 12:15:12 kettenis Exp 
-#	OpenBSD: MAKEDEV.common,v 1.120 2023/01/28 11:04:47 phessler Exp 
-#	OpenBSD: MAKEDEV.mi,v 1.83 2016/09/11 03:06:31 deraadt Exp 
+#	OpenBSD: etc.amd64/MAKEDEV.md,v 1.86 2025/11/12 11:34:36 hshoexer Exp 
+#	OpenBSD: MAKEDEV.common,v 1.124 2025/10/15 17:53:36 deraadt Exp 
+#	OpenBSD: MAKEDEV.mi,v 1.91 2025/11/19 17:49:42 deraadt Exp 
 #	OpenBSD: MAKEDEV.sub,v 1.14 2005/02/07 06:14:18 david Exp 
 #
 #
@@ -29,6 +29,7 @@
 #	ramdisk	Ramdisk kernel devices
 #	std	Standard devices
 #	local	Configuration specific devices
+#	redodisks	Recreates all partitions
 # Disks:
 #	cd*	ATAPI and SCSI CD-ROM drives
 #	fd*	Floppy disk drives (3 1/2", 5 1/4")
@@ -101,11 +102,23 @@
 #	vscsi*	Virtual SCSI controller
 #	pvbus*	paravirtual device tree root
 #	kstat	Kernel Statistics
+#	psp	Platform Security Processor
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
+UNITMULT=64
+MAKEDEV_PARTITIONS=${MAKEDEV_PARTITIONS:-`sysctl -n kern.maxpartitions`}
 T=$0
 
 # set this to echo for Echo-Only debugging
 [ "$eo" ] || eo=
+
+# Find all the disk device-names which already exist
+finddisks()
+{
+	local mode x name
+	ls -n *a | while read mode x x x x x x x x name; do
+		[[ $mode = b* ]] && echo ${name%a}
+	done
+}
 
 hex()
 {
@@ -168,9 +181,11 @@ unt()
 dodisk()
 {
 	[ "$DEBUG" ] && set -x
-	n=$(($((${5}*${7:-16}))+${6})) count=0
-	[ 0$7 -ne 8 ] && l="i j k l m n o p"
-	for d in a b c d e f g h $l
+	n=$(($((${5}*${7:-$UNITMULT}))+${6})) count=0
+	_extra=
+	[ $MAKEDEV_PARTITIONS == 52 ] && _extra="q r s t u v w x y z \
+	    A B C D E F G H I J K L M N O P Q R S T U V W X Y Z"
+	for d in a b c d e f g h i j k l m n o p $_extra
 	do
 		M $1$2$d	b $3 $(($n+$count)) 640 operator
 		M r$1$2$d	c $4 $(($n+$count)) 640 operator
@@ -180,7 +195,7 @@ dodisk()
 
 dodisk2()
 {
-	n=$(($(($5*${7:-16}))+$6))
+	n=$(($(($5*${7:-$UNITMULT}))+$6))
 	M $1$2a b $3 $n 640 operator
 	M r$1$2a c $4 $n 640 operator
 	n=$(($n+2))
@@ -227,9 +242,14 @@ U=`unt $i`
 [ "$U" ] || U=0
 
 case $i in
+vmboot)
+	R ramdisk
+	M kexec		c 18 0 600
+	;;
+
 ramdisk)
 	R std bpf fd0 wd0 sd0 tty00 tty01 rd0 bio diskmap
-	R st0 cd0 ttyC0 wskbd0 wskbd1 wskbd2 random
+	R st0 cd0 ttyC0 wskbd0 wskbd1 wskbd2 random efi
 	;;
 
 std)
@@ -250,6 +270,10 @@ std)
 ttyc*)
 	M ttyc$U c 38 $U 660 dialer root
 	M cuac$U c 38 $(($U+128)) 660 dialer root
+	;;
+
+psp)
+	M psp c 101 0 600
 	;;
 
 kstat)
@@ -579,7 +603,7 @@ fd*)
 	*)	echo bad unit $U for $i; exit 1;;
 	esac
 	nam=fd${typnam}
-	n=$(($(($U*128))+$(($typnum*16))))
+	n=$(($(($U*128))+$(($typnum*$UNITMULT))))
 	M ${nam}a	b $blk $n 640 operator
 	M ${nam}b	b $blk $(($n+1)) 640 operator
 	M ${nam}c	b $blk $(($n+2)) 640 operator
@@ -604,14 +628,14 @@ all)
 	R sd4 sd5 sd6 sd7 sd8 sd9 cd0 cd1 rd0 tap0 tap1 tap2 tap3 tun0
 	R tun1 tun2 tun3 bio pty0 fd1 fd1B fd1C fd1D fd1E fd1F fd1G
 	R fd1H fd0 fd0B fd0C fd0D fd0E fd0F fd0G fd0H diskmap vscsi0
-	R ch0 audio0 audio1 audio2 audio3 kstat dt kcov bpf pvbus0
+	R ch0 audio0 audio1 audio2 audio3 psp kstat dt kcov bpf pvbus0
 	R pvbus1 vmm fuse pppac pppx hotplug ptm local wscons pci0
 	R pci1 pci2 pci3 uall rmidi0 rmidi1 rmidi2 rmidi3 rmidi4
-	R rmidi5 rmidi6 rmidi7 tuner0 radio0 speaker video0 video1 uk0
-	R random lpa0 lpa1 lpa2 lpt0 lpt1 lpt2 tty00 tty01 tty02 tty03
-	R tty04 tty05 tty06 tty07 tty08 tty09 tty0a tty0b ttyc0 ttyc1
-	R ttyc2 ttyc3 ttyc4 ttyc5 ttyc6 ttyc7 apm pf pctr wd0 wd1 wd2
-	R wd3 std st0 st1 fd
+	R rmidi5 rmidi6 rmidi7 tuner0 radio0 speaker video0 video1
+	R video2 video3 uk0 random lpa0 lpa1 lpa2 lpt0 lpt1 lpt2 tty00
+	R tty01 tty02 tty03 tty04 tty05 tty06 tty07 tty08 tty09 tty0a
+	R tty0b ttyc0 ttyc1 ttyc2 ttyc3 ttyc4 ttyc5 ttyc6 ttyc7 apm pf
+	R pctr wd0 wd1 wd2 wd3 std st0 st1 fd
 	;;
 
 wd*|sd*)
@@ -619,6 +643,10 @@ wd*|sd*)
 	wd*) dodisk wd $U 0 3 $U 0;;
 	sd*) dodisk sd $U 4 13 $U 0;;
 	esac
+	;;
+
+redodisks)
+	R `finddisks`
 	;;
 
 *)

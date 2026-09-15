@@ -1,4 +1,4 @@
-/*	$OpenBSD: btrace.c,v 1.92 2024/07/09 16:08:30 mpi Exp $ */
+/*	$OpenBSD: btrace.c,v 1.99 2025/10/05 22:31:54 sashan Exp $ */
 
 /*
  * Copyright (c) 2019 - 2023 Martin Pieuchot <mpi@openbsd.org>
@@ -39,6 +39,8 @@
 
 #include <dev/dt/dtvar.h>
 
+#include <gelf.h>
+
 #include "btrace.h"
 #include "bt_parser.h"
 
@@ -62,13 +64,14 @@ char			*read_btfile(const char *, size_t *);
 void			 dtpi_cache(int);
 void			 dtpi_print_list(int);
 const char		*dtpi_func(struct dtioc_probe_info *);
-int			 dtpi_is_unit(const char *);
 struct dtioc_probe_info	*dtpi_get_by_value(const char *, const char *,
 			     const char *);
 
 /*
  * Main loop and rule evaluation.
  */
+void			 probe_bail(struct bt_probe *);
+const char		*probe_name(struct bt_probe *);
 void			 rules_do(int);
 int			 rules_setup(int);
 int			 rules_apply(int, struct dt_evt *);
@@ -106,7 +109,6 @@ int			 ba2dtflags(struct bt_arg *);
 __dead void		 xabort(const char *, ...);
 void			 debug(const char *, ...);
 void			 debugx(const char *, ...);
-const char		*debug_probe_name(struct bt_probe *);
 void			 debug_dump_term(struct bt_arg *);
 void			 debug_dump_expr(struct bt_arg *);
 void			 debug_dump_filter(struct bt_rule *);
@@ -120,7 +122,7 @@ struct dt_evt		 bt_devt;	/* fake event for BEGIN/END */
 #define EVENT_END	 (unsigned int)(-1)
 uint64_t		 bt_filtered;	/* # of events filtered out */
 
-struct syms		*kelf, *uelf;
+struct syms		*kelf;
 
 char			**vargs;
 int			 nargs = 0;
@@ -156,9 +158,6 @@ main(int argc, char *argv[])
 			break;
 		case 'n':
 			noaction = 1;
-			break;
-		case 'p':
-			uelf = kelf_open(optarg);
 			break;
 		case 'v':
 			verbose++;
@@ -231,8 +230,8 @@ main(int argc, char *argv[])
 __dead void
 usage(void)
 {
-	fprintf(stderr, "usage: %s [-lnv] [-e program | file] [-p file] "
-	    "[argument ...]\n", getprogname());
+	fprintf(stderr, "usage: %s [-lnv] "
+	    "programfile | -e program [argument ...]\n", getprogname());
 	exit(1);
 }
 
@@ -362,12 +361,6 @@ dtpi_func(struct dtioc_probe_info *dtpi)
 	return syscallnames[idx];
 }
 
-int
-dtpi_is_unit(const char *unit)
-{
-	return !strncmp("hz", unit, sizeof("hz"));
-}
-
 struct dtioc_probe_info *
 dtpi_get_by_value(const char *prov, const char *func, const char *name)
 {
@@ -376,20 +369,16 @@ dtpi_get_by_value(const char *prov, const char *func, const char *name)
 
 	dtpi = dt_dtpis;
 	for (i = 0; i < dt_ndtpi; i++, dtpi++) {
-		if (prov != NULL &&
-		    strncmp(prov, dtpi->dtpi_prov, DTNAMESIZE))
-			continue;
-
-		if (func != NULL) {
-			if (dtpi_is_unit(func))
-				return dtpi;
-
-			if (strncmp(func, dtpi_func(dtpi), DTNAMESIZE))
+		if (prov != NULL) {
+			if (strncmp(prov, dtpi->dtpi_prov, DTNAMESIZE))
 				continue;
 		}
-
-		if (strncmp(name, dtpi->dtpi_name, DTNAMESIZE))
-			continue;
+		if (func != NULL && name != NULL) {
+			if (strncmp(func, dtpi_func(dtpi), DTNAMESIZE))
+				continue;
+			if (strncmp(name, dtpi->dtpi_name, DTNAMESIZE))
+				continue;
+		}
 
 		debug("matched probe %s:%s:%s\n", dtpi->dtpi_prov,
 		    dtpi_func(dtpi), dtpi->dtpi_name);
@@ -397,6 +386,68 @@ dtpi_get_by_value(const char *prov, const char *func, const char *name)
 	}
 
 	return NULL;
+}
+
+static uint64_t
+bp_nsecs_to_unit(struct bt_probe *bp)
+{
+	static const struct {
+		const char *name;
+		enum { UNIT_HZ, UNIT_US, UNIT_MS, UNIT_S } id;
+	} units[] = {
+		{ .name = "hz", .id = UNIT_HZ },
+		{ .name = "us", .id = UNIT_US },
+		{ .name = "ms", .id = UNIT_MS },
+		{ .name = "s", .id = UNIT_S },
+	};
+	size_t i;
+
+	for (i = 0; i < nitems(units); i++) {
+		if (strcmp(units[i].name, bp->bp_unit) == 0) {
+			switch (units[i].id) {
+			case UNIT_HZ:
+				return (1000000000LLU / bp->bp_nsecs);
+			case UNIT_US:
+				return (bp->bp_nsecs / 1000LLU);
+			case UNIT_MS:
+				return (bp->bp_nsecs / 1000000LLU);
+			case UNIT_S:
+				return (bp->bp_nsecs / 1000000000LLU);
+			}
+		}
+	}
+	return 0;
+}
+
+void
+probe_bail(struct bt_probe *bp)
+{
+	errx(1, "Cannot register multiple probes of the same type: '%s'",
+	    probe_name(bp));
+}
+
+const char *
+probe_name(struct bt_probe *bp)
+{
+	static char buf[64];
+
+	if (bp->bp_type == B_PT_BEGIN)
+		return "BEGIN";
+
+	if (bp->bp_type == B_PT_END)
+		return "END";
+
+	assert(bp->bp_type == B_PT_PROBE);
+
+	if (bp->bp_nsecs) {
+		snprintf(buf, sizeof(buf), "%s:%s:%llu", bp->bp_prov,
+		    bp->bp_unit, bp_nsecs_to_unit(bp));
+	} else {
+		snprintf(buf, sizeof(buf), "%s:%s:%s", bp->bp_prov,
+		    bp->bp_unit, bp->bp_name);
+	}
+
+	return buf;
 }
 
 void
@@ -452,6 +503,10 @@ rules_do(int fd)
 		fprintf(stderr, "%llu events read\n", dtst.dtst_readevt);
 		fprintf(stderr, "%llu events dropped\n", dtst.dtst_dropevt);
 		fprintf(stderr, "%llu events filtered\n", bt_filtered);
+		fprintf(stderr, "%llu clock ticks skipped\n",
+			dtst.dtst_skiptick);
+		fprintf(stderr, "%llu recursive events dropped\n",
+			dtst.dtst_recurevt);
 	}
 }
 
@@ -493,7 +548,7 @@ rules_setup(int fd)
 {
 	struct dtioc_probe_info *dtpi;
 	struct dtioc_req *dtrq;
-	struct bt_rule *r, *rbegin = NULL;
+	struct bt_rule *r, *rbegin = NULL, *rend = NULL;
 	struct bt_probe *bp;
 	struct bt_stmt *bs;
 	struct bt_arg *ba;
@@ -515,12 +570,20 @@ rules_setup(int fd)
 		evtflags |= rules_action_scan(SLIST_FIRST(&r->br_action));
 
 		SLIST_FOREACH(bp, &r->br_probes, bp_next) {
-			debug("parsed probe '%s'", debug_probe_name(bp));
+			debug("parsed probe '%s'", probe_name(bp));
 			debug_dump_filter(r);
 
 			if (bp->bp_type != B_PT_PROBE) {
-				if (bp->bp_type == B_PT_BEGIN)
+				if (bp->bp_type == B_PT_BEGIN) {
+					if (rbegin != NULL)
+						probe_bail(bp);
 					rbegin = r;
+				}
+				if (bp->bp_type == B_PT_END) {
+					if (rend != NULL)
+						probe_bail(bp);
+					rend = r;
+				}
 				continue;
 			}
 
@@ -538,7 +601,7 @@ rules_setup(int fd)
 
 			bp->bp_pbn = dtpi->dtpi_pbn;
 			dtrq->dtrq_pbn = dtpi->dtpi_pbn;
-			dtrq->dtrq_rate = bp->bp_rate;
+			dtrq->dtrq_nsecs = bp->bp_nsecs;
 			dtrq->dtrq_evtflags = evtflags;
 			if (dtrq->dtrq_evtflags & DTEVT_KSTACK)
 				dokstack = 1;
@@ -547,7 +610,7 @@ rules_setup(int fd)
 	}
 
 	if (dokstack)
-		kelf = kelf_open(_PATH_KSYMS);
+		kelf = kelf_open_kernel(_PATH_KSYMS);
 
 	/* Initialize "fake" event for BEGIN/END */
 	bt_devt.dtev_pbn = EVENT_BEGIN;
@@ -566,8 +629,11 @@ rules_setup(int fd)
 				continue;
 
 			dtrq = bp->bp_cookie;
-			if (ioctl(fd, DTIOCPRBENABLE, dtrq))
+			if (ioctl(fd, DTIOCPRBENABLE, dtrq)) {
+				if (errno == EEXIST)
+					probe_bail(bp);
 				err(1, "DTIOCPRBENABLE");
+			}
 		}
 	}
 
@@ -632,9 +698,6 @@ rules_teardown(int fd)
 	}
 
 	kelf_close(kelf);
-	kelf = NULL;
-	kelf_close(uelf);
-	uelf = NULL;
 
 	/* Update "fake" event for BEGIN/END */
 	bt_devt.dtev_pbn = EVENT_END;
@@ -658,7 +721,7 @@ rule_eval(struct bt_rule *r, struct dt_evt *dtev)
 	struct bt_probe *bp;
 
 	SLIST_FOREACH(bp, &r->br_probes, bp_next) {
-		debug("eval rule '%s'", debug_probe_name(bp));
+		debug("eval rule '%s'", probe_name(bp));
 		debug_dump_filter(r);
 	}
 
@@ -739,7 +802,7 @@ builtin_nsecs(struct dt_evt *dtev)
 }
 
 const char *
-builtin_stack(struct dt_evt *dtev, int kernel, unsigned long offset)
+builtin_stack(struct dt_evt *dtev, int kernel)
 {
 	struct stacktrace *st = &dtev->dtev_kstack;
 	static char buf[4096];
@@ -762,11 +825,11 @@ builtin_stack(struct dt_evt *dtev, int kernel, unsigned long offset)
 		int l;
 
 		if (!kernel)
-			l = kelf_snprintsym(uelf, bp, sz - 1, st->st_pc[i],
-			    offset);
+			l = kelf_snprintsym_proc(dtfd, dtev->dtev_pid, bp, sz - 1,
+			    st->st_pc[i]);
 		else
-			l = kelf_snprintsym(kelf, bp, sz - 1, st->st_pc[i],
-			    offset);
+			l = kelf_snprintsym_kernel(kelf, bp, sz - 1,
+			    st->st_pc[i]);
 		if (l < 0)
 			break;
 		if (l >= sz - 1) {
@@ -1738,10 +1801,10 @@ ba2str(struct bt_arg *ba, struct dt_evt *dtev)
 		str = "";
 		break;
 	case B_AT_BI_KSTACK:
-		str = builtin_stack(dtev, 1, 0);
+		str = builtin_stack(dtev, 1);
 		break;
 	case B_AT_BI_USTACK:
-		str = builtin_stack(dtev, 0, dt_get_offset(dtev->dtev_pid));
+		str = builtin_stack(dtev, 0);
 		break;
 	case B_AT_BI_COMM:
 		str = dtev->dtev_comm;
@@ -2035,58 +2098,4 @@ debug_dump_filter(struct bt_rule *r)
 	debugx(" /");
 	debug_dump_expr(SLIST_FIRST(&bs->bs_args));
 	debugx("/\n");
-}
-
-const char *
-debug_probe_name(struct bt_probe *bp)
-{
-	static char buf[64];
-
-	if (verbose < 2)
-		return "";
-
-	if (bp->bp_type == B_PT_BEGIN)
-		return "BEGIN";
-
-	if (bp->bp_type == B_PT_END)
-		return "END";
-
-	assert(bp->bp_type == B_PT_PROBE);
-
-	if (bp->bp_rate) {
-		snprintf(buf, sizeof(buf), "%s:%s:%u", bp->bp_prov,
-		    bp->bp_unit, bp->bp_rate);
-	} else {
-		snprintf(buf, sizeof(buf), "%s:%s:%s", bp->bp_prov,
-		    bp->bp_unit, bp->bp_name);
-	}
-
-	return buf;
-}
-
-unsigned long
-dt_get_offset(pid_t pid)
-{
-	static struct dtioc_getaux	cache[32];
-	static int			next;
-	struct dtioc_getaux		*aux = NULL;
-	int				 i;
-
-	for (i = 0; i < 32; i++) {
-		if (cache[i].dtga_pid != pid)
-			continue;
-		aux = cache + i;
-		break;
-	}
-
-	if (aux == NULL) {
-		aux = &cache[next++];
-		next %= 32;
-
-		aux->dtga_pid = pid;
-		if (ioctl(dtfd, DTIOCGETAUXBASE, aux))
-			aux->dtga_auxbase = 0;
-	}
-
-	return aux->dtga_auxbase;
 }

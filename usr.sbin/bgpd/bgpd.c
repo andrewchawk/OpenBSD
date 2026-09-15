@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpd.c,v 1.264 2024/05/15 09:09:38 job Exp $ */
+/*	$OpenBSD: bgpd.c,v 1.294 2026/09/10 15:06:22 deraadt Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -30,6 +30,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <stddef.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,16 +46,16 @@ void		sighdlr(int);
 __dead void	usage(void);
 int		main(int, char *[]);
 pid_t		start_child(enum bgpd_process, char *, int, int, int);
-int		send_filterset(struct imsgbuf *, struct filter_set_head *);
-int		reconfigure(char *, struct bgpd_config *);
+int		reconfigure(const char *, struct bgpd_config *);
 int		send_config(struct bgpd_config *);
 int		dispatch_imsg(struct imsgbuf *, int, struct bgpd_config *);
 int		control_setup(struct bgpd_config *);
 static void	getsockpair(int [2]);
 int		imsg_send_sockets(struct imsgbuf *, struct imsgbuf *,
 		    struct imsgbuf *);
-void		bgpd_rtr_connect(struct rtr_config *);
-void		bgpd_rtr_connect_done(int, struct bgpd_config *);
+void		bgpd_rtr_conn_setup(struct rtr_config *);
+void		bgpd_rtr_conn_setup_done(int, struct bgpd_config *);
+void		bgpd_rtr_conn_teardown(uint32_t);
 
 int			 cflags;
 volatile sig_atomic_t	 mrtdump;
@@ -71,12 +72,15 @@ char			*rcname;
 
 struct connect_elm {
 	TAILQ_ENTRY(connect_elm)	entry;
+	struct auth_state		auth_state;
 	uint32_t			id;
 	int				fd;
 };
 
 TAILQ_HEAD(, connect_elm)	connect_queue = \
-				    TAILQ_HEAD_INITIALIZER(connect_queue);
+				    TAILQ_HEAD_INITIALIZER(connect_queue),
+				socket_queue = \
+				    TAILQ_HEAD_INITIALIZER(socket_queue);
 u_int				connect_cnt;
 #define MAX_CONNECT_CNT		32
 
@@ -127,10 +131,10 @@ main(int argc, char *argv[])
 	struct peer		*p;
 	struct pollfd		*pfd = NULL;
 	struct connect_elm	*ce;
-	time_t			 timeout;
+	monotime_t		 timeout;
 	pid_t			 se_pid = 0, rde_pid = 0, rtr_pid = 0, pid;
-	char			*conffile;
-	char			*saved_argv0;
+	const char		*conffile;
+	char			 execpath[PATH_MAX];
 	u_int			 pfd_elms = 0, npfd, i;
 	int			 debug = 0;
 	int			 rfd, keyfd;
@@ -144,10 +148,6 @@ main(int argc, char *argv[])
 	log_init(1, LOG_DAEMON);	/* log to stderr until daemonized */
 	log_procinit(log_procnames[PROC_MAIN]);
 	log_setverbose(1);
-
-	saved_argv0 = argv[0];
-	if (saved_argv0 == NULL)
-		saved_argv0 = "bgpd";
 
 	while ((ch = getopt(argc, argv, "cdD:f:nRSTvV")) != -1) {
 		switch (ch) {
@@ -195,6 +195,9 @@ main(int argc, char *argv[])
 	argv += optind;
 	if (argc > 0)
 		usage();
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	if (cmd_opts & BGPD_OPT_NOACTION) {
 		if ((conf = parse_config(conffile, NULL, NULL)) == NULL)
@@ -254,11 +257,11 @@ main(int argc, char *argv[])
 	getsockpair(pipe_m2roa);
 
 	/* fork children */
-	rde_pid = start_child(PROC_RDE, saved_argv0, pipe_m2r[1], debug,
+	rde_pid = start_child(PROC_RDE, execpath, pipe_m2r[1], debug,
 	    cmd_opts & BGPD_OPT_VERBOSE);
-	se_pid = start_child(PROC_SE, saved_argv0, pipe_m2s[1], debug,
+	se_pid = start_child(PROC_SE, execpath, pipe_m2s[1], debug,
 	    cmd_opts & BGPD_OPT_VERBOSE);
-	rtr_pid = start_child(PROC_RTR, saved_argv0, pipe_m2roa[1], debug,
+	rtr_pid = start_child(PROC_RTR, execpath, pipe_m2roa[1], debug,
 	    cmd_opts & BGPD_OPT_VERBOSE);
 
 	signal(SIGTERM, sighdlr);
@@ -272,9 +275,16 @@ main(int argc, char *argv[])
 	    (ibuf_rde = malloc(sizeof(struct imsgbuf))) == NULL ||
 	    (ibuf_rtr = malloc(sizeof(struct imsgbuf))) == NULL)
 		fatal(NULL);
-	imsg_init(ibuf_se, pipe_m2s[0]);
-	imsg_init(ibuf_rde, pipe_m2r[0]);
-	imsg_init(ibuf_rtr, pipe_m2roa[0]);
+	if (imsgbuf_init(ibuf_se, pipe_m2s[0]) == -1 ||
+	    imsgbuf_set_maxsize(ibuf_se, MAX_BGPD_IMSGSIZE) == -1 ||
+	    imsgbuf_init(ibuf_rde, pipe_m2r[0]) == -1 ||
+	    imsgbuf_set_maxsize(ibuf_rde, MAX_BGPD_IMSGSIZE) == -1 ||
+	    imsgbuf_init(ibuf_rtr, pipe_m2roa[0]) == -1 ||
+	    imsgbuf_set_maxsize(ibuf_rtr, MAX_BGPD_IMSGSIZE) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(ibuf_se);
+	imsgbuf_allow_fdpass(ibuf_rde);
+	imsgbuf_allow_fdpass(ibuf_rtr);
 	mrt_init(ibuf_rde, ibuf_se);
 	if (kr_init(&rfd, conf->fib_priority) == -1)
 		quit = 1;
@@ -326,7 +336,10 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 		}
 		memset(pfd, 0, sizeof(struct pollfd) * pfd_elms);
 
-		timeout = mrt_timeout(conf->mrt);
+		timeout = monotime_add(getmonotime(),
+		    monotime_from_sec(MAX_TIMEOUT));
+
+		timeout = mrt_timeout(conf->mrt, timeout);
 
 		pfd[PFD_SOCK_ROUTE].fd = rfd;
 		pfd[PFD_SOCK_ROUTE].events = POLLIN;
@@ -346,9 +359,11 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 				fatalx("polli pfd overflow");
 		}
 
-		if (timeout < 0 || timeout > MAX_TIMEOUT)
-			timeout = MAX_TIMEOUT;
-		if (poll(pfd, npfd, timeout * 1000) == -1) {
+		timeout = monotime_sub(timeout, getmonotime());
+		if (!monotime_valid(timeout))
+			timeout = monotime_clear();
+
+		if (poll(pfd, npfd, monotime_to_msec(timeout)) == -1) {
 			if (errno != EINTR) {
 				log_warn("poll error");
 				quit = 1;
@@ -358,7 +373,7 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 
 		if (handle_pollfd(&pfd[PFD_PIPE_SESSION], ibuf_se) == -1) {
 			log_warnx("main: Lost connection to SE");
-			msgbuf_clear(&ibuf_se->w);
+			imsgbuf_clear(ibuf_se);
 			free(ibuf_se);
 			ibuf_se = NULL;
 			quit = 1;
@@ -370,7 +385,7 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 
 		if (handle_pollfd(&pfd[PFD_PIPE_RDE], ibuf_rde) == -1) {
 			log_warnx("main: Lost connection to RDE");
-			msgbuf_clear(&ibuf_rde->w);
+			imsgbuf_clear(ibuf_rde);
 			free(ibuf_rde);
 			ibuf_rde = NULL;
 			quit = 1;
@@ -381,7 +396,7 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 
 		if (handle_pollfd(&pfd[PFD_PIPE_RTR], ibuf_rtr) == -1) {
 			log_warnx("main: Lost connection to RTR");
-			msgbuf_clear(&ibuf_rtr->w);
+			imsgbuf_clear(ibuf_rtr);
 			free(ibuf_rtr);
 			ibuf_rtr = NULL;
 			quit = 1;
@@ -404,7 +419,7 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 
 		for (i = PFD_CONNECT_START; i < npfd; i++)
 			if (pfd[i].revents != 0)
-				bgpd_rtr_connect_done(pfd[i].fd, conf);
+				bgpd_rtr_conn_setup_done(pfd[i].fd, conf);
 
  next_loop:
 		if (reconfig) {
@@ -443,19 +458,19 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 
 	/* close pipes */
 	if (ibuf_se) {
-		msgbuf_clear(&ibuf_se->w);
+		imsgbuf_clear(ibuf_se);
 		close(ibuf_se->fd);
 		free(ibuf_se);
 		ibuf_se = NULL;
 	}
 	if (ibuf_rde) {
-		msgbuf_clear(&ibuf_rde->w);
+		imsgbuf_clear(ibuf_rde);
 		close(ibuf_rde->fd);
 		free(ibuf_rde);
 		ibuf_rde = NULL;
 	}
 	if (ibuf_rtr) {
-		msgbuf_clear(&ibuf_rtr->w);
+		imsgbuf_clear(ibuf_rtr);
 		close(ibuf_rtr->fd);
 		free(ibuf_rtr);
 		ibuf_rtr = NULL;
@@ -467,7 +482,7 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 	pftable_clear_all();
 
 	RB_FOREACH(p, peer_head, &conf->peers)
-		pfkey_remove(p);
+		pfkey_remove(&p->auth_state);
 
 	while ((rr = SIMPLEQ_FIRST(&ribnames)) != NULL) {
 		SIMPLEQ_REMOVE_HEAD(&ribnames, entry);
@@ -502,7 +517,7 @@ BROKEN	if (pledge("stdio rpath wpath cpath fattr unix route recvfd sendfd",
 }
 
 pid_t
-start_child(enum bgpd_process p, char *argv0, int fd, int debug, int verbose)
+start_child(enum bgpd_process p, char *execpath, int fd, int debug, int verbose)
 {
 	char *argv[5];
 	int argc = 0;
@@ -524,7 +539,7 @@ start_child(enum bgpd_process p, char *argv0, int fd, int debug, int verbose)
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	switch (p) {
 	case PROC_MAIN:
 		fatalx("Can not start main process");
@@ -544,24 +559,12 @@ start_child(enum bgpd_process p, char *argv0, int fd, int debug, int verbose)
 		argv[argc++] = "-v";
 	argv[argc++] = NULL;
 
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 int
-send_filterset(struct imsgbuf *i, struct filter_set_head *set)
-{
-	struct filter_set	*s;
-
-	TAILQ_FOREACH(s, set, entry)
-		if (imsg_compose(i, IMSG_FILTER_SET, 0, 0, -1, s,
-		    sizeof(struct filter_set)) == -1)
-			return (-1);
-	return (0);
-}
-
-int
-reconfigure(char *conffile, struct bgpd_config *conf)
+reconfigure(const char *conffile, struct bgpd_config *conf)
 {
 	struct bgpd_config	*new_conf;
 
@@ -575,13 +578,11 @@ reconfigure(char *conffile, struct bgpd_config *conf)
 
 	merge_config(conf, new_conf);
 
-	if (prepare_listeners(conf) == -1) {
+	if (prepare_listeners(conf) == -1)
 		return (1);
-	}
 
-	if (control_setup(conf) == -1) {
+	if (control_setup(conf) == -1)
 		return (1);
-	}
 
 	return send_config(conf);
 }
@@ -611,14 +612,9 @@ send_config(struct bgpd_config *conf)
 	cflags = conf->flags;
 
 	/* start reconfiguration */
-	if (imsg_compose(ibuf_se, IMSG_RECONF_CONF, 0, 0, -1,
-	    conf, sizeof(*conf)) == -1)
-		return (-1);
-	if (imsg_compose(ibuf_rde, IMSG_RECONF_CONF, 0, 0, -1,
-	    conf, sizeof(*conf)) == -1)
-		return (-1);
-	if (imsg_compose(ibuf_rtr, IMSG_RECONF_CONF, 0, 0, -1,
-	    conf, sizeof(*conf)) == -1)
+	if (imsg_send_config(ibuf_se, conf) == -1 ||
+	    imsg_send_config(ibuf_rde, conf) == -1 ||
+	    imsg_send_config(ibuf_rtr, conf) == -1)
 		return (-1);
 
 	TAILQ_FOREACH(la, conf->listen_addrs, entry) {
@@ -647,13 +643,19 @@ send_config(struct bgpd_config *conf)
 
 	/* send peer list to the SE */
 	RB_FOREACH(p, peer_head, &conf->peers) {
+		if (p->reconf_action == RECONF_DELETE)
+			continue;
+
 		if (imsg_compose(ibuf_se, IMSG_RECONF_PEER, p->conf.id, 0, -1,
 		    &p->conf, sizeof(p->conf)) == -1)
 			return (-1);
+		if (pfkey_send_conf(ibuf_se, p->conf.id, &p->auth_conf) == -1)
+			return (-1);
 
 		if (p->reconf_action == RECONF_REINIT)
-			if (pfkey_establish(p) == -1)
-				log_peer_warnx(&p->conf, "pfkey setup failed");
+			if (pfkey_establish(&p->auth_state, &p->auth_conf,
+			    session_localaddr(p), &p->conf.remote_addr) == -1)
+				log_peer_warnx(&p->conf, "auth setup failed");
 	}
 
 	/* networks go via kroute to the RDE */
@@ -665,7 +667,7 @@ send_config(struct bgpd_config *conf)
 			if (imsg_compose(ibuf_rde, IMSG_FLOWSPEC_ADD, 0, 0, -1,
 			    f->flow, FLOWSPEC_SIZE + f->flow->len) == -1)
 				return (-1);
-			if (send_filterset(ibuf_rde, &f->attrset) == -1)
+			if (imsg_send_filterset(ibuf_rde, &f->attrset) == -1)
 				return (-1);
 			if (imsg_compose(ibuf_rde, IMSG_FLOWSPEC_DONE, 0, 0, -1,
 			    NULL, 0) == -1)
@@ -718,14 +720,6 @@ send_config(struct bgpd_config *conf)
 	}
 	free_roatree(&conf->roa);
 	RB_FOREACH(aspa, aspa_tree, &conf->aspa) {
-		/* XXX prevent oversized IMSG for now */
-		if (aspa->num * sizeof(*aspa->tas) >
-		    MAX_IMSGSIZE - IMSG_HEADER_SIZE) {
-			log_warnx("oversized ASPA set for customer-as %s, %s",
-			    log_as(aspa->as), "dropped");
-			continue;
-		}
-
 		if (imsg_compose(ibuf_rtr, IMSG_RECONF_ASPA, 0, 0,
 		    -1, aspa, offsetof(struct aspa_set, tas)) == -1)
 			return (-1);
@@ -738,8 +732,12 @@ send_config(struct bgpd_config *conf)
 	}
 	free_aspatree(&conf->aspa);
 	SIMPLEQ_FOREACH(rtr, &conf->rtrs, entry) {
+		struct rtr_config_msg rtrconf = { 0 };
+
+		strlcpy(rtrconf.descr, rtr->descr, sizeof(rtrconf.descr));
+		rtrconf.min_version = rtr->min_version;
 		if (imsg_compose(ibuf_rtr, IMSG_RECONF_RTR_CONFIG, rtr->id,
-		    0, -1, rtr->descr, sizeof(rtr->descr)) == -1)
+		    0, -1, &rtrconf, sizeof(rtrconf)) == -1)
 			return (-1);
 	}
 
@@ -778,7 +776,7 @@ send_config(struct bgpd_config *conf)
 	/* filters for the RDE */
 	while ((r = TAILQ_FIRST(conf->filters)) != NULL) {
 		TAILQ_REMOVE(conf->filters, r, entry);
-		if (send_filterset(ibuf_rde, &r->set) == -1)
+		if (imsg_send_filterset(ibuf_rde, &r->set) == -1)
 			return (-1);
 		if (imsg_compose(ibuf_rde, IMSG_RECONF_FILTER, 0, 0, -1,
 		    r, sizeof(struct filter_rule)) == -1)
@@ -803,7 +801,7 @@ send_config(struct bgpd_config *conf)
 			return (-1);
 
 		/* export targets */
-		if (send_filterset(ibuf_rde, &vpn->export) == -1)
+		if (imsg_send_filterset(ibuf_rde, &vpn->export) == -1)
 			return (-1);
 		if (imsg_compose(ibuf_rde, IMSG_RECONF_VPN_EXPORT, 0, 0,
 		    -1, NULL, 0) == -1)
@@ -811,7 +809,7 @@ send_config(struct bgpd_config *conf)
 		filterset_free(&vpn->export);
 
 		/* import targets */
-		if (send_filterset(ibuf_rde, &vpn->import) == -1)
+		if (imsg_send_filterset(ibuf_rde, &vpn->import) == -1)
 			return (-1);
 		if (imsg_compose(ibuf_rde, IMSG_RECONF_VPN_IMPORT, 0, 0,
 		    -1, NULL, 0) == -1)
@@ -849,15 +847,14 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 	struct pftable_msg	 pfmsg;
 	struct demote_msg	 demote;
 	char			 reason[REASON_LEN], ifname[IFNAMSIZ];
-	ssize_t			 n;
+	int			 n;
 	u_int			 rtableid;
 	int			 rv, verbose;
 
 	rv = 0;
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
 			return (-1);
-
 		if (n == 0)
 			break;
 
@@ -938,7 +935,9 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 			}
 			p = getpeerbyid(conf, imsg_get_id(&imsg));
 			if (p != NULL) {
-				if (pfkey_establish(p) == -1)
+				if (pfkey_establish(&p->auth_state,
+				    &p->auth_conf, session_localaddr(p),
+				    &p->conf.remote_addr) == -1)
 					log_peer_warnx(&p->conf,
 					    "pfkey setup failed");
 			}
@@ -950,9 +949,11 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 				reconfig = 1;
 				reconfpid = imsg_get_pid(&imsg);
 				if (imsg_get_data(&imsg, reason,
-				    sizeof(reason)) == 0 && reason[0] != '\0')
+				    sizeof(reason)) == 0 && reason[0] != '\0') {
+					reason[sizeof(reason) - 1] = '\0';
 					log_info("reload due to: %s",
 					    log_reason(reason));
+				}
 			}
 			break;
 		case IMSG_CTL_FIB_COUPLE:
@@ -992,12 +993,14 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 			else if (imsg_get_data(&imsg, &demote, sizeof(demote))
 			    == -1)
 				log_warn("wrong imsg len");
-			else
+			else {
+				demote.demote_group[
+				    sizeof(demote.demote_group) - 1] = '\0';
 				carp_demote_set(demote.demote_group,
 				    demote.level);
+			}
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by SE */
 			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
 			    -1)
 				log_warn("wrong imsg len");
@@ -1021,6 +1024,9 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 
 				/* redistribute list needs to be reloaded too */
 				kr_reload();
+
+				/* also remove old peers */
+				free_deleted_peers(conf);
 			}
 			reconfpending--;
 			break;
@@ -1040,19 +1046,27 @@ dispatch_imsg(struct imsgbuf *imsgbuf, int idx, struct bgpd_config *conf)
 				reconfpending = 3; /* expecting 2 DONE msg */
 			}
 			break;
-		case IMSG_SOCKET_CONN:
+		case IMSG_SOCKET_SETUP:
 			if (idx != PFD_PIPE_RTR) {
 				log_warnx("connect request not from RTR");
 			} else {
+				uint32_t rtrid = imsg_get_id(&imsg);
 				SIMPLEQ_FOREACH(r, &conf->rtrs, entry) {
-					if (imsg_get_id(&imsg) == r->id)
+					if (rtrid == r->id)
 						break;
 				}
 				if (r == NULL)
-					log_warnx("unknown rtr id %d",
-					    imsg_get_id(&imsg));
+					log_warnx("unknown rtr id %d", rtrid);
 				else
-					bgpd_rtr_connect(r);
+					bgpd_rtr_conn_setup(r);
+			}
+			break;
+		case IMSG_SOCKET_TEARDOWN:
+			if (idx != PFD_PIPE_RTR) {
+				log_warnx("connect request not from RTR");
+			} else {
+				uint32_t rtrid = imsg_get_id(&imsg);
+				bgpd_rtr_conn_teardown(rtrid);
 			}
 			break;
 		case IMSG_CTL_SHOW_RTR:
@@ -1149,7 +1163,7 @@ send_network(int type, struct network_config *net, struct filter_set_head *h)
 	/* networks that get deleted don't need to send the filter set */
 	if (type == IMSG_NETWORK_REMOVE)
 		return (0);
-	if (send_filterset(ibuf_rde, h) == -1)
+	if (imsg_send_filterset(ibuf_rde, h) == -1)
 		return (-1);
 	if (imsg_compose(ibuf_rde, IMSG_NETWORK_DONE, 0, 0, -1, NULL, 0) == -1)
 		return (-1);
@@ -1171,6 +1185,12 @@ bgpd_oknexthop(struct kroute_full *kf)
 
 	/* any other route is fine */
 	return (1);
+}
+
+int
+bgpd_has_bgpnh(void)
+{
+	return ((cflags & BGPD_FLAG_NEXTHOP_BGP) != 0);
 }
 
 int
@@ -1229,20 +1249,20 @@ set_pollfd(struct pollfd *pfd, struct imsgbuf *i)
 	}
 	pfd->fd = i->fd;
 	pfd->events = POLLIN;
-	if (i->w.queued > 0)
+	if (imsgbuf_queuelen(i) > 0)
 		pfd->events |= POLLOUT;
 }
 
 int
 handle_pollfd(struct pollfd *pfd, struct imsgbuf *i)
 {
-	ssize_t n;
+	int n;
 
 	if (i == NULL)
 		return (0);
 
 	if (pfd->revents & POLLOUT)
-		if (msgbuf_write(&i->w) <= 0 && errno != EAGAIN) {
+		if (imsgbuf_write(i) == -1) {
 			log_warn("imsg write error");
 			close(i->fd);
 			i->fd = -1;
@@ -1250,7 +1270,7 @@ handle_pollfd(struct pollfd *pfd, struct imsgbuf *i)
 		}
 
 	if (pfd->revents & POLLIN) {
-		if ((n = imsg_read(i)) == -1 && errno != EAGAIN) {
+		if ((n = imsgbuf_read(i)) == -1) {
 			log_warn("imsg read error");
 			close(i->fd);
 			i->fd = -1;
@@ -1276,29 +1296,23 @@ getsockpair(int pipe[2])
 		fatal("socketpair");
 
 	for (i = 0; i < 2; i++) {
-		for (bsize = MAX_SOCK_BUF; bsize >= 16 * 1024; bsize /= 2) {
-			if (setsockopt(pipe[i], SOL_SOCKET, SO_RCVBUF,
-			    &bsize, sizeof(bsize)) == -1) {
-				if (errno != ENOBUFS)
-					fatal("setsockopt(SO_RCVBUF, %d)",
-					    bsize);
-				log_warn("setsockopt(SO_RCVBUF, %d)", bsize);
-				continue;
-			}
-			break;
+		bsize = MAX_SOCK_BUF;
+		if (setsockopt(pipe[i], SOL_SOCKET, SO_RCVBUF,
+		    &bsize, sizeof(bsize)) == -1) {
+			if (errno != ENOBUFS)
+				fatal("setsockopt(SO_RCVBUF, %d)",
+				    bsize);
+			log_warn("setsockopt(SO_RCVBUF, %d)", bsize);
 		}
 	}
 	for (i = 0; i < 2; i++) {
-		for (bsize = MAX_SOCK_BUF; bsize >= 16 * 1024; bsize /= 2) {
-			if (setsockopt(pipe[i], SOL_SOCKET, SO_SNDBUF,
-			    &bsize, sizeof(bsize)) == -1) {
-				if (errno != ENOBUFS)
-					fatal("setsockopt(SO_SNDBUF, %d)",
-					    bsize);
-				log_warn("setsockopt(SO_SNDBUF, %d)", bsize);
-				continue;
-			}
-			break;
+		bsize = MAX_SOCK_BUF;
+		if (setsockopt(pipe[i], SOL_SOCKET, SO_SNDBUF,
+		    &bsize, sizeof(bsize)) == -1) {
+			if (errno != ENOBUFS)
+				fatal("setsockopt(SO_SNDBUF, %d)",
+				    bsize);
+			log_warn("setsockopt(SO_SNDBUF, %d)", bsize);
 		}
 	}
 }
@@ -1339,7 +1353,7 @@ imsg_send_sockets(struct imsgbuf *se, struct imsgbuf *rde, struct imsgbuf *rtr)
 }
 
 void
-bgpd_rtr_connect(struct rtr_config *r)
+bgpd_rtr_conn_setup(struct rtr_config *r)
 {
 	struct connect_elm *ce;
 	struct sockaddr *sa;
@@ -1357,23 +1371,55 @@ bgpd_rtr_connect(struct rtr_config *r)
 		log_warn("rtr %s", r->descr);
 		return;
 	}
-
+	ce->fd = -1;
 	ce->id = r->id;
+
+	if (pfkey_establish(&ce->auth_state, &r->auth,
+	    &r->local_addr, &r->remote_addr) == -1) {
+		log_warnx("rtr %s: pfkey setup failed", r->descr);
+		goto fail;
+	}
+
 	ce->fd = socket(aid2af(r->remote_addr.aid),
 	    SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_TCP);
 	if (ce->fd == -1) {
 		log_warn("rtr %s", r->descr);
-		free(ce);
-		return;
+		goto fail;
+	}
+
+	switch (r->remote_addr.aid) {
+	case AID_INET:
+		if (setsockopt(ce->fd, IPPROTO_IP, IP_TOS, &pre, sizeof(pre)) ==
+		    -1) {
+			log_warn("rtr %s: setsockopt IP_TOS", r->descr);
+			goto fail;
+		}
+		break;
+	case AID_INET6:
+		if (setsockopt(ce->fd, IPPROTO_IPV6, IPV6_TCLASS, &pre,
+		    sizeof(pre)) == -1) {
+			log_warn("rtr %s: setsockopt IPV6_TCLASS", r->descr);
+			goto fail;
+		}
+		break;
+	}
+
+	if (setsockopt(ce->fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+	    sizeof(nodelay)) == -1) {
+		log_warn("rtr %s: setsockopt TCP_NODELAY", r->descr);
+		goto fail;
+	}
+
+	if (tcp_md5_set(ce->fd, &r->auth, &r->remote_addr) == -1) {
+		log_warn("rtr %s: setting md5sig", r->descr);
+		goto fail;
 	}
 
 	if ((sa = addr2sa(&r->local_addr, 0, &len)) != NULL) {
 		if (bind(ce->fd, sa, len) == -1) {
 			log_warn("rtr %s: bind to %s", r->descr,
 			    log_addr(&r->local_addr));
-			close(ce->fd);
-			free(ce);
-			return;
+			goto fail;
 		}
 	}
 
@@ -1382,44 +1428,26 @@ bgpd_rtr_connect(struct rtr_config *r)
 		if (errno != EINPROGRESS) {
 			log_warn("rtr %s: connect to %s:%u", r->descr,
 			    log_addr(&r->remote_addr), r->remote_port);
-			close(ce->fd);
-			free(ce);
-			return;
+			goto fail;
 		}
 		TAILQ_INSERT_TAIL(&connect_queue, ce, entry);
 		connect_cnt++;
 		return;
 	}
 
-	switch (r->remote_addr.aid) {
-	case AID_INET:
-		if (setsockopt(ce->fd, IPPROTO_IP, IP_TOS, &pre, sizeof(pre)) ==
-		    -1) {
-			log_warn("rtr %s: setsockopt IP_TOS", r->descr);
-			return;
-		}
-		break;
-	case AID_INET6:
-		if (setsockopt(ce->fd, IPPROTO_IPV6, IPV6_TCLASS, &pre,
-		    sizeof(pre)) == -1) {
-			log_warn("rtr %s: setsockopt IP_TOS", r->descr);
-			return;
-		}
-		break;
-	}
+	imsg_compose(ibuf_rtr, IMSG_SOCKET_SETUP, ce->id, 0, ce->fd, NULL, 0);
+	TAILQ_INSERT_TAIL(&socket_queue, ce, entry);
+	return;
 
-	if (setsockopt(ce->fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
-	    sizeof(nodelay)) == -1) {
-		log_warn("rtr %s: setsockopt TCP_NODELAY", r->descr);
-		return;
-	}
-
-	imsg_compose(ibuf_rtr, IMSG_SOCKET_CONN, ce->id, 0, ce->fd, NULL, 0);
+ fail:
+	if (ce->fd != -1)
+		close(ce->fd);
+	pfkey_remove(&ce->auth_state);
 	free(ce);
 }
 
 void
-bgpd_rtr_connect_done(int fd, struct bgpd_config *conf)
+bgpd_rtr_conn_setup_done(int fd, struct bgpd_config *conf)
 {
 	struct rtr_config *r;
 	struct connect_elm *ce;
@@ -1458,11 +1486,27 @@ bgpd_rtr_connect_done(int fd, struct bgpd_config *conf)
 		goto fail;
 	}
 
-	imsg_compose(ibuf_rtr, IMSG_SOCKET_CONN, ce->id, 0, ce->fd, NULL, 0);
-	free(ce);
+	imsg_compose(ibuf_rtr, IMSG_SOCKET_SETUP, ce->id, 0, ce->fd, NULL, 0);
+	TAILQ_INSERT_TAIL(&socket_queue, ce, entry);
 	return;
 
 fail:
 	close(fd);
+	pfkey_remove(&ce->auth_state);
 	free(ce);
+}
+
+void
+bgpd_rtr_conn_teardown(uint32_t id)
+{
+	struct connect_elm *ce;
+
+	TAILQ_FOREACH(ce, &socket_queue, entry) {
+		if (ce->id == id) {
+			pfkey_remove(&ce->auth_state);
+			TAILQ_REMOVE(&socket_queue, ce, entry);
+			free(ce);
+			return;
+		}
+	}
 }

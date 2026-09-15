@@ -1,4 +1,4 @@
-/*	$OpenBSD: frontend.c,v 1.49 2024/07/02 17:41:27 florian Exp $	*/
+/*	$OpenBSD: frontend.c,v 1.59 2026/07/29 11:06:18 claudio Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -110,7 +110,7 @@ struct ra_iface {
 	int				 removed;
 	int				 link_state;
 	int				 prefix_count;
-	int				 ltime_decaying;
+	int				 has_autoconf_prefix;
 	size_t				 datalen;
 	uint8_t				 data[RA_MAX_SIZE];
 };
@@ -151,11 +151,12 @@ void			 unref_icmp6ev(struct ra_iface *);
 void			 set_icmp6sock(int, int);
 void			 add_new_prefix_to_ra_iface(struct ra_iface *r,
 			    struct in6_addr *, int, struct ra_prefix_conf *,
-			    uint32_t, uint32_t);
+			    int, uint32_t, uint32_t);
 void			 free_ra_iface(struct ra_iface *);
 int			 in6_mask2prefixlen(struct in6_addr *);
 void			 get_interface_prefixes(struct ra_iface *,
 			     struct ra_prefix_conf *, struct ifaddrs *);
+uint32_t		 calc_autoconf_ltime(time_t, uint32_t, uint32_t);
 int			 build_packet(struct ra_iface *);
 void			 build_leaving_packet(struct ra_iface *);
 void			 ra_output(struct ra_iface *, struct sockaddr_in6 *);
@@ -240,7 +241,9 @@ frontend(int debug, int verbose)
 	/* Setup pipe and event handler to the parent process. */
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = frontend_dispatch_main;
 	iev_main->events = EV_READ;
 	event_set(&iev_main->ev, iev_main->ibuf.fd, iev_main->events,
@@ -273,11 +276,11 @@ __dead void
 frontend_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_write(&iev_engine->ibuf.w);
-	msgbuf_clear(&iev_engine->ibuf.w);
+	imsgbuf_write(&iev_engine->ibuf);
+	imsgbuf_clear(&iev_engine->ibuf);
 	close(iev_engine->ibuf.fd);
-	msgbuf_write(&iev_main->ibuf.w);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_write(&iev_main->ibuf);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	config_clear(frontend_conf);
@@ -319,21 +322,23 @@ frontend_dispatch_main(int fd, short event, void *bula)
 	int				 n, shut = 0, icmp6sock, rdomain;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -355,7 +360,8 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			if (iev_engine == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_engine->ibuf, fd);
+			if (imsgbuf_init(&iev_engine->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_engine->handler = frontend_dispatch_engine;
 			iev_engine->events = EV_READ;
 
@@ -390,6 +396,10 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(ra_iface_conf, imsg.data, sizeof(struct
 			    ra_iface_conf));
+			if (ra_iface_conf->name[IF_NAMESIZE - 1] != '\0')
+				fatalx("%s: IMSG_RECONF_RA_IFACE invalid name",
+				    __func__);
+
 			ra_iface_conf->autoprefix = NULL;
 			SIMPLEQ_INIT(&ra_iface_conf->ra_prefix_list);
 			SIMPLEQ_INIT(&ra_iface_conf->ra_options.ra_rdnss_list);
@@ -448,6 +458,10 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(ra_dnssl_conf, imsg.data, sizeof(struct
 			    ra_dnssl_conf));
+			if (ra_dnssl_conf->search[MAX_SEARCH - 1] != '\0')
+				fatalx("%s: IMSG_RECONF_RA_DNSSL invalid "
+				    "search list", __func__);
+
 			SIMPLEQ_INSERT_TAIL(&ra_options->ra_dnssl_list,
 			    ra_dnssl_conf, entry);
 			break;
@@ -532,21 +546,23 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 	int			 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -964,7 +980,7 @@ merge_ra_interfaces(void)
 		    entry) {
 			add_new_prefix_to_ra_iface(ra_iface,
 			    &ra_prefix_conf->prefix,
-			    ra_prefix_conf->prefixlen, ra_prefix_conf,
+			    ra_prefix_conf->prefixlen, ra_prefix_conf, 0,
 			    ND6_INFINITE_LIFETIME, ND6_INFINITE_LIFETIME);
 		}
 
@@ -1031,7 +1047,7 @@ get_interface_prefixes(struct ra_iface *ra_iface, struct ra_prefix_conf
 	struct in6_ifreq	 ifr6;
 	struct ifaddrs		*ifa;
 	struct sockaddr_in6	*sin6;
-	uint32_t		 decaying_vltime, decaying_pltime;
+	uint32_t		 if_vltime, if_pltime;
 	int			 prefixlen;
 
 	for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
@@ -1051,8 +1067,8 @@ get_interface_prefixes(struct ra_iface *ra_iface, struct ra_prefix_conf
 		strlcpy(ifr6.ifr_name, ra_iface->name, sizeof(ifr6.ifr_name));
 		memcpy(&ifr6.ifr_addr, sin6, sizeof(ifr6.ifr_addr));
 
-		decaying_vltime = ND6_INFINITE_LIFETIME;
-		decaying_pltime = ND6_INFINITE_LIFETIME;
+		if_vltime = ND6_INFINITE_LIFETIME;
+		if_pltime = ND6_INFINITE_LIFETIME;
 
 		if (ioctl(ioctlsock, SIOCGIFALIFETIME_IN6,
 		    (caddr_t)&ifr6) != -1) {
@@ -1060,9 +1076,9 @@ get_interface_prefixes(struct ra_iface *ra_iface, struct ra_prefix_conf
 
 			lifetime = &ifr6.ifr_ifru.ifru_lifetime;
 			if (lifetime->ia6t_preferred)
-				decaying_pltime = lifetime->ia6t_preferred;
+				if_pltime = lifetime->ia6t_preferred;
 			if (lifetime->ia6t_expire)
-				decaying_vltime = lifetime->ia6t_expire;
+				if_vltime = lifetime->ia6t_expire;
 		}
 
 		memset(&ifr6, 0, sizeof(ifr6));
@@ -1081,8 +1097,7 @@ get_interface_prefixes(struct ra_iface *ra_iface, struct ra_prefix_conf
 		mask_prefix(&sin6->sin6_addr, prefixlen);
 
 		add_new_prefix_to_ra_iface(ra_iface, &sin6->sin6_addr,
-		    prefixlen, autoprefix_conf, decaying_vltime,
-		    decaying_pltime);
+		    prefixlen, autoprefix_conf, 1, if_vltime, if_pltime);
 	}
 }
 
@@ -1103,41 +1118,30 @@ find_ra_prefix_conf(struct ra_prefix_conf_head* head, struct in6_addr *prefix,
 
 void
 add_new_prefix_to_ra_iface(struct ra_iface *ra_iface, struct in6_addr *addr,
-    int prefixlen, struct ra_prefix_conf *ra_prefix_conf,
-    uint32_t decaying_vltime, uint32_t decaying_pltime)
+    int prefixlen, struct ra_prefix_conf *ra_prefix_conf, int autoconf,
+    uint32_t if_vltime, uint32_t if_pltime)
 {
 	struct ra_prefix_conf	*new_ra_prefix_conf;
 
 	if ((new_ra_prefix_conf = find_ra_prefix_conf(&ra_iface->prefixes, addr,
 	    prefixlen)) != NULL) {
-		if (decaying_vltime != ND6_INFINITE_LIFETIME ||
-		    decaying_pltime != ND6_INFINITE_LIFETIME) {
-			ra_iface->ltime_decaying = 1;
-			new_ra_prefix_conf->ltime_decaying = 0;
-			if (decaying_vltime != ND6_INFINITE_LIFETIME) {
-				new_ra_prefix_conf->vltime = decaying_vltime;
-				new_ra_prefix_conf->ltime_decaying |=
-				    VLTIME_DECAYING;
-			}
-			if (decaying_pltime != ND6_INFINITE_LIFETIME) {
-				new_ra_prefix_conf->pltime = decaying_pltime;
-				new_ra_prefix_conf->ltime_decaying |=
-				    PLTIME_DECAYING;
-			}
-		} else if (new_ra_prefix_conf->ltime_decaying) {
+		int changed = new_ra_prefix_conf->autoconf != autoconf;
+
+		new_ra_prefix_conf->autoconf = autoconf;
+		new_ra_prefix_conf->if_vltime = if_vltime;
+		new_ra_prefix_conf->if_pltime = if_pltime;
+
+		if (changed) {
 			struct ra_prefix_conf *pc;
 
-			new_ra_prefix_conf->ltime_decaying = 0;
-			ra_iface->ltime_decaying = 0;
+			ra_iface->has_autoconf_prefix = 0;
 			SIMPLEQ_FOREACH(pc, &ra_iface->prefixes, entry) {
-				if (pc->ltime_decaying) {
-					ra_iface->ltime_decaying = 1;
+				if (pc->autoconf) {
+					ra_iface->has_autoconf_prefix = 1;
 					break;
 				}
 			}
-		} else
-			log_debug("ignoring duplicate %s/%d prefix",
-			    in6_to_str(addr), prefixlen);
+		}
 		return;
 	}
 
@@ -1149,22 +1153,34 @@ add_new_prefix_to_ra_iface(struct ra_iface *ra_iface, struct in6_addr *addr,
 	new_ra_prefix_conf->prefixlen = prefixlen;
 	new_ra_prefix_conf->vltime = ra_prefix_conf->vltime;
 	new_ra_prefix_conf->pltime = ra_prefix_conf->pltime;
-	if (decaying_vltime != ND6_INFINITE_LIFETIME ||
-	    decaying_pltime != ND6_INFINITE_LIFETIME) {
-		ra_iface->ltime_decaying = 1;
-		if (decaying_vltime != ND6_INFINITE_LIFETIME) {
-			new_ra_prefix_conf->vltime = decaying_vltime;
-			new_ra_prefix_conf->ltime_decaying |= VLTIME_DECAYING;
-		}
-		if (decaying_pltime != ND6_INFINITE_LIFETIME) {
-			new_ra_prefix_conf->pltime = decaying_pltime;
-			new_ra_prefix_conf->ltime_decaying |= PLTIME_DECAYING;
-		}
-	}
+	new_ra_prefix_conf->autoconf = autoconf;
+	if (autoconf)
+		ra_iface->has_autoconf_prefix = 1;
+	new_ra_prefix_conf->if_vltime = if_vltime;
+	new_ra_prefix_conf->if_pltime = if_pltime;
 	new_ra_prefix_conf->aflag = ra_prefix_conf->aflag;
 	new_ra_prefix_conf->lflag = ra_prefix_conf->lflag;
 	SIMPLEQ_INSERT_TAIL(&ra_iface->prefixes, new_ra_prefix_conf, entry);
 	ra_iface->prefix_count++;
+}
+
+uint32_t
+calc_autoconf_ltime(time_t t, uint32_t conf_ltime, uint32_t if_ltime)
+{
+	uint32_t ltime;
+
+	if (if_ltime == ND6_INFINITE_LIFETIME)
+		return conf_ltime;
+
+	if (if_ltime > t)
+		ltime = if_ltime - t;
+	else
+		ltime = 0;
+
+	if (ltime < conf_ltime)
+		return ltime;
+	else
+		return conf_ltime;
 }
 
 int
@@ -1279,16 +1295,15 @@ build_packet(struct ra_iface *ra_iface)
 			ndopt_pi->nd_opt_pi_flags_reserved |=
 			    ND_OPT_PI_FLAG_AUTO;
 
-		if (ra_prefix_conf->ltime_decaying & VLTIME_DECAYING)
-			vltime = ra_prefix_conf->vltime < t ? 0 :
-			    ra_prefix_conf->vltime - t;
-		else
-			vltime = ra_prefix_conf->vltime;
-		if (ra_prefix_conf->ltime_decaying & PLTIME_DECAYING)
-			pltime = ra_prefix_conf->pltime < t ? 0 :
-			    ra_prefix_conf->pltime - t;
-		else
+		if (ra_prefix_conf->autoconf) {
+			pltime = calc_autoconf_ltime(t,
+			    ra_prefix_conf->pltime, ra_prefix_conf->if_pltime);
+			vltime = calc_autoconf_ltime(t,
+			    ra_prefix_conf->vltime, ra_prefix_conf->if_vltime);
+		} else {
 			pltime = ra_prefix_conf->pltime;
+			vltime = ra_prefix_conf->vltime;
+		}
 
 		ndopt_pi->nd_opt_pi_valid_time = htonl(vltime);
 		ndopt_pi->nd_opt_pi_preferred_time = htonl(pltime);
@@ -1337,7 +1352,7 @@ build_packet(struct ra_iface *ra_iface)
 			*p++ = '\0'; /* last dot */
 		}
 		/* zero pad */
-		while (((uintptr_t)p) % 8 != 0)
+		while (((ptrdiff_t)(p - buf)) % 8 != 0)
 			*p++ = '\0';
 	}
 
@@ -1415,7 +1430,7 @@ ra_output(struct ra_iface *ra_iface, struct sockaddr_in6 *to)
 	if (!LINK_STATE_IS_UP(ra_iface->link_state))
 		return;
 
-	if (ra_iface->ltime_decaying)
+	if (ra_iface->has_autoconf_prefix)
 		/* update vltime & pltime */
 		build_packet(ra_iface);
 

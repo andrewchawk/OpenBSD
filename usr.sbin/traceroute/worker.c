@@ -1,4 +1,4 @@
-/*	$OpenBSD: worker.c,v 1.8 2021/09/03 09:13:00 florian Exp $	*/
+/*	$OpenBSD: worker.c,v 1.10 2025/12/06 09:48:30 phessler Exp $	*/
 /*	$NetBSD: traceroute.c,v 1.10 1995/05/21 15:50:45 mycroft Exp $	*/
 
 /*
@@ -998,6 +998,7 @@ map_tos(char *s, int *val)
 		{ "netcontrol",		IPTOS_PREC_NETCONTROL },
 		{ "reliability",	IPTOS_RELIABILITY },
 		{ "throughput",		IPTOS_THROUGHPUT },
+		{ "va",			IPTOS_DSCP_VA },
 		{ NULL,			-1 },
 	};
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_witness.c,v 1.53 2024/06/03 14:34:19 claudio Exp $	*/
+/*	$OpenBSD: subr_witness.c,v 1.59 2026/03/23 08:37:35 jsg Exp $	*/
 
 /*-
  * Copyright (c) 2008 Isilon Systems, Inc.
@@ -333,6 +333,8 @@ static struct lock_instance	*find_instance(struct lock_list_entry *list,
 static int	isitmychild(struct witness *parent, struct witness *child);
 static int	isitmydescendant(struct witness *parent, struct witness *child);
 static void	itismychild(struct witness *parent, struct witness *child);
+static int	islockmychild(struct lock_object *parent,
+		    struct lock_object *child);
 #ifdef DDB
 static void	db_witness_add_fullgraph(struct witness *parent);
 static void	witness_ddb_compute_levels(void);
@@ -593,6 +595,8 @@ witness_init(struct lock_object *lock, const struct lock_type *type)
 			    __func__);
 	} else
 		lock->lo_witness = enroll(type, lock->lo_name, class);
+
+	lock->lo_relative = NULL;
 }
 
 static inline int
@@ -766,7 +770,6 @@ witness_checkorder(struct lock_object *lock, int flags,
 	struct lock_list_entry *lock_list, *lle;
 	struct lock_instance *lock1, *lock2, *plock;
 	struct lock_class *class, *iclass;
-	struct proc *p;
 	struct witness *w, *w1;
 	int i, j, s;
 
@@ -792,9 +795,9 @@ witness_checkorder(struct lock_object *lock, int flags,
 		w = lock->lo_witness =
 		    enroll(lock->lo_type, lock->lo_name, class);
 
-	p = curproc;
-
 	if (class->lc_flags & LC_SLEEPLOCK) {
+		struct proc *p;
+
 		/*
 		 * Since spin locks include a critical section, this check
 		 * implicitly enforces a lock order of all sleep locks before
@@ -811,6 +814,9 @@ witness_checkorder(struct lock_object *lock, int flags,
 		 * If this is the first lock acquired then just return as
 		 * no order checking is needed.
 		 */
+		p = curproc;
+		if (p == NULL)
+			return;
 		lock_list = p->p_sleeplocks;
 		if (lock_list == NULL || lock_list->ll_count == 0)
 			return;
@@ -907,6 +913,7 @@ witness_checkorder(struct lock_object *lock, int flags,
 	if (w1 == w) {
 		i = w->w_index;
 		if (!(lock->lo_flags & LO_DUPOK) && !(flags & LOP_DUPOK) &&
+		    !islockmychild(plock->li_lock, lock) &&
 		    !(w_rmatrix[i][i] & WITNESS_REVERSAL)) {
 			w_rmatrix[i][i] |= WITNESS_REVERSAL;
 			w->w_reversed = 1;
@@ -989,7 +996,7 @@ witness_checkorder(struct lock_object *lock, int flags,
 				goto reversal;
 
 			/*
-			 * Check the lock order hierarchy for a reveresal.
+			 * Check the lock order hierarchy for a reversal.
 			 */
 			if (!isitmydescendant(w, w1))
 				continue;
@@ -1097,7 +1104,6 @@ witness_lock(struct lock_object *lock, int flags)
 {
 	struct lock_list_entry **lock_list, *lle;
 	struct lock_instance *instance;
-	struct proc *p;
 	struct witness *w;
 	int s;
 
@@ -1110,12 +1116,15 @@ witness_lock(struct lock_object *lock, int flags)
 		w = lock->lo_witness =
 		    enroll(lock->lo_type, lock->lo_name, LOCK_CLASS(lock));
 
-	p = curproc;
-
 	/* Determine lock list for this lock. */
-	if (LOCK_CLASS(lock)->lc_flags & LC_SLEEPLOCK)
+	if (LOCK_CLASS(lock)->lc_flags & LC_SLEEPLOCK) {
+		struct proc *p;
+
+		p = curproc;
+		if (p == NULL)
+			return;
 		lock_list = &p->p_sleeplocks;
-	else
+	} else
 		lock_list = &witness_cpu[cpu_number()].wc_spinlocks;
 
 	s = splhigh();
@@ -1243,20 +1252,23 @@ witness_unlock(struct lock_object *lock, int flags)
 	struct lock_list_entry **lock_list, *lle;
 	struct lock_instance *instance;
 	struct lock_class *class;
-	struct proc *p;
 	int i, j;
 	int s;
 
 	if (witness_cold || lock->lo_witness == NULL ||
 	    panicstr != NULL || db_active)
 		return;
-	p = curproc;
 	class = LOCK_CLASS(lock);
 
 	/* Find lock instance associated with this lock. */
-	if (class->lc_flags & LC_SLEEPLOCK)
+	if (class->lc_flags & LC_SLEEPLOCK) {
+		struct proc *p;
+
+		p = curproc;
+		if (p == NULL)
+			return;
 		lock_list = &p->p_sleeplocks;
-	else
+	} else
 		lock_list = &witness_cpu[cpu_number()].wc_spinlocks;
 
 	s = splhigh();
@@ -1340,6 +1352,37 @@ found:
 	}
 out:
 	splx(s);
+}
+
+/*
+ * Set the permitted parent/child relation for the given lock.
+ * This allows the nesting of two locks that are of the same type.
+ *
+ * Once a lock relation has been set, the caller is not allowed
+ * to change the type (parent/child), as doing so is indicative of a bug.
+ *
+ * This function is allowed only when the caller has exclusive access
+ * to @lock.
+ */
+void
+witness_setrelative(struct lock_object *lock, struct lock_object *relative,
+    int is_parent)
+{
+	if (witness_watch < 0 || panicstr != NULL || db_active)
+		return;
+
+	mtx_enter(&w_mtx);
+	if (is_parent) {
+		KASSERT(lock->lo_relative == NULL ||
+		    (lock->lo_flags & LO_HASPARENT));
+		lock->lo_flags |= LO_HASPARENT;
+	} else {
+		KASSERT(lock->lo_relative == NULL ||
+		    !(lock->lo_flags & LO_HASPARENT));
+		lock->lo_flags &= ~LO_HASPARENT;
+	}
+	lock->lo_relative = relative;
+	mtx_leave(&w_mtx);
 }
 
 void
@@ -1634,7 +1677,7 @@ _isitmyx(struct witness *w1, struct witness *w2, int rmask, const char *fname)
 	if (!((WITNESS_ATOD(r1) == r2 && WITNESS_DTOA(r2) == r1) ||
 	    (WITNESS_DTOA(r1) == r2 && WITNESS_ATOD(r2) == r1))) {
 		/* Don't squawk if we're potentially racing with an update. */
-		if (w_mtx.mtx_owner != curcpu())
+		if (mtx_owner(&w_mtx) != mtx_curcpu())
 			return (0);
 		printf("witness: %s: rmatrix mismatch between %s (index %d) "
 		    "and %s (index %d): w_rmatrix[%d][%d] == %x but "
@@ -1670,6 +1713,21 @@ isitmydescendant(struct witness *ancestor, struct witness *descendant)
 
 	return (_isitmyx(ancestor, descendant, WITNESS_ANCESTOR_MASK,
 	    __func__));
+}
+
+/*
+ * Checks if the @parent/@child relation is allowed.
+ */
+static int
+islockmychild(struct lock_object *parent, struct lock_object *child)
+{
+	if (!(parent->lo_flags & LO_HASPARENT) &&
+	    parent->lo_relative == child)
+		return (1);
+	if ((child->lo_flags & LO_HASPARENT) &&
+	    child->lo_relative == parent)
+		return (1);
+	return (0);
 }
 
 static struct witness *

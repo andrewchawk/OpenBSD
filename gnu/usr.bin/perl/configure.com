@@ -1,3 +1,4 @@
+
 $! OpenVMS configuration procedure for Perl -- do not attempt to run under DOS
 $ sav_ver = 'F$VERIFY(0)'
 $ on control_y then goto clean_up
@@ -2199,7 +2200,6 @@ $     echo4 "...and architecture name already has -ld."
 $   ENDIF
 $ ENDIF
 $!
-$ bool_dflt = "n"
 $ vms_prefix = "perl_root"
 $ vms_prefixup = F$EDIT(vms_prefix,"UPCASE")
 $!
@@ -4050,8 +4050,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  long double x = NaN;
-$ WS "  return isnanl(x) ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  long double x = NaN;"
+$ WS "  return isnanl(x) ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "isnanl"
@@ -4065,8 +4065,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  long long x = llrint(1.5);
-$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  long long x = llrint(1.5);"
+$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "llrint"
@@ -4080,8 +4080,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  long long x = llrintl(1.5);
-$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  long long x = llrintl(1.5);"
+$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "llrintl"
@@ -4095,8 +4095,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  long long x = llround(1.5);
-$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  long long x = llround(1.5);"
+$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "llround"
@@ -4110,8 +4110,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  long long x = llroundl(1.5);
-$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  long long x = llroundl(1.5);"
+$ WS "  return x == 2 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "llroundl"
@@ -4125,8 +4125,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  double x = llroundl(1.5);
-$ WS "  return x == 2.0 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  double x = llroundl(1.5);"
+$ WS "  return x == 2.0 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "nearbyint"
@@ -4140,8 +4140,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  double x = round(1.5);
-$ WS "  return x == 2.0 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  double x = round(1.5);"
+$ WS "  return x == 2.0 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "round"
@@ -4155,8 +4155,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  double x = scalbn(1.0, 3);
-$ WS "  return x == 8.0 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  double x = scalbn(1.0, 3);"
+$ WS "  return x == 8.0 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "scalbn"
@@ -4170,8 +4170,8 @@ $ WS "#include <stdlib.h>"
 $ WS "#include <math.h>"
 $ WS "int main()"
 $ WS "{"
-$ WS "  long double x = scalbn(1.0, 3);
-$ WS "  return x == 8.0 ? EXIT_SUCCESS : EXIT_FAILURE;
+$ WS "  long double x = scalbn(1.0, 3);"
+$ WS "  return x == 8.0 ? EXIT_SUCCESS : EXIT_FAILURE;"
 $ WS "}"
 $ CS
 $ tmp = "scalbnl"
@@ -5091,9 +5091,9 @@ $ OS
 $ WS "#include <sys/stat.h>"
 $ WS "#include <stdio.h>"
 $ WS "#if defined(__DECC) || defined(__DECCXX)"
-$ WS "#include <stdlib.h>
+$ WS "#include <stdlib.h>"
 $ WS "#endif"
-$ WS "int main() {
+$ WS "int main() {"
 $ WS "#''uselargefiles' _LARGEFILE"
 $ WS "#ifdef _LARGEFILE"
 $ WS "    printf(""%d\n"", sizeof(__ino64_t));"
@@ -5826,7 +5826,7 @@ $ WC "PERL_CONFIG_SH='true'"
 $ WC "_a='" + lib_ext + "'"
 $ WC "_exe='" + exe_ext + "'"
 $ WC "_o='" + obj_ext + "'"
-$ WC "afs='undef'"
+$ WC "afs='false'"
 $ WC "afsroot='/afs'"
 $ WC "alignbytes='" + alignbytes + "'"
 $ WC "aphostname='write sys$output f$edit(f$getsyi(\""SCSNODE\""),\""TRIM,LOWERCASE\"")'"
@@ -6010,6 +6010,7 @@ $ WC "d_fd_set='" + d_fd_set + "'"
 $ WC "d_fd_macros='define'"
 $ WC "d_fdclose='undef'"
 $ WC "d_fdim='" + d_fdim + "'"
+$ WC "d_fdopendir='undef'"
 $ WC "d_fds_bits='define'"
 $ WC "d_fegetround='undef'"
 $ WC "d_ffs='undef'"
@@ -6215,6 +6216,10 @@ $ WC "d_oldpthreads='" + d_oldpthreads + "'"
 $ WC "d_oldsock='undef'"
 $ WC "d_open3='define'"
 $ WC "d_openat='undef'"
+$ WC "d_perl_lc_all_category_positions_init='define'"
+$ WC "d_perl_lc_all_separator='undef'"
+$ WC "d_perl_lc_all_uses_name_value_pairs='undef'"
+$ WC "perl_lc_all_category_positions_init='{ 0, 1, 5, 2, 3, 4 }'"
 $ WC "d_unlinkat='undef'"
 $ WC "d_renameat='undef'"
 $ WC "d_linkat='undef'"
@@ -6480,7 +6485,7 @@ $ WC "freetype='void'"
 $ WC "full_ar='" + "'"
 $ WC "full_csh='" + " '"
 $ WC "full_sed='_NLA0:'"
-$ WC "gidformat='lu'"
+$ WC "gidformat='""lu""'"
 $ WC "gidsign='1'"
 $ WC "gidsize='4'"
 $ WC "gidtype='" + gidtype + "'"
@@ -6679,6 +6684,8 @@ $ WC "package='" + package + "'"
 $ WC "pager='" + pager + "'"
 $ WC "patchlevel='" + patchlevel + "'"
 $ WC "path_sep='|'"
+$ WC "perl_lc_all_category_positions_init='undef'"
+$ WC "perl_lc_all_separator='undef'"
 $ WC "perl_root='" + perl_root + "'" ! VMS specific $trnlnm()
 $ WC "perladmin='" + perladmin + "'"
 $ WC "perllibs='" + perllibs + "'"
@@ -6796,7 +6803,7 @@ $ WC "u64size='" + u64size + "'"
 $ WC "u64type='" + u64type + "'"
 $ WC "u8size='" + u8size + "'"
 $ WC "u8type='" + u8type + "'"
-$ WC "uidformat='lu'"
+$ WC "uidformat='""lu""'"
 $ WC "uidsign='1'"
 $ WC "uidsize='4'"
 $ WC "uidtype='" + uidtype + "'"

@@ -1,16 +1,57 @@
-#	$OpenBSD: Makefile,v 1.34 2024/02/22 12:49:42 job Exp $
+#	$OpenBSD: Makefile,v 1.41 2026/06/22 21:25:44 job Exp $
 
 PROG=	rpki-client
-SRCS=	as.c aspa.c cert.c cms.c constraints.c crl.c encoding.c filemode.c \
-	gbr.c geofeed.c http.c io.c ip.c json.c main.c mft.c mkdir.c ometric.c \
-	output.c output-bgpd.c output-bird.c output-csv.c output-json.c \
-	output-ometric.c parser.c print.c repo.c rfc3779.c roa.c \
-	rrdp.c rrdp_delta.c rrdp_notification.c rrdp_snapshot.c rrdp_util.c \
-	rsc.c rsync.c spl.c tak.c tal.c validate.c x509.c
+
+SRCS+=	as.c
+SRCS+=	asn1_bit_string.c
+SRCS+=	aspa.c
+SRCS+=	ccr.c
+SRCS+=	cert.c
+SRCS+=	cms.c
+SRCS+=	constraints.c
+SRCS+=	crl.c
+SRCS+=	encoding.c
+SRCS+=	filemode.c
+SRCS+=	http.c
+SRCS+=	io.c
+SRCS+=	ip.c
+SRCS+=	json.c
+SRCS+=	main.c
+SRCS+=	mft.c
+SRCS+=	mkdir.c
+SRCS+=	nca.c
+SRCS+=	ometric.c
+SRCS+=	output-bgpd.c
+SRCS+=	output-bird.c
+SRCS+=	output-csv.c
+SRCS+=	output-json.c
+SRCS+=	output-ometric.c
+SRCS+=	output.c
+SRCS+=	parser.c
+SRCS+=	print.c
+SRCS+=	repo.c
+SRCS+=	rfc3779.c
+SRCS+=	roa.c
+SRCS+=	rrdp.c
+SRCS+=	rrdp_delta.c
+SRCS+=	rrdp_notification.c
+SRCS+=	rrdp_snapshot.c
+SRCS+=	rrdp_util.c
+SRCS+=	rsc.c
+SRCS+=	rsync.c
+SRCS+=	spl.c
+SRCS+=	tak.c
+SRCS+=	tal.c
+SRCS+=	validate.c
+SRCS+=	x509.c
+
 MAN=	rpki-client.8
 
 LDADD+= -lexpat -ltls -lssl -lcrypto -lutil -lz
 DPADD+= ${LIBEXPAT} ${LIBTLS} ${LIBSSL} ${LIBCRYPTO} ${LIBUTIL} ${LIBZ}
+
+LDADD+= -lpthread
+DPADD+= ${LIBPTHREAD}
 
 CFLAGS+= -Wall -I${.CURDIR}
 CFLAGS+= -Wstrict-prototypes -Wmissing-prototypes

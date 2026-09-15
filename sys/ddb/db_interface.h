@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_interface.h,v 1.27 2024/02/03 18:51:58 beck Exp $	*/
+/*	$OpenBSD: db_interface.h,v 1.29 2026/02/02 15:20:51 claudio Exp $	*/
 /*	$NetBSD: db_interface.h,v 1.1 1996/02/05 01:57:03 christos Exp $	*/
 
 /*
@@ -41,6 +41,7 @@ vaddr_t db_disasm(vaddr_t, int);
 
 /* kern/kern_proc.c */
 void db_kill_cmd(db_expr_t, int, db_expr_t, char *);
+void db_stop_cmd(db_expr_t, int, db_expr_t, char *);
 void db_show_all_procs(db_expr_t, int, db_expr_t, char *);
 
 /* kern/kern_clockintr.c */
@@ -61,6 +62,8 @@ void db_show_all_pools(db_expr_t, int, db_expr_t, char *);
 
 /* kern/uipc_mbuf.c */
 void m_print(void *, int (*)(const char *, ...));
+void m_print_chain(void *, int, int (*)(const char *, ...));
+void m_print_packet(void *, int, int (*)(const char *, ...));
 
 /* kern/uipc_socket.c */
 void so_print(void *, int (*)(const char *, ...));

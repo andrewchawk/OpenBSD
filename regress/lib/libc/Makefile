@@ -1,26 +1,27 @@
-#	$OpenBSD: Makefile,v 1.59 2024/07/14 09:48:48 jca Exp $
+#	$OpenBSD: Makefile,v 1.65 2026/08/31 15:17:51 deraadt Exp $
 
 SUBDIR+= _setjmp
 SUBDIR+= alloca arc4random-fork atexit
 SUBDIR+= basename
 SUBDIR+= cephes cxa-atexit
 SUBDIR+= db dirname
-SUBDIR+= elf_aux_info
+SUBDIR+= elf_aux_info getexecpath
 SUBDIR+= env explicit_bzero
-SUBDIR+= ffs fmemopen fnmatch fpclassify fread
+SUBDIR+= ffs fmemopen fnmatch fpclassify fread freeaddrinfo
 SUBDIR+= gcvt getaddrinfo getcap getopt getopt_long glob
+SUBDIR+= hash
 SUBDIR+= hsearch
-SUBDIR+= ieeefp ifnameindex
+SUBDIR+= ieeefp ifnameindex illumos
 SUBDIR+= ldexp locale longjmp
 SUBDIR+= malloc mkstemp modf
 SUBDIR+= netdb
-SUBDIR+= open_memstream orientation
+SUBDIR+= open_memstream orientation open_wmemstream
 SUBDIR+= popen printf
 SUBDIR+= qsort
 SUBDIR+= regex
-SUBDIR+= setjmp setjmp-signal sigsetjmp sigthr sleep sprintf stdio_threading
-SUBDIR+= stpncpy strchr strerror strlcat strlcpy strnlen strtod strtol strtonum
-SUBDIR+= sys
+SUBDIR+= setjmp setjmp-signal sigsetjmp sigthr sleep sprintf stdio
+SUBDIR+= stdio_threading stpncpy strchr strerror strlcat strlcpy strnlen
+SUBDIR+= strtod strtol strtonum sys
 SUBDIR+= telldir time timingsafe
 SUBDIR+= uuid
 SUBDIR+= vis

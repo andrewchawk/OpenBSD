@@ -1,4 +1,4 @@
-/*	$OpenBSD: privsep.c,v 1.77 2023/10/12 22:36:54 bluhm Exp $	*/
+/*	$OpenBSD: privsep.c,v 1.80 2026/09/08 20:07:52 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2003 Anil Madhavapeddy <anil@recoil.org>
@@ -95,11 +95,29 @@ static int  may_read(int, void *, size_t);
 
 static struct passwd *pw;
 
+static int
+transform_path(char *path, size_t pathsize, const char *from, const char *to)
+{
+	const size_t pathlen = strlen(path);
+	const size_t fromlen = strlen(from);
+	char *cp;
+
+	if (pathlen < fromlen)
+		return -1;
+	cp = &path[pathlen - fromlen];
+	if (strcmp(cp, from) != 0)
+		return -1;
+	*cp = '\0';
+	if (strlcat(path, to, pathsize) >= pathsize)
+		return -1;
+	return 0;
+}
+
 void
-priv_init(int lockfd, int nullfd, int argc, char *argv[])
+priv_init(int debug, int lockfd, int nullfd, int argc, char *argv[])
 {
 	int i, socks[2];
-	char *execpath, childnum[11], **privargv;
+	char execpath[PATH_MAX], childnum[11], **privargv;
 
 	/* Create sockets */
 	if (socketpair(AF_LOCAL, SOCK_STREAM, PF_UNSPEC, socks) == -1)
@@ -132,14 +150,10 @@ priv_init(int lockfd, int nullfd, int argc, char *argv[])
 	}
 	close(socks[1]);
 
-	if (strchr(argv[0], '/') == NULL)
-		execpath = argv[0];
-	else if ((execpath = realpath(argv[0], NULL)) == NULL)
-		err(1, "realpath %s", argv[0]);
 	if (chdir("/") != 0)
 		err(1, "chdir /");
 
-	if (!Debug) {
+	if (!debug) {
 		close(lockfd);
 		dup2(nullfd, STDIN_FILENO);
 		dup2(nullfd, STDOUT_FILENO);
@@ -156,22 +170,28 @@ priv_init(int lockfd, int nullfd, int argc, char *argv[])
 	snprintf(childnum, sizeof(childnum), "%d", child_pid);
 	if ((privargv = reallocarray(NULL, argc + 3, sizeof(char *))) == NULL)
 		err(1, "alloc priv argv failed");
+
+	if (getexecpath(execpath, sizeof(execpath)) != 0)
+		err(1, "getexecpath");
+	if (transform_path(execpath, sizeof(execpath),
+	    "/sbin/syslogd", "/libexec/syslogd-parent") == -1)
+		errx(1, "bad execpath %s", execpath);
 	privargv[0] = execpath;
 	for (i = 1; i < argc; i++)
 		privargv[i] = argv[i];
 	privargv[i++] = "-P";
 	privargv[i++] = childnum;
 	privargv[i++] = NULL;
-	execvp(privargv[0], privargv);
-	err(1, "exec priv '%s' failed", privargv[0]);
+	execv(execpath, privargv);
+	err(1, "exec priv '%s' failed", execpath);
 }
 
 __dead void
-priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
+priv_exec(const char *conf, int numeric, int child, int argc, char *argv[])
 {
 	int i, fd, sock, cmd, addr_len, result, restart;
 	size_t path_len, protoname_len, hostname_len, servname_len;
-	char path[PATH_MAX], protoname[5];
+	char execpath[PATH_MAX], path[PATH_MAX], protoname[5];
 	char hostname[NI_MAXHOST], servname[NI_MAXSERV];
 	struct sockaddr_storage addr;
 	struct stat cf_info, cf_stat;
@@ -198,11 +218,13 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 		err(1, "unveil %s", _PATH_BSHELL);
 
 	/* For HUP / re-exec */
-	if (unveil("/usr/sbin/syslogd", "x") == -1)
-		err(1, "unveil /usr/sbin/syslogd");
-	if (argv[0][0] == '/')
-		if (unveil(argv[0], "x") == -1)
-			err(1, "unveil %s", argv[0]);
+	if (getexecpath(execpath, sizeof(execpath)) != 0)
+		err(1, "getexecpath");
+	if (transform_path(execpath, sizeof(execpath),
+	    "/libexec/syslogd-parent", "/sbin/syslogd") == -1)
+		errx(1, "bad execpath %s", execpath);
+	if (unveil(execpath, "x") == -1)
+		err(1, "unveil %s", execpath);
 
 	if (pledge("stdio unveil rpath wpath cpath dns sendfd id proc exec",
 	    NULL) == -1)
@@ -235,7 +257,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 	sigaction(SIGCHLD, &sa, NULL);
 
 	setproctitle("[priv]");
-	log_debug("[priv]: fork+exec done");
+	log_debug("fork+exec done");
 
 	sigemptyset(&sigmask);
 	if (sigprocmask(SIG_SETMASK, &sigmask, NULL) == -1)
@@ -253,7 +275,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 			break;
 		switch (cmd) {
 		case PRIV_OPEN_TTY:
-			log_debug("[priv]: msg PRIV_OPEN_TTY received");
+			log_debug("msg PRIV_OPEN_TTY received");
 			/* Expecting: length, path */
 			must_read(sock, &path_len, sizeof(size_t));
 			if (path_len == 0 || path_len > sizeof(path))
@@ -271,7 +293,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 
 		case PRIV_OPEN_LOG:
 		case PRIV_OPEN_PIPE:
-			log_debug("[priv]: msg PRIV_OPEN_%s received",
+			log_debug("msg PRIV_OPEN_%s received",
 			    cmd == PRIV_OPEN_PIPE ? "PIPE" : "LOG");
 			/* Expecting: length, path */
 			must_read(sock, &path_len, sizeof(size_t));
@@ -296,7 +318,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 			break;
 
 		case PRIV_OPEN_UTMP:
-			log_debug("[priv]: msg PRIV_OPEN_UTMP received");
+			log_debug("msg PRIV_OPEN_UTMP received");
 			fd = open(_PATH_UTMP, O_RDONLY|O_NONBLOCK);
 			send_fd(sock, fd);
 			if (fd == -1)
@@ -306,7 +328,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 			break;
 
 		case PRIV_OPEN_CONFIG:
-			log_debug("[priv]: msg PRIV_OPEN_CONFIG received");
+			log_debug("msg PRIV_OPEN_CONFIG received");
 			stat(conf, &cf_info);
 			fd = open(conf, O_RDONLY|O_NONBLOCK);
 			send_fd(sock, fd);
@@ -317,7 +339,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 			break;
 
 		case PRIV_CONFIG_MODIFIED:
-			log_debug("[priv]: msg PRIV_CONFIG_MODIFIED received");
+			log_debug("msg PRIV_CONFIG_MODIFIED received");
 			if (stat(conf, &cf_stat) == -1 ||
 			    timespeccmp(&cf_info.st_mtim,
 			    &cf_stat.st_mtim, <) ||
@@ -335,13 +357,13 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 			if (pledge("stdio rpath wpath cpath dns sendfd id proc exec",
 			    NULL) == -1)
 				err(1, "pledge done config");
-			log_debug("[priv]: msg PRIV_DONE_CONFIG_PARSE "
+			log_debug("msg PRIV_DONE_CONFIG_PARSE "
 			    "received");
 			increase_state(STATE_RUNNING);
 			break;
 
 		case PRIV_GETADDRINFO:
-			log_debug("[priv]: msg PRIV_GETADDRINFO received");
+			log_debug("msg PRIV_GETADDRINFO received");
 			/* Expecting: len, proto, len, host, len, serv */
 			must_read(sock, &protoname_len, sizeof(size_t));
 			if (protoname_len == 0 ||
@@ -407,7 +429,7 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 			break;
 
 		case PRIV_GETNAMEINFO:
-			log_debug("[priv]: msg PRIV_GETNAMEINFO received");
+			log_debug("msg PRIV_GETNAMEINFO received");
 			if (numeric)
 				errx(1, "rejected attempt to getnameinfo");
 			/* Expecting: length, sockaddr */
@@ -442,8 +464,9 @@ priv_exec(char *conf, int numeric, int child, int argc, char *argv[])
 		sigaddset(&sigmask, SIGHUP);
 		if (sigprocmask(SIG_SETMASK, &sigmask, NULL) == -1)
 			err(1, "sigprocmask exec");
-		execvp(argv[0], argv);
-		err(1, "exec restart '%s' failed", argv[0]);
+		argv[0] = execpath;
+		execv(execpath, argv);
+		err(1, "exec restart '%s' failed", execpath);
 	}
 	unlink(_PATH_LOGPID);
 	exit(0);

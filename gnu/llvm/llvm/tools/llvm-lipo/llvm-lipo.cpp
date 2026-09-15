@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -27,9 +26,10 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileOutputBuffer.h"
-#include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/LLVMDriver.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/WithColor.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/TextAPI/Architecture.h"
 #include <optional>
 
@@ -66,28 +66,23 @@ static const StringRef ToolName = "llvm-lipo";
 namespace {
 enum LipoID {
   LIPO_INVALID = 0, // This is not an option ID.
-#define OPTION(PREFIX, NAME, ID, KIND, GROUP, ALIAS, ALIASARGS, FLAGS, PARAM,  \
-               HELPTEXT, METAVAR, VALUES)                                      \
-  LIPO_##ID,
+#define OPTION(...) LLVM_MAKE_OPT_ID_WITH_ID_PREFIX(LIPO_, __VA_ARGS__),
 #include "LipoOpts.inc"
 #undef OPTION
 };
 
 namespace lipo {
-#define PREFIX(NAME, VALUE)                                                    \
-  static constexpr llvm::StringLiteral NAME##_init[] = VALUE;                  \
-  static constexpr llvm::ArrayRef<llvm::StringLiteral> NAME(                   \
-      NAME##_init, std::size(NAME##_init) - 1);
+#define OPTTABLE_STR_TABLE_CODE
 #include "LipoOpts.inc"
-#undef PREFIX
+#undef OPTTABLE_STR_TABLE_CODE
 
+#define OPTTABLE_PREFIXES_TABLE_CODE
+#include "LipoOpts.inc"
+#undef OPTTABLE_PREFIXES_TABLE_CODE
+
+using namespace llvm::opt;
 static constexpr opt::OptTable::Info LipoInfoTable[] = {
-#define OPTION(PREFIX, NAME, ID, KIND, GROUP, ALIAS, ALIASARGS, FLAGS, PARAM,  \
-               HELPTEXT, METAVAR, VALUES)                                      \
-  {PREFIX,       NAME,      HELPTEXT,                                          \
-   METAVAR,      LIPO_##ID, opt::Option::KIND##Class,                          \
-   PARAM,        FLAGS,     LIPO_##GROUP,                                      \
-   LIPO_##ALIAS, ALIASARGS, VALUES},
+#define OPTION(...) LLVM_CONSTRUCT_OPT_INFO_WITH_ID_PREFIX(LIPO_, __VA_ARGS__),
 #include "LipoOpts.inc"
 #undef OPTION
 };
@@ -95,7 +90,9 @@ static constexpr opt::OptTable::Info LipoInfoTable[] = {
 
 class LipoOptTable : public opt::GenericOptTable {
 public:
-  LipoOptTable() : opt::GenericOptTable(lipo::LipoInfoTable) {}
+  LipoOptTable()
+      : opt::GenericOptTable(lipo::OptionStrTable, lipo::OptionPrefixesTable,
+                             lipo::LipoInfoTable) {}
 };
 
 enum class LipoAction {
@@ -121,6 +118,7 @@ struct Config {
   std::string ArchType;
   std::string OutputFile;
   LipoAction ActionToPerform;
+  bool UseFat64;
 };
 
 static Slice createSliceFromArchive(LLVMContext &LLVMCtx, const Archive &A) {
@@ -147,7 +145,7 @@ static void validateArchitectureName(StringRef ArchitectureName) {
        << "\nValid architecture names are:";
     for (auto arch : MachOObjectFile::getValidArchs())
       OS << " " << arch;
-    reportError(OS.str());
+    reportError(Buf);
   }
 }
 
@@ -228,6 +226,8 @@ static Config parseLipoOptions(ArrayRef<const char *> ArgsArr) {
                   Twine(AlignmentValue));
   }
 
+  C.UseFat64 = InputArgs.hasArg(LIPO_fat64);
+
   SmallVector<opt::Arg *, 1> ActionArgs(InputArgs.filtered(LIPO_action_group));
   if (ActionArgs.empty())
     reportError("at least one action should be specified");
@@ -244,13 +244,13 @@ static Config parseLipoOptions(ArrayRef<const char *> ArgsArr) {
     OS << "only one of the following actions can be specified:";
     for (auto *Arg : ActionArgs)
       OS << " " << Arg->getSpelling();
-    reportError(OS.str());
+    reportError(Buf);
   }
 
   switch (ActionArgs[0]->getOption().getID()) {
   case LIPO_verify_arch:
-    for (auto A : InputArgs.getAllArgValues(LIPO_verify_arch))
-      C.VerifyArchList.push_back(A);
+    llvm::append_range(C.VerifyArchList,
+                       InputArgs.getAllArgValues(LIPO_verify_arch));
     if (C.VerifyArchList.empty())
       reportError(
           "verify_arch requires at least one architecture to be specified");
@@ -425,6 +425,11 @@ static void printBinaryArchs(LLVMContext &LLVMCtx, const Binary *Binary,
     return;
   }
 
+  if (const auto *A = dyn_cast<Archive>(Binary)) {
+    OS << createSliceFromArchive(LLVMCtx, *A).getArchString() << "\n";
+    return;
+  }
+
   // This should be always the case, as this is tested in readInputBinaries
   const auto *IR = cast<IRObjectFile>(Binary);
   Expected<Slice> SliceOrErr = createSliceFromIR(*IR, 0);
@@ -455,7 +460,8 @@ printInfo(LLVMContext &LLVMCtx, ArrayRef<OwningBinary<Binary>> InputBinaries) {
   for (auto &IB : InputBinaries) {
     const Binary *Binary = IB.getBinary();
     if (!Binary->isMachOUniversalBinary()) {
-      assert(Binary->isMachO() && "expected MachO binary");
+      assert((Binary->isMachO() || Binary->isArchive()) &&
+             "expected MachO binary");
       outs() << "Non-fat file: " << Binary->getFileName()
              << " is architecture: ";
       printBinaryArchs(LLVMCtx, Binary, outs());
@@ -601,9 +607,11 @@ buildSlices(LLVMContext &LLVMCtx, ArrayRef<OwningBinary<Binary>> InputBinaries,
   return Slices;
 }
 
-[[noreturn]] static void createUniversalBinary(
-    LLVMContext &LLVMCtx, ArrayRef<OwningBinary<Binary>> InputBinaries,
-    const StringMap<const uint32_t> &Alignments, StringRef OutputFileName) {
+[[noreturn]] static void
+createUniversalBinary(LLVMContext &LLVMCtx,
+                      ArrayRef<OwningBinary<Binary>> InputBinaries,
+                      const StringMap<const uint32_t> &Alignments,
+                      StringRef OutputFileName, FatHeaderType HeaderType) {
   assert(InputBinaries.size() >= 1 && "Incorrect number of input binaries");
   assert(!OutputFileName.empty() && "Create expects a single output file");
 
@@ -614,7 +622,7 @@ buildSlices(LLVMContext &LLVMCtx, ArrayRef<OwningBinary<Binary>> InputBinaries,
   checkUnusedAlignments(Slices, Alignments);
 
   llvm::stable_sort(Slices);
-  if (Error E = writeUniversalBinary(Slices, OutputFileName))
+  if (Error E = writeUniversalBinary(Slices, OutputFileName, HeaderType))
     reportError(std::move(E));
 
   exit(EXIT_SUCCESS);
@@ -723,8 +731,7 @@ replaceSlices(LLVMContext &LLVMCtx,
   exit(EXIT_SUCCESS);
 }
 
-int llvm_lipo_main(int argc, char **argv) {
-  InitLLVM X(argc, argv);
+int llvm_lipo_main(int argc, char **argv, const llvm::ToolContext &) {
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmParsers();
@@ -752,8 +759,9 @@ int llvm_lipo_main(int argc, char **argv) {
                  C.OutputFile);
     break;
   case LipoAction::CreateUniversal:
-    createUniversalBinary(LLVMCtx, InputBinaries, C.SegmentAlignments,
-                          C.OutputFile);
+    createUniversalBinary(
+        LLVMCtx, InputBinaries, C.SegmentAlignments, C.OutputFile,
+        C.UseFat64 ? FatHeaderType::Fat64Header : FatHeaderType::FatHeader);
     break;
   case LipoAction::ReplaceArch:
     replaceSlices(LLVMCtx, InputBinaries, C.SegmentAlignments, C.OutputFile,

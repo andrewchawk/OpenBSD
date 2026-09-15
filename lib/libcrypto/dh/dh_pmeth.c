@@ -1,4 +1,4 @@
-/* $OpenBSD: dh_pmeth.c,v 1.16 2024/01/01 16:01:48 tb Exp $ */
+/* $OpenBSD: dh_pmeth.c,v 1.18 2025/05/10 05:54:38 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2006.
  */
@@ -58,17 +58,18 @@
 
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <openssl/asn1t.h>
 #include <openssl/bn.h>
 #include <openssl/dh.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/x509.h>
 
 #include "bn_local.h"
 #include "dh_local.h"
+#include "err_local.h"
 #include "evp_local.h"
 
 /* DH pkey context structure */
@@ -153,36 +154,21 @@ pkey_dh_ctrl(EVP_PKEY_CTX *ctx, int type, int p1, void *p2)
 static int
 pkey_dh_ctrl_str(EVP_PKEY_CTX *ctx, const char *type, const char *value)
 {
-	long lval;
-	char *ep;
+	const char *errstr;
 	int len;
 
 	if (!strcmp(type, "dh_paramgen_prime_len")) {
-		errno = 0;
-		lval = strtol(value, &ep, 10);
-		if (value[0] == '\0' || *ep != '\0')
-			goto not_a_number;
-		if ((errno == ERANGE &&
-		    (lval == LONG_MAX || lval == LONG_MIN)) ||
-		    (lval > INT_MAX || lval < INT_MIN))
-			goto out_of_range;
-		len = lval;
+		len = strtonum(value, INT_MIN, INT_MAX, &errstr);
+		if (errstr != NULL)
+			return -2;
 		return EVP_PKEY_CTX_set_dh_paramgen_prime_len(ctx, len);
 	} else if (!strcmp(type, "dh_paramgen_generator")) {
-		errno = 0;
-		lval = strtol(value, &ep, 10);
-		if (value[0] == '\0' || *ep != '\0')
-			goto not_a_number;
-		if ((errno == ERANGE &&
-		    (lval == LONG_MAX || lval == LONG_MIN)) ||
-		    (lval > INT_MAX || lval < INT_MIN))
-			goto out_of_range;
-		len = lval;
+		len = strtonum(value, INT_MIN, INT_MAX, &errstr);
+		if (errstr != NULL)
+			return -2;
 		return EVP_PKEY_CTX_set_dh_paramgen_generator(ctx, len);
 	}
 
-not_a_number:
-out_of_range:
 	return -2;
 }
 

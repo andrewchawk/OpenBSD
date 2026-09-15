@@ -1,4 +1,4 @@
-/*	$OpenBSD: ax.c,v 1.6 2024/02/20 12:51:10 martijn Exp $ */
+/*	$OpenBSD: ax.c,v 1.10 2026/08/30 12:39:08 jsg Exp $ */
 /*
  * Copyright (c) 2019 Martijn van Duren <martijn@openbsd.org>
  *
@@ -815,7 +815,7 @@ ax_error2string(enum ax_pdu_error error)
 	case AX_PDU_ERROR_DUPLICATEREGISTRATION:
 		return "Duplicate registration";
 	case AX_PDU_ERROR_UNKNOWNREGISTRATION:
-		return "Unkown registration";
+		return "Unknown registration";
 	case AX_PDU_ERROR_UNKNOWNAGENTCAPS:
 		return "Unknown agent capabilities";
 	case AX_PDU_ERROR_PARSEERROR:
@@ -1208,10 +1208,10 @@ ax_pdu_add_oid(struct ax *ax, struct ax_oid *oid)
 	static struct ax_oid nulloid = {0};
 	uint8_t prefix = 0, n_subid, i = 0;
 
-	n_subid = oid->aoi_idlen;
-
 	if (oid == NULL)
 		oid = &nulloid;
+
+	n_subid = oid->aoi_idlen;
 
 	if (oid->aoi_idlen > 4 &&
 	    oid->aoi_id[0] == 1 && oid->aoi_id[1] == 3 &&
@@ -1400,26 +1400,23 @@ static ssize_t
 ax_pdutoostring(struct ax_pdu_header *header,
     struct ax_ostring *ostring, uint8_t *buf, size_t rawlen)
 {
-	ssize_t nread;
+	size_t padding;
 
 	if (rawlen < 4)
 		goto fail;
-
 	ostring->aos_slen = ax_pdutoh32(header, buf);
 	rawlen -= 4;
 	buf += 4;
-	if (ostring->aos_slen > rawlen)
+
+	padding = (4 - (ostring->aos_slen % 4)) % 4;
+	if (rawlen < ostring->aos_slen || rawlen - ostring->aos_slen < padding)
 		goto fail;
 	if ((ostring->aos_string = malloc(ostring->aos_slen + 1)) == NULL)
 		return -1;
 	memcpy(ostring->aos_string, buf, ostring->aos_slen);
 	ostring->aos_string[ostring->aos_slen] = '\0';
 
-	nread = 4 + ostring->aos_slen;
-	if (ostring->aos_slen % 4 != 0)
-		nread += 4 - (ostring->aos_slen % 4);
-
-	return nread;
+	return 4 + ostring->aos_slen + padding;
 
 fail:
 	errno = EPROTO;

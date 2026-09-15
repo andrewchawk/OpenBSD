@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_node.h,v 1.94 2022/03/20 12:01:58 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_node.h,v 1.102 2026/05/28 10:50:47 kirill Exp $	*/
 /*	$NetBSD: ieee80211_node.h,v 1.9 2004/04/30 22:57:32 dyoung Exp $	*/
 
 /*-
@@ -52,7 +52,7 @@ extern const struct ieee80211_rateset ieee80211_std_rateset_11a;
 extern const struct ieee80211_rateset ieee80211_std_rateset_11b;
 extern const struct ieee80211_rateset ieee80211_std_rateset_11g;
 
-/* Index into ieee80211_std_rateset_11n[] array. */
+/* Index into ieee80211_std_ratesets_11n[] array. */
 #define IEEE80211_HT_RATESET_SISO	0
 #define IEEE80211_HT_RATESET_SISO_SGI	1
 #define IEEE80211_HT_RATESET_MIMO2	2
@@ -98,7 +98,7 @@ struct ieee80211_ht_rateset {
 
 extern const struct ieee80211_ht_rateset ieee80211_std_ratesets_11n[];
 
-/* Index into ieee80211_std_rateset_11ac[] array. */
+/* Index into ieee80211_std_ratesets_11ac[] array. */
 #define IEEE80211_VHT_RATESET_SISO		0
 #define IEEE80211_VHT_RATESET_SISO_SGI		1
 #define IEEE80211_VHT_RATESET_MIMO2		2
@@ -117,7 +117,7 @@ extern const struct ieee80211_ht_rateset ieee80211_std_ratesets_11n[];
 #define IEEE80211_VHT_RATESET_MAX_NRATES	10
 
 struct ieee80211_vht_rateset {
-	int idx; /* This rateset's index in ieee80211_std_rateset_11ac[]. */
+	int idx; /* This rateset's index in ieee80211_std_ratesets_11ac[]. */
 
 	uint32_t nrates;
 	uint32_t rates[IEEE80211_VHT_RATESET_MAX_NRATES]; /* 500 kbit/s units */
@@ -306,6 +306,8 @@ struct ieee80211_node {
 	/* power saving mode */
 	u_int8_t		ni_pwrsave;
 	struct mbuf_queue	ni_savedq;	/* packets queued for pspoll */
+	u_int8_t		ni_uapsd_ac;
+	u_int8_t		ni_uapsd_maxsp;
 
 	/* RSN */
 	struct timeout		ni_eapol_to;
@@ -370,6 +372,20 @@ struct ieee80211_node {
 	uint8_t			ni_vht_chan_center_freq_idx1;
 	uint16_t		ni_vht_basic_mcs;
 
+	/* HE capabilities */
+	uint8_t			ni_he_mac_cap[IEEE80211_HE_MAC_CAPS_LEN];
+	uint8_t			ni_he_phy_cap[IEEE80211_HE_PHY_CAPS_LEN];
+	uint16_t		ni_he_rxmcs_80;
+	uint16_t		ni_he_txmcs_80;
+	uint16_t		ni_he_rxmcs_160;
+	uint16_t		ni_he_txmcs_160;
+	uint16_t		ni_he_rxmcs_80p80;
+	uint16_t		ni_he_txmcs_80p80;
+
+	/* HE operation */
+	uint8_t			ni_he_oper_params[IEEE80211_HEOP_PARAMS_LEN];
+	uint16_t		ni_he_basic_mcs;
+
 	/* Timeout handlers which trigger Tx Block Ack negotiation. */
 	struct timeout		ni_addba_req_to[IEEE80211_NUM_TID];
 	int			ni_addba_req_intval[IEEE80211_NUM_TID];
@@ -381,6 +397,7 @@ struct ieee80211_node {
 
 	int			ni_txmcs;	/* current MCS used for TX */
 	int			ni_vht_ss;	/* VHT # spatial streams */
+	int			ni_he_ss;	/* HE # spatial streams */
 
 	/* others */
 	u_int16_t		ni_associd;	/* assoc response */
@@ -398,6 +415,7 @@ struct ieee80211_node {
 #define IEEE80211_NODE_ASSOCFAIL_BSSID		0x20
 #define IEEE80211_NODE_ASSOCFAIL_WPA_PROTO	0x40
 #define IEEE80211_NODE_ASSOCFAIL_WPA_KEY	0x80
+#define IEEE80211_NODE_ASSOCFAIL_CSA		0x100
 
 	int			ni_inact;	/* inactivity mark count */
 	int			ni_txrate;	/* index to ni_rates[] */
@@ -427,6 +445,10 @@ struct ieee80211_node {
 #define IEEE80211_NODE_VHTCAP		0x40000	/* claims to support VHT */
 #define IEEE80211_NODE_VHT_SGI80	0x80000	/* SGI on 80 MHz negotiated */ 
 #define IEEE80211_NODE_VHT_SGI160	0x100000 /* SGI on 160 MHz negotiated */ 
+#define IEEE80211_NODE_HE		0x200000 /* HE negotiated */
+#define IEEE80211_NODE_HECAP		0x400000 /* claims to support HE */
+#define IEEE80211_NODE_CSA		0x800000 /* channel switch announced */
+#define IEEE80211_NODE_UAPSD		0x1000000 /* uAPSD negotiated */
 
 	/* If not NULL, this function gets called when ni_refcnt hits zero. */
 	void			(*ni_unref_cb)(struct ieee80211com *,
@@ -590,7 +612,11 @@ ieee80211_node_supports_vht_chan160(struct ieee80211_node *ni)
 
 	cap_chan_width = (ni->ni_vhtcaps & IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
 	    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
-	if (cap_chan_width != IEEE80211_VHTCAP_CHAN_WIDTH_160)
+	if (cap_chan_width != IEEE80211_VHTCAP_CHAN_WIDTH_160 &&
+	    cap_chan_width != IEEE80211_VHTCAP_CHAN_WIDTH_160_8080 &&
+	    ((ni->ni_vhtcaps & IEEE80211_VHTCAP_EXT_NSS_BW_MASK) == 0 ||
+	    (ni->ni_vht_tx_max_lgi_mbit_s &
+	    IEEE80211_VHT_EXT_NSS_BW_CAPABLE) == 0))
 		return 0;
 
 	op_chan_width = (ni->ni_vht_chan_width &
@@ -598,6 +624,23 @@ ieee80211_node_supports_vht_chan160(struct ieee80211_node *ni)
 	    IEEE80211_VHTOP0_CHAN_WIDTH_SHIFT;
 
 	return (op_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_160);
+}
+
+/* 
+ * Check if the peer supports HE.
+ * Require a HE capabilities IE and support for HE MCS with a single
+ * spatial stream.
+ */
+static inline int
+ieee80211_node_supports_he(struct ieee80211_node *ni)
+{
+	uint16_t rx_mcs;
+
+	rx_mcs = (ni->ni_he_rxmcs_80 & IEEE80211_HE_MCS_FOR_SS_MASK(1)) >>
+	    IEEE80211_HE_MCS_FOR_SS_SHIFT(1);
+
+	return ((ni->ni_flags & IEEE80211_NODE_HECAP) &&
+	    rx_mcs != IEEE80211_HE_MCS_SS_NOT_SUPP);
 }
 
 struct ieee80211com;
@@ -642,10 +685,16 @@ void ieee80211_setup_vhtcaps(struct ieee80211_node *, const uint8_t *,
 void ieee80211_clear_vhtcaps(struct ieee80211_node *);
 int ieee80211_setup_vhtop(struct ieee80211_node *, const uint8_t *,
     uint8_t, int);
+void ieee80211_setup_hecaps(struct ieee80211_node *, const uint8_t *,
+    uint8_t);
+void ieee80211_clear_hecaps(struct ieee80211_node *);
+int ieee80211_setup_heop(struct ieee80211_node *, const uint8_t *,
+    uint8_t, int);
 int ieee80211_setup_rates(struct ieee80211com *,
 	    struct ieee80211_node *, const u_int8_t *, const u_int8_t *, int);
+enum ieee80211_phymode ieee80211_node_abg_mode(struct ieee80211com *,
+	    struct ieee80211_node *);
 void ieee80211_node_trigger_addba_req(struct ieee80211_node *, int);
-int ieee80211_iserp_sta(const struct ieee80211_node *);
 void ieee80211_count_longslotsta(void *, struct ieee80211_node *);
 void ieee80211_count_nonerpsta(void *, struct ieee80211_node *);
 void ieee80211_count_pssta(void *, struct ieee80211_node *);
@@ -655,6 +704,7 @@ void ieee80211_node_join(struct ieee80211com *,
 void ieee80211_node_leave(struct ieee80211com *,
 		struct ieee80211_node *);
 int ieee80211_match_bss(struct ieee80211com *, struct ieee80211_node *, int);
+void ieee80211_node_switch_bss(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_tx_stopped(struct ieee80211com *, struct ieee80211_node *);
 struct ieee80211_node *ieee80211_node_choose_bss(struct ieee80211com *, int,
 		struct ieee80211_node **);

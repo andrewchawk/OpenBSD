@@ -131,8 +131,10 @@ static void	remove_dead_process(long child);
 static int	terminate_process(DWORD pid, HANDLE process_handle, int sig);
 static int	my_killpg(int pid, int sig);
 static int	my_kill(int pid, int sig);
-static void	out_of_memory(void);
+static void	out_of_memory(const char *context, STRLEN len);
+#ifdef _DEBUG
 static char*	wstr_to_str(const wchar_t* wstr);
+#endif
 static long	filetime_to_clock(PFILETIME ft);
 static BOOL	filetime_from_time(PFILETIME ft, time_t t);
 static char*	create_command_line(char *cname, STRLEN clen,
@@ -723,8 +725,7 @@ Perl_do_aspawn(pTHX_ SV *really, SV **mark, SV **sp)
     }
     else {
         if (status < 0) {
-            if (ckWARN(WARN_EXEC))
-                Perl_warner(aTHX_ packWARN(WARN_EXEC), "Can't spawn \"%s\": %s", argv[0], strerror(errno));
+            ck_warner(packWARN(WARN_EXEC), "Can't spawn \"%s\": %s", argv[0], strerror(errno));
             status = 255 * 256;
         }
         else
@@ -842,10 +843,9 @@ do_spawn2_handles(pTHX_ const char *cmd, int exectype, const int *handles)
     }
     else {
         if (status < 0) {
-            if (ckWARN(WARN_EXEC))
-                Perl_warner(aTHX_ packWARN(WARN_EXEC), "Can't %s \"%s\": %s",
-                     (exectype == EXECF_EXEC ? "exec" : "spawn"),
-                     cmd, strerror(errno));
+            ck_warner(packWARN(WARN_EXEC), "Can't %s \"%s\": %s",
+                      (exectype == EXECF_EXEC ? "exec" : "spawn"),
+                      cmd, strerror(errno));
             status = 255 * 256;
         }
         else
@@ -1199,6 +1199,9 @@ int
 chown(const char *path, uid_t owner, gid_t group)
 {
     /* XXX noop */
+    PERL_UNUSED_ARG(path);
+    PERL_UNUSED_ARG(owner);
+    PERL_UNUSED_ARG(group);
     return 0;
 }
 
@@ -1431,7 +1434,7 @@ get_hwnd_delay(pTHX, long child, DWORD tries)
         }
     }
 
-    Perl_croak(aTHX_ "panic: child pseudo-process was never scheduled");
+    croak("panic: child pseudo-process was never scheduled");
 }
 #endif
 
@@ -1455,7 +1458,7 @@ win32_kill(int pid, int sig)
                     /* kill -9 style un-graceful exit */
                     /* Do a wait to make sure child starts and isn't in DLL
                      * Loader Lock */
-                    HWND hwnd = get_hwnd_delay(aTHX, child, 5);
+                    (void)get_hwnd_delay(aTHX, child, 5);
                     if (TerminateThread(hProcess, sig)) {
                         /* Allow the scheduler to finish cleaning up the other
                          * thread.
@@ -1856,7 +1859,6 @@ DllExport int
 win32_stat(const char *path, Stat_t *sbuf)
 {
     dTHX;
-    BOOL        expect_dir = FALSE;
     int result;
     HANDLE handle;
     DWORD reparse_type = 0;
@@ -1937,8 +1939,6 @@ translate_to_errno(void)
 static BOOL
 is_symlink(HANDLE h) {
     MY_REPARSE_DATA_BUFFER linkdata;
-    const MY_SYMLINK_REPARSE_BUFFER * const sd =
-        &linkdata.Data.SymbolicLinkReparseBuffer;
     DWORD linkdata_returned;
 
     if (!DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, NULL, 0, &linkdata, sizeof(linkdata), &linkdata_returned, NULL)) {
@@ -2227,11 +2227,11 @@ win32_longpath(char *path)
 }
 
 static void
-out_of_memory(void)
+out_of_memory(const char *context, STRLEN len)
 {
 
     if (PL_curinterp)
-        croak_no_mem();
+        croak_no_mem_ext(context, len);
     exit(1);
 }
 
@@ -2243,6 +2243,7 @@ win32_croak_not_implemented(const char * fname)
     Perl_croak_nocontext("%s not implemented!\n", fname);
 }
 
+#ifdef _DEBUG
 /* Converts a wide character (UTF-16) string to the Windows ANSI code page,
  * potentially using the system's default replacement character for any
  * unrepresentable characters. The caller must free() the returned string. */
@@ -2255,11 +2256,12 @@ wstr_to_str(const wchar_t* wstr)
                                    NULL, 0, NULL, NULL);
     char* str = (char*)malloc(len);
     if (!str)
-        out_of_memory();
+        out_of_memory(STR_WITH_LEN("win32:wstr_to_str"));
     WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wstr, wlen,
                         str, len, NULL, &used_default);
     return str;
 }
+#endif
 
 /* The win32_ansipath() function takes a Unicode filename and converts it
  * into the current Windows codepage. If some characters cannot be mapped,
@@ -2288,7 +2290,7 @@ win32_ansipath(const WCHAR *widename)
                                   NULL, 0, NULL, NULL);
     name = (char*)win32_malloc(len);
     if (!name)
-        out_of_memory();
+        out_of_memory(STR_WITH_LEN("win32:win32_ansipath"));
 
     WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, widename, widelen,
                         name, len, NULL, &use_default);
@@ -2297,14 +2299,14 @@ win32_ansipath(const WCHAR *widename)
         if (shortlen) {
             WCHAR *shortname = (WCHAR*)win32_malloc(shortlen*sizeof(WCHAR));
             if (!shortname)
-                out_of_memory();
+                out_of_memory(STR_WITH_LEN("win32:win32_ansipath"));
             shortlen = GetShortPathNameW(widename, shortname, shortlen)+1;
 
             len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, shortname, shortlen,
                                       NULL, 0, NULL, NULL);
             name = (char*)win32_realloc(name, len);
             if (!name)
-                out_of_memory();
+                out_of_memory(STR_WITH_LEN("win32:win32_ansipath"));
             WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, shortname, shortlen,
                                 name, len, NULL, NULL);
             win32_free(shortname);
@@ -2337,7 +2339,7 @@ win32_getenvironmentstrings(void)
                                           lpWStr, wenvstrings_len, NULL, 0, NULL, NULL);
     lpTmp = lpStr = (char *)win32_calloc(aenvstrings_len, sizeof(char));
     if(!lpTmp)
-        out_of_memory();
+        out_of_memory(STR_WITH_LEN("win32:win32_getenvironmentstrings"));
 
     /* Convert the string from UTF-16 encoding to ACP encoding */
     WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, lpWStr, wenvstrings_len, lpStr, 
@@ -2604,6 +2606,7 @@ DllExport int
 win32_gettimeofday(struct timeval *tp, void *not_used)
 {
     FT_t ft;
+    PERL_UNUSED_ARG(not_used);
 
     /* this returns time in 100-nanosecond units  (i.e. tens of usecs) */
     GetSystemTimeAsFileTime(&ft.ft_val);
@@ -2740,7 +2743,7 @@ do_raise(pTHX_ int sig)
 void
 sig_terminate(pTHX_ int sig)
 {
-    Perl_warn(aTHX_ "Terminating on signal SIG%s(%d)\n",PL_sig_name[sig], sig);
+    warn("Terminating on signal SIG%s(%d)\n",PL_sig_name[sig], sig);
     /* exit() seems to be safe, my_exit() or die() is a problem in ^C 
        thread 
      */
@@ -3019,7 +3022,7 @@ win32_sleep(unsigned int t)
     dTHX;
     /* Win32 times are in ms so *1000 in and /1000 out */
     if (t > UINT_MAX / 1000) {
-        Perl_ck_warner(aTHX_ packWARN(WARN_OVERFLOW),
+        ck_warner(packWARN(WARN_OVERFLOW),
                         "sleep(%lu) too large", t);
     }
     return win32_msgwait(aTHX_ 0, NULL, t * 1000, NULL) / 1000;
@@ -3543,25 +3546,18 @@ do_popen(const char *mode, const char *command, IV narg, SV **args) {
     int p[2];
     int handles[3];
     int parent, child;
-    int stdfd;
     int ourmode;
     int childpid;
-    DWORD nhandle;
-    int lock_held = 0;
     const char **args_pvs = NULL;
 
     /* establish which ends read and write */
     if (strchr(mode,'w')) {
-        stdfd = 0;		/* stdin */
         parent = 1;
         child = 0;
-        nhandle = STD_INPUT_HANDLE;
     }
     else if (strchr(mode,'r')) {
-        stdfd = 1;		/* stdout */
         parent = 0;
         child = 1;
-        nhandle = STD_OUTPUT_HANDLE;
     }
     else
         return NULL;
@@ -3702,6 +3698,17 @@ win32_pclose(PerlIO *pf)
 #endif /* USE_RTL_POPEN */
 }
 
+/* wcscpy() arguments are restrict qualified, but if they're equal
+   we don't need to do the copy
+*/
+static inline WCHAR *
+cond_wcsncpy(WCHAR *out, const WCHAR *in, size_t n) {
+    assert(wcslen(in) < n);
+    if (out != in)
+        wcsncpy(out, in, n);
+    return out;
+}
+
 DllExport int
 win32_link(const char *oldname, const char *newname)
 {
@@ -3711,7 +3718,8 @@ win32_link(const char *oldname, const char *newname)
 
     if (MultiByteToWideChar(CP_ACP, 0, oldname, -1, wOldName, MAX_PATH+1) &&
         MultiByteToWideChar(CP_ACP, 0, newname, -1, wNewName, MAX_PATH+1) &&
-        ((aTHXa(PERL_GET_THX)), wcscpy(wOldName, PerlDir_mapW(wOldName)),
+        ((aTHXa(PERL_GET_THX)),
+          cond_wcsncpy(wOldName, PerlDir_mapW(wOldName), C_ARRAY_LENGTH(wOldName)),
         CreateHardLinkW(PerlDir_mapW(wNewName), wOldName, NULL)))
     {
         return 0;
@@ -3735,8 +3743,10 @@ win32_symlink(const char *oldfile, const char *newfile)
 {
     dTHX;
     size_t oldfile_len = strlen(oldfile);
+    GCC_DIAG_IGNORE_DECL(-Wcast-function-type);
     pCreateSymbolicLinkA_t pCreateSymbolicLinkA =
         (pCreateSymbolicLinkA_t)GetProcAddress(GetModuleHandle("kernel32.dll"), "CreateSymbolicLinkA");
+    GCC_DIAG_RESTORE_DECL;
     DWORD create_flags = 0;
 
     /* this flag can be used only on Windows 10 1703 or newer */
@@ -3805,7 +3815,6 @@ win32_symlink(const char *oldfile, const char *newfile)
             /* dest_path = oldfile; already done */
         }
         else if (oldfile[0] != '\\') {
-            size_t newfile_len = strlen(newfile);
             const char *last_slash = strrchr(newfile, '/');
             const char *last_bslash = strrchr(newfile, '\\');
             const char *end_dir = last_slash && last_bslash
@@ -3910,10 +3919,11 @@ win32_chsize(int fd, Off_t size)
         /* must grow the file, padding with nulls */
         char b[4096];
         int oldmode = win32_setmode(fd, O_BINARY);
-        size_t count;
+        Off_t count;
         memset(b, '\0', sizeof(b));
         do {
-            count = extend >= sizeof(b) ? sizeof(b) : (size_t)extend;
+            /* Casts to 'Off_t' avoid '[-Wsign-compare]' warning */
+            count = extend >= (Off_t)sizeof(b) ? (Off_t)sizeof(b) : extend;
             count = win32_write(fd, b, count);
             if ((int)count < 0) {
                 retval = -1;
@@ -4143,6 +4153,7 @@ DllExport int
 win32_mkdir(const char *dir, int mode)
 {
     dTHX;
+    PERL_UNUSED_ARG(mode);
     return mkdir(PerlDir_mapA(dir)); /* just ignore mode */
 }
 
@@ -4182,7 +4193,7 @@ static char *
 create_command_line(char *cname, STRLEN clen, const char * const *args)
 {
     PERL_DEB(dTHX;)
-    int index, argc;
+    int index;
     char *cmd, *ptr;
     const char *arg;
     STRLEN len = 0;
@@ -4252,7 +4263,6 @@ create_command_line(char *cname, STRLEN clen, const char * const *args)
     }
     DEBUG_p(PerlIO_printf(Perl_debug_log, "\n"));
 
-    argc = index;
     Newx(cmd, len, char);
     ptr = cmd;
 
@@ -4449,6 +4459,7 @@ win32_get_childenv(void)
 DllExport void
 win32_free_childenv(void* d)
 {
+    PERL_UNUSED_ARG(d);
 }
 
 DllExport void
@@ -4744,7 +4755,9 @@ win32_fgets(char *s, int n, FILE *pf)
 DllExport char*
 win32_gets(char *s)
 {
+    GCC_DIAG_IGNORE_STMT(-Wattribute-warning); /* gets() only for compat */
     return gets(s);
+    GCC_DIAG_RESTORE_STMT;
 }
 
 DllExport int
@@ -5006,6 +5019,7 @@ XS(w32_SetChildShowWindow)
 XS(w32_GetCwd)
 {
     dXSARGS;
+    PERL_UNUSED_VAR(items);
     /* Make the host for current directory */
     char* ptr = PerlEnv_get_childdir();
     /*
@@ -5041,7 +5055,9 @@ Perl_init_os_extras(void)
     HMODULE module = (HMODULE)((w32_perldll_handle == INVALID_HANDLE_VALUE)
                                ? GetModuleHandle(NULL)
                                : w32_perldll_handle);
+    GCC_DIAG_IGNORE_DECL(-Wcast-function-type);
     pfn_init = (void (*)(pTHX))GetProcAddress(module, "init_Win32CORE");
+    GCC_DIAG_RESTORE_DECL;
     aTHXa(PERL_GET_THX);
     if (pfn_init)
         pfn_init(aTHX);
@@ -5258,7 +5274,7 @@ win32_hook_imported_function_in_module(
             = (PIMAGE_THUNK_DATA)(image_base + idt->FirstThunk);
 
         ULONG_PTR address_of_data;
-        for (; address_of_data = ilt->u1.AddressOfData; ++ilt, ++iat) {
+        for (; (address_of_data = ilt->u1.AddressOfData); ++ilt, ++iat) {
             /* Ordinal imports are quite rare, so skipping them will most likely
              * not cause any problems. */
             BOOL is_ordinal
@@ -5346,12 +5362,12 @@ my_CloseHandle(HANDLE h)
         }
     }
 
-    if (maybe_socket)
+    if (maybe_socket) {
         if (closesocket((SOCKET)h) == 0)
             return TRUE;
         else if (WSAGetLastError() != WSAENOTSOCK)
             return FALSE;
-
+    }
     return CloseHandle_orig(h);
 }
 
@@ -5414,6 +5430,8 @@ win32_unhook_closehandle_in_crt()
 void
 Perl_win32_init(int *argcp, char ***argvp)
 {
+    PERL_UNUSED_ARG(argcp);
+    PERL_UNUSED_ARG(argvp);
 #ifdef SET_INVALID_PARAMETER_HANDLER
     _invalid_parameter_handler oldHandler, newHandler;
     newHandler = my_invalid_parameter_handler;
@@ -5482,6 +5500,7 @@ Perl_win32_init(int *argcp, char ***argvp)
 void
 Perl_win32_term(void)
 {
+    SHUTDOWN_TERM;
     HINTS_REFCNT_TERM;
     OP_REFCNT_TERM;
     PERLIO_TERM;
@@ -5563,7 +5582,8 @@ win32_process_message(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
      * complexity of getting the correct context passed into
      * win32_create_message_window() */
     dTHX;
-
+    PERL_UNUSED_ARG(hwnd);
+    PERL_UNUSED_ARG(lParam);
     switch(msg) {
 
 #ifdef USE_ITHREADS
@@ -5647,8 +5667,9 @@ win32_csighandler(int sig)
 {
 #if 0
     dTHXa(PERL_GET_SIG_CONTEXT);
-    Perl_warn(aTHX_ "Got signal %d",sig);
+    warn("Got signal %d",sig);
 #endif
+    PERL_UNUSED_ARG(sig);
     /* Does nothing */
 }
 
@@ -5673,7 +5694,8 @@ Perl_sys_intern_init(pTHX)
     w32_pseudo_id		= 0;
     Newx(w32_pseudo_children, 1, pseudo_child_tab);
     w32_num_pseudo_children	= 0;
-#  endif
+    PL_sys_intern.cur_tid = GetCurrentThreadId();
+#endif
     w32_timerid                 = 0;
     w32_message_hwnd            = CAST_HWND__(INVALID_HANDLE_VALUE);
     w32_poll_count              = 0;
@@ -5716,6 +5738,15 @@ Perl_sys_intern_clear(pTHX)
     }
     if (w32_message_hwnd != NULL && w32_message_hwnd != INVALID_HANDLE_VALUE)
         DestroyWindow(w32_message_hwnd);
+
+/*  "win32_checkTLS()" executes very late in perl_destruct() and/or perl_free().
+    Field cur_tid must be working to the very end of the
+    interp struct/mem alloc/process.
+#ifdef USE_ITHREADS
+    PL_sys_intern.cur_tid = 0;
+#endif
+*/
+
 #  ifdef MULTIPLICITY
     if (my_perl == PL_curinterp) {
 #  else
@@ -5741,6 +5772,7 @@ Perl_sys_intern_dup(pTHX_ struct interp_intern *src, struct interp_intern *dst)
     dst->fdpid			= newAV();
     Newxz(dst->children, 1, child_tab);
     dst->pseudo_id		= 0;
+    dst->cur_tid = 0;
     Newxz(dst->pseudo_children, 1, pseudo_child_tab);
     dst->timerid                = 0;
     dst->message_hwnd		= CAST_HWND__(INVALID_HANDLE_VALUE);

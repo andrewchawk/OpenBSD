@@ -14,12 +14,11 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/Config/config.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Support/Jobserver.h"
 
 #include <cassert>
-#include <errno.h>
 #include <optional>
 #include <stdlib.h>
-#include <string.h>
 
 using namespace llvm;
 
@@ -53,6 +52,10 @@ int llvm::get_physical_cores() { return -1; }
 static int computeHostNumHardwareThreads();
 
 unsigned llvm::ThreadPoolStrategy::compute_thread_count() const {
+  if (UseJobserver)
+    if (auto JS = JobserverClient::getInstance())
+      return JS->getNumJobs();
+
   int MaxThreadCount =
       UseHyperThreads ? computeHostNumHardwareThreads() : get_physical_cores();
   if (MaxThreadCount <= 0)
@@ -83,6 +86,11 @@ unsigned llvm::ThreadPoolStrategy::compute_thread_count() const {
   // the same interface as std::thread but requests the same stack size as the
   // main thread (8MB) before creation.
 const std::optional<unsigned> llvm::thread::DefaultStackSize = 8 * 1024 * 1024;
+#elif defined(_AIX)
+  // On AIX, the default pthread stack size limit is ~192k for 64-bit programs.
+  // This limit is easily reached when doing link-time thinLTO. AIX library
+  // developers have used 4MB, so we'll do the same.
+const std::optional<unsigned> llvm::thread::DefaultStackSize = 4 * 1024 * 1024;
 #else
 const std::optional<unsigned> llvm::thread::DefaultStackSize;
 #endif

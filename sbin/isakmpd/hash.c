@@ -1,4 +1,4 @@
-/* $OpenBSD: hash.c,v 1.24 2015/10/15 06:35:54 mmcc Exp $	 */
+/* $OpenBSD: hash.c,v 1.26 2025/07/18 03:16:28 tb Exp $	 */
 /* $EOM: hash.c,v 1.10 1999/04/17 23:20:34 niklas Exp $	 */
 
 /*
@@ -43,7 +43,7 @@ void	hmac_init(struct hash *, unsigned char *, unsigned int);
 void	hmac_final(unsigned char *, struct hash *);
 
 /* Temporary hash contexts.  */
-static union {
+static union ANY_CTX {
 	MD5_CTX		md5ctx;
 	SHA1_CTX        sha1ctx;
 	SHA2_CTX	sha2ctx;
@@ -54,45 +54,135 @@ static unsigned char digest[HASH_MAX];
 
 /* Encapsulation of hash functions.  */
 
+static void
+md5_init(union ANY_CTX *ctx)
+{
+	MD5Init(&ctx->md5ctx);
+}
+
+static void
+md5_update(union ANY_CTX *ctx, const unsigned char *data, size_t len)
+{
+	MD5Update(&ctx->md5ctx, data, len);
+}
+
+static void
+md5_final(unsigned char *digest, union ANY_CTX *ctx)
+{
+	MD5Final(digest, &ctx->md5ctx);
+}
+
+static void
+sha1_init(union ANY_CTX *ctx)
+{
+	SHA1Init(&ctx->sha1ctx);
+}
+
+static void
+sha1_update(union ANY_CTX *ctx, const unsigned char *data, size_t len)
+{
+	SHA1Update(&ctx->sha1ctx, data, len);
+}
+
+static void
+sha1_final(unsigned char *digest, union ANY_CTX *ctx)
+{
+	SHA1Final(digest, &ctx->sha1ctx);
+}
+
+static void
+sha256_init(union ANY_CTX *ctx)
+{
+	SHA256Init(&ctx->sha2ctx);
+}
+
+static void
+sha256_update(union ANY_CTX *ctx, const unsigned char *data, size_t len)
+{
+	SHA256Update(&ctx->sha2ctx, data, len);
+}
+
+static void
+sha256_final(unsigned char *digest, union ANY_CTX *ctx)
+{
+	SHA256Final(digest, &ctx->sha2ctx);
+}
+
+static void
+sha384_init(union ANY_CTX *ctx)
+{
+	SHA384Init(&ctx->sha2ctx);
+}
+
+static void
+sha384_update(union ANY_CTX *ctx, const unsigned char *data, size_t len)
+{
+	SHA384Update(&ctx->sha2ctx, data, len);
+}
+
+static void
+sha384_final(unsigned char *digest, union ANY_CTX *ctx)
+{
+	SHA384Final(digest, &ctx->sha2ctx);
+}
+
+static void
+sha512_init(union ANY_CTX *ctx)
+{
+	SHA512Init(&ctx->sha2ctx);
+}
+
+static void
+sha512_update(union ANY_CTX *ctx, const unsigned char *data, size_t len)
+{
+	SHA512Update(&ctx->sha2ctx, data, len);
+}
+
+static void
+sha512_final(unsigned char *digest, union ANY_CTX *ctx)
+{
+	SHA512Final(digest, &ctx->sha2ctx);
+}
+
 static struct hash hashes[] = {
     {
-	HASH_MD5, 5, MD5_SIZE, (void *)&Ctx.md5ctx, digest,
+	HASH_MD5, 5, MD5_SIZE, MD5_BLOCK_LENGTH, (void *)&Ctx.md5ctx, digest,
 	sizeof(MD5_CTX), (void *)&Ctx2.md5ctx,
-	(void (*)(void *))MD5Init,
-	(void (*)(void *, unsigned char *, unsigned int))MD5Update,
-	(void (*)(unsigned char *, void *))MD5Final,
+	md5_init,
+	md5_update,
+	md5_final,
 	hmac_init,
 	hmac_final
     }, {
-	HASH_SHA1, 6, SHA1_SIZE, (void *)&Ctx.sha1ctx, digest,
-	sizeof(SHA1_CTX), (void *)&Ctx2.sha1ctx,
-	(void (*)(void *))SHA1Init,
-	(void (*)(void *, unsigned char *, unsigned int))SHA1Update,
-	(void (*)(unsigned char *, void *))SHA1Final,
+	HASH_SHA1, 6, SHA1_SIZE, SHA1_BLOCK_LENGTH, (void *)&Ctx.sha1ctx,
+	digest, sizeof(SHA1_CTX), (void *)&Ctx2.sha1ctx,
+	sha1_init,
+	sha1_update,
+	sha1_final,
 	hmac_init,
 	hmac_final
     }, {
-	HASH_SHA2_256, 7, SHA2_256_SIZE, (void *)&Ctx.sha2ctx, digest,
-	sizeof(SHA2_CTX), (void *)&Ctx2.sha2ctx,
-	(void (*)(void *))SHA256Init,
-	(void (*)(void *, unsigned char *, unsigned int))SHA256Update,
-	(void (*)(u_int8_t *, void *))SHA256Final,
+	HASH_SHA2_256, 7, SHA2_256_SIZE, SHA256_BLOCK_LENGTH,
+	(void *)&Ctx.sha2ctx, digest, sizeof(SHA2_CTX), (void *)&Ctx2.sha2ctx,
+	sha256_init,
+	sha256_update,
+	sha256_final,
 	hmac_init,
 	hmac_final
     }, {
-	HASH_SHA2_384, 8, SHA2_384_SIZE, (void *)&Ctx.sha2ctx, digest,
-	sizeof(SHA2_CTX), (void *)&Ctx2.sha2ctx,
-	(void (*)(void *))SHA384Init,
-	(void (*)(void *, unsigned char *, unsigned int))SHA384Update,
-	(void (*)(u_int8_t *, void *))SHA384Final,
+	HASH_SHA2_384, 8, SHA2_384_SIZE, SHA384_BLOCK_LENGTH,
+	(void *)&Ctx.sha2ctx, digest, sizeof(SHA2_CTX), (void *)&Ctx2.sha2ctx,
+	sha384_init,
+	sha384_update,
+	sha384_final,
 	hmac_init,
 	hmac_final
     }, {
-	HASH_SHA2_512, 9, SHA2_512_SIZE, (void *)&Ctx.sha2ctx, digest,
-	sizeof(SHA2_CTX), (void *)&Ctx2.sha2ctx,
-	(void (*)(void *))SHA512Init,
-	(void (*)(void *, unsigned char *, unsigned int))SHA512Update,
-	(void (*)(u_int8_t *, void *))SHA512Final,
+	HASH_SHA2_512, 9, SHA2_512_SIZE, SHA512_BLOCK_LENGTH,
+	(void *)&Ctx.sha2ctx, digest, sizeof(SHA2_CTX), (void *)&Ctx2.sha2ctx,
+	sha512_init,
+	sha512_update,
+	sha512_final,
 	hmac_init,
 	hmac_final
     }
@@ -122,11 +212,11 @@ hash_get(enum hashes hashtype)
 void
 hmac_init(struct hash *hash, unsigned char *okey, unsigned int len)
 {
-	unsigned int    i, blocklen = HMAC_BLOCKLEN;
-	unsigned char   key[HMAC_BLOCKLEN];
+	unsigned int    i;
+	unsigned char   key[128];
 
-	bzero(key, blocklen);
-	if (len > blocklen) {
+	bzero(key, sizeof(key));
+	if (len > hash->blocklen) {
 		/* Truncate key down to blocklen */
 		hash->Init(hash->ctx);
 		hash->Update(hash->ctx, okey, len);
@@ -136,19 +226,19 @@ hmac_init(struct hash *hash, unsigned char *okey, unsigned int len)
 	}
 
 	/* HMAC I and O pad computation */
-	for (i = 0; i < blocklen; i++)
+	for (i = 0; i < hash->blocklen; i++)
 		key[i] ^= HMAC_IPAD_VAL;
 
 	hash->Init(hash->ctx);
-	hash->Update(hash->ctx, key, blocklen);
+	hash->Update(hash->ctx, key, hash->blocklen);
 
-	for (i = 0; i < blocklen; i++)
+	for (i = 0; i < hash->blocklen; i++)
 		key[i] ^= (HMAC_IPAD_VAL ^ HMAC_OPAD_VAL);
 
 	hash->Init(hash->ctx2);
-	hash->Update(hash->ctx2, key, blocklen);
+	hash->Update(hash->ctx2, key, hash->blocklen);
 
-	explicit_bzero(key, blocklen);
+	explicit_bzero(key, sizeof(key));
 }
 
 /*

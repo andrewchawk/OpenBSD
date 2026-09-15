@@ -1,4 +1,4 @@
-#	$OpenBSD: files.i386,v 1.250 2023/07/08 08:01:10 tobhe Exp $
+#	$OpenBSD: files.i386,v 1.253 2025/06/07 15:11:12 kettenis Exp $
 #
 # new style config file for i386 architecture
 #
@@ -42,7 +42,6 @@ file	arch/i386/i386/process_machdep.c
 file	arch/i386/i386/sys_machdep.c
 file	arch/i386/i386/trap.c
 file	arch/i386/i386/vm_machdep.c
-file	arch/i386/i386/softintr.c
 file	arch/i386/i386/dkcsum.c		bios
 file	dev/cninit.c
 file	arch/i386/i386/mptramp.s	multiprocessor
@@ -66,7 +65,6 @@ include "dev/mii/files.mii"
 
 include "scsi/files.scsi"
 major	{sd = 4}
-major	{st = 5}
 major	{cd = 6}
 major	{rd = 17}
 
@@ -378,6 +376,7 @@ file	arch/i386/i386/acpi_machdep.c		acpi
 file	arch/i386/i386/acpi_wakecode.S		acpi & !small_kernel
 file	dev/acpi/acpi_x86.c			acpi & suspend & !small_kernel
 file	dev/acpi/acpi_apm.c			acpi
+file	dev/acpi/acpicpu_x86.c			acpicpu needs-flag
 
 #
 # IPMI

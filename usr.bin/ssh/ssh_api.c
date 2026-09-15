@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh_api.c,v 1.29 2024/05/17 00:30:24 djm Exp $ */
+/* $OpenBSD: ssh_api.c,v 1.35 2026/07/27 12:28:52 markus Exp $ */
 /*
  * Copyright (c) 2012 Markus Friedl.  All rights reserved.
  *
@@ -90,9 +90,6 @@ ssh_init(struct ssh **sshp, int is_server, struct kex_params *kex_params)
 	int r;
 
 	if (!called) {
-#ifdef WITH_OPENSSL
-		OpenSSL_add_all_algorithms();
-#endif
 		called = 1;
 	}
 
@@ -130,6 +127,8 @@ ssh_init(struct ssh **sshp, int is_server, struct kex_params *kex_params)
 #endif /* WITH_OPENSSL */
 		ssh->kex->kex[KEX_C25519_SHA256] = kex_gen_server;
 		ssh->kex->kex[KEX_KEM_SNTRUP761X25519_SHA512] = kex_gen_server;
+		ssh->kex->kex[KEX_KEM_MLKEM768X25519_SHA256] = kex_gen_server;
+		ssh->kex->kex[KEX_KEM_MLKEM768ECDH_SHA256] = kex_gen_server;
 		ssh->kex->load_host_public_key=&_ssh_host_public_key;
 		ssh->kex->load_host_private_key=&_ssh_host_private_key;
 		ssh->kex->sign=&_ssh_host_key_sign;
@@ -146,6 +145,8 @@ ssh_init(struct ssh **sshp, int is_server, struct kex_params *kex_params)
 #endif /* WITH_OPENSSL */
 		ssh->kex->kex[KEX_C25519_SHA256] = kex_gen_client;
 		ssh->kex->kex[KEX_KEM_SNTRUP761X25519_SHA512] = kex_gen_client;
+		ssh->kex->kex[KEX_KEM_MLKEM768X25519_SHA256] = kex_gen_client;
+		ssh->kex->kex[KEX_KEM_MLKEM768ECDH_SHA256] = kex_gen_client;
 		ssh->kex->verify_host_key =&_ssh_verify_host_key;
 	}
 	*sshp = ssh;
@@ -247,7 +248,7 @@ int
 ssh_packet_next(struct ssh *ssh, u_char *typep)
 {
 	int r;
-	u_int32_t seqnr;
+	uint32_t seqnr;
 	u_char type;
 
 	/*
@@ -524,7 +525,7 @@ _ssh_order_hostkeyalgs(struct ssh *ssh)
 	char *orig, *avail, *oavail = NULL, *alg, *replace = NULL;
 	char **proposal;
 	size_t maxlen;
-	int ktype, r;
+	int ktype, nid, r;
 
 	/* XXX we de-serialize ssh->kex->my, modify it, and change it */
 	if ((r = kex_buf2prop(ssh->kex->my, NULL, &proposal)) != 0)
@@ -543,15 +544,20 @@ _ssh_order_hostkeyalgs(struct ssh *ssh)
 	while ((alg = strsep(&avail, ",")) && *alg != '\0') {
 		if ((ktype = sshkey_type_from_name(alg)) == KEY_UNSPEC)
 			continue;
+		nid = sshkey_ecdsa_nid_from_name(alg);
 		TAILQ_FOREACH(k, &ssh->public_keys, next) {
-			if (k->key->type == ktype ||
-			    (sshkey_is_cert(k->key) && k->key->type ==
-			    sshkey_type_plain(ktype))) {
-				if (*replace != '\0')
-					strlcat(replace, ",", maxlen);
-				strlcat(replace, alg, maxlen);
-				break;
-			}
+			if (k->key->type != ktype &&
+			    (!sshkey_is_cert(k->key) ||
+			    k->key->type != sshkey_type_plain(ktype)))
+				continue;
+			if (sshkey_type_plain(k->key->type) == KEY_ECDSA &&
+			    k->key->ecdsa_nid != nid)
+				continue;
+			/* Candidate */
+			if (*replace != '\0')
+				strlcat(replace, ",", maxlen);
+			strlcat(replace, alg, maxlen);
+			break;
 		}
 	}
 	if (*replace != '\0') {

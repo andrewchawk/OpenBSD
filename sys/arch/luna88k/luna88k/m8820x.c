@@ -1,4 +1,4 @@
-/*	$OpenBSD: m8820x.c,v 1.18 2022/05/19 12:55:59 aoyama Exp $	*/
+/*	$OpenBSD: m8820x.c,v 1.21 2026/07/15 18:44:50 miod Exp $	*/
 /*
  * Copyright (c) 2004, Miodrag Vallat.
  *
@@ -123,28 +123,53 @@ m8820x_probe_cmmus(uint32_t icmmu, uint32_t dcmmu)
 void
 m8820x_setup_board_config()
 {
-	u_int pos = 0;
+	struct m8820x_cmmu *cmmup;
+#ifdef M8820X_DEBUG
+	int num;
+#endif
 
+	/*
+	 * Reset ncpusfound since we recount them here.
+	 * It is initialized to 1 in kern/init_main.c.
+	 */
+	ncpusfound = 0;
+
+	cmmup = (struct m8820x_cmmu *)m8820x_cmmu;
 	if (m8820x_probe_cmmus(CMMU_I0, CMMU_D0) != 0) {
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_I0;
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_D0;
+		cmmup->cmmu_regs = (void *)CMMU_I0;
+		cmmup->cmmu_next = cmmup + 1;
+		cmmup++;
+		cmmup->cmmu_regs = (void *)CMMU_D0;
+		cmmup++;
+		ncpusfound++;
 	}
 	if (m8820x_probe_cmmus(CMMU_I1, CMMU_D1) != 0) {
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_I1;
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_D1;
+		cmmup->cmmu_regs = (void *)CMMU_I1;
+		cmmup->cmmu_next = cmmup + 1;
+		cmmup++;
+		cmmup->cmmu_regs = (void *)CMMU_D1;
+		cmmup++;
+		ncpusfound++;
 	}
 	if (m8820x_probe_cmmus(CMMU_I2, CMMU_D2) != 0) {
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_I2;
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_D2;
+		cmmup->cmmu_regs = (void *)CMMU_I2;
+		cmmup->cmmu_next = cmmup + 1;
+		cmmup++;
+		cmmup->cmmu_regs = (void *)CMMU_D2;
+		cmmup++;
+		ncpusfound++;
 	}
 	if (m8820x_probe_cmmus(CMMU_I3, CMMU_D3) != 0) {
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_I3;
-		m8820x_cmmu[pos++].cmmu_regs = (void *)CMMU_D3;
+		cmmup->cmmu_regs = (void *)CMMU_I3;
+		cmmup->cmmu_next = cmmup + 1;
+		cmmup++;
+		cmmup->cmmu_regs = (void *)CMMU_D3;
+		cmmup++;
+		ncpusfound++;
 	}
 
-	ncpusfound = pos >> 1;
-	max_cmmus = pos;
-	cmmu_shift = 1;	/* fixed 2:1 configuration */
+	*(u_int *)&max_cmmus = cmmup - m8820x_cmmu;
+	*(u_int *)&cmmu_shift = 1;	/* fixed 2:1 configuration */
 
 #ifdef M8820X_DEBUG
 	/*
@@ -180,19 +205,16 @@ m8820x_cpu_number()
 	CMMU_LOCK;
 
 	for (i = 0; i < 10; i++) {
-		/* clear CMMU P-bus status registers */
-		for (cmmu = 0; cmmu < max_cmmus; cmmu++) {
-			if (CMMU_MODE(cmmu) != INST_CMMU)
-				m8820x_cmmu[cmmu].cmmu_regs[CMMU_PFSR] = 0;
-		}
+		/* clear data CMMU P-bus status registers */
+		for (cmmu = DATA_CMMU; cmmu < max_cmmus; cmmu += 2)
+			m8820x_cmmu[cmmu].cmmu_regs[CMMU_PFSR] = 0;
 
 		/* access faulting address */
 		badaddr((vaddr_t)ILLADDRESS, 4);
 
-		/* check which CMMU is reporting the fault  */
-		for (cmmu = 0; cmmu < max_cmmus; cmmu++) {
-			if (CMMU_MODE(cmmu) != INST_CMMU &&
-			    CMMU_PFSR_FAULT(m8820x_cmmu[cmmu].
+		/* check which data CMMU is reporting the fault  */
+		for (cmmu = DATA_CMMU; cmmu < max_cmmus; cmmu += 2) {
+			if (CMMU_PFSR_FAULT(m8820x_cmmu[cmmu].
 			      cmmu_regs[CMMU_PFSR]) != CMMU_PFSR_SUCCESS) {
 				/* clean register, just in case... */
 				m8820x_cmmu[cmmu].cmmu_regs[CMMU_PFSR] = 0;

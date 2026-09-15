@@ -1,4 +1,4 @@
-/*	$OpenBSD: line.c,v 1.16 2022/02/20 19:45:51 tb Exp $	*/
+/*	$OpenBSD: line.c,v 1.19 2026/06/19 14:45:26 millert Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "common.h"
@@ -49,7 +50,7 @@ db_eget(SCR *sp, recno_t lno, char **pp, size_t *lenp, int *isemptyp)
 	 * line in an empty file, find the last line of the file; db_last
 	 * fails loudly.
 	 */
-	if ((lno == 0 || lno == 1) && db_last(sp, &l1))
+	if ((lno == OOBLNO || lno == 1) && db_last(sp, &l1))
 		return (1);
 
 	/* If the file isn't empty, fail loudly. */
@@ -84,7 +85,7 @@ db_get(SCR *sp, recno_t lno, u_int32_t flags, char **pp, size_t *lenp)
 	 * have to have an OOB condition for the look-aside into the input
 	 * buffer anyway.
 	 */
-	if (lno == 0)
+	if (lno == OOBLNO)
 		goto err1;
 
 	/* Check for no underlying file. */
@@ -143,7 +144,7 @@ nocache:
 	key.data = &lno;
 	key.size = sizeof(lno);
 	switch (ep->db->get(ep->db, &key, &data, 0)) {
-        case -1:
+	case -1:
 		goto err2;
 	case 1:
 err1:		if (LF_ISSET(DBG_FATAL))
@@ -156,9 +157,8 @@ err3:		if (lenp != NULL)
 	}
 
 	/* Reset the cache. */
-	ep->c_lno = lno;
-	ep->c_len = data.size;
-	ep->c_lp = data.data;
+	if (db_cache_update(sp, ep, lno, data.data, data.size))
+		goto err3;
 
 #if defined(DEBUG) && 0
 	TRACE(sp, "retrieve DB line %lu\n", (u_long)lno);
@@ -190,7 +190,7 @@ db_delete(SCR *sp, recno_t lno)
 		ex_emsg(sp, NULL, EXM_NOFILEYET);
 		return (1);
 	}
-		
+
 	/* Update marks, @ and global commands. */
 	if (mark_insdel(sp, LINE_DELETE, lno))
 		return (1);
@@ -245,7 +245,7 @@ db_append(SCR *sp, int update, recno_t lno, char *p, size_t len)
 		ex_emsg(sp, NULL, EXM_NOFILEYET);
 		return (1);
 	}
-		
+
 	/* Update file. */
 	key.data = &lno;
 	key.size = sizeof(lno);
@@ -313,7 +313,7 @@ db_insert(SCR *sp, recno_t lno, char *p, size_t len)
 		ex_emsg(sp, NULL, EXM_NOFILEYET);
 		return (1);
 	}
-		
+
 	/* Update file. */
 	key.data = &lno;
 	key.size = sizeof(lno);
@@ -372,7 +372,7 @@ db_set(SCR *sp, recno_t lno, char *p, size_t len)
 		ex_emsg(sp, NULL, EXM_NOFILEYET);
 		return (1);
 	}
-		
+
 	/* Log before change. */
 	log_line(sp, lno, LOG_LINE_RESET_B);
 
@@ -422,7 +422,7 @@ db_exist(SCR *sp, recno_t lno)
 
 	if (lno == OOBLNO)
 		return (0);
-		
+
 	/*
 	 * Check the last-line number cache.  Adjust the cached line
 	 * number for the lines used by the text input buffers.
@@ -454,7 +454,7 @@ db_last(SCR *sp, recno_t *lnop)
 		ex_emsg(sp, NULL, EXM_NOFILEYET);
 		return (1);
 	}
-		
+
 	/*
 	 * Check the last-line number cache.  Adjust the cached line
 	 * number for the lines used by the text input buffers.
@@ -471,11 +471,11 @@ db_last(SCR *sp, recno_t *lnop)
 	key.size = sizeof(lno);
 
 	switch (ep->db->seq(ep->db, &key, &data, R_LAST)) {
-        case -1:
+	case -1:
 		msgq(sp, M_SYSERR, "unable to get last line");
 		*lnop = 0;
 		return (1);
-        case 1:
+	case 1:
 		*lnop = 0;
 		return (0);
 	default:
@@ -484,9 +484,9 @@ db_last(SCR *sp, recno_t *lnop)
 
 	/* Fill the cache. */
 	memcpy(&lno, key.data, sizeof(lno));
-	ep->c_nlines = ep->c_lno = lno;
-	ep->c_len = data.size;
-	ep->c_lp = data.data;
+	if (db_cache_update(sp, ep, lno, data.data, data.size))
+		return (1);
+	ep->c_nlines = lno;
 
 	/* Return the value. */
 	*lnop = (F_ISSET(sp, SC_TINPUT) &&
@@ -529,4 +529,31 @@ scr_update(SCR *sp, recno_t lno, lnop_t op, int current)
 				if (vs_change(tsp, lno, op))
 					return (1);
 	return (current ? vs_change(sp, lno, op) : 0);
+}
+
+/*
+ * db_cache_update --
+ *	Update the line cache with a private copy of the data.
+ */
+int
+db_cache_update(SCR *sp, EXF *ep, recno_t lno, void *data, size_t size)
+{
+	if (size > ep->c_buf_len) {
+		free(ep->c_buf);
+		MALLOC(sp, ep->c_buf, size);
+		if (ep->c_buf == NULL) {
+			ep->c_buf_len = 0;
+			ep->c_lp = NULL;
+			ep->c_lno = OOBLNO;
+			return (1);
+		}
+		ep->c_buf_len = size;
+	}
+	if (size > 0)
+		memcpy(ep->c_buf, data, size);
+
+	ep->c_lno = lno;
+	ep->c_len = size;
+	ep->c_lp = ep->c_buf;
+	return (0);
 }

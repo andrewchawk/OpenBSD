@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.288 2024/07/10 08:51:28 tb Exp $
+# $OpenBSD: Makefile,v 1.312 2025/07/17 10:31:50 schwarze Exp $
 
 .include <bsd.own.mk>
 
@@ -105,10 +105,10 @@ MAN=	\
 	CMS_verify_receipt.3 \
 	CONF_modules_free.3 \
 	CONF_modules_load_file.3 \
-	CRYPTO_get_mem_functions.3 \
 	CRYPTO_lock.3 \
 	CRYPTO_memcmp.3 \
 	CRYPTO_set_ex_data.3 \
+	CRYPTO_set_mem_functions.3 \
 	ChaCha.3 \
 	DES_set_key.3 \
 	DH_generate_key.3 \
@@ -133,13 +133,16 @@ MAN=	\
 	DSA_size.3 \
 	ECDH_compute_key.3 \
 	ECDSA_SIG_new.3 \
-	EC_GFp_simple_method.3 \
-	EC_GROUP_copy.3 \
-	EC_GROUP_new.3 \
+	EC_GROUP_check.3 \
+	EC_GROUP_get_curve_name.3 \
+	EC_GROUP_new_by_curve_name.3 \
+	EC_GROUP_new_curve_GFp.3 \
 	EC_KEY_METHOD_new.3 \
 	EC_KEY_new.3 \
 	EC_POINT_add.3 \
+	EC_POINT_get_affine_coordinates.3 \
 	EC_POINT_new.3 \
+	EC_POINT_point2oct.3 \
 	ENGINE_new.3 \
 	ERR.3 \
 	ERR_GET_LIB.3 \
@@ -177,19 +180,15 @@ MAN=	\
 	EVP_PKEY_CTX_new.3 \
 	EVP_PKEY_CTX_set_hkdf_md.3 \
 	EVP_PKEY_CTX_set_tls1_prf_md.3 \
-	EVP_PKEY_add1_attr.3 \
 	EVP_PKEY_asn1_get_count.3 \
-	EVP_PKEY_asn1_new.3 \
-	EVP_PKEY_check.3 \
 	EVP_PKEY_cmp.3 \
 	EVP_PKEY_decrypt.3 \
 	EVP_PKEY_derive.3 \
 	EVP_PKEY_encrypt.3 \
 	EVP_PKEY_get_default_digest_nid.3 \
 	EVP_PKEY_keygen.3 \
-	EVP_PKEY_meth_get0_info.3 \
-	EVP_PKEY_meth_new.3 \
 	EVP_PKEY_new.3 \
+	EVP_PKEY_new_CMAC_key.3 \
 	EVP_PKEY_print_private.3 \
 	EVP_PKEY_set1_RSA.3 \
 	EVP_PKEY_sign.3 \
@@ -200,22 +199,23 @@ MAN=	\
 	EVP_SignInit.3 \
 	EVP_VerifyInit.3 \
 	EVP_aes_128_cbc.3 \
+	EVP_aes_128_ccm.3 \
+	EVP_aes_128_gcm.3 \
 	EVP_camellia_128_cbc.3 \
 	EVP_chacha20.3 \
 	EVP_des_cbc.3 \
+	EVP_rc2_cbc.3 \
 	EVP_rc4.3 \
 	EVP_sha1.3 \
 	EVP_sha3_224.3 \
 	EVP_sm3.3 \
 	EVP_sm4_cbc.3 \
-	EVP_whirlpool.3 \
 	EXTENDED_KEY_USAGE_new.3 \
 	GENERAL_NAME_new.3 \
 	HMAC.3 \
 	IPAddressRange_new.3 \
 	MD5.3 \
 	NAME_CONSTRAINTS_new.3 \
-	OBJ_NAME_add.3 \
 	OBJ_create.3 \
 	OBJ_find_sigid_algs.3 \
 	OBJ_nid2obj.3 \
@@ -231,12 +231,11 @@ MAN=	\
 	OPENSSL_cleanse.3 \
 	OPENSSL_config.3 \
 	OPENSSL_init_crypto.3 \
-	OPENSSL_load_builtin_modules.3 \
 	OPENSSL_malloc.3 \
 	OPENSSL_sk_new.3 \
 	OpenSSL_add_all_algorithms.3 \
 	PEM_ASN1_read.3 \
-	PEM_X509_INFO_read.3 \
+	PEM_X509_INFO_read_bio.3 \
 	PEM_bytes_read_bio.3 \
 	PEM_read.3 \
 	PEM_read_bio_PrivateKey.3 \
@@ -269,6 +268,7 @@ MAN=	\
 	RAND_bytes.3 \
 	RAND_load_file.3 \
 	RAND_set_rand_method.3 \
+	RC2_encrypt.3 \
 	RC4.3 \
 	RIPEMD160.3 \
 	RSA_PSS_PARAMS_new.3 \
@@ -291,16 +291,13 @@ MAN=	\
 	RSA_size.3 \
 	SHA1.3 \
 	SMIME_crlf_copy.3 \
-	SMIME_read_ASN1.3 \
 	SMIME_read_CMS.3 \
 	SMIME_read_PKCS7.3 \
 	SMIME_text.3 \
-	SMIME_write_ASN1.3 \
 	SMIME_write_CMS.3 \
 	SMIME_write_PKCS7.3 \
 	STACK_OF.3 \
 	TS_REQ_new.3 \
-	UI_UTIL_read_pw.3 \
 	UI_create_method.3 \
 	UI_get_string_type.3 \
 	UI_new.3 \
@@ -309,6 +306,7 @@ MAN=	\
 	X509V3_EXT_print.3 \
 	X509V3_extensions_print.3 \
 	X509V3_get_d2i.3 \
+	X509V3_parse_list.3 \
 	X509_ALGOR_dup.3 \
 	X509_ATTRIBUTE_get0_object.3 \
 	X509_ATTRIBUTE_new.3 \
@@ -328,7 +326,6 @@ MAN=	\
 	X509_NAME_new.3 \
 	X509_NAME_print_ex.3 \
 	X509_OBJECT_get0_X509.3 \
-	X509_PKEY_new.3 \
 	X509_PUBKEY_new.3 \
 	X509_PURPOSE_set.3 \
 	X509_REQ_add1_attr.3 \
@@ -349,7 +346,6 @@ MAN=	\
 	X509_STORE_new.3 \
 	X509_STORE_set1_param.3 \
 	X509_STORE_set_verify_cb_func.3 \
-	X509_TRUST_set.3 \
 	X509_VERIFY_PARAM_new.3 \
 	X509_VERIFY_PARAM_set_flags.3 \
 	X509_add1_trust_object.3 \
@@ -358,7 +354,6 @@ MAN=	\
 	X509_check_issued.3 \
 	X509_check_private_key.3 \
 	X509_check_purpose.3 \
-	X509_check_trust.3 \
 	X509_cmp.3 \
 	X509_cmp_time.3 \
 	X509_digest.3 \
@@ -380,17 +375,15 @@ MAN=	\
 	X509_sign.3 \
 	X509_signature_dump.3 \
 	X509_verify_cert.3 \
-	X509at_add1_attr.3 \
-	X509at_get_attr.3 \
 	X509v3_addr_add_inherit.3 \
 	X509v3_addr_get_range.3 \
 	X509v3_addr_inherits.3 \
 	X509v3_addr_subset.3 \
 	X509v3_addr_validate_path.3 \
 	X509v3_asid_add_id_or_range.3 \
-	X509v3_asid_add_id_or_range.3 \
 	X509v3_get_ext_by_NID.3 \
 	a2d_ASN1_OBJECT.3 \
+	a2i_ipadd.3 \
 	crypto.3 \
 	d2i_ASN1_NULL.3 \
 	d2i_ASN1_OBJECT.3 \
@@ -432,6 +425,7 @@ MAN=	\
 	lh_new.3 \
 	openssl.cnf.5 \
 	s2i_ASN1_INTEGER.3 \
+	v2i_ASN1_BIT_STRING.3 \
 	x509v3.cnf.5
 
 all clean cleandir depend includes obj tags:

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sched.c,v 1.100 2024/07/09 08:44:36 claudio Exp $	*/
+/*	$OpenBSD: kern_sched.c,v 1.116 2026/04/09 01:30:02 jsg Exp $	*/
 /*
  * Copyright (c) 2007, 2008 Artur Grabowski <art@openbsd.org>
  *
@@ -54,7 +54,9 @@ uint64_t sched_stolen;		/* Times we stole proc from other cpus */
 uint64_t sched_choose;		/* Times we chose a cpu */
 uint64_t sched_wasidle;		/* Times we came out of idle */
 
-int sched_smt;
+#ifdef __HAVE_CPU_TOPOLOGY
+int sched_blockcpu;		/* Types of cpu to not schedule on */
+#endif
 
 /*
  * A few notes about cpu_switchto that is implemented in MD code.
@@ -72,6 +74,17 @@ int sched_smt;
  * Therefore no locking is necessary in cpu_switchto other than blocking
  * interrupts during the context switch.
  */
+
+/*
+ * sched_init() is called in main() before calling sched_init_cpu(curcpu()).
+ * Setup the bare minimum to allow things like setrunqueue() to work even
+ * before the scheduler is actually started.
+ */
+void
+sched_init(void)
+{
+	cpuset_add(&sched_all_cpus, curcpu());
+}
 
 /*
  * sched_init_cpu is called from main() for the boot cpu, then it's the
@@ -95,7 +108,7 @@ sched_init_cpu(struct cpu_info *ci)
 
 	kthread_create_deferred(sched_kthreads_create, ci);
 
-	LIST_INIT(&spc->spc_deadproc);
+	TAILQ_INIT(&spc->spc_deadproc);
 	SIMPLEQ_INIT(&spc->spc_deferred);
 
 	/*
@@ -103,12 +116,6 @@ sched_init_cpu(struct cpu_info *ci)
 	 * structures.
 	 */
 	cpuset_init_cpu(ci);
-
-#ifdef __HAVE_CPU_TOPOLOGY
-	if (!sched_smt && ci->ci_smt_id > 0)
-		return;
-#endif
-	cpuset_add(&sched_all_cpus, ci);
 }
 
 void
@@ -140,35 +147,38 @@ sched_idle(void *v)
 
 	KERNEL_UNLOCK();
 
-	spc = &ci->ci_schedstate;
-
 	/*
-	 * First time we enter here, we're not supposed to idle,
-	 * just go away for a while.
+	 * The idle thread is setup in fork1(). When the CPU hatches we
+	 * enter here for the first time. The CPU is now ready to take
+	 * work and so add it to sched_all_cpus when appropriate.
+	 * After that just go away and properly reenter once idle.
 	 */
-	SCHED_LOCK();
-	cpuset_add(&sched_idle_cpus, ci);
-	p->p_stat = SSLEEP;
-	p->p_cpu = ci;
-	atomic_setbits_int(&p->p_flag, P_CPUPEG);
-	mi_switch();
-	cpuset_del(&sched_idle_cpus, ci);
-	SCHED_UNLOCK();
+#ifdef __HAVE_CPU_TOPOLOGY
+	if ((ci->ci_cputype & sched_blockcpu) == 0)
+		cpuset_add(&sched_all_cpus, ci);
+#else
+	cpuset_add(&sched_all_cpus, ci);
+#endif
+	spc = &ci->ci_schedstate;
 
 	KASSERT(ci == curcpu());
 	KASSERT(curproc == spc->spc_idleproc);
+	KASSERT(p->p_cpu == ci);
+
+	SCHED_LOCK();
+	p->p_stat = SSLEEP;
+	mi_switch();
 
 	while (1) {
-		while (!cpu_is_idle(curcpu())) {
+		while (spc->spc_whichqs != 0) {
 			struct proc *dead;
 
 			SCHED_LOCK();
 			p->p_stat = SSLEEP;
 			mi_switch();
-			SCHED_UNLOCK();
 
-			while ((dead = LIST_FIRST(&spc->spc_deadproc))) {
-				LIST_REMOVE(dead, p_hash);
+			while ((dead = TAILQ_FIRST(&spc->spc_deadproc))) {
+				TAILQ_REMOVE(&spc->spc_deadproc, dead, p_runq);
 				exit2(dead);
 			}
 		}
@@ -206,28 +216,15 @@ sched_idle(void *v)
  * stack torn from under us before we manage to switch to another proc.
  * Therefore we have a per-cpu list of dead processes where we put this
  * proc and have idle clean up that list and move it to the reaper list.
- * All this will be unnecessary once we can bind the reaper this cpu
- * and not risk having it switch to another in case it sleeps.
  */
 void
 sched_exit(struct proc *p)
 {
 	struct schedstate_percpu *spc = &curcpu()->ci_schedstate;
-	struct timespec ts;
 
-	LIST_INSERT_HEAD(&spc->spc_deadproc, p, p_hash);
+	TAILQ_INSERT_TAIL(&spc->spc_deadproc, p, p_runq);
 
-	/* update the tu_runtime one last time */
-	nanouptime(&ts);
-	if (timespeccmp(&ts, &spc->spc_runtime, <))
-		timespecclear(&ts);
-	else
-		timespecsub(&ts, &spc->spc_runtime, &ts);
-
-	/* add the time counts for this thread */
-	tu_enter(&p->p_tu);
-	timespecadd(&p->p_tu.tu_runtime, &ts, &p->p_tu.tu_runtime);
-	tu_leave(&p->p_tu);
+	tuagg_add_runtime();
 
 	KERNEL_ASSERT_LOCKED();
 	sched_toidle();
@@ -268,14 +265,6 @@ sched_toidle(void)
 	panic("cpu_switchto returned");
 }
 
-/*
- * Run queue management.
- */
-void
-sched_init_runqueues(void)
-{
-}
-
 void
 setrunqueue(struct cpu_info *ci, struct proc *p, uint8_t prio)
 {
@@ -288,6 +277,7 @@ setrunqueue(struct cpu_info *ci, struct proc *p, uint8_t prio)
 	KASSERT(ci != NULL);
 	SCHED_ASSERT_LOCKED();
 	KASSERT(p->p_wchan == NULL);
+	KASSERT(!ISSET(p->p_flag, P_INSCHED));
 
 	p->p_cpu = ci;
 	p->p_stat = SRUN;
@@ -378,6 +368,7 @@ again:
 	} 
 
 	KASSERT(p->p_wchan == NULL);
+	KASSERT(!ISSET(p->p_flag, P_INSCHED));
 	return (p);
 }
 
@@ -427,10 +418,10 @@ sched_choosecpu_fork(struct proc *parent, int flags)
 		}
 	}
 
-	return (choice);
-#else
-	return (curcpu());
+	if (choice != NULL)
+		return (choice);
 #endif
+	return (curcpu());
 }
 
 struct cpu_info *
@@ -491,10 +482,10 @@ sched_choosecpu(struct proc *p)
 	else
 		sched_nomigrations++;
 
-	return (choice);
-#else
-	return (curcpu());
+	if (choice != NULL)
+		return (choice);
 #endif
+	return (curcpu());
 }
 
 /*
@@ -580,7 +571,6 @@ log2(unsigned int i)
  * Just total guesstimates for now.
  */
 
-int sched_cost_load = 1;
 int sched_cost_priority = 1;
 int sched_cost_runnable = 3;
 int sched_cost_resident = 1;
@@ -644,7 +634,6 @@ sched_peg_curproc(struct cpu_info *ci)
 	setrunqueue(ci, p, p->p_usrpri);
 	p->p_ru.ru_nvcsw++;
 	mi_switch();
-	SCHED_UNLOCK();
 }
 
 void
@@ -671,7 +660,7 @@ sched_start_secondary_cpus(void)
 		atomic_clearbits_int(&spc->spc_schedflags,
 		    SPCF_SHOULDHALT | SPCF_HALTED);
 #ifdef __HAVE_CPU_TOPOLOGY
-		if (!sched_smt && ci->ci_smt_id > 0)
+		if (ci->ci_cputype & sched_blockcpu)
 			continue;
 #endif
 		cpuset_add(&sched_all_cpus, ci);
@@ -702,7 +691,7 @@ sched_stop_secondary_cpus(void)
 			continue;
 		while ((spc->spc_schedflags & SPCF_HALTED) == 0) {
 			sleep_setup(spc, PZERO, "schedstate");
-			sleep_finish(0,
+			sleep_finish(INFSLP,
 			    (spc->spc_schedflags & SPCF_HALTED) == 0);
 		}
 	}
@@ -763,19 +752,11 @@ sched_barrier(struct cpu_info *ci)
  * Functions to manipulate cpu sets.
  */
 struct cpu_info *cpuset_infos[MAXCPUS];
-static struct cpuset cpuset_all;
 
 void
 cpuset_init_cpu(struct cpu_info *ci)
 {
-	cpuset_add(&cpuset_all, ci);
 	cpuset_infos[CPU_INFO_UNIT(ci)] = ci;
-}
-
-void
-cpuset_clear(struct cpuset *cs)
-{
-	memset(cs, 0, sizeof(*cs));
 }
 
 void
@@ -800,12 +781,6 @@ cpuset_isset(struct cpuset *cs, struct cpu_info *ci)
 }
 
 void
-cpuset_add_all(struct cpuset *cs)
-{
-	cpuset_copy(cs, &cpuset_all);
-}
-
-void
 cpuset_copy(struct cpuset *to, struct cpuset *from)
 {
 	memcpy(to, from, sizeof(*to));
@@ -821,15 +796,6 @@ cpuset_first(struct cpuset *cs)
 			return (cpuset_infos[i * 32 + ffs(cs->cs_set[i]) - 1]);
 
 	return (NULL);
-}
-
-void
-cpuset_union(struct cpuset *to, struct cpuset *a, struct cpuset *b)
-{
-	int i;
-
-	for (i = 0; i < CPUSET_ASIZE(ncpus); i++)
-		to->cs_set[i] = a->cs_set[i] | b->cs_set[i];
 }
 
 void
@@ -880,33 +846,93 @@ cpu_is_online(struct cpu_info *ci)
 
 #include <sys/sysctl.h>
 
+#ifndef SMALL_KERNEL
 int
-sysctl_hwsmt(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
+sched_cpuadjust(int newblockcpu)
 {
 	CPU_INFO_ITERATOR cii;
 	struct cpu_info *ci;
-	int err, newsmt;
+	int inset;
 
-	newsmt = sched_smt;
-	err = sysctl_int_bounded(oldp, oldlenp, newp, newlen, &newsmt, 0, 1);
-	if (err)
-		return err;
-	if (newsmt == sched_smt)
+	if (newblockcpu == sched_blockcpu)
 		return 0;
-
-	sched_smt = newsmt;
+	sched_blockcpu = newblockcpu;
 	CPU_INFO_FOREACH(cii, ci) {
 		if (CPU_IS_PRIMARY(ci) || !CPU_IS_RUNNING(ci))
 			continue;
-		if (ci->ci_smt_id == 0)
-			continue;
-		if (sched_smt)
-			cpuset_add(&sched_all_cpus, ci);
-		else
-			cpuset_del(&sched_all_cpus, ci);
+		inset = cpuset_isset(&sched_all_cpus, ci);
+		if (ci->ci_cputype & sched_blockcpu) {
+			if (inset)
+				cpuset_del(&sched_all_cpus, ci);
+		} else {
+			if (!inset)
+				cpuset_add(&sched_all_cpus, ci);
+		}
 	}
-
 	return 0;
 }
 
-#endif
+/* emulate hw.smt temporarily */
+int
+sysctl_hwsmt(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
+{
+	int err, newsmt = 1, newblockcpu;
+
+	if (sched_blockcpu & CPUTYP_SMT)
+		newsmt = 0;
+	err = sysctl_int_bounded(oldp, oldlenp, newp, newlen, &newsmt, 0, 1);
+	if (err || newp == NULL)
+		return err;
+	newblockcpu = sched_blockcpu;
+	if (newsmt)
+		newblockcpu &= ~CPUTYP_SMT;
+	else
+		newblockcpu |= CPUTYP_SMT;
+	return sched_cpuadjust(newblockcpu);
+} 
+
+int
+sysctl_hwblockcpu(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
+{
+	int err, newblockcpu;
+	char type[8], *typ = type;
+
+	if (sched_blockcpu & CPUTYP_SMT)
+		*typ++ = 'S';
+	if (sched_blockcpu & CPUTYP_P)
+		*typ++ = 'P';
+	if (sched_blockcpu & CPUTYP_E)
+		*typ++ = 'E';
+	if (sched_blockcpu & CPUTYP_L)
+		*typ++ = 'L';
+	*typ = '\0';
+	if (newp == NULL)
+		return sysctl_rdstring(oldp, oldlenp, newp, type);
+
+	err = sysctl_string(oldp, oldlenp, newp, newlen, type, sizeof type);
+	if (err)
+		return err;
+	for (newblockcpu = 0, typ = type; *typ; typ++) {
+		switch (*typ) {
+		case 'S':
+			newblockcpu |= CPUTYP_SMT;
+			break;
+		case 'P':
+			newblockcpu |= CPUTYP_P;
+			break;
+		case 'E':
+			newblockcpu |= CPUTYP_E;
+			break;
+		case 'L':
+			newblockcpu |= CPUTYP_L;
+			break;
+		default:
+			return (EINVAL);
+		}
+	}
+	return sched_cpuadjust(newblockcpu);
+}
+
+#endif /* SMALL_KERNEL */
+
+#endif /* __HAVE_CPU_TOPOLOGY */

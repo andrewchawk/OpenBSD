@@ -1,4 +1,4 @@
-.\" $OpenBSD: bsd.port.mk.5,v 1.644 2023/11/11 10:46:37 espie Exp $
+.\" $OpenBSD: bsd.port.mk.5,v 1.656 2026/09/14 00:17:01 jsg Exp $
 .\"
 .\" Copyright (c) 2000-2008 Marc Espie
 .\"
@@ -24,7 +24,7 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd $Mdocdate: November 11 2023 $
+.Dd $Mdocdate: September 14 2026 $
 .Dt BSD.PORT.MK 5
 .Os
 .Sh NAME
@@ -172,6 +172,13 @@ Apply
 to all subpackages of the current port.
 .It Cm checkpatch
 Check that patches would apply cleanly, but do not modify anything.
+.It Cm check-shlib-syms
+Compare exported dynamic symbols for
+.Ev PLIST
+shared libraries after
+.Cm fake ,
+against matching installed libraries.
+Libraries with no installed counterpart are reported and skipped.
 .It Cm checksum
 Compute a
 .Xr sha256 1
@@ -1432,8 +1439,6 @@ First element in the list that matches will be chosen.
 gcc 4.2 compiler from base
 .It base-clang
 clang compiler from base
-.It gcc3
-gcc 3 compiler from base
 .It ports-gcc
 gcc 8 compiler from ports
 (heeds
@@ -1447,12 +1452,12 @@ from the module)
 .El
 .Pp
 The first compiler that matches criteria will be chosen.
-On clang-based architectures, even though gcc is still compiled in base,
+On clang-based architectures
 .Sq base-gcc
 never matches.
 .Pp
 Defaults to base compilers, e.g.,
-.Sq base-clang base-gcc gcc3 .
+.Sq base-clang base-gcc .
 .Pp
 Common reasons for explicitly setting
 .Ev COMPILER
@@ -1530,8 +1535,8 @@ preferring various gnu programs, unless
 .Ev BUILD_DEPENDS
 explicitly ask for them.
 Read-only, available for debugging purposes.
-.It Ev CLANG_ARCHS, GCC3_ARCHS , GCC4_ARCHS
-List of architectures using Clang, GCC 3.3.6 or GCC 4.2.1 as the base compiler.
+.It Ev CLANG_ARCHS, GCC4_ARCHS
+List of architectures using Clang or GCC 4.2.1 as the base compiler.
 Read-only.
 Use with
 .Ev NOT_FOR_ARCHS
@@ -1574,6 +1579,9 @@ style.
 .Pp
 If
 .Sq gnu ,
+.Sq autoconf ,
+or
+.Sq autoreconf ,
 assume
 GNU configure style.
 Add
@@ -1587,13 +1595,13 @@ see also
 Add
 .Sq old
 if port is an older autoconf port that does not recognize --sysconfdir.
-Add
+Use
 .Sq autoconf
 if autoconf needs to be rerun first,
 but set
 .Sq no-autoheader
 to prevent autoheader from running.
-Alternatively, add
+Alternatively, use
 .Sq autoreconf
 to rerun autoconf, automake, and related tools to completely regenerate
 the GNU build framework.
@@ -1656,8 +1664,9 @@ See
 .Sx THE DEBUG_PACKAGES INFRASTRUCTURE
 below for details.
 .It Ev DEBUGINFO_ARCHS
-List of archs for which debug information may be provided as extra packages.
-Normally only amd64 for performance reasons.
+List of architectures for which debug information may be provided as
+extra packages.
+Normally only amd64 and aarch64, for performance reasons.
 .It Ev DESCR
 Location of description file for the package, defaults to
 .Pa ${PKGDIR}/DESCR
@@ -1681,6 +1690,7 @@ The template
 .Ar name
 should be one of
 .Sq codeberg ,
+.Sq fdo ,
 .Sq github ,
 .Sq gitlab ,
 .Sq gnome ,
@@ -1731,12 +1741,7 @@ checksummed and extracted (see
 .Cm checksum ,
 .Cm extract ) .
 .Ev DISTFILES
-normally holds a list of files, possibly with
-.Sq :0
-to
-.Sq :9
-appended to select a different
-.Ev SITES .
+normally holds a list of files.
 .Pp
 Preferably, adding a suffix to
 .Ev DISTFILES ,
@@ -1843,6 +1848,20 @@ package and
 to perform introspection and obtain
 .Nm Ns 's
 default values for variables without needing to access any specific port.
+.It Ev DWZ
+Command line invocation of
+.Xr dwz 1
+to shrink debug information while building debug packages.
+Defaults to
+.Sq dwz -L 100000000
+Can be set to
+.Sq \&:
+to not run
+.Xr dwz 1
+at all.
+See
+.Sx THE DEBUG_PACKAGES INFRASTRUCTURE
+for details.
 .It Ev ECHO_MSG
 User settings.
 Used to display
@@ -2710,6 +2729,12 @@ PATCH_LIST=${PORTSDIR}/x11/kde/libs2/patches/p-* patch-*
 But beware that minor variations will result in
 .Cm update-patches
 creating useless churn !
+.It Ev PATCH_QUIET
+User settings.
+If set to
+.Sq Yes ,
+.Ev PATCH
+will work quietly.
 .It Ev PATCH_STRIP
 Patch option used to strip directory levels while applying port's patches.
 Defaults to -p0.
@@ -3136,7 +3161,7 @@ Actually lives in
 Set to
 .Sq Yes
 to randomize tree traversal, as used by
-.Xr dbp 1 Ns 's Fl r
+.Xr dpb 1 Ns 's Fl r
 option.
 Defaults to
 .Sq \&No Ns .
@@ -3265,15 +3290,6 @@ to handle this mechanism correctly.
 User settings.
 List of sites to try after normal master sites.
 Normally includes ${SITE_OPENBSD} and ${SITE_FREEBSD}.
-.Po
-For now the ports tree is transitioning from
-.Ev MASTER_SITES*
-to
-.Ev SITES*
-which means that
-.Ev MASTER_SITE_BACKUP
-should be set instead until the transition is complete.
-.Pc
 .It Ev SITE_*
 Lists of standard sites to retrieve files from, refer to
 .Pa ${PORTSDIR}/infrastructure/db/network.conf
@@ -3671,10 +3687,9 @@ bfd's
 .Xr ld 1
 .Pc .
 .Sq ports
-force the use of
+forces the use of
 .Xr ld.lld 1
 from lang/clang module.
-.Pc
 Defaults to the appropriate value for the current architecture
 .Po
 see
@@ -3961,7 +3976,7 @@ target ,
 .Xr build-debug-info 1
 will be invoked to deduce debug packing-lists from the normal packing-lists,
 and some extra makefile rules will be invoked to set aside the debug
-information.
+information, and shrink it by processing it through ${DWZ}.
 .Pp
 Then each normal package will have a "shadow" debug-* package built alongside
 it, with the exact same package signature, except it will also be tied closely

@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.4 2023/06/21 07:49:24 claudio Exp $	*/
+/*	$OpenBSD: util.c,v 1.7 2026/08/07 10:21:39 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -27,6 +27,7 @@
 #include <ctype.h>
 
 #include "relayd.h"
+#include "log.h"
 
 const char *
 host_error(enum host_error he)
@@ -149,7 +150,7 @@ host_status(enum host_status status)
 		return ("unknown");
 	case HOST_UP:
 		return ("up");
-	};
+	}
 	/* NOTREACHED */
 	return ("invalid");
 }
@@ -173,12 +174,11 @@ table_check(enum table_check check)
 		return ("send expect");
 	case CHECK_SCRIPT:
 		return ("script");
-	};
+	}
 	/* NOTREACHED */
 	return ("invalid");
 }
 
-#ifdef DEBUG
 const char *
 relay_state(enum relay_state state)
 {
@@ -195,11 +195,10 @@ relay_state(enum relay_state state)
 		return ("closed");
 	case STATE_DONE:
 		return ("done");
-	};
+	}
 	/* NOTREACHED */
 	return ("invalid");
 }
-#endif
 
 const char *
 print_availability(u_long cnt, u_long up)

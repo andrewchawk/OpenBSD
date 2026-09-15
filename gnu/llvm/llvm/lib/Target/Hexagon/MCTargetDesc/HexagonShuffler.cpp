@@ -16,6 +16,7 @@
 #include "MCTargetDesc/HexagonMCInstrInfo.h"
 #include "MCTargetDesc/HexagonMCTargetDesc.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInst.h"
@@ -23,14 +24,12 @@
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
 #include <optional>
 #include <utility>
-#include <vector>
 
 #define DEBUG_TYPE "hexagon-shuffle"
 
@@ -101,7 +100,7 @@ unsigned HexagonResource::setWeight(unsigned s) {
     return Weight = 0;
 
   unsigned Ctpop = llvm::popcount(Units);
-  unsigned Cttz = countTrailingZeros(Units);
+  unsigned Cttz = llvm::countr_zero(Units);
   Weight = (1u << (SlotWeight * s)) * ((MaskWeight - Ctpop) << Cttz);
   return Weight;
 }
@@ -652,7 +651,7 @@ HexagonShuffler::tryAuction(HexagonPacketSummary const &Summary) {
 
 bool HexagonShuffler::shuffle() {
   if (size() > HEXAGON_PACKET_SIZE) {
-    // Ignore a packet with with more than what a packet can hold
+    // Ignore a packet with more than what a packet can hold
     // or with compound or duplex insns for now.
     reportError("invalid instruction packet");
     return false;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: qciic_fdt.c,v 1.1 2022/11/06 15:36:13 patrick Exp $	*/
+/*	$OpenBSD: qciic_fdt.c,v 1.5 2026/05/28 19:03:44 mglocker Exp $	*/
 /*
  * Copyright (c) 2022 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -18,6 +18,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/device.h>
+#include <sys/malloc.h>
 
 #include <machine/bus.h>
 #include <machine/intr.h>
@@ -25,6 +26,7 @@
 
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_gpio.h>
+#include <dev/ofw/ofw_pinctrl.h>
 #include <dev/ofw/fdt.h>
 
 #define _I2C_PRIVATE
@@ -108,6 +110,8 @@ qciic_fdt_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	printf("\n");
+
+	pinctrl_byname(sc->sc_node, "default");
 
 	sc->sc_ic.ic_cookie = sc;
 	sc->sc_ic.ic_acquire_bus = qciic_fdt_acquire_bus;
@@ -305,41 +309,40 @@ qciic_fdt_bus_scan(struct device *self, struct i2cbus_attach_args *iba, void *au
 	int iba_node = *(int *)aux;
 	extern int iic_print(void *, const char *);
 	struct i2c_attach_args ia;
-	char name[32], status[32];
+	char *compat;
 	uint32_t reg[1];
 	int node;
+	int len;
 
 	for (node = OF_child(iba_node); node; node = OF_peer(node)) {
-		memset(name, 0, sizeof(name));
-		memset(status, 0, sizeof(status));
+		if (!OF_is_enabled(node))
+			continue;
+
 		memset(reg, 0, sizeof(reg));
-
-		if (OF_getprop(node, "compatible", name, sizeof(name)) == -1)
-			continue;
-		if (name[0] == '\0')
-			continue;
-
-		if (OF_getprop(node, "status", status, sizeof(status)) > 0 &&
-		    strcmp(status, "disabled") == 0)
-			continue;
-
 		if (OF_getprop(node, "reg", &reg, sizeof(reg)) != sizeof(reg))
+			continue;
+
+		if (OF_getpropstr(node, "compatible", &compat, &len) == -1)
 			continue;
 
 		memset(&ia, 0, sizeof(ia));
 		ia.ia_tag = iba->iba_tag;
 		ia.ia_addr = bemtoh32(&reg[0]);
-		ia.ia_name = name;
+		ia.ia_name = compat;
+		ia.ia_namelen = len - 1;
 		ia.ia_cookie = &node;
 		ia.ia_intr = &node;
 
 		/* Quirk for ihidev(4) */
-		if (strcmp(name, "hid-over-i2c") == 0) {
+		if (strcmp(compat, "hid-over-i2c") == 0) {
 			ia.ia_name = "ihidev";
+			ia.ia_namelen = 0;
 			ia.ia_size = OF_getpropint(node, "hid-descr-addr", 0);
-			ia.ia_cookie = name;
+			ia.ia_cookie = compat;
 		}
 
 		config_found(self, &ia, iic_print);
+
+		OF_freepropstr(compat, len);
 	}
 }

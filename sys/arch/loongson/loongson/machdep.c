@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.101 2023/10/24 13:20:10 claudio Exp $ */
+/*	$OpenBSD: machdep.c,v 1.103 2026/04/06 19:34:08 mlarkin Exp $ */
 
 /*
  * Copyright (c) 2009, 2010, 2014 Miodrag Vallat.
@@ -75,10 +75,6 @@
 #include <mips64/mips_cpu.h>
 #include <machine/memconf.h>
 #include <machine/pmon.h>
-
-#ifdef HIBERNATE
-#include <machine/hibernate_var.h>
-#endif /* HIBERNATE */
 
 #include <dev/cons.h>
 
@@ -705,9 +701,6 @@ mips_init(uint64_t argc, uint64_t argv, uint64_t envp, uint64_t cv,
 		lastkernpa = CKSEG0_TO_PHYS((vaddr_t)ekern);
 
 		firstkernpage = atop(trunc_page(firstkernpa));
-#ifdef HIBERNATE
-		firstkernpage -= HIBERNATE_RESERVED_PAGES;
-#endif
 		lastkernpage = atop(round_page(lastkernpa));
 
 		if (loongson_memlo_alias != 0) {
@@ -1307,8 +1300,6 @@ hw_cpu_hatch(struct cpu_info *ci)
 
 	ci->ci_flags |= CPUF_RUNNING;
 	membar_sync();
-
-	ncpus++;
 
 	spl0();
 	(void)updateimask(0);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: setup.c,v 1.70 2024/02/03 18:51:57 beck Exp $	*/
+/*	$OpenBSD: setup.c,v 1.72 2025/09/17 16:07:57 deraadt Exp $	*/
 /*	$NetBSD: setup.c,v 1.27 1996/09/27 22:45:19 christos Exp $	*/
 
 /*
@@ -614,18 +614,20 @@ calcsb(char *dev, int devfd, struct fs *fs, struct disklabel *lp,
 	int i;
 
 	cp = strchr(dev, '\0');
-	if ((cp == NULL || (cp[-1] < 'a' || cp[-1] >= 'a' + MAXPARTITIONS)) &&
+	if ((cp == NULL || DL_PARTNAME2NUM(cp[-1]) == -1) &&
 	    !isdigit((unsigned char)cp[-1])) {
 		pfatal("%s: CANNOT FIGURE OUT FILE SYSTEM PARTITION\n", dev);
 		return (0);
 	}
 	cp--;
-	if (lp == NULL)
+	if (lp == NULL) {
 		pfatal("%s: CANNOT READ DISKLABEL\n", dev);
+		return (0);
+	}
 	if (isdigit((unsigned char)*cp))
 		pp = &lp->d_partitions[0];
 	else
-		pp = &lp->d_partitions[*cp - 'a'];
+		pp = &lp->d_partitions[DL_PARTNAME2NUM(*cp)];
 	if (pp->p_fstype != FS_BSDFFS) {
 		pfatal("%s: NOT LABELED AS A BSD FILE SYSTEM (%s)\n",
 		    dev, pp->p_fstype < FSMAXTYPES ?
@@ -661,7 +663,7 @@ getdisklabel(char *s, int fd)
 	if (ioctl(fd, DIOCGDINFO, (char *)&lab) == -1) {
 		if (s == NULL)
 			return (NULL);
-		pwarn("ioctl (GCINFO): %s\n", strerror(errno));
+		pwarn("ioctl (CGDINFO): %s\n", strerror(errno));
 		errexit("%s: can't read disk label\n", s);
 	}
 	return (&lab);

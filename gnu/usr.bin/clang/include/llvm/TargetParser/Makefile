@@ -1,10 +1,13 @@
-# $OpenBSD: Makefile,v 1.1 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.3 2026/05/29 11:18:30 robert Exp $
 
 .include <bsd.own.mk>
 
 LLVM_SRCS=	${.CURDIR}/../../../../../llvm/llvm
 
-HDRS=	RISCVTargetParserDef.inc
+HDRS=	ARMTargetParserDef.inc \
+	AArch64TargetParserDef.inc \
+	RISCVTargetParserDef.inc \
+	PPCGenTargetFeatures.inc
 
 all: ${HDRS}
 
@@ -14,9 +17,24 @@ install:
 clean cleandir:
 	rm -f ${HDRS}
 
+ARMTargetParserDef.inc: ${LLVM_SRCS}/lib/Target/ARM/ARM.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-arm-target-def \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/ARM \
+		-o ${.TARGET} ${.ALLSRC}
+
+AArch64TargetParserDef.inc: ${LLVM_SRCS}/lib/Target/AArch64/AArch64.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-arm-target-def \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/AArch64 \
+		-o ${.TARGET} ${.ALLSRC}
+
 RISCVTargetParserDef.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td 
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-riscv-target-def \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
+PPCGenTargetFeatures.inc: ${LLVM_SRCS}/lib/Target/PowerPC/PPC.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-target-features \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/PowerPC \
 		-o ${.TARGET} ${.ALLSRC}
 
 .include <bsd.obj.mk>

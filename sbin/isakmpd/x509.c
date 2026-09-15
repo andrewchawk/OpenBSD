@@ -1,4 +1,4 @@
-/* $OpenBSD: x509.c,v 1.126 2024/04/28 16:43:42 florian Exp $	 */
+/* $OpenBSD: x509.c,v 1.128 2025/12/05 19:35:40 tb Exp $	 */
 /* $EOM: x509.c,v 1.54 2001/01/16 18:42:16 ho Exp $	 */
 
 /*
@@ -116,7 +116,8 @@ x509_generate_kn(int id, X509 *cert)
 	time_t	tt;
 	char	before[15], after[15], *timecomp, *timecomp2;
 	ASN1_TIME *tm;
-	int	i;
+	const unsigned char *data;
+	int	i, len;
 
 	LOG_DBG((LOG_POLICY, 90,
 	    "x509_generate_kn: generating KeyNote policy for certificate %p",
@@ -220,8 +221,8 @@ x509_generate_kn(int id, X509 *cert)
 	key = NULL;
 
 	if (((tm = X509_get_notBefore(cert)) == NULL) ||
-	    (tm->type != V_ASN1_UTCTIME &&
-		tm->type != V_ASN1_GENERALIZEDTIME)) {
+	    (ASN1_STRING_type(tm) != V_ASN1_UTCTIME &&
+	     ASN1_STRING_type(tm) != V_ASN1_GENERALIZEDTIME)) {
 		struct tm *ltm;
 
 		tt = time(NULL);
@@ -233,16 +234,18 @@ x509_generate_kn(int id, X509 *cert)
 		strftime(before, 14, "%Y%m%d%H%M%S", ltm);
 		timecomp = "LocalTimeOfDay";
 	} else {
-		if (tm->data[tm->length - 1] == 'Z') {
+		data = ASN1_STRING_get0_data(tm);
+		len = ASN1_STRING_length(tm);
+		if (data[len - 1] == 'Z') {
 			timecomp = "GMTTimeOfDay";
-			i = tm->length - 2;
+			i = len - 2;
 		} else {
 			timecomp = "LocalTimeOfDay";
-			i = tm->length - 1;
+			i = len - 1;
 		}
 
 		for (; i >= 0; i--) {
-			if (tm->data[i] < '0' || tm->data[i] > '9') {
+			if (data[i] < '0' || data[i] > '9') {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid data in "
 				    "NotValidBefore time field"));
@@ -250,64 +253,64 @@ x509_generate_kn(int id, X509 *cert)
 			}
 		}
 
-		if (tm->type == V_ASN1_UTCTIME) {
-			if ((tm->length < 10) || (tm->length > 13)) {
+		if (ASN1_STRING_type(tm) == V_ASN1_UTCTIME) {
+			if (len < 10 || len > 13) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid length "
 				    "of NotValidBefore time field (%d)",
-				    tm->length));
+				    len));
 				goto fail;
 			}
 			/* Validity checks.  */
-			if ((tm->data[2] != '0' && tm->data[2] != '1') ||
-			    (tm->data[2] == '0' && tm->data[3] == '0') ||
-			    (tm->data[2] == '1' && tm->data[3] > '2') ||
-			    (tm->data[4] > '3') ||
-			    (tm->data[4] == '0' && tm->data[5] == '0') ||
-			    (tm->data[4] == '3' && tm->data[5] > '1') ||
-			    (tm->data[6] > '2') ||
-			    (tm->data[6] == '2' && tm->data[7] > '3') ||
-			    (tm->data[8] > '5')) {
+			if ((data[2] != '0' && data[2] != '1') ||
+			    (data[2] == '0' && data[3] == '0') ||
+			    (data[2] == '1' && data[3] > '2') ||
+			    (data[4] > '3') ||
+			    (data[4] == '0' && data[5] == '0') ||
+			    (data[4] == '3' && data[5] > '1') ||
+			    (data[6] > '2') ||
+			    (data[6] == '2' && data[7] > '3') ||
+			    (data[8] > '5')) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid value in "
 				    "NotValidBefore time field"));
 				goto fail;
 			}
 			/* Stupid UTC tricks.  */
-			if (tm->data[0] < '5')
+			if (data[0] < '5')
 				snprintf(before, sizeof before, "20%s",
-				    tm->data);
+				    data);
 			else
 				snprintf(before, sizeof before, "19%s",
-				    tm->data);
-		} else {	/* V_ASN1_GENERICTIME */
-			if ((tm->length < 12) || (tm->length > 15)) {
+				    data);
+		} else {	/* V_ASN1_GENERALIZEDTIME */
+			if (len < 12 || len > 15) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid length of "
 				    "NotValidBefore time field (%d)",
-				    tm->length));
+				    len));
 				goto fail;
 			}
 			/* Validity checks.  */
-			if ((tm->data[4] != '0' && tm->data[4] != '1') ||
-			    (tm->data[4] == '0' && tm->data[5] == '0') ||
-			    (tm->data[4] == '1' && tm->data[5] > '2') ||
-			    (tm->data[6] > '3') ||
-			    (tm->data[6] == '0' && tm->data[7] == '0') ||
-			    (tm->data[6] == '3' && tm->data[7] > '1') ||
-			    (tm->data[8] > '2') ||
-			    (tm->data[8] == '2' && tm->data[9] > '3') ||
-			    (tm->data[10] > '5')) {
+			if ((data[4] != '0' && data[4] != '1') ||
+			    (data[4] == '0' && data[5] == '0') ||
+			    (data[4] == '1' && data[5] > '2') ||
+			    (data[6] > '3') ||
+			    (data[6] == '0' && data[7] == '0') ||
+			    (data[6] == '3' && data[7] > '1') ||
+			    (data[8] > '2') ||
+			    (data[8] == '2' && data[9] > '3') ||
+			    (data[10] > '5')) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid value in "
 				    "NotValidBefore time field"));
 				goto fail;
 			}
-			snprintf(before, sizeof before, "%s", tm->data);
+			snprintf(before, sizeof before, "%s", data);
 		}
 
 		/* Fix missing seconds.  */
-		if (tm->length < 12) {
+		if (len < 12) {
 			before[12] = '0';
 			before[13] = '0';
 		}
@@ -317,8 +320,8 @@ x509_generate_kn(int id, X509 *cert)
 
 	tm = X509_get_notAfter(cert);
 	if (tm == NULL ||
-	    (tm->type != V_ASN1_UTCTIME &&
-		tm->type != V_ASN1_GENERALIZEDTIME)) {
+	    (ASN1_STRING_type(tm) != V_ASN1_UTCTIME &&
+	     ASN1_STRING_type(tm) != V_ASN1_GENERALIZEDTIME)) {
 		struct tm *ltm;
 
 		tt = time(0);
@@ -330,16 +333,18 @@ x509_generate_kn(int id, X509 *cert)
 		strftime(after, 14, "%Y%m%d%H%M%S", ltm);
 		timecomp2 = "LocalTimeOfDay";
 	} else {
-		if (tm->data[tm->length - 1] == 'Z') {
+		data = ASN1_STRING_get0_data(tm);
+		len = ASN1_STRING_length(tm);
+		if (data[len - 1] == 'Z') {
 			timecomp2 = "GMTTimeOfDay";
-			i = tm->length - 2;
+			i = len - 2;
 		} else {
 			timecomp2 = "LocalTimeOfDay";
-			i = tm->length - 1;
+			i = len - 1;
 		}
 
 		for (; i >= 0; i--) {
-			if (tm->data[i] < '0' || tm->data[i] > '9') {
+			if (data[i] < '0' || data[i] > '9') {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid data in "
 				    "NotValidAfter time field"));
@@ -347,64 +352,64 @@ x509_generate_kn(int id, X509 *cert)
 			}
 		}
 
-		if (tm->type == V_ASN1_UTCTIME) {
-			if ((tm->length < 10) || (tm->length > 13)) {
+		if (ASN1_STRING_type(tm) == V_ASN1_UTCTIME) {
+			if (len < 10 || len > 13) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid length of "
 				    "NotValidAfter time field (%d)",
-				    tm->length));
+				    len));
 				goto fail;
 			}
 			/* Validity checks. */
-			if ((tm->data[2] != '0' && tm->data[2] != '1') ||
-			    (tm->data[2] == '0' && tm->data[3] == '0') ||
-			    (tm->data[2] == '1' && tm->data[3] > '2') ||
-			    (tm->data[4] > '3') ||
-			    (tm->data[4] == '0' && tm->data[5] == '0') ||
-			    (tm->data[4] == '3' && tm->data[5] > '1') ||
-			    (tm->data[6] > '2') ||
-			    (tm->data[6] == '2' && tm->data[7] > '3') ||
-			    (tm->data[8] > '5')) {
+			if ((data[2] != '0' && data[2] != '1') ||
+			    (data[2] == '0' && data[3] == '0') ||
+			    (data[2] == '1' && data[3] > '2') ||
+			    (data[4] > '3') ||
+			    (data[4] == '0' && data[5] == '0') ||
+			    (data[4] == '3' && data[5] > '1') ||
+			    (data[6] > '2') ||
+			    (data[6] == '2' && data[7] > '3') ||
+			    (data[8] > '5')) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid value in "
 				    "NotValidAfter time field"));
 				goto fail;
 			}
 			/* Stupid UTC tricks.  */
-			if (tm->data[0] < '5')
+			if (data[0] < '5')
 				snprintf(after, sizeof after, "20%s",
-				    tm->data);
+				    data);
 			else
 				snprintf(after, sizeof after, "19%s",
-				    tm->data);
-		} else {	/* V_ASN1_GENERICTIME */
-			if ((tm->length < 12) || (tm->length > 15)) {
+				    data);
+		} else {	/* V_ASN1_GENERALIZEDTIME */
+			if (len < 12 || len > 15) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid length of "
 				    "NotValidAfter time field (%d)",
-				    tm->length));
+				    len));
 				goto fail;
 			}
 			/* Validity checks.  */
-			if ((tm->data[4] != '0' && tm->data[4] != '1') ||
-			    (tm->data[4] == '0' && tm->data[5] == '0') ||
-			    (tm->data[4] == '1' && tm->data[5] > '2') ||
-			    (tm->data[6] > '3') ||
-			    (tm->data[6] == '0' && tm->data[7] == '0') ||
-			    (tm->data[6] == '3' && tm->data[7] > '1') ||
-			    (tm->data[8] > '2') ||
-			    (tm->data[8] == '2' && tm->data[9] > '3') ||
-			    (tm->data[10] > '5')) {
+			if ((data[4] != '0' && data[4] != '1') ||
+			    (data[4] == '0' && data[5] == '0') ||
+			    (data[4] == '1' && data[5] > '2') ||
+			    (data[6] > '3') ||
+			    (data[6] == '0' && data[7] == '0') ||
+			    (data[6] == '3' && data[7] > '1') ||
+			    (data[8] > '2') ||
+			    (data[8] == '2' && data[9] > '3') ||
+			    (data[10] > '5')) {
 				LOG_DBG((LOG_POLICY, 30,
 				    "x509_generate_kn: invalid value in "
 				    "NotValidAfter time field"));
 				goto fail;
 			}
-			snprintf(after, sizeof after, "%s", tm->data);
+			snprintf(after, sizeof after, "%s", data);
 		}
 
 		/* Fix missing seconds.  */
-		if (tm->length < 12) {
+		if (len < 12) {
 			after[12] = '0';
 			after[13] = '0';
 		}
@@ -1098,11 +1103,11 @@ x509_cert_obtain(u_int8_t *id, size_t id_len, void *data, u_int8_t **cert,
 
 /* Returns a pointer to the subjectAltName information of X509 certificate.  */
 int
-x509_cert_subjectaltname(X509 *scert, u_int8_t **altname, u_int32_t *len)
+x509_cert_subjectaltname(X509 *scert, const u_int8_t **altname, u_int32_t *len)
 {
 	X509_EXTENSION		*subjectaltname;
 	ASN1_OCTET_STRING	*sanasn1data;
-	u_int8_t		*sandata;
+	const u_int8_t		*sandata;
 	int			 extpos, santype, sanlen;
 
 	extpos = X509_get_ext_by_NID(scert, NID_subject_alt_name, -1);
@@ -1114,14 +1119,15 @@ x509_cert_subjectaltname(X509 *scert, u_int8_t **altname, u_int32_t *len)
 	subjectaltname = X509_get_ext(scert, extpos);
 	sanasn1data = X509_EXTENSION_get_data(subjectaltname);
 
-	if (!subjectaltname || !sanasn1data || !sanasn1data->data ||
-	    sanasn1data->length < 4) {
+	if (!subjectaltname || !sanasn1data ||
+	    !ASN1_STRING_get0_data(sanasn1data) ||
+	     ASN1_STRING_length(sanasn1data) < 4) {
 		log_print("x509_cert_subjectaltname: invalid "
 		    "subjectaltname extension");
 		return 0;
 	}
 	/* SSL does not handle unknown ASN stuff well, do it by hand.  */
-	sandata = sanasn1data->data;
+	sandata = ASN1_STRING_get0_data(sanasn1data);
 	santype = sandata[2] & 0x3f;
 	sanlen = sandata[3];
 	sandata += 4;
@@ -1131,7 +1137,7 @@ x509_cert_subjectaltname(X509 *scert, u_int8_t **altname, u_int32_t *len)
 	 * extra stuff in subjectAltName, so we will just take the first
 	 * salen bytes, and not worry about what follows.
 	 */
-	if (sanlen + 4 > sanasn1data->length) {
+	if (sanlen + 4 > ASN1_STRING_length(sanasn1data)) {
 		log_print("x509_cert_subjectaltname: subjectaltname invalid "
 		    "length");
 		return 0;
@@ -1148,7 +1154,7 @@ x509_cert_get_subjects(void *scert, int *cnt, u_int8_t ***id,
 	X509		*cert = scert;
 	X509_NAME	*subject;
 	int		type;
-	u_int8_t	*altname;
+	const u_int8_t	*altname;
 	u_int32_t	altlen;
 	u_int8_t	*buf = 0;
 	unsigned char	*ubuf;

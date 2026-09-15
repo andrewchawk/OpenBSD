@@ -10,7 +10,7 @@
    Copyright (c) 2003      Greg Stein <gstein@users.sourceforge.net>
    Copyright (c) 2005-2007 Steven Solie <steven@solie.ca>
    Copyright (c) 2005-2012 Karl Waclawek <karl@waclawek.net>
-   Copyright (c) 2016-2024 Sebastian Pipping <sebastian@pipping.org>
+   Copyright (c) 2016-2026 Sebastian Pipping <sebastian@pipping.org>
    Copyright (c) 2017-2022 Rhodri James <rhodri@wildebeest.org.uk>
    Copyright (c) 2017      Joe Orton <jorton@redhat.com>
    Copyright (c) 2017      José Gutiérrez de la Concha <jose@zeroc.com>
@@ -19,6 +19,11 @@
    Copyright (c) 2020      Tim Gates <tim.gates@iress.com>
    Copyright (c) 2021      Donghee Na <donghee.na@python.org>
    Copyright (c) 2023-2024 Sony Corporation / Snild Dolkow <snild@sony.com>
+   Copyright (c) 2024-2026 Berkay Eren Ürün <berkay.ueruen@siemens.com>
+   Copyright (c) 2026      Francesco Bertolaccini
+   Copyright (c) 2026      Matthew Fernandez <matthew.fernandez@gmail.com>
+   Copyright (c) 2026      Kartik Kenchi <netliomax25@gmail.com>
+   Copyright (c) 2026      Zeyou Liu <zeyouliu@tencent.com>
    Licensed under the MIT license:
 
    Permission is  hereby granted,  free of charge,  to any  person obtaining
@@ -39,23 +44,22 @@
    DAMAGES OR  OTHER LIABILITY, WHETHER  IN AN  ACTION OF CONTRACT,  TORT OR
    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+   SPDX-License-Identifier: MIT
 */
 
 #if defined(NDEBUG)
 #  undef NDEBUG /* because test suite relies on assert(...) at the moment */
 #endif
 
-#include <assert.h>
+#include "expat_config.h"
 
+#include <assert.h>
+#include <limits.h> // ULONG_MAX
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-
-#if ! defined(__cplusplus)
-#  include <stdbool.h>
-#endif
-
-#include "expat_config.h"
 
 #include "expat.h"
 #include "internal.h"
@@ -66,6 +70,21 @@
 #include "handlers.h"
 #include "siphash.h"
 #include "basic_tests.h"
+
+#define EXPAT_TESTS_ASAN 1
+
+#if defined(__has_feature)
+#  if ! __has_feature(address_sanitizer)
+#    undef EXPAT_TESTS_ASAN
+#    define EXPAT_TESTS_ASAN 0
+#  endif
+#endif
+
+#if ULONG_MAX == 18446744073709551615u // 2^64-1
+#  define EXPAT_TESTS_64BIT 1
+#else
+#  define EXPAT_TESTS_64BIT 0
+#endif
 
 static void
 basic_setup(void) {
@@ -202,6 +221,30 @@ START_TEST(test_hash_collision) {
 }
 END_TEST
 #undef COLLIDING_HASH_SALT
+
+START_TEST(test_hash_salt_setter) {
+  const uint8_t entropy[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
+                               '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+  XML_Parser parser = XML_ParserCreate(NULL);
+
+  // NULL parser should be rejected
+  assert_true(XML_SetHashSalt16Bytes(NULL, entropy) == XML_FALSE);
+
+  // NULL entropy should be rejected
+  assert_true(XML_SetHashSalt16Bytes(parser, NULL) == XML_FALSE);
+
+  // Setting should be allowed more than once
+  assert_true(XML_SetHashSalt16Bytes(parser, entropy) == XML_TRUE);
+  assert_true(XML_SetHashSalt16Bytes(parser, entropy) == XML_TRUE);
+
+  // But not after parsing has started
+  assert_true(XML_Parse(parser, "", 0, XML_FALSE /* isFinal */)
+              == XML_STATUS_OK);
+  assert_true(XML_SetHashSalt16Bytes(parser, entropy) == XML_FALSE);
+
+  XML_ParserFree(parser);
+}
+END_TEST
 
 /* Regression test for SF bug #491986. */
 START_TEST(test_danish_latin1) {
@@ -411,13 +454,13 @@ START_TEST(test_utf16_le_epilog_newline) {
 
   if (first_chunk_bytes >= sizeof(text) - 1)
     fail("bad value of first_chunk_bytes");
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, first_chunk_bytes, XML_FALSE)
+  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)first_chunk_bytes, XML_FALSE)
       == XML_STATUS_ERROR)
     xml_failure(g_parser);
   else {
     enum XML_Status rc;
     rc = _XML_Parse_SINGLE_BYTES(g_parser, text + first_chunk_bytes,
-                                 sizeof(text) - first_chunk_bytes - 1,
+                                 (int)(sizeof(text) - first_chunk_bytes - 1),
                                  XML_TRUE);
     if (rc == XML_STATUS_ERROR)
       xml_failure(g_parser);
@@ -947,6 +990,14 @@ START_TEST(test_xmldecl_missing_value) {
 }
 END_TEST
 
+START_TEST(test_xmldecl_empty_version) {
+  expect_failure("<?xml version=''?>\n"
+                 "<doc/>",
+                 XML_ERROR_XML_DECL,
+                 "Failed to report empty version in XML declaration");
+}
+END_TEST
+
 /* Regression test for SF bug #584832. */
 START_TEST(test_unknown_encoding_internal_entity) {
   const char *text = "<?xml version='1.0' encoding='unsupported-encoding'?>\n"
@@ -1191,6 +1242,22 @@ START_TEST(test_not_standalone_handler_accept) {
 }
 END_TEST
 
+START_TEST(test_entity_start_tag_level_greater_than_one) {
+  const char *const text = "<!DOCTYPE t1 [\n"
+                           "  <!ENTITY e1 'hello'>\n"
+                           "]>\n"
+                           "<t1>\n"
+                           "  <t2>&e1;</t2>\n"
+                           "</t1>\n";
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text),
+                                      /*isFinal*/ XML_TRUE)
+              == XML_STATUS_OK);
+  XML_ParserFree(parser);
+}
+END_TEST
+
 START_TEST(test_wfc_no_recursive_entity_refs) {
   const char *text = "<!DOCTYPE doc [\n"
                      "  <!ENTITY entity '&#38;entity;'>\n"
@@ -1199,6 +1266,93 @@ START_TEST(test_wfc_no_recursive_entity_refs) {
 
   expect_failure(text, XML_ERROR_RECURSIVE_ENTITY_REF,
                  "Parser did not report recursive entity reference.");
+}
+END_TEST
+
+START_TEST(test_no_indirectly_recursive_entity_refs) {
+  struct TestCase {
+    const char *doc;
+    bool usesParameterEntities;
+  };
+
+  const struct TestCase cases[] = {
+      // general entity + character data
+      {"<!DOCTYPE a [\n"
+       "  <!ENTITY e1 '&e2;'>\n"
+       "  <!ENTITY e2 '&e1;'>\n"
+       "]><a>&e2;</a>\n",
+       false},
+
+      // general entity + attribute value
+      {"<!DOCTYPE a [\n"
+       "  <!ENTITY e1 '&e2;'>\n"
+       "  <!ENTITY e2 '&e1;'>\n"
+       "]><a k1='&e2;' />\n",
+       false},
+
+      // parameter entity
+      {"<!DOCTYPE doc [\n"
+       "  <!ENTITY % p1 '&#37;p2;'>\n"
+       "  <!ENTITY % p2 '&#37;p1;'>\n"
+       "  <!ENTITY % define_g \"<!ENTITY g '&#37;p2;'>\">\n"
+       "  %define_g;\n"
+       "]>\n"
+       "<doc/>\n",
+       true},
+  };
+  const XML_Bool reset_or_not[] = {XML_TRUE, XML_FALSE};
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    for (size_t j = 0; j < sizeof(reset_or_not) / sizeof(reset_or_not[0]);
+         j++) {
+      const XML_Bool reset_wanted = reset_or_not[j];
+      const char *const doc = cases[i].doc;
+      const bool usesParameterEntities = cases[i].usesParameterEntities;
+
+      set_subtest("[%i,reset=%i] %s", (int)i, (int)j, doc);
+
+#ifdef XML_DTD // both GE and DTD
+      const bool rejection_expected = true;
+#elif XML_GE == 1 // GE but not DTD
+      const bool rejection_expected = ! usesParameterEntities;
+#else             // neither DTD nor GE
+      const bool rejection_expected = false;
+#endif
+
+      XML_Parser parser = XML_ParserCreate(NULL);
+
+#ifdef XML_DTD
+      if (usesParameterEntities) {
+        assert_true(
+            XML_SetParamEntityParsing(parser, XML_PARAM_ENTITY_PARSING_ALWAYS)
+            == 1);
+      }
+#else
+      UNUSED_P(usesParameterEntities);
+#endif // XML_DTD
+
+      const enum XML_Status status
+          = _XML_Parse_SINGLE_BYTES(parser, doc, (int)strlen(doc),
+                                    /*isFinal*/ XML_TRUE);
+
+      if (rejection_expected) {
+        assert_true(status == XML_STATUS_ERROR);
+        assert_true(XML_GetErrorCode(parser) == XML_ERROR_RECURSIVE_ENTITY_REF);
+      } else {
+        assert_true(status == XML_STATUS_OK);
+      }
+
+      if (reset_wanted) {
+        // This covers free'ing of (eventually) all three open entity lists by
+        // XML_ParserReset.
+        XML_ParserReset(parser, NULL);
+      }
+
+      // This covers free'ing of (eventually) all three open entity lists by
+      // XML_ParserFree (unless XML_ParserReset has already done that above).
+      XML_ParserFree(parser);
+    }
+  }
 }
 END_TEST
 
@@ -1417,7 +1571,9 @@ START_TEST(test_suspend_parser_between_char_data_calls) {
 
   XML_SetCharacterDataHandler(g_parser, clearing_aborting_character_handler);
   g_resumable = XML_TRUE;
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+  // can't use SINGLE_BYTES here, because it'll return early on suspension, and
+  // we won't know exactly how much input we actually managed to give Expat.
+  if (XML_Parse(g_parser, text, (int)strlen(text), XML_TRUE)
       != XML_STATUS_SUSPENDED)
     xml_failure(g_parser);
   if (XML_GetErrorCode(g_parser) != XML_ERROR_NONE)
@@ -1446,7 +1602,9 @@ START_TEST(test_repeated_stop_parser_between_char_data_calls) {
   XML_SetCharacterDataHandler(g_parser, parser_stop_character_handler);
   g_resumable = XML_TRUE;
   g_abortable = XML_FALSE;
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+  // can't use SINGLE_BYTES here, because it'll return early on suspension, and
+  // we won't know exactly how much input we actually managed to give Expat.
+  if (XML_Parse(g_parser, text, (int)strlen(text), XML_TRUE)
       != XML_STATUS_SUSPENDED)
     fail("Failed to double-suspend parser");
 
@@ -1830,12 +1988,19 @@ END_TEST
 
 /* Test suspending the parser in cdata handler */
 START_TEST(test_suspend_parser_between_cdata_calls) {
+  if (g_chunkSize != 0) {
+    // this test does not use SINGLE_BYTES, because of suspension
+    return;
+  }
+
   const char *text = long_cdata_text;
   enum XML_Status result;
 
   XML_SetCharacterDataHandler(g_parser, clearing_aborting_character_handler);
   g_resumable = XML_TRUE;
-  result = _XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE);
+  // can't use SINGLE_BYTES here, because it'll return early on suspension, and
+  // we won't know exactly how much input we actually managed to give Expat.
+  result = XML_Parse(g_parser, text, (int)strlen(text), XML_TRUE);
   if (result != XML_STATUS_SUSPENDED) {
     if (result == XML_STATUS_ERROR)
       xml_failure(g_parser);
@@ -2351,17 +2516,370 @@ START_TEST(test_attributes) {
                          {XCS("id"), XCS("one")},
                          {NULL, NULL}};
   AttrInfo tag_info[] = {{XCS("c"), XCS("3")}, {NULL, NULL}};
-  ElementInfo info[] = {{XCS("doc"), 3, XCS("id"), NULL},
-                        {XCS("tag"), 1, NULL, NULL},
-                        {NULL, 0, NULL, NULL}};
-  info[0].attributes = doc_info;
-  info[1].attributes = tag_info;
+  ElementInfo info[] = {{XCS("doc"), 3, 0, XCS("id"), doc_info},
+                        {XCS("tag"), 1, 0, NULL, tag_info},
+                        {NULL, 0, 0, NULL, NULL}};
 
-  XML_SetStartElementHandler(g_parser, counting_start_element_handler);
-  XML_SetUserData(g_parser, info);
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
       == XML_STATUS_ERROR)
-    xml_failure(g_parser);
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_cdata_attribute) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one definition is provided for the same attribute of a given
+    element type, the first declaration is binding and later declarations are
+    ignored.
+  */
+
+  const char *text
+      = "<!DOCTYPE doc [\n"
+        "  <!ATTLIST doc attribute CDATA 'expected' attribute CDATA 'ignored'>\n"
+        "]>\n"
+        "<doc/>\n";
+  AttrInfo doc_info[] = {{XCS("attribute"), XCS("expected")}, {NULL, NULL}};
+  ElementInfo info[]
+      = {{XCS("doc"), 0, 1, NULL, doc_info}, {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_id_attribute_1) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one definition is provided for the same attribute of a given
+    element type, the first declaration is binding and later declarations are
+    ignored.
+  */
+
+  const char *text
+      = "<!DOCTYPE doc [\n"
+        "  <!ATTLIST doc identifier CDATA 'expected' identifier ID #REQUIRED>\n"
+        "]>\n"
+        "<doc/>\n";
+  AttrInfo doc_info[] = {{XCS("identifier"), XCS("expected")}, {NULL, NULL}};
+  ElementInfo info[]
+      = {{XCS("doc"), 0, 1, NULL, doc_info}, {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_id_attribute_2) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one definition is provided for the same attribute of a given
+    element type, the first declaration is binding and later declarations are
+    ignored.
+  */
+
+  const char *text
+      = "<!DOCTYPE doc [\n"
+        "  <!ATTLIST doc identifier ID #REQUIRED identifier CDATA 'unexpected'>\n"
+        "]>\n"
+        "<doc/>\n";
+  AttrInfo doc_info[] = {{NULL, NULL}};
+
+  ElementInfo info[]
+      = {{XCS("doc"), 0, 0, NULL, doc_info}, {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_cdata_attribute_multiple_attlistdecl) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one AttlistDecl is provided for a given element type,
+    the contents of all those provided are merged.
+  */
+  const char *text = "<!DOCTYPE doc [\n"
+                     "  <!ATTLIST doc attribute CDATA 'expected'>\n"
+                     "  <!ATTLIST doc attribute CDATA 'ignored'>\n"
+                     "]>\n"
+                     "<doc/>\n";
+  AttrInfo doc_info[] = {{XCS("attribute"), XCS("expected")}, {NULL, NULL}};
+  ElementInfo info[]
+      = {{XCS("doc"), 0, 1, NULL, doc_info}, {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_cdata_attribute_multiple_attlistdecl_2) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one AttlistDecl is provided for a given element type,
+    the contents of all those provided are merged.
+  */
+  const char *text = "<!DOCTYPE doc [\n"
+                     "  <!ATTLIST doc attribute CDATA 'expected_doc'>\n"
+                     "  <!ATTLIST tag attribute CDATA 'expected_tag'>\n"
+                     "  <!ATTLIST doc attribute CDATA 'ignored_doc'>\n"
+                     "]>\n"
+                     "<doc><tag></tag></doc>\n";
+  AttrInfo doc_info[] = {{XCS("attribute"), XCS("expected_doc")}, {NULL, NULL}};
+  AttrInfo tag_info[] = {{XCS("attribute"), XCS("expected_tag")}, {NULL, NULL}};
+  ElementInfo info[] = {{XCS("doc"), 0, 1, NULL, doc_info},
+                        {XCS("tag"), 0, 1, NULL, tag_info},
+                        {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_cdata_attribute_multiple_attlistdecl_3) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one AttlistDecl is provided for a given element type,
+    the contents of all those provided are merged.
+  */
+  const char *text
+      = "<!DOCTYPE doc [\n"
+        "  <!ATTLIST doc attribute CDATA 'expected_doc'>\n"
+        "  <!ATTLIST tag attribute CDATA 'expected_tag'>\n"
+        "  <!ATTLIST doc second_attribute CDATA 'second_expected_doc' attribute CDATA 'ignored_doc'>\n"
+        "]>\n"
+        "<doc><tag></tag></doc>\n";
+  AttrInfo doc_info[] = {{XCS("attribute"), XCS("expected_doc")},
+                         {XCS("second_attribute"), XCS("second_expected_doc")},
+                         {NULL, NULL}};
+  AttrInfo tag_info[] = {{XCS("attribute"), XCS("expected_tag")}, {NULL, NULL}};
+  ElementInfo info[] = {{XCS("doc"), 0, 2, NULL, doc_info},
+                        {XCS("tag"), 0, 1, NULL, tag_info},
+                        {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_duplicate_id_attribute_multiple_attlistdecl) {
+  /*
+  https://www.w3.org/TR/xml/#attdecls
+
+  Test the following statement from the linked specification:
+    When more than one AttlistDecl is provided for a given element type,
+    the contents of all those provided are merged.
+  */
+  const char *text = "<!DOCTYPE doc [\n"
+                     "  <!ATTLIST doc identifier ID #REQUIRED>\n"
+                     "  <!ATTLIST tag identifier CDATA 'identifier_tag'>\n"
+                     "  <!ATTLIST doc identifier CDATA 'ignored'>\n"
+                     "]>\n"
+                     "<doc identifier='doc_identity'><tag></tag></doc>\n";
+  AttrInfo doc_info[]
+      = {{XCS("identifier"), XCS("doc_identity")}, {NULL, NULL}};
+  AttrInfo tag_info[]
+      = {{XCS("identifier"), XCS("identifier_tag")}, {NULL, NULL}};
+  ElementInfo info[] = {{XCS("doc"), 1, 0, XCS("identifier"), doc_info},
+                        {XCS("tag"), 0, 1, NULL, tag_info},
+                        {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+
+  ParserAndElementInfo parserAndElementInfos = {
+      parser,
+      info,
+  };
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserAndElementInfos);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+static void XMLCALL
+check_second_attr_normalization(void *userData, const XML_Char *name,
+                                const XML_Char **atts) {
+  int *const seen_second = userData;
+  UNUSED_P(name);
+
+  for (size_t i = 0; atts[i] != NULL; i += 2) {
+    const XML_Char *const key = atts[i];
+    const XML_Char *const value = atts[i + 1];
+    if (xcstrcmp(key, XCS("second")) != 0)
+      continue;
+    *seen_second = 1;
+    /* Attribute "second" is not of type CDATA, so leading, trailing and
+     * repeated whitespace is to be normalized away. */
+    if (xcstrcmp(value, XCS("a b")) != 0)
+      fail("Attribute of non-CDATA type was not whitespace-normalized");
+  }
+}
+
+static int XMLCALL
+external_entity_attr_checker(XML_Parser parser, const XML_Char *context,
+                             const XML_Char *base, const XML_Char *systemId,
+                             const XML_Char *publicId) {
+  const char *const text = "<tag second=' a  b '/>";
+  UNUSED_P(base);
+  UNUSED_P(systemId);
+  UNUSED_P(publicId);
+
+  XML_Parser ext_parser = XML_ExternalEntityParserCreate(parser, context, NULL);
+  if (ext_parser == NULL)
+    fail("Could not create external entity parser");
+
+  if (_XML_Parse_SINGLE_BYTES(ext_parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(ext_parser);
+
+  XML_ParserFree(ext_parser);
+  return XML_STATUS_OK;
+}
+
+START_TEST(test_default_attr_index_after_dtd_copy) {
+  /* Function storeAtts resolves member .attIndex of structure
+   * NAME_AND_DEFAULT_ATTRIBUTE to tell whether an attribute value needs
+   * whitespace normalization, so function dtdCopy needs to carry that index
+   * over to the copy.  Attribute "first" is declared before attribute
+   * "second" so that a mixed-up index resolves to the wrong declaration.
+   */
+  const char *text = "<!DOCTYPE doc [\n"
+                     "  <!ENTITY e SYSTEM 'entity.ent'>\n"
+                     "  <!ELEMENT doc ANY>\n"
+                     "  <!ELEMENT tag EMPTY>\n"
+                     "  <!ATTLIST tag first CDATA #IMPLIED>\n"
+                     "  <!ATTLIST tag second NMTOKENS #IMPLIED>\n"
+                     "]>\n"
+                     "<doc>&e;</doc>\n";
+  int seen_second = 0;
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(parser != NULL);
+  XML_SetUserData(parser, &seen_second);
+  XML_SetExternalEntityRefHandler(parser, external_entity_attr_checker);
+  XML_SetStartElementHandler(parser, check_second_attr_normalization);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      != XML_STATUS_OK)
+    xml_failure(parser);
+  if (! seen_second)
+    fail("Attribute \"second\" has not been reported");
+
+  XML_ParserFree(parser);
 }
 END_TEST
 
@@ -2369,6 +2887,11 @@ END_TEST
  * entity.  Exercises some obscure code in XML_ParserReset().
  */
 START_TEST(test_reset_in_entity) {
+  if (g_chunkSize != 0) {
+    // this test does not use SINGLE_BYTES, because of suspension
+    return;
+  }
+
   const char *text = "<!DOCTYPE doc [\n"
                      "<!ENTITY wombat 'wom'>\n"
                      "<!ENTITY entity 'hi &wom; there'>\n"
@@ -2378,7 +2901,9 @@ START_TEST(test_reset_in_entity) {
 
   g_resumable = XML_TRUE;
   XML_SetCharacterDataHandler(g_parser, clearing_aborting_character_handler);
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+  // can't use SINGLE_BYTES here, because it'll return early on suspension, and
+  // we won't know exactly how much input we actually managed to give Expat.
+  if (XML_Parse(g_parser, text, (int)strlen(text), XML_TRUE)
       == XML_STATUS_ERROR)
     xml_failure(g_parser);
   XML_GetParsingStatus(g_parser, &status);
@@ -2804,6 +3329,61 @@ START_TEST(test_empty_parse) {
 }
 END_TEST
 
+/* Test XML_Parse for len < 0 */
+START_TEST(test_negative_len_parse) {
+  const char *const doc = "<root/>";
+  for (int isFinal = 0; isFinal < 2; isFinal++) {
+    set_subtest("isFinal=%d", isFinal);
+
+    XML_Parser parser = XML_ParserCreate(NULL);
+
+    if (XML_GetErrorCode(parser) != XML_ERROR_NONE)
+      fail("There was not supposed to be any initial parse error.");
+
+    const enum XML_Status status = XML_Parse(parser, doc, -1, isFinal);
+
+    if (status != XML_STATUS_ERROR)
+      fail("Negative len was expected to fail the parse but did not.");
+
+    if (XML_GetErrorCode(parser) != XML_ERROR_INVALID_ARGUMENT)
+      fail("Parse error does not match XML_ERROR_INVALID_ARGUMENT.");
+
+    XML_ParserFree(parser);
+  }
+}
+END_TEST
+
+/* Test XML_ParseBuffer for len < 0 */
+START_TEST(test_negative_len_parse_buffer) {
+  const char *const doc = "<root/>";
+  for (int isFinal = 0; isFinal < 2; isFinal++) {
+    set_subtest("isFinal=%d", isFinal);
+
+    XML_Parser parser = XML_ParserCreate(NULL);
+
+    if (XML_GetErrorCode(parser) != XML_ERROR_NONE)
+      fail("There was not supposed to be any initial parse error.");
+
+    void *const buffer = XML_GetBuffer(parser, (int)strlen(doc));
+
+    if (buffer == NULL)
+      fail("XML_GetBuffer failed.");
+
+    memcpy(buffer, doc, strlen(doc));
+
+    const enum XML_Status status = XML_ParseBuffer(parser, -1, isFinal);
+
+    if (status != XML_STATUS_ERROR)
+      fail("Negative len was expected to fail the parse but did not.");
+
+    if (XML_GetErrorCode(parser) != XML_ERROR_INVALID_ARGUMENT)
+      fail("Parse error does not match XML_ERROR_INVALID_ARGUMENT.");
+
+    XML_ParserFree(parser);
+  }
+}
+END_TEST
+
 /* Test odd corners of the XML_GetBuffer interface */
 static enum XML_Status
 get_feature(enum XML_FeatureEnum feature_id, long *presult) {
@@ -2823,7 +3403,6 @@ get_feature(enum XML_FeatureEnum feature_id, long *presult) {
 /* Test odd corners of the XML_GetBuffer interface */
 START_TEST(test_get_buffer_1) {
   const char *text = get_buffer_test_text;
-  void *buffer;
   long context_bytes;
 
   /* Attempt to allocate a negative length buffer */
@@ -2831,7 +3410,7 @@ START_TEST(test_get_buffer_1) {
     fail("Negative length buffer not failed");
 
   /* Now get a small buffer and extend it past valid length */
-  buffer = XML_GetBuffer(g_parser, 1536);
+  void *const buffer = XML_GetBuffer(g_parser, 1536);
   if (buffer == NULL)
     fail("1.5K buffer failed");
   assert(buffer != NULL);
@@ -2866,10 +3445,9 @@ END_TEST
 /* Test more corners of the XML_GetBuffer interface */
 START_TEST(test_get_buffer_2) {
   const char *text = get_buffer_test_text;
-  void *buffer;
 
   /* Now get a decent buffer */
-  buffer = XML_GetBuffer(g_parser, 1536);
+  void *const buffer = XML_GetBuffer(g_parser, 1536);
   if (buffer == NULL)
     fail("1.5K buffer failed");
   assert(buffer != NULL);
@@ -2926,29 +3504,45 @@ START_TEST(test_buffer_can_grow_to_max) {
 #if defined(__MINGW32__) && ! defined(__MINGW64__)
   // workaround for mingw/wine32 on GitHub CI not being able to reach 1GiB
   // Can we make a big allocation?
-  void *big = malloc(maxbuf);
-  if (! big) {
+  for (int i = 1; i <= 2; i++) {
+    void *const big = malloc(maxbuf);
+    if (big != NULL) {
+      free(big);
+      break;
+    }
     // The big allocation failed. Let's be a little lenient.
     maxbuf = maxbuf / 2;
+    fprintf(stderr, "Reducing maxbuf to %d...\n", maxbuf);
   }
-  free(big);
+#else
+  UNUSED_P(maxbuf);
 #endif
 
   for (int i = 0; i < num_prefixes; ++i) {
     set_subtest("\"%s\"", prefixes[i]);
     XML_Parser parser = XML_ParserCreate(NULL);
+#if XML_GE == 1
+    assert_true(XML_SetAllocTrackerActivationThreshold(parser, (size_t)-1)
+                == XML_TRUE); // i.e. deactivate
+#endif
     const int prefix_len = (int)strlen(prefixes[i]);
     const enum XML_Status s
         = _XML_Parse_SINGLE_BYTES(parser, prefixes[i], prefix_len, XML_FALSE);
     if (s != XML_STATUS_OK)
       xml_failure(parser);
 
+// Avoid running into "AddressSanitizer: out of memory" on 32bit Windows
+#if ! defined(_WIN32) || EXPAT_TESTS_ASAN == 0 || EXPAT_TESTS_64BIT == 1
     // XML_CONTEXT_BYTES of the prefix may remain in the buffer;
     // subtracting the whole prefix is easiest, and close enough.
     assert_true(XML_GetBuffer(parser, maxbuf - prefix_len) != NULL);
     // The limit should be consistent; no prefix should allow us to
     // reach above the max buffer size.
     assert_true(XML_GetBuffer(parser, maxbuf + 1) == NULL);
+#else
+    UNUSED_P(maxbuf);
+#endif
+
     XML_ParserFree(parser);
   }
 }
@@ -3216,8 +3810,7 @@ external_bom_checker(XML_Parser parser, const XML_Char *context,
     fail("Could not create external entity parser");
 
   if (! xcstrcmp(systemId, XCS("004-2.ent"))) {
-    struct bom_testdata *const testdata
-        = (struct bom_testdata *)XML_GetUserData(parser);
+    struct bom_testdata *const testdata = XML_GetUserData(parser);
     const char *const external = testdata->external;
     const int split = testdata->split;
     testdata->nested_callback_happened = XML_TRUE;
@@ -3570,7 +4163,9 @@ START_TEST(test_suspend_xdecl) {
   XML_SetXmlDeclHandler(g_parser, entity_suspending_xdecl_handler);
   XML_SetUserData(g_parser, g_parser);
   g_resumable = XML_TRUE;
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+  // can't use SINGLE_BYTES here, because it'll return early on suspension, and
+  // we won't know exactly how much input we actually managed to give Expat.
+  if (XML_Parse(g_parser, text, (int)strlen(text), XML_TRUE)
       != XML_STATUS_SUSPENDED)
     xml_failure(g_parser);
   if (XML_GetErrorCode(g_parser) != XML_ERROR_NONE)
@@ -3766,13 +4361,20 @@ END_TEST
 
 /* Test syntax error is caught at parse resumption */
 START_TEST(test_resume_entity_with_syntax_error) {
+  if (g_chunkSize != 0) {
+    // this test does not use SINGLE_BYTES, because of suspension
+    return;
+  }
+
   const char *text = "<!DOCTYPE doc [\n"
                      "<!ENTITY foo '<suspend>Hi</wombat>'>\n"
                      "]>\n"
                      "<doc>&foo;</doc>\n";
 
   XML_SetStartElementHandler(g_parser, start_element_suspender);
-  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+  // can't use SINGLE_BYTES here, because it'll return early on suspension, and
+  // we won't know exactly how much input we actually managed to give Expat.
+  if (XML_Parse(g_parser, text, (int)strlen(text), XML_TRUE)
       != XML_STATUS_SUSPENDED)
     xml_failure(g_parser);
   if (XML_ResumeParser(g_parser) != XML_STATUS_ERROR)
@@ -3888,6 +4490,37 @@ START_TEST(test_skipped_external_entity) {
 }
 END_TEST
 
+START_TEST(test_scaff_index_shared_across_external_entity_parser) {
+  const char text[]
+      = "<!DOCTYPE doc [\n"
+        "<!ELEMENT a "
+        "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((b))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))>\n"
+        "<!ENTITY % e SYSTEM 'ext'>\n"
+        "%e;\n"
+        "<!ELEMENT c "
+        "(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((d)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))>\n"
+        "]>\n"
+        "<doc/>";
+  ExtOption options[]
+      = {{XCS("ext"),
+          "<!ELEMENT x "
+          "((((((((((((((((((((((((((((((((y))))))))))))))))))))))))))))))))>"},
+         {NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  XML_SetParamEntityParsing(parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
+  XML_SetUserData(parser, options);
+  XML_SetExternalEntityRefHandler(parser, external_entity_optioner);
+  XML_SetElementDeclHandler(parser, dummy_element_decl_handler);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      == XML_STATUS_ERROR)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
 /* Test a different form of unknown external entity */
 START_TEST(test_skipped_null_loaded_ext_entity) {
   const char *text = "<!DOCTYPE doc SYSTEM 'http://example.org/one.ent'>\n"
@@ -3896,7 +4529,7 @@ START_TEST(test_skipped_null_loaded_ext_entity) {
       = {"<!ENTITY % pe1 SYSTEM 'http://example.org/two.ent'>\n"
          "<!ENTITY % pe2 '%pe1;'>\n"
          "%pe2;\n",
-         external_entity_null_loader};
+         external_entity_null_loader, NULL};
 
   XML_SetUserData(g_parser, &test_data);
   XML_SetParamEntityParsing(g_parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
@@ -3914,7 +4547,7 @@ START_TEST(test_skipped_unloaded_ext_entity) {
       = {"<!ENTITY % pe1 SYSTEM 'http://example.org/two.ent'>\n"
          "<!ENTITY % pe2 '%pe1;'>\n"
          "%pe2;\n",
-         NULL};
+         NULL, NULL};
 
   XML_SetUserData(g_parser, &test_data);
   XML_SetParamEntityParsing(g_parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
@@ -4368,6 +5001,46 @@ START_TEST(test_unknown_encoding_invalid_attr_value) {
   XML_SetUnknownEncodingHandler(g_parser, MiscEncodingHandler, NULL);
   expect_failure(text, XML_ERROR_INVALID_TOKEN,
                  "Invalid attribute valid not faulted");
+}
+END_TEST
+
+START_TEST(test_unknown_encoding_user_data_primary) {
+  // This test is based on ideas contributed by Artiphishell Inc.
+  const char *const text = "<?xml version='1.0' encoding='x-unk'?>\n"
+                           "<root />\n";
+  XML_Parser parser = XML_ParserCreate(NULL);
+  XML_SetUnknownEncodingHandler(parser,
+                                user_data_checking_unknown_encoding_handler,
+                                (void *)(intptr_t)0xC0FFEE);
+
+  assert_true(_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+              == XML_STATUS_OK);
+
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_unknown_encoding_user_data_secondary) {
+  // This test is based on ideas contributed by Artiphishell Inc.
+  const char *const text_main = "<!DOCTYPE r [\n"
+                                "  <!ENTITY ext SYSTEM 'ext.ent'>\n"
+                                "]>\n"
+                                "<r>&ext;</r>\n";
+  const char *const text_external = "<?xml version='1.0' encoding='x-unk'?>\n"
+                                    "<e>data</e>";
+  ExtTest2 test_data = {text_external, (int)strlen(text_external), NULL, NULL};
+  XML_Parser parser = XML_ParserCreate(NULL);
+  XML_SetExternalEntityRefHandler(parser, external_entity_loader2);
+  XML_SetUnknownEncodingHandler(parser,
+                                user_data_checking_unknown_encoding_handler,
+                                (void *)(intptr_t)0xC0FFEE);
+  XML_SetUserData(parser, &test_data);
+
+  assert_true(_XML_Parse_SINGLE_BYTES(parser, text_main, (int)strlen(text_main),
+                                      XML_TRUE)
+              == XML_STATUS_OK);
+
+  XML_ParserFree(parser);
 }
 END_TEST
 
@@ -5214,6 +5887,151 @@ START_TEST(test_pool_integrity_with_unfinished_attr) {
 }
 END_TEST
 
+/* Test a possible early return location in internalEntityProcessor */
+START_TEST(test_entity_ref_no_elements) {
+  const char *const text = "<!DOCTYPE foo [\n"
+                           "<!ENTITY e1 \"test\">\n"
+                           "]> <foo>&e1;"; // intentionally missing newline
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  assert_true(_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+              == XML_STATUS_ERROR);
+  assert_true(XML_GetErrorCode(parser) == XML_ERROR_NO_ELEMENTS);
+  XML_ParserFree(parser);
+}
+END_TEST
+
+/* Tests if chained entity references lead to unbounded recursion */
+START_TEST(test_deep_nested_entity) {
+  const size_t N_LINES = 60000;
+  const size_t SIZE_PER_LINE = 50;
+
+  char *const text = malloc((N_LINES + 4) * SIZE_PER_LINE);
+  if (text == NULL) {
+    fail("malloc failed");
+  }
+
+  char *textPtr = text;
+
+  // Create the XML
+  textPtr += snprintf(textPtr, SIZE_PER_LINE,
+                      "<!DOCTYPE foo [\n"
+                      "	<!ENTITY s0 'deepText'>\n");
+
+  for (size_t i = 1; i < N_LINES; ++i) {
+    textPtr += snprintf(textPtr, SIZE_PER_LINE, "  <!ENTITY s%lu '&s%lu;'>\n",
+                        (long unsigned)i, (long unsigned)(i - 1));
+  }
+
+  snprintf(textPtr, SIZE_PER_LINE, "]> <foo>&s%lu;</foo>\n",
+           (long unsigned)(N_LINES - 1));
+
+  const XML_Char *const expected = XCS("deepText");
+
+  CharData storage;
+  CharData_Init(&storage);
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+
+  XML_SetCharacterDataHandler(parser, accumulate_characters);
+  XML_SetUserData(parser, &storage);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      == XML_STATUS_ERROR)
+    xml_failure(parser);
+
+  CharData_CheckXMLChars(&storage, expected);
+  XML_ParserFree(parser);
+  free(text);
+}
+END_TEST
+
+/* Tests if chained entity references in attributes
+lead to unbounded recursion */
+START_TEST(test_deep_nested_attribute_entity) {
+  const size_t N_LINES = 60000;
+  const size_t SIZE_PER_LINE = 100;
+
+  char *const text = malloc((N_LINES + 4) * SIZE_PER_LINE);
+  if (text == NULL) {
+    fail("malloc failed");
+  }
+
+  char *textPtr = text;
+
+  // Create the XML
+  textPtr += snprintf(textPtr, SIZE_PER_LINE,
+                      "<!DOCTYPE foo [\n"
+                      "	<!ENTITY s0 'deepText'>\n");
+
+  for (size_t i = 1; i < N_LINES; ++i) {
+    textPtr += snprintf(textPtr, SIZE_PER_LINE, "  <!ENTITY s%lu '&s%lu;'>\n",
+                        (long unsigned)i, (long unsigned)(i - 1));
+  }
+
+  snprintf(textPtr, SIZE_PER_LINE, "]> <foo name='&s%lu;'>mainText</foo>\n",
+           (long unsigned)(N_LINES - 1));
+
+  AttrInfo doc_info[] = {{XCS("name"), XCS("deepText")}, {NULL, NULL}};
+  ElementInfo info[]
+      = {{XCS("foo"), 1, 0, NULL, doc_info}, {NULL, 0, 0, NULL, NULL}};
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+  ParserAndElementInfo parserPlusElemenInfo = {parser, info};
+
+  XML_SetStartElementHandler(parser, counting_start_element_handler);
+  XML_SetUserData(parser, &parserPlusElemenInfo);
+
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      == XML_STATUS_ERROR)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+  free(text);
+}
+END_TEST
+
+START_TEST(test_deep_nested_entity_delayed_interpretation) {
+  const size_t N_LINES = 70000;
+  const size_t SIZE_PER_LINE = 100;
+
+  char *const text = malloc((N_LINES + 4) * SIZE_PER_LINE);
+  if (text == NULL) {
+    fail("malloc failed");
+  }
+
+  char *textPtr = text;
+
+  // Create the XML
+  textPtr += snprintf(textPtr, SIZE_PER_LINE,
+                      "<!DOCTYPE foo [\n"
+                      "	<!ENTITY %% s0 'deepText'>\n");
+
+  for (size_t i = 1; i < N_LINES; ++i) {
+    textPtr += snprintf(textPtr, SIZE_PER_LINE,
+                        "  <!ENTITY %% s%lu '&#37;s%lu;'>\n", (long unsigned)i,
+                        (long unsigned)(i - 1));
+  }
+
+  snprintf(textPtr, SIZE_PER_LINE,
+           "  <!ENTITY %% define_g \"<!ENTITY g '&#37;s%lu;'>\">\n"
+           "  %%define_g;\n"
+           "]>\n"
+           "<foo/>\n",
+           (long unsigned)(N_LINES - 1));
+
+  XML_Parser parser = XML_ParserCreate(NULL);
+
+  XML_SetParamEntityParsing(parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
+  if (_XML_Parse_SINGLE_BYTES(parser, text, (int)strlen(text), XML_TRUE)
+      == XML_STATUS_ERROR)
+    xml_failure(parser);
+
+  XML_ParserFree(parser);
+  free(text);
+}
+END_TEST
+
 START_TEST(test_nested_entity_suspend) {
   const char *const text = "<!DOCTYPE a [\n"
                            "  <!ENTITY e1 '<!--e1-->'>\n"
@@ -5230,6 +6048,35 @@ START_TEST(test_nested_entity_suspend) {
 
   XML_SetParamEntityParsing(parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
   XML_SetCommentHandler(parser, accumulate_and_suspend_comment_handler);
+  XML_SetUserData(parser, &parserPlusStorage);
+
+  enum XML_Status status = XML_Parse(parser, text, (int)strlen(text), XML_TRUE);
+  while (status == XML_STATUS_SUSPENDED) {
+    status = XML_ResumeParser(parser);
+  }
+  if (status != XML_STATUS_OK)
+    xml_failure(parser);
+
+  CharData_CheckXMLChars(&storage, expected);
+  XML_ParserFree(parser);
+}
+END_TEST
+
+START_TEST(test_nested_entity_suspend_2) {
+  const char *const text = "<!DOCTYPE doc [\n"
+                           "  <!ENTITY ge1 'head1Ztail1'>\n"
+                           "  <!ENTITY ge2 'head2&ge1;tail2'>\n"
+                           "  <!ENTITY ge3 'head3&ge2;tail3'>\n"
+                           "]>\n"
+                           "<doc>&ge3;</doc>";
+  const XML_Char *const expected = XCS("head3") XCS("head2") XCS("head1")
+      XCS("Z") XCS("tail1") XCS("tail2") XCS("tail3");
+  CharData storage;
+  CharData_Init(&storage);
+  XML_Parser parser = XML_ParserCreate(NULL);
+  ParserPlusStorage parserPlusStorage = {parser, &storage};
+
+  XML_SetCharacterDataHandler(parser, accumulate_char_data_and_suspend);
   XML_SetUserData(parser, &parserPlusStorage);
 
   enum XML_Status status = XML_Parse(parser, text, (int)strlen(text), XML_TRUE);
@@ -5629,7 +6476,8 @@ START_TEST(test_bypass_heuristic_when_close_to_bufsize) {
   }
 
   const int document_length = 65536;
-  char *const document = (char *)malloc(document_length);
+  char *const document = malloc(document_length);
+  assert_true(document != NULL);
 
   const XML_Memory_Handling_Suite memfuncs = {
       counting_malloc,
@@ -5740,7 +6588,7 @@ START_TEST(test_varying_buffer_fills) {
     return; // this test is slow, and doesn't use _XML_Parse_SINGLE_BYTES().
   }
 
-  char *const document = (char *)malloc(document_length);
+  char *const document = malloc(document_length);
   assert_true(document != NULL);
   memset(document, 'x', document_length);
   document[0] = '<';
@@ -5844,6 +6692,24 @@ START_TEST(test_varying_buffer_fills) {
 END_TEST
 #endif
 
+START_TEST(test_empty_ext_param_entity_in_value) {
+  const char *text = "<!DOCTYPE r SYSTEM \"ext.dtd\"><r/>";
+  ExtOption options[] = {
+      {XCS("ext.dtd"), "<!ENTITY % pe SYSTEM \"empty\">"
+                       "<!ENTITY ge \"%pe;\">"},
+      {XCS("empty"), ""},
+      {NULL, NULL},
+  };
+
+  XML_SetParamEntityParsing(g_parser, XML_PARAM_ENTITY_PARSING_ALWAYS);
+  XML_SetExternalEntityRefHandler(g_parser, external_entity_optioner);
+  XML_SetUserData(g_parser, options);
+  if (_XML_Parse_SINGLE_BYTES(g_parser, text, (int)strlen(text), XML_TRUE)
+      == XML_STATUS_ERROR)
+    xml_failure(g_parser);
+}
+END_TEST
+
 void
 make_basic_test_case(Suite *s) {
   TCase *tc_basic = tcase_create("basic tests");
@@ -5860,6 +6726,7 @@ make_basic_test_case(Suite *s) {
   tcase_add_test(tc_basic, test_bom_utf16_le);
   tcase_add_test(tc_basic, test_nobom_utf16_le);
   tcase_add_test(tc_basic, test_hash_collision);
+  tcase_add_test(tc_basic, test_hash_salt_setter);
   tcase_add_test(tc_basic, test_illegal_utf8);
   tcase_add_test(tc_basic, test_utf8_auto_align);
   tcase_add_test(tc_basic, test_utf16);
@@ -5892,6 +6759,7 @@ make_basic_test_case(Suite *s) {
   tcase_add_test(tc_basic, test_xmldecl_invalid);
   tcase_add_test(tc_basic, test_xmldecl_missing_attr);
   tcase_add_test(tc_basic, test_xmldecl_missing_value);
+  tcase_add_test(tc_basic, test_xmldecl_empty_version);
   tcase_add_test__if_xml_ge(tc_basic, test_unknown_encoding_internal_entity);
   tcase_add_test(tc_basic, test_unrecognised_encoding_internal_entity);
   tcase_add_test__ifdef_xml_dtd(tc_basic, test_ext_entity_set_encoding);
@@ -5908,7 +6776,9 @@ make_basic_test_case(Suite *s) {
   tcase_add_test(tc_basic, test_wfc_undeclared_entity_with_external_subset);
   tcase_add_test(tc_basic, test_not_standalone_handler_reject);
   tcase_add_test(tc_basic, test_not_standalone_handler_accept);
+  tcase_add_test(tc_basic, test_entity_start_tag_level_greater_than_one);
   tcase_add_test__if_xml_ge(tc_basic, test_wfc_no_recursive_entity_refs);
+  tcase_add_test(tc_basic, test_no_indirectly_recursive_entity_refs);
   tcase_add_test__ifdef_xml_dtd(tc_basic, test_ext_entity_invalid_parse);
   tcase_add_test__if_xml_ge(tc_basic, test_dtd_default_handling);
   tcase_add_test(tc_basic, test_dtd_attr_handling);
@@ -5940,6 +6810,16 @@ make_basic_test_case(Suite *s) {
   tcase_add_test__ifdef_xml_dtd(tc_basic, test_empty_foreign_dtd);
   tcase_add_test(tc_basic, test_set_base);
   tcase_add_test(tc_basic, test_attributes);
+  tcase_add_test(tc_basic, test_duplicate_cdata_attribute);
+  tcase_add_test(tc_basic, test_duplicate_id_attribute_1);
+  tcase_add_test(tc_basic, test_duplicate_id_attribute_2);
+  tcase_add_test(tc_basic, test_duplicate_cdata_attribute_multiple_attlistdecl);
+  tcase_add_test(tc_basic,
+                 test_duplicate_cdata_attribute_multiple_attlistdecl_2);
+  tcase_add_test(tc_basic,
+                 test_duplicate_cdata_attribute_multiple_attlistdecl_3);
+  tcase_add_test(tc_basic, test_duplicate_id_attribute_multiple_attlistdecl);
+  tcase_add_test__if_xml_ge(tc_basic, test_default_attr_index_after_dtd_copy);
   tcase_add_test__if_xml_ge(tc_basic, test_reset_in_entity);
   tcase_add_test(tc_basic, test_resume_invalid_parse);
   tcase_add_test(tc_basic, test_resume_resuspended);
@@ -5959,6 +6839,8 @@ make_basic_test_case(Suite *s) {
   tcase_add_test__ifdef_xml_dtd(tc_basic, test_user_parameters);
   tcase_add_test__ifdef_xml_dtd(tc_basic, test_ext_entity_ref_parameter);
   tcase_add_test(tc_basic, test_empty_parse);
+  tcase_add_test(tc_basic, test_negative_len_parse);
+  tcase_add_test(tc_basic, test_negative_len_parse_buffer);
   tcase_add_test(tc_basic, test_get_buffer_1);
   tcase_add_test(tc_basic, test_get_buffer_2);
 #if XML_CONTEXT_BYTES > 0
@@ -6012,6 +6894,8 @@ make_basic_test_case(Suite *s) {
   tcase_add_test(tc_basic, test_trailing_cr_in_att_value);
   tcase_add_test(tc_basic, test_standalone_internal_entity);
   tcase_add_test(tc_basic, test_skipped_external_entity);
+  tcase_add_test__ifdef_xml_dtd(
+      tc_basic, test_scaff_index_shared_across_external_entity_parser);
   tcase_add_test(tc_basic, test_skipped_null_loaded_ext_entity);
   tcase_add_test(tc_basic, test_skipped_unloaded_ext_entity);
   tcase_add_test__ifdef_xml_dtd(tc_basic, test_param_entity_with_trailing_cr);
@@ -6043,6 +6927,8 @@ make_basic_test_case(Suite *s) {
   tcase_add_test(tc_basic, test_unknown_encoding_invalid_surrogate);
   tcase_add_test(tc_basic, test_unknown_encoding_invalid_high);
   tcase_add_test(tc_basic, test_unknown_encoding_invalid_attr_value);
+  tcase_add_test(tc_basic, test_unknown_encoding_user_data_primary);
+  tcase_add_test(tc_basic, test_unknown_encoding_user_data_secondary);
   tcase_add_test__if_xml_ge(tc_basic, test_ext_entity_latin1_utf16le_bom);
   tcase_add_test__if_xml_ge(tc_basic, test_ext_entity_latin1_utf16be_bom);
   tcase_add_test__if_xml_ge(tc_basic, test_ext_entity_latin1_utf16le_bom2);
@@ -6085,7 +6971,14 @@ make_basic_test_case(Suite *s) {
   tcase_add_test(tc_basic, test_empty_element_abort);
   tcase_add_test__ifdef_xml_dtd(tc_basic,
                                 test_pool_integrity_with_unfinished_attr);
+  tcase_add_test__ifdef_xml_dtd(tc_basic, test_empty_ext_param_entity_in_value);
+  tcase_add_test__if_xml_ge(tc_basic, test_entity_ref_no_elements);
+  tcase_add_test__if_xml_ge(tc_basic, test_deep_nested_entity);
+  tcase_add_test__if_xml_ge(tc_basic, test_deep_nested_attribute_entity);
+  tcase_add_test__if_xml_ge(tc_basic,
+                            test_deep_nested_entity_delayed_interpretation);
   tcase_add_test__if_xml_ge(tc_basic, test_nested_entity_suspend);
+  tcase_add_test__if_xml_ge(tc_basic, test_nested_entity_suspend_2);
 #if defined(XML_TESTING)
   tcase_add_test(tc_basic, test_big_tokens_scale_linearly);
 #endif

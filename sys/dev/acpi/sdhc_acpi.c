@@ -1,4 +1,4 @@
-/*	$OpenBSD: sdhc_acpi.c,v 1.22 2022/10/08 19:46:52 kettenis Exp $	*/
+/*	$OpenBSD: sdhc_acpi.c,v 1.24 2025/06/11 09:57:01 kettenis Exp $	*/
 /*
  * Copyright (c) 2016 Mark Kettenis
  *
@@ -51,7 +51,8 @@ int	sdhc_acpi_match(struct device *, void *, void *);
 void	sdhc_acpi_attach(struct device *, struct device *, void *);
 
 const struct cfattach sdhc_acpi_ca = {
-	sizeof(struct sdhc_acpi_softc), sdhc_acpi_match, sdhc_acpi_attach
+	sizeof(struct sdhc_acpi_softc), sdhc_acpi_match, sdhc_acpi_attach,
+	NULL, sdhc_activate
 };
 
 const char *sdhc_hids[] = {
@@ -130,7 +131,8 @@ sdhc_acpi_attach(struct device *parent, struct device *self, void *aux)
 		struct acpi_gpio *gpio = sc->sc_gpio_int_node->gpio;
 
 		gpio->intr_establish(gpio->cookie, sc->sc_gpio_int_pin,
-		    sc->sc_gpio_int_flags, sdhc_acpi_card_detect_intr, sc);
+		    sc->sc_gpio_int_flags, IPL_BIO,
+		    sdhc_acpi_card_detect_intr, sc);
 	}
 
 	sdhc_acpi_power_on(sc, sc->sc_node);

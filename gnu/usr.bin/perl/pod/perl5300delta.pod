@@ -90,7 +90,7 @@ rules for use with Turkic languages.  Previously, Perl ignored these,
 but now, it uses them when it detects that it is operating under a
 Turkic UTF-8 locale.
 
-=head2 It is now possible to compile perl to always use thread-safe locale operations.
+=head2 It is now possible to compile perl to always use thread-safe locale operations
 
 Previously, these calls were only used when the perl was compiled to be
 multi-threaded.  To always enable them, add
@@ -211,12 +211,12 @@ by default, JSON::PP also enabled allow_nonref by default.
 
 =head1 Deprecations
 
-=head2 In XS code, use of various macros dealing with UTF-8.
+=head2 In XS code, use of various macros dealing with UTF-8
 
 This deprecation was scheduled to become fatal in 5.30, but has been
 delayed to 5.32 due to problems that showed up with some CPAN modules.
-For details of what's affected, see L<perldeprecation|
-perldeprecation/In XS code, use of various macros dealing with UTF-8.>.
+For details of what's affected, see
+L<perldeprecation|perldeprecation/In XS code, use of various macros dealing with UTF-8>.
 
 =head1 Performance Enhancements
 
@@ -667,6 +667,14 @@ not usually on concerns over their design.
 
 =item *
 
+arybase has been removed. It used to provide the implementation of the C<$[>
+variable (also known as the C<array_base> feature), letting array and string
+indices start at a non-zero value. As the feature has been removed (see
+L</Assigning non-zero to C<$[> is fatal>), this internal module is gone as
+well.
+
+=item *
+
 B::Debug is no longer distributed with the core distribution.  It
 continues to be available on CPAN as
 C<< L<B::Debug|https://metacpan.org/pod/B::Debug> >>.
@@ -1053,7 +1061,7 @@ L<[GH #16461]|https://github.com/Perl/perl5/issues/16461>.
 
 =item *
 
-It is now forbidden to malloc more than C<PTRDIFF_T_MAX> bytes.  Much
+It is now forbidden to malloc more than C<PTRDIFF_MAX> bytes.  Much
 code (including C optimizers) assumes that all data structures will not
 be larger than this, so this catches such attempts before overflow
 happens.

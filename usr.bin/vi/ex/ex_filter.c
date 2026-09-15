@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_filter.c,v 1.15 2016/08/01 18:27:35 bentley Exp $	*/
+/*	$OpenBSD: ex_filter.c,v 1.16 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1991, 1993, 1994
@@ -34,7 +34,7 @@ static int filter_ldisplay(SCR *, FILE *);
  *	replace the original text with the stdout/stderr output of
  *	the utility.
  *
- * PUBLIC: int ex_filter(SCR *, 
+ * PUBLIC: int ex_filter(SCR *,
  * PUBLIC:    EXCMD *, MARK *, MARK *, MARK *, char *, enum filtertype);
  */
 int

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpufunc.h,v 1.41 2024/05/14 01:46:24 guenther Exp $	*/
+/*	$OpenBSD: cpufunc.h,v 1.48 2026/07/28 15:08:06 hshoexer Exp $	*/
 /*	$NetBSD: cpufunc.h,v 1.3 2003/05/08 10:27:43 fvdl Exp $	*/
 
 /*-
@@ -159,6 +159,25 @@ rcr4(void)
 	return (u_int) val64;
 }
 
+/*
+ * DR6 and DR7 debug registers
+ */
+static inline uint64_t
+rdr6(void)
+{
+	u_int64_t val;
+	__asm volatile("movq %%dr6,%0" : "=r" (val));
+	return val;
+}
+
+static inline uint64_t
+rdr7(void)
+{
+	u_int64_t val;
+	__asm volatile("movq %%dr7,%0" : "=r" (val));
+	return val;
+}
+
 static __inline void
 tlbflush(void)
 {
@@ -230,7 +249,7 @@ rdmsr(u_int msr)
 	return (((uint64_t)hi << 32) | (uint64_t) lo);
 }
 
-static __inline int
+static __inline uint32_t
 rdpkru(u_int ecx)
 {
 	uint32_t edx, pkru;
@@ -292,7 +311,7 @@ wbinvd_on_all_cpus(void)
 	wbinvd();
 	return 0;
 }
-#endif
+#endif /* MULTIPROCESSOR */
 
 static __inline void
 clflush(u_int64_t addr)
@@ -410,6 +429,14 @@ static __inline void
 breakpoint(void)
 {
 	__asm volatile("int $3");
+}
+
+/* VMGEXIT */
+static __inline void
+vmgexit(void)
+{
+	/* rep; vmmcall encodes the vmgexit instruction */
+	__asm volatile("rep; vmmcall");
 }
 
 void amd64_errata(struct cpu_info *);

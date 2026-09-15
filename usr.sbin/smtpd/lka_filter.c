@@ -1,4 +1,4 @@
-/*	$OpenBSD: lka_filter.c,v 1.77 2024/05/14 13:38:54 op Exp $	*/
+/*	$OpenBSD: lka_filter.c,v 1.82 2026/08/30 12:35:16 jsg Exp $	*/
 
 /*
  * Copyright (c) 2018 Gilles Chehade <gilles@poolp.org>
@@ -20,11 +20,12 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 
 #include "smtpd.h"
 #include "log.h"
 
-#define	PROTOCOL_VERSION	"0.7"
+#define	PROTOCOL_VERSION	"0.8"
 
 struct filter;
 struct filter_session;
@@ -47,6 +48,7 @@ static int	filter_builtins_data(struct filter_session *, struct filter *, uint64
 static int	filter_builtins_commit(struct filter_session *, struct filter *, uint64_t, const char *);
 
 static void	filter_result_proceed(uint64_t);
+static void	filter_result_report(uint64_t, const char *);
 static void	filter_result_junk(uint64_t);
 static void	filter_result_rewrite(uint64_t, const char *);
 static void	filter_result_reject(uint64_t, const char *);
@@ -93,7 +95,6 @@ static struct filter_exec {
 	{ FILTER_QUIT,    	"quit",		filter_builtins_notimpl },
 	{ FILTER_NOOP,    	"noop",		filter_builtins_notimpl },
 	{ FILTER_HELP,    	"help",		filter_builtins_notimpl },
-	{ FILTER_WIZ,    	"wiz",		filter_builtins_notimpl },
 	{ FILTER_COMMIT,    	"commit",      	filter_builtins_commit },
 };
 
@@ -165,6 +166,7 @@ static struct dict		processors;
 
 struct processor_instance {
 	char			*name;
+	struct syslog_data	 sd;
 	struct io		*io;
 	struct io		*errfd;
 	int			 ready;
@@ -204,7 +206,7 @@ lka_proc_config(struct processor_instance *pi)
 }
 
 void
-lka_proc_forked(const char *name, uint32_t subsystems, int fd)
+lka_proc_forked(const char *name, const char *tag, uint32_t subsystems, int fd)
 {
 	struct processor_instance	*processor;
 
@@ -215,6 +217,10 @@ lka_proc_forked(const char *name, uint32_t subsystems, int fd)
 
 	processor = xcalloc(1, sizeof *processor);
 	processor->name = xstrdup(name);
+	processor->sd = (struct syslog_data)SYSLOG_DATA_INIT;
+	/* Make sure it persists */
+	tag = xstrdup(tag);
+	openlog_r(tag, LOG_ODELAY, LOG_MAIL, &processor->sd);
 	processor->io = io_new();
 	processor->subsystems = subsystems;
 
@@ -236,7 +242,7 @@ lka_proc_errfd(const char *name, int fd)
 
 	processor->errfd = io_new();
 	io_set_fd(processor->errfd, fd);
-	io_set_callback(processor->errfd, processor_errfd, processor->name);
+	io_set_callback(processor->errfd, processor_errfd, processor);
 
 	lka_proc_config(processor);
 }
@@ -310,14 +316,36 @@ processor_io(struct io *io, int evt, void *arg)
 static void
 processor_errfd(struct io *io, int evt, void *arg)
 {
-	const char	*name = arg;
+	struct processor_instance *processor = arg;
 	char		*line = NULL;
 	ssize_t		 len;
 
 	switch (evt) {
 	case IO_DATAIN:
-		while ((line = io_getline(io, &len)) != NULL)
-			log_warnx("%s: %s", name, line);
+		while ((line = io_getline(io, &len)) != NULL) {
+			if (!strncasecmp(
+			    line, "DEBUG|", sizeof("DEBUG|") - 1))
+				log_debug_r(&processor->sd, "%s",
+				    line + sizeof("DEBUG|") - 1);
+			else if (!strncasecmp(
+			    line, "INFO|", sizeof("INFO|") - 1))
+				log_info_r(&processor->sd, "%s",
+				    line + sizeof("INFO|") - 1);
+			else if (!strncasecmp(
+			    line, "WARNING|", sizeof("WARNING|") - 1))
+				log_warnx_r(&processor->sd, "%s",
+				    line + sizeof("WARNING|") - 1);
+			else if (!strncasecmp(
+			    line, "WARN|", sizeof("WARN|") - 1))
+				log_warnx_r(&processor->sd, "%s",
+				    line + sizeof("WARN|") - 1);
+			else if (!strncasecmp(
+			    line, "FATAL|", sizeof("FATAL|") - 1))
+				logit_r(&processor->sd, LOG_CRIT, "%s",
+				    line + sizeof("FATAL|") - 1);
+			else
+				log_warnx_r(&processor->sd, "%s", line);
+		}
 	}
 }
 
@@ -644,7 +672,7 @@ lka_filter_process_response(const char *name, const char *line)
 		return;
 	} else if (strcmp(response, "junk") == 0) {
 		if (fs->phase == FILTER_COMMIT)
-			fatalx("filter-reponse junk after DATA");
+			fatalx("filter-response junk after DATA");
 		filter_result_junk(reqid);
 		return;
 	} else {
@@ -657,6 +685,8 @@ lka_filter_process_response(const char *name, const char *line)
 			filter_result_reject(reqid, parameter);
 		else if (strncmp(response, "disconnect|", 11) == 0)
 			filter_result_disconnect(reqid, parameter);
+		else if (strncmp(response, "report|", 7) == 0)
+			filter_result_report(reqid, parameter);
 		else
 			fatalx("Invalid directive: %s", line);
 	}
@@ -953,6 +983,16 @@ filter_result_proceed(uint64_t reqid)
 	m_create(p_dispatcher, IMSG_FILTER_SMTP_PROTOCOL, 0, 0, -1);
 	m_add_id(p_dispatcher, reqid);
 	m_add_int(p_dispatcher, FILTER_PROCEED);
+	m_close(p_dispatcher);
+}
+
+static void
+filter_result_report(uint64_t reqid, const char *param)
+{
+	m_create(p_dispatcher, IMSG_FILTER_SMTP_PROTOCOL, 0, 0, -1);
+	m_add_id(p_dispatcher, reqid);
+	m_add_int(p_dispatcher, FILTER_REPORT);
+	m_add_string(p_dispatcher, param);
 	m_close(p_dispatcher);
 }
 
@@ -1619,9 +1659,6 @@ lka_report_smtp_filter_response(const char *direction, struct timeval *tv, uint6
 	case FILTER_HELP:
 		phase_name = "help";
 		break;
-	case FILTER_WIZ:
-		phase_name = "wiz";
-		break;
 	case FILTER_COMMIT:
 		phase_name = "commit";
 		break;
@@ -1632,6 +1669,9 @@ lka_report_smtp_filter_response(const char *direction, struct timeval *tv, uint6
 	switch (response) {
 	case FILTER_PROCEED:
 		response_name = "proceed";
+		break;
+	case FILTER_REPORT:
+		response_name = "report";
 		break;
 	case FILTER_JUNK:
 		response_name = "junk";

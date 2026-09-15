@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_pool.c,v 1.236 2022/08/14 01:58:28 jsg Exp $	*/
+/*	$OpenBSD: subr_pool.c,v 1.243 2026/01/29 01:04:35 dlg Exp $	*/
 /*	$NetBSD: subr_pool.c,v 1.61 2001/09/26 07:14:56 chs Exp $	*/
 
 /*-
@@ -154,6 +154,10 @@ struct pool_page_header {
 #define POOL_PHPOISON(ph) ISSET((ph)->ph_magic, POOL_MAGICBIT)
 
 #ifdef MULTIPROCESSOR
+#define POOL_CACHE_LIST_MIN	8		/* minimum list length */
+#define POOL_CACHE_LIST_INC	8
+#define POOL_CACHE_LIST_DEC	1
+
 struct pool_cache_item {
 	struct pool_cache_item	*ci_next;	/* next item in list */
 	unsigned long		 ci_nitems;	/* number of items in list */
@@ -400,6 +404,7 @@ pool_init(struct pool *pp, size_t size, u_int align, int ipl, int flags,
 	 * Initialize the pool structure.
 	 */
 	memset(pp, 0, sizeof(*pp));
+	refcnt_init(&pp->pr_refcnt);
 	if (ISSET(flags, PR_RWLOCK)) {
 		KASSERT(flags & PR_WAITOK);
 		pp->pr_lock_ops = &pool_lock_ops_rw;
@@ -423,11 +428,6 @@ pool_init(struct pool *pp, size_t size, u_int align, int ipl, int flags,
 	pp->pr_nitems = 0;
 	pp->pr_nout = 0;
 	pp->pr_hardlimit = UINT_MAX;
-	pp->pr_hardlimit_warning = NULL;
-	pp->pr_hardlimit_ratecap.tv_sec = 0;
-	pp->pr_hardlimit_ratecap.tv_usec = 0;
-	pp->pr_hardlimit_warning_last.tv_sec = 0;
-	pp->pr_hardlimit_warning_last.tv_usec = 0;
 	RBT_INIT(phtree, &pp->pr_phtree);
 
 	/*
@@ -492,11 +492,6 @@ pool_destroy(struct pool *pp)
 	struct pool_page_header *ph;
 	struct pool *prev, *iter;
 
-#ifdef MULTIPROCESSOR
-	if (pp->pr_cache != NULL)
-		pool_cache_destroy(pp);
-#endif
-
 #ifdef DIAGNOSTIC
 	if (pp->pr_nout != 0)
 		panic("%s: pool busy: still out: %u", __func__, pp->pr_nout);
@@ -519,6 +514,14 @@ pool_destroy(struct pool *pp)
 		}
 	}
 	rw_exit_write(&pool_lock);
+
+	/* Wait for concurrent sysctl_dopool() */
+	refcnt_finalize(&pp->pr_refcnt, "pooldtor");
+
+#ifdef MULTIPROCESSOR
+	if (pp->pr_cache != NULL)
+		pool_cache_destroy(pp);
+#endif
 
 	/* Remove all pages */
 	while ((ph = TAILQ_FIRST(&pp->pr_emptypages)) != NULL) {
@@ -562,6 +565,9 @@ pool_get(struct pool *pp, int flags)
 {
 	void *v = NULL;
 	int slowdown = 0;
+
+	if (flags & PR_WAITOK)
+		assertwaitok();
 
 	KASSERT(flags & (PR_WAITOK | PR_NOWAIT));
 	if (pp->pr_flags & PR_RWLOCK)
@@ -1088,9 +1094,11 @@ pool_sethiwat(struct pool *pp, int n)
 }
 
 int
-pool_sethardlimit(struct pool *pp, u_int n, const char *warnmsg, int ratecap)
+pool_sethardlimit(struct pool *pp, u_int n)
 {
 	int error = 0;
+
+	pl_enter(pp, &pp->pr_lock);
 
 	if (n < pp->pr_nout) {
 		error = EINVAL;
@@ -1098,12 +1106,9 @@ pool_sethardlimit(struct pool *pp, u_int n, const char *warnmsg, int ratecap)
 	}
 
 	pp->pr_hardlimit = n;
-	pp->pr_hardlimit_warning = warnmsg;
-	pp->pr_hardlimit_ratecap.tv_sec = ratecap;
-	pp->pr_hardlimit_warning_last.tv_sec = 0;
-	pp->pr_hardlimit_warning_last.tv_usec = 0;
-
 done:
+	pl_leave(pp, &pp->pr_lock);
+
 	return (error);
 }
 
@@ -1456,6 +1461,7 @@ pool_walk(struct pool *pp, int full,
 }
 #endif
 
+#ifndef SMALL_KERNEL
 /*
  * We have three different sysctls.
  * kern.pool.npools - the number of pools.
@@ -1467,7 +1473,7 @@ sysctl_dopool(int *name, u_int namelen, char *oldp, size_t *oldlenp)
 {
 	struct kinfo_pool pi;
 	struct pool *pp;
-	int rv = ENOENT;
+	int rv = EOPNOTSUPP;
 
 	switch (name[0]) {
 	case KERN_POOL_NPOOLS:
@@ -1488,14 +1494,16 @@ sysctl_dopool(int *name, u_int namelen, char *oldp, size_t *oldlenp)
 		return (ENOTDIR);
 
 	rw_enter_read(&pool_lock);
-
 	SIMPLEQ_FOREACH(pp, &pool_head, pr_poollist) {
-		if (name[1] == pp->pr_serial)
+		if (name[1] == pp->pr_serial) {
+			refcnt_take(&pp->pr_refcnt);
 			break;
+		}
 	}
+	rw_exit_read(&pool_lock);
 
 	if (pp == NULL)
-		goto done;
+		return (ENOENT);
 
 	switch (name[0]) {
 	case KERN_POOL_NAME:
@@ -1537,11 +1545,11 @@ sysctl_dopool(int *name, u_int namelen, char *oldp, size_t *oldlenp)
 		break;
 	}
 
-done:
-	rw_exit_read(&pool_lock);
+	refcnt_rele_wake(&pp->pr_refcnt);
 
 	return (rv);
 }
+#endif /* SMALL_KERNEL */
 
 void
 pool_gc_sched(void *null)
@@ -1732,7 +1740,7 @@ pool_cache_init(struct pool *pp)
 	TAILQ_INIT(&pp->pr_cache_lists);
 	pp->pr_cache_nitems = 0;
 	pp->pr_cache_timestamp = getnsecuptime();
-	pp->pr_cache_items = 8;
+	pp->pr_cache_items = POOL_CACHE_LIST_MIN;
 	pp->pr_cache_contention = 0;
 	pp->pr_cache_ngc = 0;
 
@@ -2039,11 +2047,12 @@ pool_cache_gc(struct pool *pp)
 	contention = pp->pr_cache_contention;
 	delta = contention - pp->pr_cache_contention_prev;
 	if (delta > 8 /* magic */) {
-		if ((ncpusfound * 8 * 2) <= pp->pr_cache_nitems)
-			pp->pr_cache_items += 8;
+		if ((ncpusfound * POOL_CACHE_LIST_MIN * 2) <=
+		    pp->pr_cache_nitems)
+			pp->pr_cache_items += POOL_CACHE_LIST_INC;
 	} else if (delta == 0) {
-		if (pp->pr_cache_items > 8)
-			pp->pr_cache_items--;
+		if (pp->pr_cache_items > POOL_CACHE_LIST_MIN)
+			pp->pr_cache_items -= POOL_CACHE_LIST_DEC;
 	}
 	pp->pr_cache_contention_prev = contention;
 }
@@ -2243,7 +2252,7 @@ void
 pool_lock_rw_init(struct pool *pp, union pool_lock *lock,
     const struct lock_type *type)
 {
-	_rw_init_flags(&lock->prl_rwlock, pp->pr_wchan, 0, type);
+	_rw_init_flags(&lock->prl_rwlock, pp->pr_wchan, 0, type, 0);
 }
 
 void

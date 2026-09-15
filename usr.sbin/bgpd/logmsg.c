@@ -1,4 +1,4 @@
-/*	$OpenBSD: logmsg.c,v 1.14 2024/05/20 10:00:00 claudio Exp $ */
+/*	$OpenBSD: logmsg.c,v 1.19 2026/04/30 15:48:13 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -68,7 +68,7 @@ log_peer_info(const struct peer_config *peer, const char *emsg, ...)
 	if (vasprintf(&msg, emsg, ap) == -1)
 		fatal(NULL);
 	va_end(ap);
-	logit(LOG_INFO, "%s: %s", p, msg);
+	log_info("%s: %s", p, msg);
 	free(msg);
 	free(p);
 }
@@ -82,13 +82,13 @@ log_peer_warn(const struct peer_config *peer, const char *emsg, ...)
 
 	p = log_fmt_peer(peer);
 	if (emsg == NULL) {
-		logit(LOG_ERR, "%s: %s", p, strerror(saved_errno));
+		log_warnx("%s: %s", p, strerror(saved_errno));
 	} else {
 		va_start(ap, emsg);
 		if (vasprintf(&msg, emsg, ap) == -1)
 			fatal(NULL);
 		va_end(ap);
-		logit(LOG_ERR, "%s: %s: %s", p, msg, strerror(saved_errno));
+		log_warnx("%s: %s: %s", p, msg, strerror(saved_errno));
 		free(msg);
 	}
 	free(p);
@@ -105,30 +105,50 @@ log_peer_warnx(const struct peer_config *peer, const char *emsg, ...)
 	if (vasprintf(&msg, emsg, ap) == -1)
 		fatal(NULL);
 	va_end(ap);
-	logit(LOG_ERR, "%s: %s", p, msg);
+	log_warnx("%s: %s", p, msg);
 	free(msg);
 	free(p);
 }
 
 void
-log_statechange(struct peer *peer, enum session_state nstate,
+log_statechange(struct peer *peer, enum session_state ostate,
     enum session_events event)
 {
-	char	*p;
-
 	/* don't clutter the logs with constant Connect -> Active -> Connect */
-	if (nstate == STATE_CONNECT && peer->state == STATE_ACTIVE &&
-	    peer->prev_state == STATE_CONNECT)
+	if (peer->state == STATE_CONNECT && peer->prev_state == STATE_ACTIVE &&
+	    ostate == STATE_CONNECT)
 		return;
-	if (nstate == STATE_ACTIVE && peer->state == STATE_CONNECT &&
-	    peer->prev_state == STATE_ACTIVE)
+	if (peer->state == STATE_ACTIVE && peer->prev_state == STATE_CONNECT &&
+	    ostate == STATE_ACTIVE)
 		return;
 
 	peer->lasterr = 0;
-	p = log_fmt_peer(&peer->conf);
-	logit(LOG_INFO, "%s: state change %s -> %s, reason: %s",
-	    p, statenames[peer->state], statenames[nstate], eventnames[event]);
-	free(p);
+	log_peer_info(&peer->conf, "state change %s -> %s, reason: %s",
+	    statenames[peer->prev_state], statenames[peer->state],
+	    eventnames[event]);
+}
+
+static const char *
+tohex(const unsigned char *in, size_t len)
+{
+	const char hex[] = "0123456789ABCDEF";
+	static char out[(16 + 1) * 3];
+	size_t i, o = 0;
+
+	if (len == 0)
+		return "";
+	if (len > 16)
+		len = 16;
+	for (i = 0; i < len; i++) {
+		out[o++] = hex[in[i] >> 4];
+		out[o++] = hex[in[i] & 0xf];
+		out[o++] = ' ';
+		if (i == 7)
+			out[o++] = ' ';
+	}
+	out[o - 1] = '\0';
+
+	return out;
 }
 
 void
@@ -138,7 +158,7 @@ log_notification(const struct peer *peer, uint8_t errcode, uint8_t subcode,
 	struct ibuf	 ibuf;
 	char		*p;
 	const char	*suberrname = NULL;
-	int		 uk = 0;
+	int		 uk = 0, dump = 0;
 
 	if (data != NULL)
 		ibuf_from_ibuf(&ibuf, data);
@@ -148,14 +168,14 @@ log_notification(const struct peer *peer, uint8_t errcode, uint8_t subcode,
 	p = log_fmt_peer(&peer->conf);
 	switch (errcode) {
 	case ERR_HEADER:
-		if (subcode >= sizeof(suberr_header_names) / sizeof(char *) ||
+		if (subcode >= nitems(suberr_header_names) ||
 		    suberr_header_names[subcode] == NULL)
 			uk = 1;
 		else
 			suberrname = suberr_header_names[subcode];
 		break;
 	case ERR_OPEN:
-		if (subcode >= sizeof(suberr_open_names) / sizeof(char *) ||
+		if (subcode >= nitems(suberr_open_names) ||
 		    suberr_open_names[subcode] == NULL)
 			uk = 1;
 		else
@@ -166,7 +186,7 @@ log_notification(const struct peer *peer, uint8_t errcode, uint8_t subcode,
 			if (ibuf_get_n8(&ibuf, &capa_code) == -1)
 				break;
 
-			logit(LOG_ERR, "%s: %s notification: %s, %s: %s",
+			log_warnx("%s: %s notification: %s, %s: %s",
 			    p, dir, errnames[errcode], suberrname,
 			    log_capability(capa_code));
 			free(p);
@@ -174,14 +194,15 @@ log_notification(const struct peer *peer, uint8_t errcode, uint8_t subcode,
 		}
 		break;
 	case ERR_UPDATE:
-		if (subcode >= sizeof(suberr_update_names) / sizeof(char *) ||
+		if (subcode >= nitems(suberr_update_names) ||
 		    suberr_update_names[subcode] == NULL)
 			uk = 1;
 		else
 			suberrname = suberr_update_names[subcode];
+		dump = 1;
 		break;
 	case ERR_CEASE:
-		if (subcode >= sizeof(suberr_cease_names) / sizeof(char *) ||
+		if (subcode >= nitems(suberr_cease_names) ||
 		    suberr_cease_names[subcode] == NULL)
 			uk = 1;
 		else
@@ -194,7 +215,7 @@ log_notification(const struct peer *peer, uint8_t errcode, uint8_t subcode,
 			if (ibuf_get_n8(&ibuf, &len) != -1 && len != 0) {
 				char *s;
 				if ((s = ibuf_get_string(&ibuf, len)) != NULL) {
-					logit(LOG_ERR, "%s: %s notification: "
+					log_warnx("%s: %s notification: "
 					    "%s, %s: reason \"%s\"", p, dir,
 					    errnames[errcode], suberrname,
 					    log_reason(s));
@@ -210,37 +231,53 @@ log_notification(const struct peer *peer, uint8_t errcode, uint8_t subcode,
 			uk = 1;
 		break;
 	case ERR_FSM:
-		if (subcode >= sizeof(suberr_fsm_names) / sizeof(char *) ||
+		if (subcode >= nitems(suberr_fsm_names) ||
 		    suberr_fsm_names[subcode] == NULL)
 			uk = 1;
 		else
 			suberrname = suberr_fsm_names[subcode];
 		break;
 	case ERR_RREFRESH:
-		if (subcode >= sizeof(suberr_rrefresh_names) / sizeof(char *) ||
+		if (subcode >= nitems(suberr_rrefresh_names) ||
 		    suberr_rrefresh_names[subcode] == NULL)
 			uk = 1;
 		else
 			suberrname = suberr_rrefresh_names[subcode];
 		break;
 	default:
-		logit(LOG_ERR, "%s: %s notification, unknown errcode "
+		log_warnx("%s: %s notification, unknown errcode "
 		    "%u, subcode %u", p, dir, errcode, subcode);
 		free(p);
 		return;
 	}
 
 	if (uk)
-		logit(LOG_ERR, "%s: %s notification: %s, unknown subcode %u",
+		log_warnx("%s: %s notification: %s, unknown subcode %u",
 		    p, dir, errnames[errcode], subcode);
 	else {
 		if (suberrname == NULL)
-			logit(LOG_ERR, "%s: %s notification: %s", p,
+			log_warnx("%s: %s notification: %s", p,
 			    dir, errnames[errcode]);
 		else
-			logit(LOG_ERR, "%s: %s notification: %s, %s",
+			log_warnx("%s: %s notification: %s, %s",
 			    p, dir, errnames[errcode], suberrname);
 	}
+
+	if (dump && log_getverbose() && ibuf_size(&ibuf) > 0) {
+		size_t off = 0;
+		log_info("%s: notification data", p);
+		while (ibuf_size(&ibuf) > 0) {
+			unsigned char buf[16];
+			size_t len = sizeof(buf);
+			if (ibuf_size(&ibuf) < len)
+				len = ibuf_size(&ibuf);
+			if (ibuf_get(&ibuf, buf, len) == -1)
+				break;
+			log_info("   %5zu: %s", off, tohex(buf, len));
+			off += len;
+		}
+	}
+
 	free(p);
 }
 
@@ -251,14 +288,14 @@ log_conn_attempt(const struct peer *peer, struct sockaddr *sa, socklen_t len)
 
 	if (peer == NULL) {	/* connection from non-peer, drop */
 		if (log_getverbose())
-			logit(LOG_INFO, "connection from non-peer %s refused",
+			log_info("connection from non-peer %s refused",
 			    log_sockaddr(sa, len));
 	} else {
 		/* only log if there is a chance that the session may come up */
 		if (peer->conf.down && peer->state == STATE_IDLE)
 			return;
 		p = log_fmt_peer(&peer->conf);
-		logit(LOG_INFO, "Connection attempt from %s while session is "
+		log_info("Connection attempt from %s while session is "
 		    "in state %s", p, statenames[peer->state]);
 		free(p);
 	}

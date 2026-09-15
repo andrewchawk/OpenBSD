@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfd.h,v 1.108 2021/01/19 09:37:53 claudio Exp $ */
+/*	$OpenBSD: ospfd.h,v 1.111 2026/09/10 09:10:36 claudio Exp $ */
 
 /*
  * Copyright (c) 2004 Esben Norby <norby@openbsd.org>
@@ -556,6 +556,7 @@ struct area	*area_find(struct ospfd_conf *, struct in_addr);
 void		 area_track(struct area *);
 int		 area_border_router(struct ospfd_conf *);
 u_int8_t	 area_ospf_options(struct area *);
+struct area 	*area_txsan(const struct area *);
 
 /* carp.c */
 int		 carp_demote_init(char *, int);
@@ -579,8 +580,8 @@ u_int16_t	 iso_cksum(void *, u_int16_t, u_int16_t);
 int		 kif_init(void);
 void		 kif_clear(void);
 int		 kr_init(int, u_int, int, u_int8_t);
-int		 kr_change(struct kroute *, int);
-int		 kr_delete(struct kroute *);
+int		 kr_change(struct imsg *);
+int		 kr_delete(struct imsg *);
 void		 kr_shutdown(void);
 void		 kr_fib_couple(void);
 void		 kr_fib_decouple(void);
@@ -607,6 +608,7 @@ const char	*path_type_name(enum path_type);
 u_int16_t	 rtlabel_name2id(const char *);
 const char	*rtlabel_id2name(u_int16_t);
 void		 rtlabel_unref(u_int16_t);
+void		 rtlabel_ref(u_int16_t);
 u_int32_t	 rtlabel_id2tag(u_int16_t);
 u_int16_t	 rtlabel_tag2id(u_int32_t);
 void		 rtlabel_tag(u_int16_t, u_int32_t);
@@ -621,6 +623,8 @@ void	imsg_event_add(struct imsgev *);
 int	imsg_compose_event(struct imsgev *, u_int16_t, u_int32_t,
 	    pid_t, int, void *, u_int16_t);
 int	ifstate_is_up(struct kif *kif);
+struct iface
+	*iface_txsan(const struct iface *);
 
 /* printconf.c */
 void	print_config(struct ospfd_conf *);

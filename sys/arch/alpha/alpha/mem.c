@@ -1,4 +1,4 @@
-/* $OpenBSD: mem.c,v 1.35 2024/06/23 22:08:37 kettenis Exp $ */
+/* $OpenBSD: mem.c,v 1.39 2025/06/29 15:55:21 miod Exp $ */
 /* $NetBSD: mem.c,v 1.26 2000/03/29 03:48:20 simonb Exp $ */
 
 /*
@@ -51,6 +51,7 @@
 #include <sys/msgbuf.h>
 #include <sys/mman.h>
 #include <sys/conf.h>
+#include <sys/atomic.h>
 
 #include <machine/cpu.h>
 
@@ -76,7 +77,8 @@ mmopen(dev_t dev, int flag, int mode, struct proc *p)
 	switch (minor(dev)) {
 	case 0:
 	case 1:
-		if (securelevel <= 0 || allowkmem)
+		if ((int)atomic_load_int(&securelevel) <= 0 ||
+		    atomic_load_int(&allowkmem))
 			break;
 		return (EPERM);
 	case 2:
@@ -84,7 +86,7 @@ mmopen(dev_t dev, int flag, int mode, struct proc *p)
 		break;
 #ifdef APERTURE
 	case 4:
-	        if (suser(p) != 0 || !allowaperture)
+		if (suser(p) != 0 || !allowaperture)
 			return (EPERM);
 
 		/* authorize only one simultaneous open() unless
@@ -244,7 +246,6 @@ int
 mmioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 {
 	switch (cmd) {
-	case FIONBIO:
 	case FIOASYNC:
 		/* handled by fd layer */
 		return 0;

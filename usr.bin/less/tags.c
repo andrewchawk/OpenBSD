@@ -260,6 +260,10 @@ findctag(char *tag)
 		 */
 		tagendline = 0;
 		taglinenum = getnum(&p, 0, &err);
+		if (!err && taglinenum <= 0) {
+			/* line numbers must be positive */
+			continue;
+		}
 		if (err) {
 			/*
 			 * No, it must be a pattern.

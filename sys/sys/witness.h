@@ -1,4 +1,4 @@
-/*	$OpenBSD: witness.h,v 1.5 2019/04/23 13:35:12 visa Exp $	*/
+/*	$OpenBSD: witness.h,v 1.7 2025/07/05 09:24:37 jsg Exp $	*/
 
 /*-
  * Copyright (c) 1997 Berkeley Software Design, Inc. All rights reserved.
@@ -77,14 +77,13 @@ void	witness_lock(struct lock_object *, int);
 void	witness_upgrade(struct lock_object *, int);
 void	witness_downgrade(struct lock_object *, int);
 void	witness_unlock(struct lock_object *, int);
+void	witness_setrelative(struct lock_object *, struct lock_object *, int);
 int	witness_warn(int, struct lock_object *, const char *, ...);
 void	witness_assert(const struct lock_object *, int);
 void	witness_display_spinlock(struct lock_object *, struct proc *,
 	    int (*)(const char *, ...));
-int	witness_line(struct lock_object *);
 void	witness_norelease(struct lock_object *);
 void	witness_releaseok(struct lock_object *);
-const char *witness_file(struct lock_object *);
 void	witness_thread_exit(struct proc *);
 int	witness_sysctl(int *, u_int, void *, size_t *, void *, size_t);
 int	witness_sysctl_watch(void *, size_t *, void *, size_t);
@@ -121,6 +120,14 @@ int	witness_sysctl_watch(void *, size_t *, void *, size_t);
 #define	WITNESS_UNLOCK(lock, flags)					\
 	witness_unlock((lock), (flags))
 
+/* Set permitted child lock for lock. */
+#define	WITNESS_SETCHILD(lock, child)					\
+	witness_setrelative((lock), (child), 0)
+
+/* Set permitted parent lock for lock. */
+#define	WITNESS_SETPARENT(lock, parent)					\
+	witness_setrelative((lock), (parent), 1)
+
 #define	WITNESS_CHECK(flags, lock, fmt, ...)				\
 	witness_warn((flags), (lock), (fmt), ## __VA_ARGS__)
 
@@ -145,6 +152,8 @@ int	witness_sysctl_watch(void *, size_t *, void *, size_t);
 #define	WITNESS_UPGRADE(lock, flags)				(void)0
 #define	WITNESS_DOWNGRADE(lock, flags)				(void)0
 #define	WITNESS_UNLOCK(lock, flags)				(void)0
+#define	WITNESS_SETCHILD(lock, child)				(void)0
+#define	WITNESS_SETPARENT(lock, parent)				(void)0
 #define	WITNESS_CHECK(flags, lock, fmt, ...)	0
 #define	WITNESS_WARN(flags, lock, fmt, ...)			(void)0
 #define	WITNESS_NORELEASE(lock)					(void)0

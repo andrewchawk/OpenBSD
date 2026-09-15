@@ -1,4 +1,4 @@
-# $OpenBSD: GENERIC,v 1.288 2024/07/31 10:07:33 mglocker Exp $
+# $OpenBSD: GENERIC,v 1.318 2026/09/06 18:29:44 mglocker Exp $
 #
 # GENERIC machine description file
 #
@@ -26,6 +26,7 @@ option		PCIVERBOSE
 option		USER_PCICONF	# user-space PCI configuration
 option		USBVERBOSE
 option		SUSPEND
+option		HIBERNATE
 
 makeoptions	KERNEL_BASE_PHYS="0x00200000"
 makeoptions	KERNEL_BASE_VIRT="0xffffff8000200000"
@@ -42,6 +43,7 @@ acpi0		at mainbus?
 acpiac*		at acpi?
 acpibat*	at acpi?
 acpibtn*	at acpi?
+acpicpu*	at acpi?
 acpiec*		at acpi?
 acpige*		at acpi?
 acpimcfg*	at acpi?
@@ -63,6 +65,7 @@ ehci*		at acpi?
 ipmi*		at acpi?
 ohci*		at acpi?
 pluart*		at acpi?
+qcuart*		at acpi?
 sdhc*		at acpi?
 ufshci*		at acpi?
 xhci*		at acpi?
@@ -223,7 +226,7 @@ ssdfb*		at spi?
 wsdisplay*	at ssdfb?
 imxtmu*		at fdt?
 
-# Raspberry Pi 3/4
+# Raspberry Pi 3/4/5
 bcmaux*		at fdt? early 1
 bcmbsc*		at fdt?
 iic*		at bcmbsc?
@@ -235,18 +238,28 @@ gpio*		at bcmgpio?
 bcmintc*	at fdt? early 1
 bcmirng*	at fdt?
 bcmmbox*	at fdt? early 1
+bcmmip*		at fdt? early 1
 bcmpcie*	at fdt?
 pci*		at bcmpcie?
 bcmrng*		at fdt?
 bcmsdhost*	at fdt?
 sdmmc*		at bcmsdhost?
+bcmstbgpio*	at fdt? early 1
+bcmstbintc*	at fdt? early 1
+bcmstbpinctrl*	at fdt? early 1
+bcmstbrescal*	at fdt? early 1
+bcmstbreset*	at fdt? early 1
 bcmtemp*	at fdt?
 bcmtmon*	at fdt? early 1
 bse*		at fdt?
 bse*		at acpi?
 dwctwo*		at fdt?
 usb*		at dwctwo?
+rpone*		at pci?
+rpiclock*	at fdt? early 1
 rpigpio*	at fdt? early 1
+rpipwm*		at fdt?
+rpirtc*		at fdt?
 
 # Amlogic SoCs
 amlclock*	at fdt? early 1
@@ -271,6 +284,12 @@ hiclock*	at fdt? early 1
 hidwusb*	at fdt?
 hireset*	at fdt? early 1
 hitemp*		at fdt?
+
+# MediaTek SoCs
+mtintc*		at fdt?
+mtrng*		at fdt?
+mtxhci*		at fdt?
+usb*		at mtxhci?
 
 # Marvell SoCs
 mvclock*	at fdt? early 1
@@ -304,6 +323,7 @@ rkpinctrl*	at fdt? early 1
 rkcomphy*	at fdt? early 1
 rkpciephy*	at fdt? early 1
 rktcphy*	at fdt? early 1
+rkusbdpphy*	at fdt? early 1
 rkusbphy*	at fdt? early 1
 rkanxdp*	at fdt?
 rkdrm*		at fdt?
@@ -315,6 +335,7 @@ rkgpio*		at fdt?
 rkiic*		at fdt?
 iic*		at rkiic?
 rkiis*		at fdt?
+rkotp*		at fdt?
 rkpcie*		at fdt?
 pci*		at rkpcie?
 rkpwm*		at fdt?
@@ -332,16 +353,21 @@ sdmmc*		at dwmshc?
 # Qualcomm SoCs
 qcaoss*		at fdt?
 qccpu*		at fdt?
+qccpucp*	at fdt?
+qcdrm*		at fdt?
+qcdpc*		at fdt?
 qcdwusb*	at fdt?
 qcgpio*		at acpi?
 qcgpio*		at fdt? early 1
 qciic*		at acpi?
 qciic*		at fdt?
 iic*		at qciic?
+qcuart*		at fdt?
 qcipcc*		at fdt?
 qcmtx*		at fdt? early 1
 qcpas*		at fdt?
 qcpdc*		at fdt?
+qcscm*		at acpi?
 qcscm*		at fdt?
 qcsmem*		at fdt?
 qcsmptp*	at fdt?
@@ -390,6 +416,7 @@ em*		at pci?			# Intel Pro/1000 Ethernet
 igc*		at pci?			# Intel I225 Ethernet
 ix*		at pci?			# Intel 82598EB 10Gb Ethernet
 ixl*		at pci?			# Intel Ethernet 700 Series
+ice*		at pci?			# Intel Ethernet 800 Series
 mcx*		at pci?			# Mellanox ConnectX-4/5 Ethernet
 mskc*		at pci?			# Marvell Yukon-2
 msk*		at mskc?		#  each port of above
@@ -404,6 +431,7 @@ iwn*		at pci?			# Intel WiFi Link 4965/5000/1000/6000
 iwm*		at pci?			# Intel WiFi Link 7xxx
 iwx*		at pci?			# Intel WiFi Link 22xxx
 qwx*		at pci?			# Qualcomm 802.11ax
+qwz*		at pci?			# Qualcomm 802.11be
 
 # PCI SCSI
 ahci*		at pci? flags 0x0000	# AHCI SATA controllers
@@ -413,6 +441,7 @@ mpi*		at pci?			# LSI Logic Fusion MPT Message Passing Interface
 mpii*		at pci?			# LSI Fusion MPT Message Passing Interface II
 mfi*		at pci?			# LSI MegaRAID SAS controllers
 mfii*		at pci?			# LSI MegaRAID SAS Fusion controller
+sdhc*		at pci?			# SD Host Controller
 
 # PCI Audio
 azalia*		at pci?			# High Definition Audio
@@ -579,6 +608,8 @@ ims*		at ihidev?		# HID-over-I2C mouse/trackpad
 wsmouse*	at ims? mux 0
 imt*		at ihidev?		# HID-over-I2C multitouch trackpad
 wsmouse*	at imt? mux 0
+iasuskbd*	at ihidev?		# HID-over-I2C ASUS keyboard
+wskbd*		at iasuskbd? mux 1
 ipmi*		at iic?			# IPMI (SIIF)
 islrtc*		at iic?			# ISL1208 RTC
 maxrtc*		at iic?			# DS1307 RTC
@@ -597,6 +628,8 @@ tascodec*	at iic?			# TAS2770 audio codec
 tcpci*		at iic?			# USB Type-C controller
 tipd*		at iic?			# TPS6598x Type-C controller
 pijuice*	at iic?			# PiJuice HAT
+sambat*		at iic?			# Samsung SAM060B battery monitor
+samsabi*	at iic?			# Samsung Advance BIOS Interface
 
 # GPIO "pin bus" drivers
 gpioiic*	at gpio?		# I2C bus bit-banging

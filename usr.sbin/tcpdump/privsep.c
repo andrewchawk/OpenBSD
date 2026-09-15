@@ -1,4 +1,4 @@
-/*	$OpenBSD: privsep.c,v 1.57 2021/10/24 21:24:19 deraadt Exp $	*/
+/*	$OpenBSD: privsep.c,v 1.61 2026/09/07 19:46:29 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2003 Can Erkin Acar
@@ -154,7 +154,7 @@ drop_privs(int nochroot)
 }
 
 int
-priv_init(int argc, char **argv)
+priv_init(char *execpath, int argc, char **argv)
 {
 	int i, nargc, socks[2];
 	sigset_t allsigs, oset;
@@ -195,12 +195,12 @@ priv_init(int argc, char **argv)
 	if ((privargv = reallocarray(NULL, argc + 2, sizeof(char *))) == NULL)
 		err(1, "alloc priv argv failed");
 	nargc = 0;
-	privargv[nargc++] = argv[0];
+	privargv[nargc++] = execpath;
 	privargv[nargc++] = "-P";
 	for (i = 1; i < argc; i++)
 		privargv[nargc++] = argv[i];
 	privargv[nargc] = NULL;
-	execvp(privargv[0], privargv);
+	execv(execpath, privargv);
 	err(1, "exec priv '%s' failed", privargv[0]);
 }
 
@@ -388,7 +388,16 @@ impl_open_bpf(int fd, int *bpfd)
 		    device, strerror(errno));
 	send_fd(fd, *bpfd);
 	must_write(fd, &err, sizeof(int));
-	/* do not close bpfd until filter is set */
+	/*
+	 * The security model is that the bpf descriptor is in both
+	 * processes.  The packet parser process does pledge with only
+	 * "stdio", so it can never issue ioctls and is subject to the
+	 * bpf configuration.  The privsep process uses pledge with
+	 * "bpf", which only allows ioctl BIOCGSTATS. At process
+	 * termination, the parser needs to collect the statistics and
+	 * asks the privsep to perform ioctl BIOCGSTATS.  Therefore it
+	 * is safe for the bpf descriptor to remain open in both processes.
+	 */
 }
 
 static void
@@ -465,6 +474,10 @@ impl_init_done(int fd, int *bpfd)
 	int ret;
 
 	logmsg(LOG_DEBUG, "[priv]: msg PRIV_INIT_DONE received");
+
+	/* lock the descriptor */
+	if (*bpfd != -1 && ioctl(*bpfd, BIOCLOCK, NULL) == -1)
+		err(1, "BIOCLOCK");
 
 	ret = 0;
 	must_write(fd, &ret, sizeof(ret));
@@ -572,6 +585,7 @@ impl_localtime(int fd)
 {
 	struct tm *lt, *gt;
 	time_t t;
+	const char *zone = NULL;
 
 	logmsg(LOG_DEBUG, "[priv]: msg PRIV_LOCALTIME received");
 
@@ -581,16 +595,19 @@ impl_localtime(int fd)
 	 * same local buffer */
 	if ((lt = localtime(&t)) == NULL)
 		errx(1, "localtime()");
+	zone = lt->tm_zone;
+	lt->tm_zone = NULL;
 	must_write(fd, lt, sizeof(*lt));
 
 	if ((gt = gmtime(&t)) == NULL)
 		errx(1, "gmtime()");
+	gt->tm_zone = NULL;
 	must_write(fd, gt, sizeof(*gt));
 
-	if (lt->tm_zone == NULL)
+	if (zone == NULL)
 		write_zero(fd);
 	else
-		write_string(fd, lt->tm_zone);
+		write_string(fd, zone);
 }
 
 static void
@@ -743,12 +760,11 @@ priv_localtime(const time_t *t)
 	must_read(priv_fd, &lt, sizeof(lt));
 	must_read(priv_fd, &gt0, sizeof(gt0));
 
+	if (lt.tm_zone != NULL || gt0.tm_zone != NULL)
+		errx(1, "%s: pointer leak from privileged portion", __func__);
 	if (read_string(priv_fd, zone, sizeof(zone), __func__))
 		lt.tm_zone = zone;
-	else
-		lt.tm_zone = NULL;
 
-	gt0.tm_zone = NULL;
 	gt = &gt0;
 
 	return &lt;

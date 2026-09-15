@@ -1,4 +1,4 @@
-/*	$OpenBSD: pipex_local.h,v 1.53 2024/07/26 15:51:09 yasuoka Exp $	*/
+/*	$OpenBSD: pipex_local.h,v 1.55 2026/04/24 13:25:44 jsg Exp $	*/
 
 /*
  * Copyright (c) 2009 Internet Initiative Japan Inc.
@@ -426,16 +426,19 @@ struct pipex_session  *pipex_lookup_by_ip_address_locked (struct in_addr);
 struct pipex_session  *pipex_lookup_by_ip_address (struct in_addr);
 struct pipex_session  *pipex_lookup_by_session_id_locked (int, int);
 struct pipex_session  *pipex_lookup_by_session_id (int, int);
-void                  pipex_ip_output (struct mbuf *, struct pipex_session *);
-void                  pipex_ppp_output (struct mbuf *, struct pipex_session *, int);
-int                   pipex_ppp_proto (struct mbuf *, struct pipex_session *, int, int *);
-void                  pipex_ppp_input (struct mbuf *, struct pipex_session *, int);
-void                  pipex_ip_input (struct mbuf *, struct pipex_session *);
-#ifdef INET6
-void                  pipex_ip6_input (struct mbuf *, struct pipex_session *);
-#endif
+void                  pipex_ip_output(struct mbuf *, struct pipex_session *);
+void                  pipex_ppp_output(struct mbuf *, struct pipex_session *,
+			int);
+int                   pipex_ppp_proto(struct mbuf *, struct pipex_session *,
+			int, int *);
+void                  pipex_ppp_input(struct mbuf *, struct pipex_session *,
+			int, struct netstack *);
+void                  pipex_ip_input(struct mbuf *, struct pipex_session *,
+			struct netstack *);
+void                  pipex_ip6_input(struct mbuf *, struct pipex_session *,
+			struct netstack *);
 struct mbuf           *pipex_common_input(struct pipex_session *,
-                          struct mbuf *, int, int, int);
+                          struct mbuf *, int, int, int, struct netstack *);
 
 #ifdef PIPEX_PPPOE
 void                  pipex_pppoe_output (struct mbuf *, struct pipex_session *);
@@ -465,7 +468,7 @@ int                   pipex_ccp_output (struct pipex_session *, int, int);
 
 struct mbuf           *adjust_tcp_mss (struct mbuf *, int);
 struct mbuf           *ip_is_idle_packet (struct mbuf *, int *);
-void                  pipex_session_log (struct pipex_session *, int, const char *, ...)  __attribute__((__format__(__printf__,3,4)));
+void                  pipex_session_log (struct pipex_session *, int, const char *, ...)  __attribute__((__format__(__kprintf__,3,4)));
 uint32_t              pipex_sockaddr_hash_key(struct sockaddr *);
 int                   pipex_sockaddr_compar_addr(struct sockaddr *, struct sockaddr *);
 void                  pipex_timer_start (void);

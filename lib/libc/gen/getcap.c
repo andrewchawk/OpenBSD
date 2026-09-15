@@ -1,4 +1,4 @@
-/*	$OpenBSD: getcap.c,v 1.37 2024/01/22 17:22:58 deraadt Exp $	*/
+/*	$OpenBSD: getcap.c,v 1.39 2026/04/17 06:23:09 renaud Exp $	*/
 /*-
  * Copyright (c) 1992, 1993
  *	The Regents of the University of California.  All rights reserved.
@@ -252,7 +252,7 @@ getent(char **cap, u_int *len, char **db_array, FILE *fp,
 
 			clen = snprintf(pbuf, sizeof(pbuf), "%s.db", *db_p);
 			if (clen >= 0 && clen < sizeof(pbuf) && usedb &&
-			    (capdbp = __hash_open(pbuf, O_RDONLY, 0, NULL, 0))) {
+			    (capdbp = __hash_open(pbuf, -1, O_RDONLY, 0, NULL, 0))) {
 				opened++;
 				retval = cdbget(capdbp, &dbrecord, name);
 				if (retval < 0) {
@@ -780,6 +780,10 @@ cgetnext(char **cap, char **db_array)
 lookup:
 	/* extract name from record */
 	len = strcspn(record, "|:");
+	if (len >= sizeof(nbuf)) {
+		status = -1;
+		goto done;
+	}
 	memcpy(nbuf, record, len);
 	nbuf[len] = '\0';
 

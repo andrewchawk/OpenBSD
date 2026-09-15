@@ -1,4 +1,4 @@
-/*	$OpenBSD: verifytest.c,v 1.8 2023/05/28 09:02:01 beck Exp $	*/
+/*	$OpenBSD: verifytest.c,v 1.10 2026/05/30 17:04:48 jsing Exp $	*/
 /*
  * Copyright (c) 2014 Joel Sing <jsing@openbsd.org>
  *
@@ -121,6 +121,14 @@ struct verify_test verify_tests[] = {
 		.common_name = "*.org",
 		.common_name_len = -1,
 		.name = "openbsd.org",
+		.want_return = 0,
+		.want_match = 0,
+	},
+	{
+		/* CN wildcard without SANs - invalid CN wildcard. */
+		.common_name = "*.org.",
+		.common_name_len = -1,
+		.name = "openbsd.org.",
 		.want_return = 0,
 		.want_match = 0,
 	},
@@ -497,8 +505,9 @@ do_verify_test(int test_no, struct verify_test *vt)
 		goto done;
 	}
 	if (match != vt->want_match) {
-		fprintf(stderr, "FAIL: test %i failed to match name '%s'\n",
-		    test_no, vt->name);
+		fprintf(stderr, "FAIL: test %i %s name '%s'\n",
+		    test_no, vt->want_match ? "failed to match" : "matched",
+		    vt->name);
 		goto done;
 	}
 

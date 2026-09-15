@@ -1,4 +1,4 @@
-/*	$OpenBSD: gmon.h,v 1.9 2022/01/11 23:59:55 jsg Exp $	*/
+/*	$OpenBSD: gmon.h,v 1.12 2025/07/16 16:22:58 deraadt Exp $	*/
 /*	$NetBSD: gmon.h,v 1.5 1996/04/09 20:55:30 cgd Exp $	*/
 
 /*-
@@ -35,6 +35,7 @@
 #ifndef _SYS_GMON_H_
 #define _SYS_GMON_H_
 
+#include <sys/queue.h>
 #include <machine/profile.h>
 
 /*
@@ -46,7 +47,8 @@ struct gmonhdr {
 	int	ncnt;		/* size of sample buffer (plus this header) */
 	int	version;	/* version number */
 	int	profrate;	/* profiling clock rate */
-	int	spare[3];	/* reserved */
+	int	totarc;		/* space used by arcs */
+	int	spare[2];	/* reserved */
 };
 #define GMONVERSION	0x00051879
 
@@ -136,6 +138,11 @@ struct gmonparam {
 	u_long		highpc;
 	u_long		textsize;
 	u_long		hashfraction;
+	void		*outbuf;
+	size_t		outbuflen;
+	void		*rawarcs;
+	int		dirfd;
+	SLIST_ENTRY(gmonparam)	list;
 };
 
 /*
@@ -167,7 +174,7 @@ extern struct gmonparam _gmonparam;
 void	_mcleanup(void);
 void	_monstartup(u_long, u_long);
 void	moncontrol(int);
-void	monstartup(u_long, u_long);
+struct gmonparam *_gmon_alloc(void);
 __END_DECLS
 
 #endif /* !_KERNEL */

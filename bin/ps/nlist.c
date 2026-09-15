@@ -1,4 +1,4 @@
-/*	$OpenBSD: nlist.c,v 1.22 2021/12/01 18:21:23 deraadt Exp $	*/
+/*	$OpenBSD: nlist.c,v 1.24 2025/07/02 13:24:48 deraadt Exp $	*/
 /*	$NetBSD: nlist.c,v 1.11 1995/03/21 09:08:03 cgd Exp $	*/
 
 /*-
@@ -58,7 +58,6 @@ struct	nlist psnl[] = {
 };
 
 fixpt_t	ccpu;				/* kernel _ccpu variable */
-int	nlistread;			/* if nlist already read. */
 u_int	mempages;			/* number of pages of phys. memory */
 int	fscale;				/* kernel _fscale variable */
 int	maxslp;
@@ -69,36 +68,32 @@ extern kvm_t *kd;
 	kvm_read(kd, psnl[x].n_value, &v, sizeof v) != sizeof(v)
 
 int
-donlist(void)
+getkernvars(void)
 {
 	int64_t physmem;
-	int rval, mib[2];
+	int rval = 0, mib[2];
 	size_t siz;
-
-	rval = 0;
-	nlistread = 1;
 
 	if (kd != NULL && !kvm_sysctl_only) {
 		if (kvm_nlist(kd, psnl)) {
 			nlisterr(psnl);
-			eval = 1;
 			return (1);
 		}
 		if (kread(X_FSCALE, fscale)) {
 			warnx("fscale: %s", kvm_geterr(kd));
-			eval = rval = 1;
+			rval = 1;
 		}
 		if (kread(X_PHYSMEM, mempages)) {
 			warnx("physmem: %s", kvm_geterr(kd));
-			eval = rval = 1;
+			rval = 1;
 		}
 		if (kread(X_CCPU, ccpu)) {
 			warnx("ccpu: %s", kvm_geterr(kd));
-			eval = rval = 1;
+			rval = 1;
 		}
 		if (kread(X_MAXSLP, maxslp)) {
 			warnx("maxslp: %s", kvm_geterr(kd));
-			eval = rval = 1;
+			rval = 1;
 		}
 	} else {
 		siz = sizeof (fscale);
@@ -106,14 +101,14 @@ donlist(void)
 		mib[1] = KERN_FSCALE;
 		if (sysctl(mib, 2, &fscale, &siz, NULL, 0) == -1) {
 			warnx("fscale: failed to get kern.fscale");
-			eval = rval = 1;
+			rval = 1;
 		}
 		siz = sizeof (physmem);
 		mib[0] = CTL_HW;
 		mib[1] = HW_PHYSMEM64;
 		if (sysctl(mib, 2, &physmem, &siz, NULL, 0) == -1) {
 			warnx("physmem: failed to get hw.physmem");
-			eval = rval = 1;
+			rval = 1;
 		}
 		/* translate bytes into page count */
 		mempages = physmem / getpagesize();
@@ -122,14 +117,14 @@ donlist(void)
 		mib[1] = KERN_CCPU;
 		if (sysctl(mib, 2, &ccpu, &siz, NULL, 0) == -1) {
 			warnx("ccpu: failed to get kern.ccpu");
-			eval = rval = 1;
+			rval = 1;
 		}
 		siz = sizeof (maxslp);
 		mib[0] = CTL_VM;
 		mib[1] = VM_MAXSLP;
 		if (sysctl(mib, 2, &maxslp, &siz, NULL, 0) == -1) {
 			warnx("maxslp: failed to get vm.maxslp");
-			eval = rval = 1;
+			rval = 1;
 		}
 	}
 	return (rval);

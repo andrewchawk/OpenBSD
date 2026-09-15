@@ -1,4 +1,4 @@
-/* $OpenBSD: verify.c,v 1.11 2023/01/28 19:12:20 tb Exp $ */
+/* $OpenBSD: verify.c,v 1.17 2026/07/29 02:08:31 tb Exp $ */
 /*
  * Copyright (c) 2020 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2020-2021 Bob Beck <beck@openbsd.org>
@@ -102,10 +102,45 @@ verify_cert_cb(int ok, X509_STORE_CTX *xsc)
 	return ok;
 }
 
+static int
+verify_cert_depth_cb(int ok, X509_STORE_CTX *xsc)
+{
+	int verify_err;
+
+	ok = verify_cert_cb(ok, xsc);
+
+	verify_err = X509_STORE_CTX_get_error(xsc);
+	if (verify_err == X509_V_ERR_CERT_CHAIN_TOO_LONG) {
+		fprintf(stderr, "overriding verify error at depth %d: %s\n",
+		    X509_STORE_CTX_get_error_depth(xsc),
+		    X509_verify_cert_error_string(verify_err));
+		ok = 1;
+	}
+
+	return ok;
+}
+
+static int
+verify_cert_yolo_cb(int ok, X509_STORE_CTX *xsc)
+{
+	int verify_err;
+
+	verify_cert_cb(ok, xsc);
+
+	verify_err = X509_STORE_CTX_get_error(xsc);
+	if (verify_err != X509_V_OK) {
+		fprintf(stderr, "overriding verify error at depth %d: %s\n",
+		    X509_STORE_CTX_get_error_depth(xsc),
+		    X509_verify_cert_error_string(verify_err));
+	}
+
+	return 1;
+}
+
 static void
 verify_cert(const char *roots_dir, const char *roots_file,
     const char *bundle_file, int *chains, int *error, int *error_depth,
-    int mode)
+    int set_depth, int (*verify_cb)(int, X509_STORE_CTX *), int mode)
 {
 	STACK_OF(X509) *roots = NULL, *bundle = NULL;
 	X509_STORE_CTX *xsc = NULL;
@@ -140,14 +175,21 @@ verify_cert(const char *roots_dir, const char *roots_file,
 		if (!X509_STORE_load_locations(store, NULL, roots_dir))
 			errx(1, "failed to set by_dir directory of %s", roots_dir);
 	}
+	if (set_depth > 0) {
+		X509_VERIFY_PARAM_set_depth(X509_STORE_CTX_get0_param(xsc),
+		    set_depth);
+	}
 	if (mode == MODE_LEGACY_VFY)
 		X509_STORE_CTX_set_flags(xsc, X509_V_FLAG_LEGACY_VERIFY);
 	else
 		X509_VERIFY_PARAM_clear_flags(X509_STORE_CTX_get0_param(xsc),
 		    X509_V_FLAG_LEGACY_VERIFY);
 
-	if (verbose)
-		X509_STORE_CTX_set_verify_cb(xsc, verify_cert_cb);
+	if (verbose && verify_cb == NULL)
+		verify_cb = verify_cert_cb;
+	if (verify_cb != NULL)
+		X509_STORE_CTX_set_verify_cb(xsc, verify_cb);
+
 	if (!use_dir)
 		X509_STORE_CTX_set0_trusted_stack(xsc, roots);
 
@@ -162,7 +204,7 @@ verify_cert(const char *roots_dir, const char *roots_file,
 	}
 
 	if (*error == 0)
-		errx(1, "Error unset on failure!\n");
+		errx(1, "Error unset on failure!");
 
 	fprintf(stderr, "failed to verify at %d: %s\n",
 	    *error_depth, X509_verify_cert_error_string(*error));
@@ -176,7 +218,8 @@ verify_cert(const char *roots_dir, const char *roots_file,
 }
 
 static void
-verify_cert_new(const char *roots_file, const char *bundle_file, int *chains)
+verify_cert_new(const char *roots_file, const char *bundle_file, int *chains,
+    int set_depth, int (*verify_cb)(int, X509_STORE_CTX *))
 {
 	STACK_OF(X509) *roots = NULL, *bundle = NULL;
 	X509_STORE_CTX *xsc = NULL;
@@ -199,16 +242,22 @@ verify_cert_new(const char *roots_file, const char *bundle_file, int *chains)
 		ERR_print_errors_fp(stderr);
 		errx(1, "failed to init store context");
 	}
-	if (verbose)
-		X509_STORE_CTX_set_verify_cb(xsc, verify_cert_cb);
+	if (verbose && verify_cb == NULL)
+		verify_cb = verify_cert_cb;
+	if (verify_cb != NULL)
+		X509_STORE_CTX_set_verify_cb(xsc, verify_cb);
 
 	if ((ctx = x509_verify_ctx_new(roots)) == NULL)
 		errx(1, "failed to create ctx");
 	if (!x509_verify_ctx_set_intermediates(ctx, bundle))
 		errx(1, "failed to set intermediates");
+	if (set_depth > 0) {
+		if (!x509_verify_ctx_set_max_depth(ctx, set_depth))
+			errx(1, "failed to set max depth");
+	}
 
 	if ((*chains = x509_verify(ctx, leaf, NULL)) == 0) {
-		fprintf(stderr, "failed to verify at %lu: %s\n",
+		fprintf(stderr, "failed to verify at %zu: %s\n",
 		    x509_verify_ctx_error_depth(ctx),
 		    x509_verify_ctx_error_string(ctx));
 	} else {
@@ -237,9 +286,12 @@ verify_cert_new(const char *roots_file, const char *bundle_file, int *chains)
 }
 
 struct verify_cert_test {
+	const char *desc;
 	const char *id;
+	int (*verify_cb)(int, X509_STORE_CTX *);
 	int want_chains;
 	int want_error;
+	int set_depth;
 	int want_error_depth;
 	int want_legacy_error;
 	int want_legacy_error_depth;
@@ -254,6 +306,32 @@ struct verify_cert_test verify_cert_tests[] = {
 	{
 		.id = "2a",
 		.want_chains = 1,
+	},
+	{
+		.desc = "2a with depth 2",
+		.id = "2a",
+		.set_depth = 2,
+		.want_chains = 1,
+	},
+	{
+		.desc = "2a with depth 1",
+		.id = "2a",
+		.set_depth = 1,
+		.want_chains = 0,
+		.want_error = X509_V_ERR_CERT_CHAIN_TOO_LONG,
+		.want_error_depth = 1,
+		.want_legacy_error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+		.want_legacy_error_depth = 1,
+	},
+	{
+		.desc = "2a with depth 1 and depth callback",
+		.id = "2a",
+		.verify_cb = verify_cert_depth_cb,
+		.set_depth = 1,
+		.want_chains = 1,
+		.want_legacy_error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+		.want_legacy_error_depth = 1,
+		.failing = 1,
 	},
 	{
 		.id = "2b",
@@ -460,6 +538,38 @@ struct verify_cert_test verify_cert_tests[] = {
 		.want_legacy_error_depth = 2,
 		.failing = 1,
 	},
+	{
+		.id = "14a",
+		.want_chains = 1,
+		.want_error_depth = 0,
+	},
+	{
+		.desc = "14a with yolo callback",
+		.id = "14a",
+		.verify_cb = verify_cert_yolo_cb,
+		.want_chains = 1,
+		.want_error_depth = 0,
+	},
+	{
+		.id = "14b",
+		.want_chains = 0,
+		.want_error = X509_V_ERR_CERT_CHAIN_TOO_LONG,
+		.want_error_depth = 31,
+		.want_legacy_error = 0,
+		.want_legacy_error_depth = 0,
+		.failing = 1,
+	},
+	{
+		.desc = "14b with yolo callback",
+		.id = "14b",
+		.verify_cb = verify_cert_yolo_cb,
+		.want_chains = 0,
+		.want_error = X509_V_ERR_CERT_CHAIN_TOO_LONG,
+		.want_error_depth = 32,
+		.want_legacy_error = 0,
+		.want_legacy_error_depth = 0,
+		.failing = 1,
+	},
 };
 
 #define N_VERIFY_CERT_TESTS \
@@ -489,12 +599,15 @@ verify_cert_test(const char *certs_path, int mode)
 		error = 0;
 		error_depth = 0;
 
-		fprintf(stderr, "== Test %zu (%s)\n", i, vct->id);
+		fprintf(stderr, "== Test %zu (%s)\n", i,
+		    vct->desc != NULL ? vct->desc : vct->id);
 		if (mode == MODE_VERIFY)
-			verify_cert_new(roots_file, bundle_file, &chains);
+			verify_cert_new(roots_file, bundle_file, &chains,
+			    vct->set_depth, vct->verify_cb);
 		else
 			verify_cert(roots_dir, roots_file, bundle_file, &chains,
-			    &error, &error_depth, mode);
+			    &error, &error_depth, vct->set_depth, vct->verify_cb,
+			    mode);
 
 		if ((mode == MODE_VERIFY && chains == vct->want_chains) ||
 		    (chains == 0 && vct->want_chains == 0) ||
@@ -557,10 +670,13 @@ main(int argc, char **argv)
 
 	fprintf(stderr, "\n\nTesting legacy x509_vfy\n");
 	failed |= verify_cert_test(argv[1], MODE_LEGACY_VFY);
+
 	fprintf(stderr, "\n\nTesting modern x509_vfy\n");
 	failed |= verify_cert_test(argv[1], MODE_MODERN_VFY);
+
 	fprintf(stderr, "\n\nTesting modern x509_vfy by_dir\n");
 	failed |= verify_cert_test(argv[1], MODE_MODERN_VFY_DIR);
+
 	fprintf(stderr, "\n\nTesting x509_verify\n");
 	failed |= verify_cert_test(argv[1], MODE_VERIFY);
 

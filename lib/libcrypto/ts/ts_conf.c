@@ -1,4 +1,4 @@
-/* $OpenBSD: ts_conf.c,v 1.14 2024/03/26 00:39:22 beck Exp $ */
+/* $OpenBSD: ts_conf.c,v 1.16 2025/05/10 05:54:39 tb Exp $ */
 /* Written by Zoltan Glozik (zglozik@stones.com) for the OpenSSL
  * project 2002.
  */
@@ -56,12 +56,13 @@
  *
  */
 
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <openssl/opensslconf.h>
 
 #include <openssl/crypto.h>
-#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ts.h>
 
@@ -394,6 +395,7 @@ TS_CONF_set_accuracy(CONF *conf, const char *section, TS_RESP_CTX *ctx)
 	int secs = 0, millis = 0, micros = 0;
 	STACK_OF(CONF_VALUE) *list = NULL;
 	char *accuracy = NCONF_get_string(conf, section, ENV_ACCURACY);
+	const char *errstr;
 
 	if (accuracy && !(list = X509V3_parse_list(accuracy))) {
 		TS_CONF_invalid(section, ENV_ACCURACY);
@@ -402,14 +404,33 @@ TS_CONF_set_accuracy(CONF *conf, const char *section, TS_RESP_CTX *ctx)
 	for (i = 0; i < sk_CONF_VALUE_num(list); ++i) {
 		CONF_VALUE *val = sk_CONF_VALUE_value(list, i);
 		if (strcmp(val->name, ENV_VALUE_SECS) == 0) {
-			if (val->value)
-				secs = atoi(val->value);
+			if (val->value) {
+				secs = strtonum(val->value, 0, INT_MAX,
+				    &errstr);
+				if (errstr != NULL) {
+					TS_CONF_invalid(section,
+					    ENV_VALUE_SECS);
+					goto err;
+				}
+			}
 		} else if (strcmp(val->name, ENV_VALUE_MILLISECS) == 0) {
-			if (val->value)
-				millis = atoi(val->value);
+			if (val->value) {
+				millis = strtonum(val->value, 1, 999, &errstr);
+				if (errstr != NULL) {
+					TS_CONF_invalid(section,
+					    ENV_VALUE_MILLISECS);
+					goto err;
+				}
+			}
 		} else if (strcmp(val->name, ENV_VALUE_MICROSECS) == 0) {
-			if (val->value)
-				micros = atoi(val->value);
+			if (val->value) {
+				micros = strtonum(val->value, 1, 999, &errstr);
+				if (errstr != NULL) {
+					TS_CONF_invalid(section,
+					    ENV_VALUE_MICROSECS);
+					goto err;
+				}
+			}
 		} else {
 			TS_CONF_invalid(section, ENV_ACCURACY);
 			goto err;

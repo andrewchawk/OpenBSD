@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.463 2024/05/22 08:41:14 claudio Exp $ */
+/*	$OpenBSD: parse.y,v 1.504 2026/08/30 23:43:22 jsg Exp $ */
 
 /*
  * Copyright (c) 2002, 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -51,10 +51,6 @@
 #include "session.h"
 #include "rde.h"
 #include "log.h"
-
-#ifndef nitems
-#define nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
-#endif
 
 #define MACRO_NAME_LEN		128
 
@@ -187,6 +183,7 @@ static int	 push_unary_numop(enum comp_ops, long long);
 static int	 push_binary_numop(enum comp_ops, long long, long long);
 static int	 geticmptypebyname(char *, uint8_t);
 static int	 geticmpcodebyname(u_long, char *, uint8_t);
+static int	 merge_auth_conf(struct auth_config *, struct auth_config *);
 
 static struct bgpd_config	*conf;
 static struct network_head	*netconf;
@@ -228,6 +225,7 @@ typedef struct {
 		}			prefix;
 		struct filter_prefixlen	prefixlen;
 		struct prefixset_item	*prefixset_item;
+		struct auth_config	authconf;
 		struct {
 			enum auth_enc_alg	enc_alg;
 			uint8_t			enc_key_len;
@@ -241,16 +239,16 @@ typedef struct {
 
 %token	AS ROUTERID HOLDTIME YMIN LISTEN ON FIBUPDATE FIBPRIORITY RTABLE
 %token	NONE UNICAST VPN RD EXPORT EXPORTTRGT IMPORTTRGT DEFAULTROUTE
-%token	RDE RIB EVALUATE IGNORE COMPARE RTR PORT
+%token	RDE RIB EVALUATE IGNORE COMPARE RTR PORT MINVERSION STALETIME
 %token	GROUP NEIGHBOR NETWORK
 %token	EBGP IBGP
 %token	FLOWSPEC PROTO FLAGS FRAGMENT TOS LENGTH ICMPTYPE CODE
 %token	LOCALAS REMOTEAS DESCR LOCALADDR MULTIHOP PASSIVE MAXPREFIX RESTART
-%token	ANNOUNCE REFRESH AS4BYTE CONNECTRETRY ENHANCED ADDPATH
-%token	SEND RECV PLUS POLICY ROLE
+%token	ANNOUNCE REFRESH AS4BYTE CONNECTRETRY ENHANCED ADDPATH EXTENDED
+%token	SEND RECV PLUS POLICY ROLE GRACEFUL NOTIFICATION MESSAGE
 %token	DEMOTE ENFORCE NEIGHBORAS ASOVERRIDE REFLECTOR DEPEND DOWN
 %token	DUMP IN OUT SOCKET RESTRICTED
-%token	LOG TRANSPARENT
+%token	LOG TRANSPARENT FILTERED
 %token	TCP MD5SIG PASSWORD KEY TTLSECURITY
 %token	ALLOW DENY MATCH
 %token	QUICK
@@ -265,7 +263,7 @@ typedef struct {
 %token	PREPEND_SELF PREPEND_PEER PFTABLE WEIGHT RTLABEL ORIGIN PRIORITY
 %token	ERROR INCLUDE
 %token	IPSEC ESP AH SPI IKE
-%token	IPV4 IPV6
+%token	IPV4 IPV6 EVPN
 %token	QUALIFY VIA
 %token	NE LE GE XRANGE LONGER MAXLEN MAX
 %token	<v.string>		STRING
@@ -293,6 +291,7 @@ typedef struct {
 %type	<v.filter_prefix>	filter_prefix filter_prefix_l filter_prefix_h
 %type	<v.filter_prefix>	filter_prefix_m
 %type	<v.u8>			unaryop equalityop binaryop filter_as_type
+%type	<v.authconf>		authconf
 %type	<v.encspec>		encspec
 %type	<v.aspa_elm>		aspa_tas aspa_tas_l
 %%
@@ -335,7 +334,7 @@ as4number	: STRING			{
 			char		*dot;
 			uint32_t	 uvalh = 0, uval;
 
-			if ((dot = strchr($1,'.')) != NULL) {
+			if ((dot = strchr($1, '.')) != NULL) {
 				*dot++ = '\0';
 				uvalh = strtonum($1, 0, USHRT_MAX, &errstr);
 				if (errstr) {
@@ -377,7 +376,7 @@ as4number_any	: STRING			{
 			char		*dot;
 			uint32_t	 uvalh = 0, uval;
 
-			if ((dot = strchr($1,'.')) != NULL) {
+			if ((dot = strchr($1, '.')) != NULL) {
 				*dot++ = '\0';
 				uvalh = strtonum($1, 0, USHRT_MAX, &errstr);
 				if (errstr) {
@@ -431,8 +430,8 @@ yesno		: STRING			{
 varset		: STRING '=' string		{
 			char *s = $1;
 			if (strlen($1) >= MACRO_NAME_LEN) {
-				yyerror("macro name to long, max %d characters",
-				    MACRO_NAME_LEN - 1);
+				yyerror("macro name too long, "
+				    "max %d characters", MACRO_NAME_LEN - 1);
 				free($1);
 				free($3);
 				YYERROR;
@@ -682,6 +681,7 @@ rtr		: RTR address	{
 			currtr->remote_port = RTR_PORT;
 			if (insert_rtr(currtr) == -1) {
 				free(currtr);
+				currtr = NULL;
 				YYERROR;
 			}
 			currtr = NULL;
@@ -692,6 +692,7 @@ rtr		: RTR address	{
 		} '{' optnl rtropt_l optnl '}' {
 			if (insert_rtr(currtr) == -1) {
 				free(currtr);
+				currtr = NULL;
 				YYERROR;
 			}
 			currtr = NULL;
@@ -723,6 +724,18 @@ rtropt		: DESCR STRING		{
 		}
 		| PORT port {
 			currtr->remote_port = $2;
+		}
+		| MINVERSION NUMBER {
+			if ($2 < 0 || $2 > RTR_MAX_VERSION) {
+				yyerror("min-version must be between %u and %u",
+				    0, RTR_MAX_VERSION);
+				YYERROR;
+			}
+			currtr->min_version = $2;
+		}
+		| authconf {
+			if (merge_auth_conf(&currtr->auth, &$1) == 0)
+				YYERROR;
 		}
 		;
 
@@ -759,6 +772,14 @@ conf_main	: AS as4number		{
 				YYERROR;
 			}
 			conf->min_holdtime = $3;
+		}
+		| STALETIME NUMBER	{
+			if ($2 < MIN_HOLDTIME || $2 > CAPA_GR_TIMEMASK) {
+				yyerror("staletime must be between %u and %u",
+				    MIN_HOLDTIME, CAPA_GR_TIMEMASK);
+				YYERROR;
+			}
+			conf->staletime = $2;
 		}
 		| LISTEN ON address	{
 			struct listen_addr	*la;
@@ -814,9 +835,9 @@ conf_main	: AS as4number		{
 		}
 		| REJECT ASSET yesno	{
 			if ($3 == 1)
-				conf->flags |= BGPD_FLAG_NO_AS_SET;
+				conf->flags &= ~BGPD_FLAG_PERMIT_AS_SET;
 			else
-				conf->flags &= ~BGPD_FLAG_NO_AS_SET;
+				conf->flags |= BGPD_FLAG_PERMIT_AS_SET;
 		}
 		| LOG STRING		{
 			if (!strcmp($2, "updates"))
@@ -932,6 +953,14 @@ conf_main	: AS as4number		{
 				YYERROR;
 			}
 			free($3);
+		}
+		| RDE RIB STRING INCLUDE FILTERED {
+			if (strcmp($3, "Loc-RIB") != 0) {
+				yyerror("include filtered only supported in "
+				    "Loc-RIB");
+				YYERROR;
+			}
+			conf->filtered_in_locrib = 1;
 		}
 		| NEXTHOP QUALIFY VIA STRING	{
 			if (!strcmp($4, "bgp"))
@@ -1174,7 +1203,6 @@ flowspec	: FLOWSPEC af {
 
 			f = flow_to_flowspec(curflow);
 			if (f == NULL) {
-				yyerror("out of memory");
 				free($5);
 				flow_free(curflow);
 				curflow = NULL;
@@ -1194,7 +1222,11 @@ flowspec	: FLOWSPEC af {
 		}
 		;
 
-proto		: PROTO proto_item
+proto		: PROTO proto_item {
+			curflow->type = FLOWSPEC_TYPE_PROTO;
+			if (push_unary_numop(OP_EQ, $2) == -1)
+				YYERROR;
+		}
 		| PROTO '{' optnl proto_list optnl '}'
 		;
 
@@ -1310,11 +1342,11 @@ flowrule	: from
 		} flags
 		| FRAGMENT {
 			curflow->type = FLOWSPEC_TYPE_FRAG;
-		} flags;
+		} flags
 		| icmpspec
-		| LENGTH lengthspec {
+		| LENGTH {
 			curflow->type = FLOWSPEC_TYPE_PKT_LEN;
-		}
+		} lengthspec
 		| proto
 		| TOS tos {
 			curflow->type = FLOWSPEC_TYPE_DSCP;
@@ -1404,7 +1436,7 @@ icmp_item	: icmptype			{
 		}
 		;
 
-icmptype        : STRING {
+icmptype	: STRING {
 			int type;
 
 			if ((type = geticmptypebyname($1, curflow->aid)) ==
@@ -1446,7 +1478,7 @@ tos		: STRING		{
 			free($1);
 		}
 		| NUMBER		{
-			if ($$ < 0 || $$ > 255) {
+			if ($1 < 0 || $1 > 255) {
 				yyerror("illegal tos value %lld", $1);
 				YYERROR;
 			}
@@ -1477,7 +1509,7 @@ length_item	: length			{
 		;
 
 length		: NUMBER			{
-			if ($$ < 0 || $$ > USHRT_MAX) {
+			if ($1 < 0 || $1 > USHRT_MAX) {
 				yyerror("illegal ptk length value %lld", $1);
 				YYERROR;
 			}
@@ -1679,7 +1711,7 @@ l3vpnopts	: RD STRING {
 		| network
 		;
 
-neighbor	: {	curpeer = new_peer(); }
+neighbor	: { curpeer = new_peer(); }
 		    NEIGHBOR addrspec {
 			memcpy(&curpeer->conf.remote_addr, &$3.prefix,
 			    sizeof(curpeer->conf.remote_addr));
@@ -1687,14 +1719,14 @@ neighbor	: {	curpeer = new_peer(); }
 			if (($3.prefix.aid == AID_INET && $3.len != 32) ||
 			    ($3.prefix.aid == AID_INET6 && $3.len != 128))
 				curpeer->conf.template = 1;
-			curpeer->conf.capabilities.mp[
-			    curpeer->conf.remote_addr.aid] = 1;
 			if (get_id(curpeer)) {
 				yyerror("get_id failed");
 				YYERROR;
 			}
 		}
 		    peeropts_h {
+			u_int		aid;
+
 			if (curpeer_filter[0] != NULL)
 				TAILQ_INSERT_TAIL(peerfilter_l,
 				    curpeer_filter[0], entry);
@@ -1704,8 +1736,28 @@ neighbor	: {	curpeer = new_peer(); }
 			curpeer_filter[0] = NULL;
 			curpeer_filter[1] = NULL;
 
+			/*
+			 * Check if any MP capa is set, if none is set and
+			 * and the default AID was not disabled via none then
+			 * enable it. Finally fixup the disabled AID.
+			 */
+			for (aid = AID_MIN; aid < AID_MAX; aid++) {
+				if (curpeer->conf.capabilities.mp[aid] > 0)
+					break;
+			}
+			if (aid == AID_MAX &&
+			    curpeer->conf.capabilities.mp[
+			    curpeer->conf.remote_addr.aid] != -1)
+				curpeer->conf.capabilities.mp[
+				    curpeer->conf.remote_addr.aid] = 1;
+			for (aid = AID_MIN; aid < AID_MAX; aid++) {
+				if (curpeer->conf.capabilities.mp[aid] == -1)
+					curpeer->conf.capabilities.mp[aid] = 0;
+			}
+
 			if (neighbor_consistent(curpeer) == -1) {
 				free(curpeer);
+				curpeer = curgroup;
 				YYERROR;
 			}
 			if (RB_INSERT(peer_head, new_peers, curpeer) != NULL)
@@ -1723,12 +1775,14 @@ group		: GROUP string			{
 				    $2, sizeof(curgroup->conf.group) - 1);
 				free($2);
 				free(curgroup);
+				curgroup = NULL;
 				YYERROR;
 			}
 			free($2);
 			if (get_id(curgroup)) {
 				yyerror("get_id failed");
 				free(curgroup);
+				curgroup = NULL;
 				YYERROR;
 			}
 		} '{' groupopts_l '}'		{
@@ -1753,22 +1807,22 @@ groupopts_l	: /* empty */
 		| groupopts_l error '\n'
 		;
 
-addpathextra	: /* empty */		{ $$ = 0;	}
+addpathextra	: /* empty */		{ $$ = 0; }
 		| PLUS NUMBER		{
-			if ($2 < 1 || $2 > USHRT_MAX) {
+			if ($2 < 1 || $2 > MAX_ADDPATH_COUNT) {
 				yyerror("additional paths must be between "
-				    "%u and %u", 1, USHRT_MAX);
+				    "%u and %u", 1, MAX_ADDPATH_COUNT);
 				YYERROR;
 			}
 			$$ = $2;
 		}
 		;
 
-addpathmax	: /* empty */		{ $$ = 0;	}
+addpathmax	: /* empty */		{ $$ = 0; }
 		| MAX NUMBER		{
-			if ($2 < 1 || $2 > USHRT_MAX) {
+			if ($2 < 1 || $2 > MAX_ADDPATH_COUNT) {
 				yyerror("maximum additional paths must be "
-				    "between %u and %u", 1, USHRT_MAX);
+				    "between %u and %u", 1, MAX_ADDPATH_COUNT);
 				YYERROR;
 			}
 			$$ = $2;
@@ -1890,18 +1944,29 @@ peeropts	: REMOTEAS as4number	{
 			}
 			curpeer->conf.min_holdtime = $3;
 		}
+		| STALETIME NUMBER	{
+			if ($2 < MIN_HOLDTIME || $2 > CAPA_GR_TIMEMASK) {
+				yyerror("staletime must be between %u and %u",
+				    MIN_HOLDTIME, CAPA_GR_TIMEMASK);
+				YYERROR;
+			}
+			curpeer->conf.staletime = $2;
+		}
 		| ANNOUNCE af safi enforce {
-			uint8_t		aid, safi;
-			uint16_t	afi;
-
 			if ($3 == SAFI_NONE) {
+				u_int		aid;
+				uint8_t		safi;
+				uint16_t	afi;
+
 				for (aid = AID_MIN; aid < AID_MAX; aid++) {
 					if (aid2afi(aid, &afi, &safi) == -1 ||
 					    afi != $2)
 						continue;
-					curpeer->conf.capabilities.mp[aid] = 0;
+					curpeer->conf.capabilities.mp[aid] = -1;
 				}
 			} else {
+				uint8_t aid;
+
 				if (afi2aid($2, $3, &aid) == -1) {
 					yyerror("unknown AFI/SAFI pair");
 					YYERROR;
@@ -1912,6 +1977,12 @@ peeropts	: REMOTEAS as4number	{
 					curpeer->conf.capabilities.mp[aid] = 1;
 			}
 		}
+		| ANNOUNCE EVPN enforce {
+			if ($3)
+				curpeer->conf.capabilities.mp[AID_EVPN] = 2;
+			else
+				curpeer->conf.capabilities.mp[AID_EVPN] = 1;
+		}
 		| ANNOUNCE REFRESH yesnoenforce {
 			curpeer->conf.capabilities.refresh = $3;
 		}
@@ -1921,12 +1992,15 @@ peeropts	: REMOTEAS as4number	{
 		| ANNOUNCE RESTART yesnoenforce {
 			curpeer->conf.capabilities.grestart.restart = $3;
 		}
+		| ANNOUNCE GRACEFUL NOTIFICATION yesno {
+			curpeer->conf.capabilities.grestart.grnotification = $4;
+		}
 		| ANNOUNCE AS4BYTE yesnoenforce {
 			curpeer->conf.capabilities.as4byte = $3;
 		}
 		| ANNOUNCE ADDPATH RECV yesnoenforce {
 			int8_t *ap = curpeer->conf.capabilities.add_path;
-			uint8_t i;
+			u_int i;
 
 			for (i = AID_MIN; i < AID_MAX; i++) {
 				if ($4) {
@@ -1940,12 +2014,12 @@ peeropts	: REMOTEAS as4number	{
 		| ANNOUNCE ADDPATH SEND STRING addpathextra addpathmax enforce {
 			int8_t *ap = curpeer->conf.capabilities.add_path;
 			enum addpath_mode mode;
-			u_int8_t i;
+			u_int i;
 
 			if (!strcmp($4, "no")) {
 				free($4);
 				if ($5 != 0 || $6 != 0 || $7 != 0) {
-					yyerror("no additional option allowed "
+					yyerror("cannot use additional options "
 					    "for 'add-path send no'");
 					YYERROR;
 				}
@@ -1953,13 +2027,18 @@ peeropts	: REMOTEAS as4number	{
 			} else if (!strcmp($4, "all")) {
 				free($4);
 				if ($5 != 0 || $6 != 0) {
-					yyerror("no additional option allowed "
+					yyerror("cannot use additional options "
 					    "for 'add-path send all'");
 					YYERROR;
 				}
 				mode = ADDPATH_EVAL_ALL;
 			} else if (!strcmp($4, "best")) {
 				free($4);
+				if ($6 != 0) {
+					yyerror("cannot use max option "
+					    "for 'add-path send best'");
+					YYERROR;
+				}
 				mode = ADDPATH_EVAL_BEST;
 			} else if (!strcmp($4, "ecmp")) {
 				free($4);
@@ -1987,6 +2066,26 @@ peeropts	: REMOTEAS as4number	{
 		}
 		| ANNOUNCE POLICY yesnoenforce {
 			curpeer->conf.capabilities.policy = $3;
+		}
+		| ANNOUNCE EXTENDED MESSAGE yesnoenforce {
+			curpeer->conf.capabilities.ext_msg = $4;
+		}
+		| ANNOUNCE EXTENDED NEXTHOP yesnoenforce {
+			if ($4 != 0) {
+				struct rde_rib *rr;
+
+				rr = find_rib("Loc-RIB");
+				if (rr == NULL)
+					fatalx("cannot find the main RIB!");
+
+				if ((rr->flags & F_RIB_NOFIBSYNC) == 0) {
+					yyerror("announce extended nexthop "
+					    "requires 'fib-update no'");
+					YYERROR;
+				}
+			}
+			curpeer->conf.capabilities.ext_nh[AID_VPN_IPv4] =
+			    curpeer->conf.capabilities.ext_nh[AID_INET] = $4;
 		}
 		| ROLE STRING {
 			if (strcmp($2, "provider") == 0) {
@@ -2059,142 +2158,9 @@ peeropts	: REMOTEAS as4number	{
 			curpeer->conf.max_out_prefix = $2;
 			curpeer->conf.max_out_prefix_restart = $4;
 		}
-		| TCP MD5SIG PASSWORD string {
-			if (curpeer->conf.auth.method) {
-				yyerror("auth method cannot be redefined");
-				free($4);
+		| authconf {
+			if (merge_auth_conf(&curpeer->auth_conf, &$1) == 0)
 				YYERROR;
-			}
-			if (strlcpy(curpeer->conf.auth.md5key, $4,
-			    sizeof(curpeer->conf.auth.md5key)) >=
-			    sizeof(curpeer->conf.auth.md5key)) {
-				yyerror("tcp md5sig password too long: max %zu",
-				    sizeof(curpeer->conf.auth.md5key) - 1);
-				free($4);
-				YYERROR;
-			}
-			curpeer->conf.auth.method = AUTH_MD5SIG;
-			curpeer->conf.auth.md5key_len = strlen($4);
-			free($4);
-		}
-		| TCP MD5SIG KEY string {
-			if (curpeer->conf.auth.method) {
-				yyerror("auth method cannot be redefined");
-				free($4);
-				YYERROR;
-			}
-
-			if (str2key($4, curpeer->conf.auth.md5key,
-			    sizeof(curpeer->conf.auth.md5key)) == -1) {
-				free($4);
-				YYERROR;
-			}
-			curpeer->conf.auth.method = AUTH_MD5SIG;
-			curpeer->conf.auth.md5key_len = strlen($4) / 2;
-			free($4);
-		}
-		| IPSEC espah IKE {
-			if (curpeer->conf.auth.method) {
-				yyerror("auth method cannot be redefined");
-				YYERROR;
-			}
-			if ($2)
-				curpeer->conf.auth.method = AUTH_IPSEC_IKE_ESP;
-			else
-				curpeer->conf.auth.method = AUTH_IPSEC_IKE_AH;
-		}
-		| IPSEC espah inout SPI NUMBER STRING STRING encspec {
-			enum auth_alg	auth_alg;
-			uint8_t		keylen;
-
-			if (curpeer->conf.auth.method &&
-			    (((curpeer->conf.auth.spi_in && $3 == 1) ||
-			    (curpeer->conf.auth.spi_out && $3 == 0)) ||
-			    ($2 == 1 && curpeer->conf.auth.method !=
-			    AUTH_IPSEC_MANUAL_ESP) ||
-			    ($2 == 0 && curpeer->conf.auth.method !=
-			    AUTH_IPSEC_MANUAL_AH))) {
-				yyerror("auth method cannot be redefined");
-				free($6);
-				free($7);
-				YYERROR;
-			}
-
-			if (!strcmp($6, "sha1")) {
-				auth_alg = AUTH_AALG_SHA1HMAC;
-				keylen = 20;
-			} else if (!strcmp($6, "md5")) {
-				auth_alg = AUTH_AALG_MD5HMAC;
-				keylen = 16;
-			} else {
-				yyerror("unknown auth algorithm \"%s\"", $6);
-				free($6);
-				free($7);
-				YYERROR;
-			}
-			free($6);
-
-			if (strlen($7) / 2 != keylen) {
-				yyerror("auth key len: must be %u bytes, "
-				    "is %zu bytes", keylen, strlen($7) / 2);
-				free($7);
-				YYERROR;
-			}
-
-			if ($2)
-				curpeer->conf.auth.method =
-				    AUTH_IPSEC_MANUAL_ESP;
-			else {
-				if ($8.enc_alg) {
-					yyerror("\"ipsec ah\" doesn't take "
-					    "encryption keys");
-					free($7);
-					YYERROR;
-				}
-				curpeer->conf.auth.method =
-				    AUTH_IPSEC_MANUAL_AH;
-			}
-
-			if ($5 <= SPI_RESERVED_MAX || $5 > UINT_MAX) {
-				yyerror("bad spi number %lld", $5);
-				free($7);
-				YYERROR;
-			}
-
-			if ($3 == 1) {
-				if (str2key($7, curpeer->conf.auth.auth_key_in,
-				    sizeof(curpeer->conf.auth.auth_key_in)) ==
-				    -1) {
-					free($7);
-					YYERROR;
-				}
-				curpeer->conf.auth.spi_in = $5;
-				curpeer->conf.auth.auth_alg_in = auth_alg;
-				curpeer->conf.auth.enc_alg_in = $8.enc_alg;
-				memcpy(&curpeer->conf.auth.enc_key_in,
-				    &$8.enc_key,
-				    sizeof(curpeer->conf.auth.enc_key_in));
-				curpeer->conf.auth.enc_keylen_in =
-				    $8.enc_key_len;
-				curpeer->conf.auth.auth_keylen_in = keylen;
-			} else {
-				if (str2key($7, curpeer->conf.auth.auth_key_out,
-				    sizeof(curpeer->conf.auth.auth_key_out)) ==
-				    -1) {
-					free($7);
-					YYERROR;
-				}
-				curpeer->conf.auth.spi_out = $5;
-				curpeer->conf.auth.auth_alg_out = auth_alg;
-				curpeer->conf.auth.enc_alg_out = $8.enc_alg;
-				memcpy(&curpeer->conf.auth.enc_key_out,
-				    &$8.enc_key,
-				    sizeof(curpeer->conf.auth.enc_key_out));
-				curpeer->conf.auth.enc_keylen_out =
-				    $8.enc_key_len;
-				curpeer->conf.auth.auth_keylen_out = keylen;
-			}
-			free($7);
 		}
 		| TTLSECURITY yesno	{
 			curpeer->conf.ttlsec = $2;
@@ -2294,9 +2260,9 @@ peeropts	: REMOTEAS as4number	{
 		}
 		| REJECT ASSET yesno	{
 			if ($3 == 1)
-				curpeer->conf.flags |= PEERFLAG_NO_AS_SET;
+				curpeer->conf.flags &= ~PEERFLAG_PERMIT_AS_SET;
 			else
-				curpeer->conf.flags &= ~PEERFLAG_NO_AS_SET;
+				curpeer->conf.flags |= PEERFLAG_PERMIT_AS_SET;
 		}
 		| PORT port {
 			curpeer->conf.remote_port = $2;
@@ -2337,8 +2303,113 @@ safi		: NONE		{ $$ = SAFI_NONE; }
 		| FLOWSPEC	{ $$ = SAFI_FLOWSPEC; }
 		;
 
-nettype		: STATIC { $$ = 1; }
-		| CONNECTED { $$ = 0; }
+nettype		: STATIC	{ $$ = 1; }
+		| CONNECTED	{ $$ = 0; }
+		;
+
+authconf	: TCP MD5SIG PASSWORD string {
+			memset(&$$, 0, sizeof($$));
+			if (strlcpy($$.md5key, $4, sizeof($$.md5key)) >=
+			    sizeof($$.md5key)) {
+				yyerror("tcp md5sig password too long: max %zu",
+				    sizeof($$.md5key) - 1);
+				free($4);
+				YYERROR;
+			}
+			$$.method = AUTH_MD5SIG;
+			$$.md5key_len = strlen($4);
+			free($4);
+		}
+		| TCP MD5SIG KEY string {
+			memset(&$$, 0, sizeof($$));
+			if (str2key($4, $$.md5key, sizeof($$.md5key)) == -1) {
+				free($4);
+				YYERROR;
+			}
+			$$.method = AUTH_MD5SIG;
+			$$.md5key_len = strlen($4) / 2;
+			free($4);
+		}
+		| IPSEC espah IKE {
+			memset(&$$, 0, sizeof($$));
+			if ($2)
+				$$.method = AUTH_IPSEC_IKE_ESP;
+			else
+				$$.method = AUTH_IPSEC_IKE_AH;
+		}
+		| IPSEC espah inout SPI NUMBER STRING STRING encspec {
+			enum auth_alg	auth_alg;
+			uint8_t		keylen;
+
+			memset(&$$, 0, sizeof($$));
+			if (!strcmp($6, "sha1")) {
+				auth_alg = AUTH_AALG_SHA1HMAC;
+				keylen = 20;
+			} else if (!strcmp($6, "md5")) {
+				auth_alg = AUTH_AALG_MD5HMAC;
+				keylen = 16;
+			} else {
+				yyerror("unknown auth algorithm \"%s\"", $6);
+				free($6);
+				free($7);
+				YYERROR;
+			}
+			free($6);
+
+			if (strlen($7) / 2 != keylen) {
+				yyerror("auth key len: must be %u bytes, "
+				    "is %zu bytes", keylen, strlen($7) / 2);
+				free($7);
+				YYERROR;
+			}
+
+			if ($2)
+				$$.method = AUTH_IPSEC_MANUAL_ESP;
+			else {
+				if ($8.enc_alg) {
+					yyerror("\"ipsec ah\" doesn't take "
+					    "encryption keys");
+					free($7);
+					YYERROR;
+				}
+				$$.method = AUTH_IPSEC_MANUAL_AH;
+			}
+
+			if ($5 <= SPI_RESERVED_MAX || $5 > UINT_MAX) {
+				yyerror("bad spi number %lld", $5);
+				free($7);
+				YYERROR;
+			}
+
+			if ($3 == 1) {
+				if (str2key($7, $$.auth_key_in,
+				    sizeof($$.auth_key_in)) == -1) {
+					free($7);
+					YYERROR;
+				}
+				$$.spi_in = $5;
+				$$.auth_alg_in = auth_alg;
+				$$.enc_alg_in = $8.enc_alg;
+				memcpy(&$$.enc_key_in, &$8.enc_key,
+				    sizeof($$.enc_key_in));
+				$$.enc_keylen_in = $8.enc_key_len;
+				$$.auth_keylen_in = keylen;
+			} else {
+				if (str2key($7, $$.auth_key_out,
+				    sizeof($$.auth_key_out)) == -1) {
+					free($7);
+					YYERROR;
+				}
+				$$.spi_out = $5;
+				$$.auth_alg_out = auth_alg;
+				$$.enc_alg_out = $8.enc_alg;
+				memcpy(&$$.enc_key_out, &$8.enc_key,
+				    sizeof($$.enc_key_out));
+				$$.enc_keylen_out = $8.enc_key_len;
+				$$.auth_keylen_out = keylen;
+			}
+			free($7);
+		}
 		;
 
 espah		: ESP		{ $$ = 1; }
@@ -2784,7 +2855,8 @@ filter_elm	: filter_prefix_h	{
 				free($2);
 				YYERROR;
 			}
-			if (parsecommunity(&fmopts.m.community[i], $1, $2) == -1) {
+			if (parsecommunity(&fmopts.m.community[i], $1, $2) ==
+			    -1) {
 				free($2);
 				YYERROR;
 			}
@@ -2833,7 +2905,7 @@ filter_elm	: filter_prefix_h	{
 		}
 		| MAXCOMMUNITIES NUMBER {
 			if ($2 < 0 || $2 > INT16_MAX) {
-				yyerror("bad max-comunities %lld", $2);
+				yyerror("bad max-communities %lld", $2);
 				YYERROR;
 			}
 			if (fmopts.m.maxcomm != 0) {
@@ -2921,7 +2993,8 @@ filter_elm	: filter_prefix_h	{
 				free($2);
 				YYERROR;
 			}
-			if ($3.op == OP_RANGE && ps->sflags & PREFIXSET_FLAG_OPS) {
+			if ($3.op == OP_RANGE &&
+			    ps->sflags & PREFIXSET_FLAG_OPS) {
 				yyerror("prefix-set %s contains prefixlen "
 				    "operators and cannot be used with an "
 				    "or-longer filter", $2);
@@ -2973,7 +3046,7 @@ filter_elm	: filter_prefix_h	{
 		}
 		;
 
-prefixlenop	: /* empty */			{ memset(&$$, 0, sizeof($$)); }
+prefixlenop	: /* empty */		{ memset(&$$, 0, sizeof($$)); }
 		| LONGER				{
 			memset(&$$, 0, sizeof($$));
 			$$.op = OP_RANGE;
@@ -3056,8 +3129,8 @@ filter_as_type	: AS		{ $$ = AS_ALL; }
 		| PEERAS	{ $$ = AS_PEER; }
 		;
 
-filter_set	: /* empty */					{ $$ = NULL; }
-		| SET filter_set_opt				{
+filter_set	: /* empty */	{ $$ = NULL; }
+		| SET filter_set_opt	{
 			if (($$ = calloc(1, sizeof(struct filter_set_head))) ==
 			    NULL)
 				fatal(NULL);
@@ -3147,7 +3220,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 				$$->action.relative = $2;
 			}
 		}
-		| MED '+' NUMBER			{
+		| MED '+' NUMBER		{
 			if ($3 < 0 || $3 > INT_MAX) {
 				yyerror("bad metric +%lld", $3);
 				YYERROR;
@@ -3157,7 +3230,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 			$$->type = ACTION_SET_RELATIVE_MED;
 			$$->action.relative = $3;
 		}
-		| MED '-' NUMBER			{
+		| MED '-' NUMBER		{
 			if ($3 < 0 || $3 > INT_MAX) {
 				yyerror("bad metric -%lld", $3);
 				YYERROR;
@@ -3182,7 +3255,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 				$$->action.relative = $2;
 			}
 		}
-		| METRIC '+' NUMBER			{
+		| METRIC '+' NUMBER		{
 			if ($3 < 0 || $3 > INT_MAX) {
 				yyerror("bad metric +%lld", $3);
 				YYERROR;
@@ -3192,7 +3265,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 			$$->type = ACTION_SET_RELATIVE_MED;
 			$$->action.metric = $3;
 		}
-		| METRIC '-' NUMBER			{
+		| METRIC '-' NUMBER		{
 			if ($3 < 0 || $3 > INT_MAX) {
 				yyerror("bad metric -%lld", $3);
 				YYERROR;
@@ -3202,7 +3275,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 			$$->type = ACTION_SET_RELATIVE_MED;
 			$$->action.relative = -$3;
 		}
-		| WEIGHT NUMBER				{
+		| WEIGHT NUMBER			{
 			if ($2 < -INT_MAX || $2 > UINT_MAX) {
 				yyerror("bad weight %lld", $2);
 				YYERROR;
@@ -3217,7 +3290,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 				$$->action.relative = $2;
 			}
 		}
-		| WEIGHT '+' NUMBER			{
+		| WEIGHT '+' NUMBER		{
 			if ($3 < 0 || $3 > INT_MAX) {
 				yyerror("bad weight +%lld", $3);
 				YYERROR;
@@ -3227,7 +3300,7 @@ filter_set_opt	: LOCALPREF NUMBER		{
 			$$->type = ACTION_SET_RELATIVE_WEIGHT;
 			$$->action.relative = $3;
 		}
-		| WEIGHT '-' NUMBER			{
+		| WEIGHT '-' NUMBER		{
 			if ($3 < 0 || $3 > INT_MAX) {
 				yyerror("bad weight -%lld", $3);
 				YYERROR;
@@ -3505,142 +3578,150 @@ lookup(char *s)
 {
 	/* this has to be sorted always */
 	static const struct keywords keywords[] = {
-		{ "AS",			AS},
-		{ "IPv4",		IPV4},
-		{ "IPv6",		IPV6},
-		{ "add-path",		ADDPATH},
-		{ "ah",			AH},
-		{ "allow",		ALLOW},
-		{ "announce",		ANNOUNCE},
-		{ "any",		ANY},
+		{ "AS",			AS },
+		{ "EVPN",		EVPN },
+		{ "IPv4",		IPV4 },
+		{ "IPv6",		IPV6 },
+		{ "add-path",		ADDPATH },
+		{ "ah",			AH },
+		{ "allow",		ALLOW },
+		{ "announce",		ANNOUNCE },
+		{ "any",		ANY },
 		{ "as-4byte",		AS4BYTE },
-		{ "as-override",	ASOVERRIDE},
+		{ "as-override",	ASOVERRIDE },
 		{ "as-set",		ASSET },
-		{ "aspa-set",		ASPASET},
-		{ "avs",		AVS},
-		{ "blackhole",		BLACKHOLE},
-		{ "community",		COMMUNITY},
-		{ "compare",		COMPARE},
-		{ "connect-retry",	CONNECTRETRY},
-		{ "connected",		CONNECTED},
-		{ "customer-as",	CUSTOMERAS},
-		{ "default-route",	DEFAULTROUTE},
-		{ "delete",		DELETE},
-		{ "demote",		DEMOTE},
-		{ "deny",		DENY},
-		{ "depend",		DEPEND},
-		{ "descr",		DESCR},
-		{ "down",		DOWN},
-		{ "dump",		DUMP},
-		{ "ebgp",		EBGP},
-		{ "enforce",		ENFORCE},
+		{ "aspa-set",		ASPASET },
+		{ "avs",		AVS },
+		{ "blackhole",		BLACKHOLE },
+		{ "community",		COMMUNITY },
+		{ "compare",		COMPARE },
+		{ "connect-retry",	CONNECTRETRY },
+		{ "connected",		CONNECTED },
+		{ "customer-as",	CUSTOMERAS },
+		{ "default-route",	DEFAULTROUTE },
+		{ "delete",		DELETE },
+		{ "demote",		DEMOTE },
+		{ "deny",		DENY },
+		{ "depend",		DEPEND },
+		{ "descr",		DESCR },
+		{ "down",		DOWN },
+		{ "dump",		DUMP },
+		{ "ebgp",		EBGP },
+		{ "enforce",		ENFORCE },
 		{ "enhanced",		ENHANCED },
-		{ "esp",		ESP},
-		{ "evaluate",		EVALUATE},
-		{ "expires",		EXPIRES},
-		{ "export",		EXPORT},
-		{ "export-target",	EXPORTTRGT},
-		{ "ext-community",	EXTCOMMUNITY},
-		{ "fib-priority",	FIBPRIORITY},
-		{ "fib-update",		FIBUPDATE},
-		{ "flags",		FLAGS},
-		{ "flowspec",		FLOWSPEC},
-		{ "fragment",		FRAGMENT},
-		{ "from",		FROM},
-		{ "group",		GROUP},
-		{ "holdtime",		HOLDTIME},
-		{ "ibgp",		IBGP},
-		{ "ignore",		IGNORE},
-		{ "ike",		IKE},
-		{ "import-target",	IMPORTTRGT},
-		{ "in",			IN},
-		{ "include",		INCLUDE},
-		{ "inet",		IPV4},
-		{ "inet6",		IPV6},
-		{ "ipsec",		IPSEC},
-		{ "key",		KEY},
-		{ "large-community",	LARGECOMMUNITY},
-		{ "listen",		LISTEN},
-		{ "local-address",	LOCALADDR},
-		{ "local-as",		LOCALAS},
-		{ "localpref",		LOCALPREF},
-		{ "log",		LOG},
-		{ "match",		MATCH},
-		{ "max",		MAX},
-		{ "max-as-len",		MAXASLEN},
-		{ "max-as-seq",		MAXASSEQ},
-		{ "max-communities",	MAXCOMMUNITIES},
-		{ "max-ext-communities",	MAXEXTCOMMUNITIES},
-		{ "max-large-communities",	MAXLARGECOMMUNITIES},
-		{ "max-prefix",		MAXPREFIX},
-		{ "maxlen",		MAXLEN},
-		{ "md5sig",		MD5SIG},
-		{ "med",		MED},
-		{ "metric",		METRIC},
-		{ "min",		YMIN},
-		{ "multihop",		MULTIHOP},
-		{ "neighbor",		NEIGHBOR},
-		{ "neighbor-as",	NEIGHBORAS},
-		{ "network",		NETWORK},
-		{ "nexthop",		NEXTHOP},
-		{ "no-modify",		NOMODIFY},
-		{ "none",		NONE},
-		{ "on",			ON},
-		{ "or-longer",		LONGER},
-		{ "origin",		ORIGIN},
-		{ "origin-set",		ORIGINSET},
-		{ "out",		OUT},
-		{ "ovs",		OVS},
-		{ "passive",		PASSIVE},
-		{ "password",		PASSWORD},
-		{ "peer-as",		PEERAS},
-		{ "pftable",		PFTABLE},
-		{ "plus",		PLUS},
-		{ "policy",		POLICY},
-		{ "port",		PORT},
-		{ "prefix",		PREFIX},
-		{ "prefix-set",		PREFIXSET},
-		{ "prefixlen",		PREFIXLEN},
-		{ "prepend-neighbor",	PREPEND_PEER},
-		{ "prepend-self",	PREPEND_SELF},
-		{ "priority",		PRIORITY},
-		{ "proto",		PROTO},
-		{ "provider-as",	PROVIDERAS},
-		{ "qualify",		QUALIFY},
-		{ "quick",		QUICK},
-		{ "rd",			RD},
-		{ "rde",		RDE},
-		{ "recv",		RECV},
+		{ "esp",		ESP },
+		{ "evaluate",		EVALUATE },
+		{ "expires",		EXPIRES },
+		{ "export",		EXPORT },
+		{ "export-target",	EXPORTTRGT },
+		{ "ext-community",	EXTCOMMUNITY },
+		{ "extended",		EXTENDED },
+		{ "fib-priority",	FIBPRIORITY },
+		{ "fib-update",		FIBUPDATE },
+		{ "filtered",		FILTERED },
+		{ "flags",		FLAGS },
+		{ "flowspec",		FLOWSPEC },
+		{ "fragment",		FRAGMENT },
+		{ "from",		FROM },
+		{ "graceful",		GRACEFUL },
+		{ "group",		GROUP },
+		{ "holdtime",		HOLDTIME },
+		{ "ibgp",		IBGP },
+		{ "ignore",		IGNORE },
+		{ "ike",		IKE },
+		{ "import-target",	IMPORTTRGT },
+		{ "in",			IN },
+		{ "include",		INCLUDE },
+		{ "inet",		IPV4 },
+		{ "inet6",		IPV6 },
+		{ "ipsec",		IPSEC },
+		{ "key",		KEY },
+		{ "large-community",	LARGECOMMUNITY },
+		{ "listen",		LISTEN },
+		{ "local-address",	LOCALADDR },
+		{ "local-as",		LOCALAS },
+		{ "localpref",		LOCALPREF },
+		{ "log",		LOG },
+		{ "match",		MATCH },
+		{ "max",		MAX },
+		{ "max-as-len",		MAXASLEN },
+		{ "max-as-seq",		MAXASSEQ },
+		{ "max-communities",	MAXCOMMUNITIES },
+		{ "max-ext-communities",	MAXEXTCOMMUNITIES },
+		{ "max-large-communities",	MAXLARGECOMMUNITIES },
+		{ "max-prefix",		MAXPREFIX },
+		{ "maxlen",		MAXLEN },
+		{ "md5sig",		MD5SIG },
+		{ "med",		MED },
+		{ "message",		MESSAGE },
+		{ "metric",		METRIC },
+		{ "min",		YMIN },
+		{ "min-version",	MINVERSION },
+		{ "multihop",		MULTIHOP },
+		{ "neighbor",		NEIGHBOR },
+		{ "neighbor-as",	NEIGHBORAS },
+		{ "network",		NETWORK },
+		{ "nexthop",		NEXTHOP },
+		{ "no-modify",		NOMODIFY },
+		{ "none",		NONE },
+		{ "notification",	NOTIFICATION },
+		{ "on",			ON },
+		{ "or-longer",		LONGER },
+		{ "origin",		ORIGIN },
+		{ "origin-set",		ORIGINSET },
+		{ "out",		OUT },
+		{ "ovs",		OVS },
+		{ "passive",		PASSIVE },
+		{ "password",		PASSWORD },
+		{ "peer-as",		PEERAS },
+		{ "pftable",		PFTABLE },
+		{ "plus",		PLUS },
+		{ "policy",		POLICY },
+		{ "port",		PORT },
+		{ "prefix",		PREFIX },
+		{ "prefix-set",		PREFIXSET },
+		{ "prefixlen",		PREFIXLEN },
+		{ "prepend-neighbor",	PREPEND_PEER },
+		{ "prepend-self",	PREPEND_SELF },
+		{ "priority",		PRIORITY },
+		{ "proto",		PROTO },
+		{ "provider-as",	PROVIDERAS },
+		{ "qualify",		QUALIFY },
+		{ "quick",		QUICK },
+		{ "rd",			RD },
+		{ "rde",		RDE },
+		{ "recv",		RECV },
 		{ "refresh",		REFRESH },
-		{ "reject",		REJECT},
-		{ "remote-as",		REMOTEAS},
-		{ "restart",		RESTART},
-		{ "restricted",		RESTRICTED},
-		{ "rib",		RIB},
+		{ "reject",		REJECT },
+		{ "remote-as",		REMOTEAS },
+		{ "restart",		RESTART },
+		{ "restricted",		RESTRICTED },
+		{ "rib",		RIB },
 		{ "roa-set",		ROASET },
-		{ "role",		ROLE},
-		{ "route-reflector",	REFLECTOR},
-		{ "router-id",		ROUTERID},
-		{ "rtable",		RTABLE},
-		{ "rtlabel",		RTLABEL},
-		{ "rtr",		RTR},
-		{ "self",		SELF},
-		{ "send",		SEND},
-		{ "set",		SET},
+		{ "role",		ROLE },
+		{ "route-reflector",	REFLECTOR },
+		{ "router-id",		ROUTERID },
+		{ "rtable",		RTABLE },
+		{ "rtlabel",		RTLABEL },
+		{ "rtr",		RTR },
+		{ "self",		SELF },
+		{ "send",		SEND },
+		{ "set",		SET },
 		{ "socket",		SOCKET },
-		{ "source-as",		SOURCEAS},
-		{ "spi",		SPI},
-		{ "static",		STATIC},
-		{ "tcp",		TCP},
-		{ "to",			TO},
-		{ "tos",		TOS},
-		{ "transit-as",		TRANSITAS},
-		{ "transparent-as",	TRANSPARENT},
-		{ "ttl-security",	TTLSECURITY},
-		{ "unicast",		UNICAST},
-		{ "via",		VIA},
-		{ "vpn",		VPN},
-		{ "weight",		WEIGHT}
+		{ "source-as",		SOURCEAS },
+		{ "spi",		SPI },
+		{ "staletime",		STALETIME },
+		{ "static",		STATIC },
+		{ "tcp",		TCP },
+		{ "to",			TO },
+		{ "tos",		TOS },
+		{ "transit-as",		TRANSITAS },
+		{ "transparent-as",	TRANSPARENT },
+		{ "ttl-security",	TTLSECURITY },
+		{ "unicast",		UNICAST },
+		{ "via",		VIA },
+		{ "vpn",		VPN },
+		{ "weight",		WEIGHT },
 	};
 	const struct keywords	*p;
 
@@ -3880,7 +3961,7 @@ top:
 	}
 
 #define allowed_to_end_number(x) \
-	(isspace(x) || x == ')' || x ==',' || x == '/' || x == '}' || x == '=')
+	(isspace(x) || x == ')' || x == ',' || x == '/' || x == '}' || x == '=')
 
 	if (c == '-' || isdigit(c)) {
 		do {
@@ -4028,6 +4109,7 @@ init_config(struct bgpd_config *c)
 
 	c->min_holdtime = MIN_HOLDTIME;
 	c->holdtime = INTERVAL_HOLD;
+	c->staletime = INTERVAL_STALE;
 	c->connectretry = INTERVAL_CONNECTRETRY;
 	c->bgpid = get_bgpid();
 	c->fib_priority = kr_default_prio();
@@ -4044,7 +4126,8 @@ init_config(struct bgpd_config *c)
 }
 
 struct bgpd_config *
-parse_config(char *filename, struct peer_head *ph, struct rtr_config_head *rh)
+parse_config(const char *filename, struct peer_head *ph,
+    struct rtr_config_head *rh)
 {
 	struct sym		*sym, *next;
 	struct rde_rib		*rr;
@@ -4090,12 +4173,12 @@ parse_config(char *filename, struct peer_head *ph, struct rtr_config_head *rh)
 
 	/* check that we dont try to announce our own routes */
 	TAILQ_FOREACH(n, netconf, entry)
-	    if (n->net.priority == conf->fib_priority) {
-		    errors++;
-		    logit(LOG_CRIT, "network priority %d == fib-priority "
-			"%d is not allowed.",
-			n->net.priority, conf->fib_priority);
-	    }
+		if (n->net.priority == conf->fib_priority) {
+			errors++;
+			logit(LOG_CRIT, "network priority %d == fib-priority "
+			    "%d is not allowed.",
+			    n->net.priority, conf->fib_priority);
+		}
 
 	/* Free macros and check which have not been used. */
 	TAILQ_FOREACH_SAFE(sym, &symhead, entry, next) {
@@ -4343,9 +4426,9 @@ parselargecommunity(struct community *c, char *s)
 	    getcommunity(q, 1, &c->data3, &dflag3) == -1)
 		return (-1);
 	c->flags = COMMUNITY_TYPE_LARGE;
-	c->flags |= dflag1 << 8;;
-	c->flags |= dflag2 << 16;;
-	c->flags |= dflag3 << 24;;
+	c->flags |= dflag1 << 8;
+	c->flags |= dflag2 << 16;
+	c->flags |= dflag3 << 24;
 	return (0);
 }
 
@@ -4485,7 +4568,7 @@ parseextvalue(int type, char *s, uint32_t *v, uint32_t *flag)
 		*v = uval | (uvalh << 16);
 		break;
 	case EXT_COMMUNITY_TRANS_IPV4:
-		if (inet_aton(s, &ip) == 0) {
+		if (inet_pton(AF_INET, s, &ip) != 1) {
 			yyerror("Bad ext-community %s not parseable", s);
 			return (-1);
 		}
@@ -4633,7 +4716,7 @@ alloc_peer(void)
 	p->conf.export_type = EXPORT_UNSET;
 	p->conf.capabilities.refresh = 1;
 	p->conf.capabilities.grestart.restart = 1;
-	p->conf.capabilities.as4byte = 1;
+	p->conf.capabilities.as4byte = 2;
 	p->conf.capabilities.policy = 1;
 	p->conf.local_as = conf->as;
 	p->conf.local_short_as = conf->short_as;
@@ -4643,8 +4726,8 @@ alloc_peer(void)
 		p->conf.flags |= PEERFLAG_TRANS_AS;
 	if (conf->flags & BGPD_FLAG_DECISION_ALL_PATHS)
 		p->conf.flags |= PEERFLAG_EVALUATE_ALL;
-	if (conf->flags & BGPD_FLAG_NO_AS_SET)
-		p->conf.flags |= PEERFLAG_NO_AS_SET;
+	if (conf->flags & BGPD_FLAG_PERMIT_AS_SET)
+		p->conf.flags |= PEERFLAG_PERMIT_AS_SET;
 
 	return (p);
 }
@@ -4657,7 +4740,8 @@ new_peer(void)
 	p = alloc_peer();
 
 	if (curgroup != NULL) {
-		memcpy(p, curgroup, sizeof(struct peer));
+		p->conf = curgroup->conf;
+		p->auth_conf = curgroup->auth_conf;
 		p->conf.groupid = curgroup->conf.id;
 	}
 	return (p);
@@ -4705,6 +4789,7 @@ add_mrtconfig(enum mrt_type type, char *name, int timeout, struct peer *p,
 		free(n);
 		return (-1);
 	}
+	TAILQ_INIT(&MRT2MC(n)->timer);
 	MRT2MC(n)->ReopenTimerInterval = timeout;
 	if (p != NULL) {
 		if (curgroup == p) {
@@ -4712,7 +4797,7 @@ add_mrtconfig(enum mrt_type type, char *name, int timeout, struct peer *p,
 			n->group_id = p->conf.id;
 		} else {
 			n->peer_id = p->conf.id;
-			n->group_id = p->conf.groupid;
+			n->group_id = 0;
 		}
 	}
 	if (rib) {
@@ -4923,7 +5008,7 @@ expand_rule(struct filter_rule *rule, struct filter_rib_l *rib,
 						return (-1);
 					}
 
-					memcpy(r, rule, sizeof(struct filter_rule));
+					memcpy(r, rule, sizeof(*r));
 					memcpy(&r->match, match,
 					    sizeof(struct filter_match));
 					filterset_copy(set, &r->set);
@@ -4934,10 +5019,11 @@ expand_rule(struct filter_rule *rule, struct filter_rib_l *rib,
 
 					if (p != NULL)
 						memcpy(&r->peer, &p->p,
-						    sizeof(struct filter_peers));
+						    sizeof(r->peer));
 
 					if (prefix != NULL)
-						memcpy(&r->match.prefix, &prefix->p,
+						memcpy(&r->match.prefix,
+						    &prefix->p,
 						    sizeof(r->match.prefix));
 
 					if (a != NULL)
@@ -5055,10 +5141,10 @@ neighbor_consistent(struct peer *p)
 	}
 
 	/* with any form of ipsec local-address is required */
-	if ((p->conf.auth.method == AUTH_IPSEC_IKE_ESP ||
-	    p->conf.auth.method == AUTH_IPSEC_IKE_AH ||
-	    p->conf.auth.method == AUTH_IPSEC_MANUAL_ESP ||
-	    p->conf.auth.method == AUTH_IPSEC_MANUAL_AH) &&
+	if ((p->auth_conf.method == AUTH_IPSEC_IKE_ESP ||
+	    p->auth_conf.method == AUTH_IPSEC_IKE_AH ||
+	    p->auth_conf.method == AUTH_IPSEC_MANUAL_ESP ||
+	    p->auth_conf.method == AUTH_IPSEC_MANUAL_AH) &&
 	    local_addr->aid == AID_UNSPEC) {
 		yyerror("neighbors with any form of IPsec configured "
 		    "need local-address to be specified");
@@ -5066,9 +5152,9 @@ neighbor_consistent(struct peer *p)
 	}
 
 	/* with static keying we need both directions */
-	if ((p->conf.auth.method == AUTH_IPSEC_MANUAL_ESP ||
-	    p->conf.auth.method == AUTH_IPSEC_MANUAL_AH) &&
-	    (!p->conf.auth.spi_in || !p->conf.auth.spi_out)) {
+	if ((p->auth_conf.method == AUTH_IPSEC_MANUAL_ESP ||
+	    p->auth_conf.method == AUTH_IPSEC_MANUAL_AH) &&
+	    (!p->auth_conf.spi_in || !p->auth_conf.spi_out)) {
 		yyerror("with manual keyed IPsec, SPIs and keys "
 		    "for both directions are required");
 		return (-1);
@@ -5455,7 +5541,7 @@ insert_rtr(struct rtr_config *new)
 	if (new->id == 0)
 		new->id = ++id;
 
-	SIMPLEQ_INSERT_TAIL(&conf->rtrs, currtr, entry);
+	SIMPLEQ_INSERT_TAIL(&conf->rtrs, new, entry);
 
 	return 0;
 }
@@ -5477,7 +5563,7 @@ merge_aspa_set(uint32_t as, struct aspa_tas_l *tas, time_t expires)
 		RB_INSERT(aspa_tree, &conf->aspa, aspa);
 	}
 
-	if (MAX_ASPA_SPAS_COUNT - aspa->num <= tas->num) {
+	if (tas->num > MAX_ASPA_SPAS_COUNT - aspa->num) {
 		yyerror("too many providers for customer-as %u", as);
 		return -1;
 	}
@@ -5540,7 +5626,8 @@ map_tos(char *s, int *val)
 		{ "lowdelay",		IPTOS_LOWDELAY },
 		{ "netcontrol",		IPTOS_PREC_NETCONTROL },
 		{ "reliability",	IPTOS_RELIABILITY },
-		{ "throughput",		IPTOS_THROUGHPUT }
+		{ "throughput",		IPTOS_THROUGHPUT },
+		{ "va",			IPTOS_DSCP_VA },
 	};
 	const struct keywords	*p;
 
@@ -5564,7 +5651,7 @@ getservice(char *n)
 		s = getservbyname(n, "udp");
 	if (s == NULL)
 		return -1;
-	return s->s_port;
+	return ntohs(s->s_port);
 }
 
 static int
@@ -5627,6 +5714,7 @@ flow_to_flowspec(struct flowspec_context *ctx)
 		aid = AID_FLOWSPECv6;
 		break;
 	default:
+		yyerror("unknown AID %d", ctx->aid);
 		return NULL;
 	}
 
@@ -5634,9 +5722,16 @@ flow_to_flowspec(struct flowspec_context *ctx)
 		if (ctx->components[i] != NULL)
 			len += ctx->complen[i] + 1;
 
-	f = flowspec_alloc(aid, len);
-	if (f == NULL)
+	if (len > FLOWSPEC_SIZE_MAX) {
+		yyerror("flowspec too long %d > %d", len, FLOWSPEC_SIZE_MAX);
 		return NULL;
+	}
+
+	f = flowspec_alloc(aid, len);
+	if (f == NULL) {
+		yyerror("out of memory");
+		return NULL;
+	}
 
 	len = 0;
 	for (i = FLOWSPEC_TYPE_MIN; i < FLOWSPEC_TYPE_MAX; i++)
@@ -5856,13 +5951,13 @@ push_binary_numop(enum comp_ops op, long long min, long long max)
 
 struct icmptypeent {
 	const char *name;
-	u_int8_t type;
+	uint8_t type;
 };
 
 struct icmpcodeent {
 	const char *name;
-	u_int8_t type;
-	u_int8_t code;
+	uint8_t type;
+	uint8_t code;
 };
 
 static const struct icmptypeent icmp_type[] = {
@@ -5890,7 +5985,7 @@ static const struct icmptypeent icmp_type[] = {
 	{ "mobregreq",	ICMP_MOBILE_REGREQUEST },
 	{ "mobregrep",	ICMP_MOBILE_REGREPLY },
 	{ "skip",	ICMP_SKIP },
-	{ "photuris",	ICMP_PHOTURIS }
+	{ "photuris",	ICMP_PHOTURIS },
 };
 
 static const struct icmptypeent icmp6_type[] = {
@@ -5953,7 +6048,7 @@ static const struct icmpcodeent icmp_code[] = {
 	{ "badlen",		ICMP_PARAMPROB,	ICMP_PARAMPROB_LENGTH },
 	{ "unknown-ind",	ICMP_PHOTURIS,	ICMP_PHOTURIS_UNKNOWN_INDEX },
 	{ "auth-fail",		ICMP_PHOTURIS,	ICMP_PHOTURIS_AUTH_FAILED },
-	{ "decrypt-fail",	ICMP_PHOTURIS,	ICMP_PHOTURIS_DECRYPT_FAILED }
+	{ "decrypt-fail",	ICMP_PHOTURIS,	ICMP_PHOTURIS_DECRYPT_FAILED },
 };
 
 static const struct icmpcodeent icmp6_code[] = {
@@ -5967,7 +6062,7 @@ static const struct icmpcodeent icmp6_code[] = {
 	{ "badhead", ICMP6_PARAM_PROB, ICMP6_PARAMPROB_HEADER },
 	{ "nxthdr", ICMP6_PARAM_PROB, ICMP6_PARAMPROB_NEXTHEADER },
 	{ "redironlink", ND_REDIRECT, ND_REDIRECT_ONLINK },
-	{ "redirrouter", ND_REDIRECT, ND_REDIRECT_ROUTER }
+	{ "redirrouter", ND_REDIRECT, ND_REDIRECT_ROUTER },
 };
 
 static int
@@ -6015,3 +6110,43 @@ geticmpcodebyname(u_long type, char *w, uint8_t aid)
 	}
 	return -1;
 }
+
+static int
+merge_auth_conf(struct auth_config *to, struct auth_config *from)
+{
+	if (to->method != 0) {
+		/* extra magic for manual ipsec rules */
+		if (to->method == from->method &&
+		    (to->method == AUTH_IPSEC_MANUAL_ESP ||
+		    to->method == AUTH_IPSEC_MANUAL_AH)) {
+			if (to->spi_in == 0 && from->spi_in != 0) {
+				to->spi_in = from->spi_in;
+				to->auth_alg_in = from->auth_alg_in;
+				to->enc_alg_in = from->enc_alg_in;
+				memcpy(to->auth_key_in, from->auth_key_in,
+				    sizeof(to->auth_key_in));
+				memcpy(to->enc_key_in, from->enc_key_in,
+				    sizeof(to->enc_key_in));
+				to->enc_keylen_in = from->enc_keylen_in;
+				to->auth_keylen_in = from->auth_keylen_in;
+				return 1;
+			} else if (to->spi_out == 0 && from->spi_out != 0) {
+				to->spi_out = from->spi_out;
+				to->auth_alg_out = from->auth_alg_out;
+				to->enc_alg_out = from->enc_alg_out;
+				memcpy(to->auth_key_out, from->auth_key_out,
+				    sizeof(to->auth_key_out));
+				memcpy(to->enc_key_out, from->enc_key_out,
+				    sizeof(to->enc_key_out));
+				to->enc_keylen_out = from->enc_keylen_out;
+				to->auth_keylen_out = from->auth_keylen_out;
+				return 1;
+			}
+		}
+		yyerror("auth method cannot be redefined");
+		return 0;
+	}
+	*to = *from;
+	return 1;
+}
+

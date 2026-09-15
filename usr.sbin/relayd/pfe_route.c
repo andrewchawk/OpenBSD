@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_route.c,v 1.14 2023/06/29 16:24:53 claudio Exp $	*/
+/*	$OpenBSD: pfe_route.c,v 1.17 2026/08/12 18:38:17 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2009 - 2011 Reyk Floeter <reyk@openbsd.org>
@@ -33,6 +33,7 @@
 #include <errno.h>
 
 #include "relayd.h"
+#include "log.h"
 
 void
 init_routes(struct relayd *env)
@@ -56,7 +57,7 @@ sync_routes(struct relayd *env, struct router *rt)
 {
 	struct netroute		*nr;
 	struct host		*host;
-	char			 buf[HOST_NAME_MAX+1];
+	char			 buf[HOST_NAME_MAX + 1];
 	struct ctl_netroute	 crt;
 
 	if (!(env->sc_conf.flags & F_NEEDRT))
@@ -81,8 +82,10 @@ sync_routes(struct relayd *env, struct router *rt)
 			memcpy(&crt.host, &host->conf, sizeof(host->conf));
 			memcpy(&crt.rt, &rt->rt_conf, sizeof(rt->rt_conf));
 
-			proc_compose(env->sc_ps, PROC_PARENT,
-			    IMSG_RTMSG, &crt, sizeof(crt));
+			if (proc_compose(env->sc_ps, PROC_PARENT, IMSG_RTMSG,
+			    &crt, sizeof(crt)) == -1) {
+				log_warn("%s: proc_compose", __func__);
+			}
 		}
 	}
 }

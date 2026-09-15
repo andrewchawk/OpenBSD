@@ -1,4 +1,4 @@
-/*	$OpenBSD: rad.c,v 1.31 2024/05/21 05:00:48 jsg Exp $	*/
+/*	$OpenBSD: rad.c,v 1.42 2026/09/06 18:45:29 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -41,6 +41,7 @@
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -122,7 +123,7 @@ main(int argc, char *argv[])
 	struct event		 ev_sigint, ev_sigterm, ev_sighup;
 	int			 ch;
 	int			 debug = 0, engine_flag = 0, frontend_flag = 0;
-	char			*saved_argv0;
+	char			 execpath[PATH_MAX];
 	int			 pipe_main2frontend[2];
 	int			 pipe_main2engine[2];
 	int			 frontend_routesock, rtfilter;
@@ -135,10 +136,6 @@ main(int argc, char *argv[])
 
 	log_init(1, LOG_DAEMON);	/* Log to stderr until daemonized. */
 	log_setverbose(1);
-
-	saved_argv0 = argv[0];
-	if (saved_argv0 == NULL)
-		saved_argv0 = "rad";
 
 	while ((ch = getopt(argc, argv, "dEFf:ns:v")) != -1) {
 		switch (ch) {
@@ -174,6 +171,9 @@ main(int argc, char *argv[])
 	argv += optind;
 	if (argc > 0 || (engine_flag && frontend_flag))
 		usage();
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	if (engine_flag)
 		engine(debug, cmd_opts & OPT_VERBOSE);
@@ -217,9 +217,9 @@ main(int argc, char *argv[])
 		fatal("main2engine socketpair");
 
 	/* Start children. */
-	engine_pid = start_child(PROC_ENGINE, saved_argv0, pipe_main2engine[1],
+	engine_pid = start_child(PROC_ENGINE, execpath, pipe_main2engine[1],
 	    debug, cmd_opts & OPT_VERBOSE);
-	frontend_pid = start_child(PROC_FRONTEND, saved_argv0,
+	frontend_pid = start_child(PROC_FRONTEND, execpath,
 	    pipe_main2frontend[1], debug, cmd_opts & OPT_VERBOSE);
 
 	log_procinit("main");
@@ -240,9 +240,13 @@ main(int argc, char *argv[])
 	if ((iev_frontend = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_engine = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_frontend->ibuf, pipe_main2frontend[0]);
+	if (imsgbuf_init(&iev_frontend->ibuf, pipe_main2frontend[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_frontend->ibuf);
 	iev_frontend->handler = main_dispatch_frontend;
-	imsg_init(&iev_engine->ibuf, pipe_main2engine[0]);
+	if (imsgbuf_init(&iev_engine->ibuf, pipe_main2engine[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_engine->ibuf);
 	iev_engine->handler = main_dispatch_engine;
 
 	/* Setup event handlers for pipes to engine & frontend. */
@@ -298,9 +302,9 @@ main_shutdown(void)
 	int	 status;
 
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_engine->ibuf.w);
+	imsgbuf_clear(&iev_engine->ibuf);
 	close(iev_engine->ibuf.fd);
 
 	config_clear(main_conf);
@@ -325,7 +329,7 @@ main_shutdown(void)
 }
 
 static pid_t
-start_child(enum rad_process p, char *argv0, int fd, int debug, int verbose)
+start_child(enum rad_process p, char *execpath, int fd, int debug, int verbose)
 {
 	char	*argv[6];
 	int	 argc = 0;
@@ -347,7 +351,7 @@ start_child(enum rad_process p, char *argv0, int fd, int debug, int verbose)
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	switch (p) {
 	case PROC_MAIN:
 		fatalx("Can not start main process");
@@ -364,8 +368,8 @@ start_child(enum rad_process p, char *argv0, int fd, int debug, int verbose)
 		argv[argc++] = "-v";
 	argv[argc++] = NULL;
 
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 void
@@ -374,28 +378,29 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 	int			 rdomain;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -443,27 +448,28 @@ main_dispatch_engine(int fd, short event, void *bula)
 	struct imsgev	*iev = bula;
 	struct imsgbuf  *ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 shut = 0;
+	int		 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -506,7 +512,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -757,7 +763,7 @@ config_new_empty(void)
 	xconf->ra_options.retrans_timer = 0;
 	xconf->ra_options.source_link_addr = 1;
 	xconf->ra_options.mtu = 0;
-	xconf->ra_options.rdns_lifetime = DEFAULT_RDNS_LIFETIME;
+	xconf->ra_options.rdns_lifetime = ADV_DEFAULT_LIFETIME;
 	SIMPLEQ_INIT(&xconf->ra_options.ra_rdnss_list);
 	SIMPLEQ_INIT(&xconf->ra_options.ra_dnssl_list);
 	SIMPLEQ_INIT(&xconf->ra_options.ra_pref64_list);

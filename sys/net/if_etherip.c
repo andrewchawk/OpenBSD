@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_etherip.c,v 1.55 2024/02/13 12:22:09 bluhm Exp $	*/
+/*	$OpenBSD: if_etherip.c,v 1.59 2025/07/07 02:28:50 jsg Exp $	*/
 /*
  * Copyright (c) 2015 Kazuya GODA <goda@openbsd.org>
  *
@@ -23,15 +23,11 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <sys/device.h>
 #include <sys/sysctl.h>
-#include <sys/tree.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/if_dl.h>
 #include <net/if_media.h>
-#include <net/route.h>
 #include <net/rtable.h>
 
 #include <netinet/in.h>
@@ -55,6 +51,11 @@
 
 #include <net/if_etherip.h>
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+ 
 union etherip_addr {
 	struct in_addr	in4;
 	struct in6_addr	in6;
@@ -97,7 +98,7 @@ struct etherip_softc {
  * We can control the acceptance of EtherIP packets by altering the sysctl
  * net.inet.etherip.allow value. Zero means drop them, all else is acceptance.
  */
-int etherip_allow = 0;
+int etherip_allow = 0;	/* [a] */
 
 struct cpumem *etheripcounters;
 
@@ -116,7 +117,8 @@ int etherip_del_tunnel(struct etherip_softc *);
 int etherip_up(struct etherip_softc *);
 int etherip_down(struct etherip_softc *);
 struct etherip_softc *etherip_find(const struct etherip_tunnel *);
-int etherip_input(struct etherip_tunnel *, struct mbuf *, uint8_t, int);
+int etherip_input(struct etherip_tunnel *, struct mbuf *, uint8_t, int,
+    struct netstack *);
 
 struct if_clone	etherip_cloner = IF_CLONE_INITIALIZER("etherip",
     etherip_clone_create, etherip_clone_destroy);
@@ -142,7 +144,7 @@ etherip_clone_create(struct if_clone *ifc, int unit)
 	snprintf(ifp->if_xname, sizeof(ifp->if_xname), "%s%d",
 	    ifc->ifc_name, unit);
 
-	sc->sc_ttl = ip_defttl;
+	sc->sc_ttl = atomic_load_int(&ip_defttl);
 	sc->sc_txhprio = IFQ_TOS2PRIO(IPTOS_PREC_ROUTINE); /* 0 */
 	sc->sc_rxhprio = IF_HDRPRIO_PACKET;
 	sc->sc_df = htons(0);
@@ -584,7 +586,8 @@ ip_etherip_output(struct ifnet *ifp, struct mbuf *m)
 }
 
 int
-ip_etherip_input(struct mbuf **mp, int *offp, int type, int af)
+ip_etherip_input(struct mbuf **mp, int *offp, int type, int af,
+    struct netstack *ns)
 {
 	struct mbuf *m = *mp;
 	struct etherip_tunnel key;
@@ -596,7 +599,7 @@ ip_etherip_input(struct mbuf **mp, int *offp, int type, int af)
 	key.t_src4 = ip->ip_dst;
 	key.t_dst4 = ip->ip_src;
 
-	return (etherip_input(&key, m, ip->ip_tos, *offp));
+	return (etherip_input(&key, m, ip->ip_tos, *offp, ns));
 }
 
 struct etherip_softc *
@@ -621,14 +624,15 @@ etherip_find(const struct etherip_tunnel *key)
 
 int
 etherip_input(struct etherip_tunnel *key, struct mbuf *m, uint8_t tos,
-    int hlen)
+    int hlen, struct netstack *ns)
 {
 	struct etherip_softc *sc;
 	struct ifnet *ifp;
 	struct etherip_header *eip;
 	int rxprio;
 
-	if (!etherip_allow && (m->m_flags & (M_AUTH|M_CONF)) == 0) {
+	if (atomic_load_int(&etherip_allow) == 0 &&
+	    (m->m_flags & (M_AUTH|M_CONF)) == 0) {
 		etheripstat_inc(etherips_pdrops);
 		goto drop;
 	}
@@ -687,7 +691,7 @@ etherip_input(struct etherip_tunnel *key, struct mbuf *m, uint8_t tos,
 	pf_pkt_addr_changed(m);
 #endif
 
-	if_vinput(ifp, m);
+	if_vinput(ifp, m, ns);
 	return IPPROTO_DONE;
 
 drop:
@@ -762,7 +766,8 @@ ip6_etherip_output(struct ifnet *ifp, struct mbuf *m)
 }
 
 int
-ip6_etherip_input(struct mbuf **mp, int *offp, int proto, int af)
+ip6_etherip_input(struct mbuf **mp, int *offp, int proto, int af,
+    struct netstack *ns)
 {
 	struct mbuf *m = *mp;
 	struct etherip_tunnel key;
@@ -777,7 +782,7 @@ ip6_etherip_input(struct mbuf **mp, int *offp, int proto, int af)
 
 	flow = bemtoh32(&ip6->ip6_flow);
 
-	return (etherip_input(&key, m, flow >> 20, *offp));
+	return (etherip_input(&key, m, flow >> 20, *offp, ns));
 }
 #endif /* INET6 */
 
@@ -799,19 +804,14 @@ int
 etherip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
     void *newp, size_t newlen)
 {
-	int error;
-
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return ENOTDIR;
 
 	switch (name[0]) {
 	case ETHERIPCTL_ALLOW:
-		NET_LOCK();
-		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
-		    &etherip_allow, 0, 1);
-		NET_UNLOCK();
-		return (error);
+		return (sysctl_int_bounded(oldp, oldlenp, newp, newlen,
+		    &etherip_allow, 0, 1));
 	case ETHERIPCTL_STATS:
 		return (etherip_sysctl_etheripstat(oldp, oldlenp, newp));
 	default:

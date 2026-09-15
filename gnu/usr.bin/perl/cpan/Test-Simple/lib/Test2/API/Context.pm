@@ -2,7 +2,7 @@ package Test2::API::Context;
 use strict;
 use warnings;
 
-our $VERSION = '1.302194';
+our $VERSION = '1.302210';
 
 
 use Carp qw/confess croak/;
@@ -25,7 +25,7 @@ my %LOADED = (
 use Test2::Util::ExternalMeta qw/meta get_meta set_meta delete_meta/;
 use Test2::Util::HashBase qw{
     stack hub trace _on_release _depth _is_canon _is_spawn _aborted
-    errno eval_error child_error thrown
+    errno eval_error child_error thrown _failed _start_fail_count
 };
 
 # Private, not package vars
@@ -41,6 +41,8 @@ sub init {
 
     confess "The 'hub' attribute is required"
         unless $self->{+HUB};
+
+    $self->{+_START_FAIL_COUNT} = $self->{+HUB}->{failed} || 0;
 
     $self->{+_DEPTH} = 0 unless defined $self->{+_DEPTH};
 
@@ -63,6 +65,8 @@ sub DESTROY {
 
     my $hub = $self->{+HUB};
     my $hid = $hub->{hid};
+
+    $self->{+_FAILED} = ($hub->{failed} || 0) - $self->{+_START_FAIL_COUNT};
 
     # Do not show the warning if it looks like an exception has been thrown, or
     # if the context is not local to this process or thread.
@@ -111,6 +115,12 @@ Cleaning up the CONTEXT stack...
         $_->($self) for reverse @$hcbk;
     }
     $_->($self) for reverse @$ON_RELEASE;
+
+    if (my @diags = Test2::API::test2_clear_pending_diags()) {
+        if ($self->{+_FAILED} || ${$self->{+_ABORTED}}) {
+            $self->diag($_) for @diags;
+        }
+    }
 }
 
 # release exists to implement behaviors like die-on-fail. In die-on-fail you
@@ -131,6 +141,8 @@ sub release {
     my $hub = $self->{+HUB};
     my $hid = $hub->{hid};
 
+    $self->{+_FAILED} = ($hub->{failed} || 0) - $self->{+_START_FAIL_COUNT};
+
     croak "context thinks it is canon, but it is not"
         unless $CONTEXTS->{$hid} && $CONTEXTS->{$hid} == $self;
 
@@ -145,6 +157,12 @@ sub release {
         $_->($self) for reverse @$hcbk;
     }
     $_->($self) for reverse @$ON_RELEASE;
+
+    if (my @diags = Test2::API::test2_clear_pending_diags()) {
+        if ($self->{+_FAILED} || ${$self->{+_ABORTED}}) {
+            $self->diag($_) for @diags;
+        }
+    }
 
     # Do this last so that nothing else changes them.
     # If one of the hooks dies then these do not get restored, this is
@@ -436,7 +454,6 @@ sub note {
 sub diag {
     my $self = shift;
     my ($message) = @_;
-    my $hub = $self->{+HUB};
     $self->send_event(
         'Diag',
         message => $message,
@@ -612,7 +629,7 @@ context was created.
 B<Note:> If a context is acquired more than once an internal refcount is kept.
 C<release()> decrements the ref count, none of the other actions of
 C<release()> will occur unless the refcount hits 0. This means only the last
-call to C<release()> will reset C<$?>, C<$!>, C<$@>,and run the cleanup tasks.
+call to C<release()> will reset C<$?>, C<$!>, C<$@>, and run the cleanup tasks.
 
 =item $ctx->throw($message)
 
@@ -987,7 +1004,7 @@ tools, plugins, and other extensions.
 =head1 SOURCE
 
 The source code repository for Test2 can be found at
-F<http://github.com/Test-More/test-more/>.
+L<https://github.com/Test-More/test-more/>.
 
 =head1 MAINTAINERS
 
@@ -1009,11 +1026,11 @@ F<http://github.com/Test-More/test-more/>.
 
 =head1 COPYRIGHT
 
-Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+Copyright Chad Granum E<lt>exodist@cpan.orgE<gt>.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.
 
-See F<http://dev.perl.org/licenses/>
+See L<https://dev.perl.org/licenses/>
 
 =cut

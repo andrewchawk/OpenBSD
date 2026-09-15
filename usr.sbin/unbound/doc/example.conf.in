@@ -1,7 +1,7 @@
 #
 # Example configuration file.
 #
-# See unbound.conf(5) man page, version 1.20.0.
+# See unbound.conf(5) man page, version 1.25.2.
 #
 # this is a comment.
 
@@ -54,7 +54,7 @@ server:
 	# interface: 192.0.2.153
 	# interface: 192.0.2.154
 	# interface: 192.0.2.154@5003
-	# interface: 2001:DB8::5
+	# interface: 2001:db8::5
 	# interface: eth0@5003
 
 	# enable this feature to copy the source address of queries to reply.
@@ -72,12 +72,12 @@ server:
 	# server from by ip-address. If none, the default (all) interface
 	# is used. Specify every interface on a 'outgoing-interface:' line.
 	# outgoing-interface: 192.0.2.153
-	# outgoing-interface: 2001:DB8::5
-	# outgoing-interface: 2001:DB8::6
+	# outgoing-interface: 2001:db8::5
+	# outgoing-interface: 2001:db8::6
 
 	# Specify a netblock to use remainder 64 bits as random bits for
 	# upstream queries.  Uses freebind option (Linux).
-	# outgoing-interface: 2001:DB8::/64
+	# outgoing-interface: 2001:db8::/64
 	# Also (Linux:) ip -6 addr add 2001:db8::/64 dev lo
 	# And: ip -6 route add local 2001:db8::/64 dev lo
 	# And set prefer-ip6: yes to use the ip6 randomness from a netblock.
@@ -116,8 +116,8 @@ server:
 	# so-rcvbuf: 0
 
 	# buffer size for UDP port 53 outgoing (SO_SNDBUF socket option).
-	# 0 is system default.  Use 4m to handle spikes on very busy servers.
-	# so-sndbuf: 0
+	# 0 is system default. Set larger to handle spikes on very busy servers.
+	# so-sndbuf: 4m
 
 	# use SO_REUSEPORT to distribute queries over threads.
 	# at extreme load it could be better to turn it off to distribute even.
@@ -163,7 +163,7 @@ server:
 	# msg-cache-slabs: 4
 
 	# the number of queries that a thread gets to service.
-	# num-queries-per-thread: 1024
+	# num-queries-per-thread: 2048
 
 	# if very busy, 50% queries run to completion, 50% get timeout in msec
 	# jostle-timeout: 200
@@ -187,6 +187,22 @@ server:
 	# query upon encountering a CNAME record.
 	# max-query-restarts: 11
 
+	# Limit on number of NS records in NS RRset for incoming packets.
+	# iter-scrub-ns: 20
+
+	# Limit on number of CNAME, DNAME records for incoming packets.
+	# iter-scrub-cname: 11
+
+	# Limit on number of RRSIGs for an RRset for incoming packets.
+	# iter-scrub-rrsig: 8
+
+	# Limit on upstream queries for an incoming query and its recursion.
+	# max-global-quota: 200
+
+	# Should the scrubber remove promiscuous NS from positive answers,
+	# protects against poison attempts.
+	# iter-scrub-promiscuous: yes
+
 	# msec for waiting for an unknown server to reply.  Increase if you
 	# are behind a slow satellite link, to eg. 1128.
 	# unknown-server-time-limit: 376
@@ -205,6 +221,12 @@ server:
 
 	# Apart from the default, the wait limit with cookie can be adjusted.
 	# wait-limit-cookie-netblock: 192.0.2.0/24 50000
+
+	# Defaults for loopback, it has no wait limit.
+	# wait-limit-netblock: 127.0.0.0/8 -1
+	# wait-limit-netblock: ::1/128 -1
+	# wait-limit-cookie-netblock: 127.0.0.0/8 -1
+	# wait-limit-cookie-netblock: ::1/128 -1
 
 	# the amount of memory to use for the RRset cache.
 	# plain value in bytes or you can append k, m or G. default is "4Mb".
@@ -228,7 +250,7 @@ server:
 
 	# the time to live (TTL) value lower bound, in seconds. Default 0.
 	# For negative responses in the cache. If disabled, default,
-	# cache-min-tll applies if configured.
+	# cache-min-ttl applies if configured.
 	# cache-min-negative-ttl: 0
 
 	# the time to live (TTL) value for cached roundtrip times, lameness and
@@ -264,7 +286,7 @@ server:
 	# do-ip6: yes
 
 	# If running unbound on an IPv6-only host, domains that only have
-	# IPv4 servers would become unresolveable.  If NAT64 is available in
+	# IPv4 servers would become unresolvable.  If NAT64 is available in
 	# the network, unbound can use NAT64 to reach these servers with
 	# the following option.  This is NOT needed for enabling DNS64 on a
 	# system that has IPv4 connectivity.
@@ -360,7 +382,7 @@ server:
 	# interface-action: 192.0.2.153 allow
 	# interface-action: 192.0.2.154 allow
 	# interface-action: 192.0.2.154@5003 allow
-	# interface-action: 2001:DB8::5 allow
+	# interface-action: 2001:db8::5 allow
 	# interface-action: eth0@5003 allow
 
 	# Similar to 'access-control-tag:' but for interfaces.
@@ -452,6 +474,10 @@ server:
 	# print UTC timestamp in ascii to logfile, default is epoch in seconds.
 	# log-time-ascii: no
 
+	# log timestamp in ISO8601 format if also log-time-ascii is enabled.
+	# (y-m-dTh:m:s.msec[+-]tzhours:tzminutes)
+	# log-time-iso: no
+
 	# print one line with time, IP, name, type, class for every query.
 	# log-queries: no
 
@@ -472,6 +498,10 @@ server:
 
 	# print log lines that say why queries return SERVFAIL to clients.
 	# log-servfail: no
+
+	# log system-wide Linux thread ID, insted of Unbound's internal thread
+	# counter. Only on Linux and only when threads are available.
+	# log-thread-id: no
 
 	# the pid file. Can be an absolute path outside of chroot/work dir.
 	# pidfile: "@UNBOUND_PIDFILE@"
@@ -524,6 +554,9 @@ server:
 	# Harden against out of zone rrsets, to avoid spoofing attempts.
 	# harden-glue: yes
 
+	# Harden against unverified (outside-zone, including sibling zone) glue rrsets
+	# harden-unverified-glue: no
+
 	# Harden against receiving dnssec-stripped data. If you turn it
 	# off, failing to validate dnskey data for a trustanchor will
 	# trigger insecure mode for that zone (like without a trustanchor).
@@ -540,8 +573,9 @@ server:
 	# harden-referral-path: no
 
 	# Harden against algorithm downgrade when multiple algorithms are
-	# advertised in the DS record.  If no, allows the weakest algorithm
-	# to validate the zone.
+	# advertised in the DS record.  If no, allows any algorithm
+	# to validate the zone which is the standard behavior for validators.
+	# Check the manpage for detailed information.
 	# harden-algo-downgrade: no
 
 	# Harden against unknown records in the authority section and the
@@ -631,7 +665,7 @@ server:
 	# or, just before the iterator).
 	# module-config: "validator iterator"
 
-	# File with trusted keys, kept uptodate using RFC5011 probes,
+	# File with trusted keys, kept up-to-date using RFC5011 probes,
 	# initial file like trust-anchor-file, then it stores metadata.
 	# Use several entries, one per domain name, to track multiple zones.
 	#
@@ -691,7 +725,7 @@ server:
 	# val-max-restart: 5
 
 	# Should additional section of secure message also be kept clean of
-	# unsecure data. Useful to shield the users of this validator from
+	# non-secure data. Useful to shield the users of this validator from
 	# potential bogus data in the additional section. All unsigned data
 	# in the additional section is removed from secure messages.
 	# val-clean-additional: yes
@@ -714,12 +748,13 @@ server:
 	# disable-edns-do: no
 
 	# Serve expired responses from cache, with serve-expired-reply-ttl in
-	# the response, and then attempt to fetch the data afresh.
+	# the response. By default it first tries to refresh an expired answer.
+	# Can be configured with serve-expired-client-timeout.
 	# serve-expired: no
 	#
 	# Limit serving of expired responses to configured seconds after
 	# expiration. 0 disables the limit.
-	# serve-expired-ttl: 0
+	# serve-expired-ttl: 86400
 	#
 	# Set the TTL of expired records to the serve-expired-ttl value after a
 	# failed attempt to retrieve the record from upstream. This makes sure
@@ -728,14 +763,14 @@ server:
 	# serve-expired-ttl-reset: no
 	#
 	# TTL value to use when replying with expired data.
+	# Capped by the original TTL of the record.
 	# serve-expired-reply-ttl: 30
 	#
 	# Time in milliseconds before replying to the client with expired data.
 	# This essentially enables the serve-stale behavior as specified in
-	# RFC 8767 that first tries to resolve before
-	# immediately responding with expired data.  0 disables this behavior.
-	# A recommended value is 1800.
-	# serve-expired-client-timeout: 0
+	# RFC 8767 that first tries to resolve before immediately responding
+	# with expired data.  0 disables this behavior.
+	# serve-expired-client-timeout: 1800
 
 	# Return the original TTL as received from the upstream name server rather
 	# than the decrementing TTL as stored in the cache.  Enabling this feature
@@ -794,6 +829,8 @@ server:
 	# local-zone: "127.in-addr.arpa." nodefault
 	# local-zone: "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa." nodefault
 	# local-zone: "home.arpa." nodefault
+	# local-zone: "resolver.arpa." nodefault
+	# local-zone: "service.arpa." nodefault
 	# local-zone: "onion." nodefault
 	# local-zone: "test." nodefault
 	# local-zone: "invalid." nodefault
@@ -896,6 +933,22 @@ server:
 	# add a netblock specific override to a localzone, with zone type
 	# local-zone-override: "example.com" 192.0.2.0/24 refuse
 
+	# Action to apply when the IP address in an AAAA or A RR in the answer
+	# section of a response matches the specified IP netblock.
+	# Requires use of the respip module.
+	# response-ip: 192.0.2.0/24 redirect
+
+	# Redirect as specified by the "resource record string" when the IP
+	# address in an AAAA or A RR in the answer section of a response
+	# matches the specified IP netblock.
+	# Requires use of the respip module.
+	# response-ip-data: 192.0.2.0/24 "example. A 192.0.2.1"
+
+	# Apply tag(s) when the IP address in an AAAA or A RR in the answer
+	# section of a response matches the specified IP netblock.
+	# Requires use of the respip module.
+	# response-ip-tag: 192.0.2.0/24 "tag1 tag2"
+
 	# service clients over TLS (on the TCP sockets) with plain DNS inside
 	# the TLS stream, and over HTTPS using HTTP/2 as specified in RFC8484.
 	# Give the certificate to use and private key.
@@ -904,21 +957,23 @@ server:
 	# tls-service-pem: "path/to/publiccertfile.pem"
 	# tls-port: 853
 	# https-port: 443
+	# quic-port: 853
+
+	# Also serve tls on these port numbers (eg. 443, ...), by listing
+	# tls-additional-port: portno for each of the port numbers.
 
 	# cipher setting for TLSv1.2
 	# tls-ciphers: "DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256"
 	# cipher setting for TLSv1.3
 	# tls-ciphersuites: "TLS_AES_128_GCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_CCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
 
-	# Pad responses to padded queries received over TLS
-	# pad-responses: yes
-
-	# Padded responses will be padded to the closest multiple of this size.
-	# pad-responses-block-size: 468
-
 	# Use the SNI extension for TLS connections.  Default is yes.
-	# Changing the value requires a reload.
+	# Changing the value requires a restart.
 	# tls-use-sni: yes
+
+	# TLS protocols.
+	# Changing the value requires a restart.
+	# tls-protocols: "TLSv1.2 TLSv1.3"
 
 	# Add the secret file for TLS Session Ticket.
 	# Secret file must be 80 bytes of random data.
@@ -940,14 +995,17 @@ server:
 	# and on other systems, the default openssl certificates
 	# tls-system-cert: no
 
+	# Pad responses to padded queries received over TLS
+	# pad-responses: yes
+
+	# Padded responses will be padded to the closest multiple of this size.
+	# pad-responses-block-size: 468
+
 	# Pad queries over TLS upstreams
 	# pad-queries: yes
 
 	# Padded queries will be padded to the closest multiple of this size.
 	# pad-queries-block-size: 128
-
-	# Also serve tls on these port numbers (eg. 443, ...), by listing
-	# tls-additional-port: portno for each of the port numbers.
 
 	# HTTP endpoint to provide DNS-over-HTTPS service on.
 	# http-endpoint: "/dns-query"
@@ -967,6 +1025,9 @@ server:
 
 	# Disable TLS for DNS-over-HTTP downstream service.
 	# http-notls-downstream: no
+
+	# Maximum number of bytes used for QUIC buffers.
+	# quic-size: 8m
 
 	# The interfaces that use these listed port numbers will support and
 	# expect PROXYv2. For UDP and TCP/TLS interfaces.
@@ -1044,6 +1105,11 @@ server:
 	# example value "000102030405060708090a0b0c0d0e0f".
 	# cookie-secret: <128 bit random hex string>
 
+	# File with cookie secrets, the 'cookie-secret:' option is ignored
+	# and the file can be managed to have staging and active secrets
+	# with remote control commands. Disabled with "". Default is "".
+	# cookie-secret-file: "/usr/local/etc/unbound_cookiesecrets.txt"
+
 	# Enable to attach Extended DNS Error codes (RFC8914) to responses.
 	# ede: no
 
@@ -1051,6 +1117,11 @@ server:
 	# Answer as EDNS0 option to expired responses.
 	# Note that the ede option above needs to be enabled for this to work.
 	# ede-serve-expired: no
+
+	# Enable DNS Error Reporting (RFC9567).
+	# qname-minimisation is advised to be turned on as well to increase
+	# privacy on the outgoing reports.
+	# dns-error-reporting: no
 
 	# Specific options for ipsecmod. Unbound needs to be configured with
 	# --enable-ipsecmod for these to take effect.
@@ -1218,10 +1289,11 @@ remote-control:
 #	zonefile: "example.org.zone"
 
 # Views
-# Create named views. Name must be unique. Map views to requests using
-# the access-control-view option. Views can contain zero or more local-zone
-# and local-data options. Options from matching views will override global
-# options. Global options will be used if no matching view is found.
+# Create named views. Name must be unique.
+# Map views to requests using the access-control-view/interface-view options.
+# Views can contain zero or more local-zone and local-data options.
+# Options from matching views will override global options.
+# Global options will be used if no matching view is found.
 # With view-first yes, it will try to answer using the global local-zone and
 # local-data elements if there is no view specific match.
 # view:
@@ -1229,6 +1301,8 @@ remote-control:
 #	local-zone: "example.com" redirect
 #	local-data: "example.com A 192.0.2.3"
 #	local-data-ptr: "192.0.2.3 www.example.com"
+#	response-ip: 192.0.2.0/24 redirect
+#	response-ip-data: 192.0.2.0/24 "example. A 192.0.2.1"
 #	view-first: no
 # view:
 #	name: "anotherview"
@@ -1279,15 +1353,35 @@ remote-control:
 #     # redis server's TCP port
 #     redis-server-port: 6379
 #     # if the server uses a unix socket, set its path, or "" when not used.
-#     # redis-server-path: "/var/lib/redis/redis-server.sock"
+#     redis-server-path: "/var/lib/redis/redis-server.sock"
 #     # if the server uses an AUTH password, specify here, or "" when not used.
-#     # redis-server-password: ""
+#     redis-server-password: ""
 #     # timeout (in ms) for communication with the redis server
 #     redis-timeout: 100
+#     # timeout (in ms) for commands, if 0, uses redis-timeout.
+#     redis-command-timeout: 0
+#     # timeout (in ms) for connection set up, if 0, uses redis-timeout.
+#     redis-connect-timeout: 0
 #     # set timeout on redis records based on DNS response TTL
 #     redis-expire-records: no
 #     # redis logical database to use, 0 is the default database.
 #     redis-logical-db: 0
+#     # redis replica server's IP address or host name
+#     redis-replica-server-host: 127.0.0.1
+#     # redis replica server's TCP port
+#     redis-replica-server-port: 6379
+#     # if the replica server uses a unix socket, set its path, or "" when not used.
+#     redis-replica-server-path: "/var/lib/redis/redis-server.sock"
+#     # if the replica server uses an AUTH password, specify here, or "" when not used.
+#     redis-replica-server-password: ""
+#     # timeout (in ms) for communication with the redis replica server
+#     redis-replica-timeout: 100
+#     # timeout (in ms) for redis replica commands, if 0, uses redis-replica-timeout.
+#     redis-replica-command-timeout: 0
+#     # timeout (in ms) for redis replica connection set up, if 0, uses redis-replica-timeout.
+#     redis-replica-connect-timeout: 0
+#     # redis logical database to use for the replica server, 0 is the default database.
+#     redis-replica-logical-db: 0
 
 # IPSet
 # Add specify domain into set via ipset.
@@ -1329,6 +1423,8 @@ remote-control:
 # 	dnstap-identity: ""
 # 	# if "" it uses the package version.
 # 	dnstap-version: ""
+# 	# log only 1/N messages, if 0 it is disabled. default 0.
+# 	dnstap-sample-rate: 0
 # 	dnstap-log-resolver-query-messages: no
 # 	dnstap-log-resolver-response-messages: no
 # 	dnstap-log-client-query-messages: no
@@ -1337,7 +1433,8 @@ remote-control:
 # 	dnstap-log-forwarder-response-messages: no
 
 # Response Policy Zones
-# RPZ policies. Applied in order of configuration. QNAME, Response IP
+# RPZ policies. Applied in order of configuration. Any match from an earlier
+# RPZ zone will terminate the RPZ lookup. QNAME, Response IP
 # Address, nsdname, nsip and clientip triggers are supported. Supported
 # actions are: NXDOMAIN, NODATA, PASSTHRU, DROP, Local Data, tcp-only
 # and drop.  Policies can be loaded from a file, or using zone

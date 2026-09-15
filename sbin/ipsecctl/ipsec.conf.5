@@ -1,4 +1,4 @@
-.\"	$OpenBSD: ipsec.conf.5,v 1.163 2022/02/04 07:59:54 tb Exp $
+.\"	$OpenBSD: ipsec.conf.5,v 1.166 2026/01/18 16:38:01 schwarze Exp $
 .\"
 .\" Copyright (c) 2004 Mathieu Sauve-Frankel  All rights reserved.
 .\"
@@ -22,7 +22,7 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd $Mdocdate: February 4 2022 $
+.Dd $Mdocdate: January 18 2026 $
 .Dt IPSEC.CONF 5
 .Os
 .Sh NAME
@@ -117,7 +117,7 @@ and extend to the end of the current line.
 Care should be taken when commenting out multi-line text:
 the comment is effective until the end of the entire block.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Addresses can be specified in CIDR notation (matching netblocks),
@@ -140,14 +140,20 @@ ike esp from 192.168.1.2 to 10.0.0.17 peer 192.168.10.1
 ike esp from 192.168.1.2 to 10.0.0.18 peer 192.168.10.1
 .Ed
 .Pp
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic flow ,
 .Ic from ,
+or
 .Ic esp ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
@@ -702,7 +708,6 @@ keyword:
 .It Li ecp256 Ta 256 Ta "[DH group 19]"
 .It Li ecp384 Ta 384 Ta "[DH group 20]"
 .It Li ecp521 Ta 512 Ta "[DH group 21]"
-.It Li ecp192 Ta 192 Ta "[DH group 25]"
 .It Li ecp224 Ta 224 Ta "[DH group 26]"
 .It Li bp224 Ta 224 Ta "[DH group 27]"
 .It Li bp256 Ta 256 Ta "[DH group 28]"

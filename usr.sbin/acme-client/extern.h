@@ -1,4 +1,4 @@
-/*	$Id: extern.h,v 1.21 2024/05/21 05:00:48 jsg Exp $ */
+/*	$Id: extern.h,v 1.25 2026/09/07 01:55:44 jsg Exp $ */
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -34,6 +34,7 @@ enum	acctop {
 	ACCT_SIGN,
 	ACCT_KID_SIGN,
 	ACCT_THUMBPRINT,
+	ACCT_EAB,
 	ACCT__MAX
 };
 
@@ -200,19 +201,17 @@ __BEGIN_DECLS
  * Start with our components.
  * These are all isolated and talk to each other using sockets.
  */
-int		 acctproc(int, const char *, enum keytype);
+int		 acctproc(int, const char *, enum keytype, const char *,
+			const unsigned char *, int);
 int		 certproc(int, int);
 int		 chngproc(int, const char *);
 int		 dnsproc(int);
-int		 revokeproc(int, const char *, int, int, const char *const *,
-			size_t);
+int		 revokeproc(int, const char *, int, int, struct domain_c *);
 int		 fileproc(int, const char *, const char *, const char *,
 			const char *);
-int		 keyproc(int, const char *, const char **, size_t,
-			enum keytype);
+int		 keyproc(int, struct domain_c *);
 int		 netproc(int, int, int, int, int, int, int,
-			struct authority_c *, const char *const *,
-			size_t);
+			struct authority_c *, struct domain_c *, int);
 
 /*
  * Debugging functions.
@@ -243,6 +242,7 @@ int		 checkexit_ext(int *, pid_t, enum comp);
  */
 size_t		 base64len(size_t);
 char		*base64buf_url(const char *, size_t);
+int		 unbase64buf_url(const unsigned char *, unsigned char **);
 
 /*
  * JSON parsing routines.
@@ -250,7 +250,7 @@ char		*base64buf_url(const char *, size_t);
  */
 struct jsmnn	*json_parse(const char *, size_t);
 void		 json_free(struct jsmnn *);
-int		 json_parse_response(struct jsmnn *);
+enum chngstatus	 json_parse_response(struct jsmnn *);
 void		 json_free_challenge(struct chng *);
 int		 json_parse_challenge(struct jsmnn *, struct chng *);
 void		 json_free_order(struct order *);
@@ -262,18 +262,19 @@ char		*json_getstr(struct jsmnn *, const char *);
 
 char		*json_fmt_newcert(const char *);
 char		*json_fmt_chkacc(void);
-char		*json_fmt_newacc(const char *);
-char		*json_fmt_neworder(const char *const *, size_t);
-char		*json_fmt_protected_rsa(const char *,
-			const char *, const char *, const char *);
-char		*json_fmt_protected_ec(const char *, const char *, const char *,
-			const char *);
-char		*json_fmt_protected_kid(const char*, const char *, const char *,
-			const char *);
+char		*json_fmt_newacc(const char *, const char *);
+char		*json_fmt_neworder(struct domain_c *);
+char		*json_fmt_jwk_rsa(const char *, const char *);
+char		*json_fmt_jwk_ec(const char *, const char *);
+char		*json_fmt_protected_jwk(const char *, const char *,
+			const char *, const char *);
+char		*json_fmt_protected_kid(const char *, const char *,
+			const char *, const char *);
 char		*json_fmt_revokecert(const char *);
 char		*json_fmt_thumb_rsa(const char *, const char *);
 char		*json_fmt_thumb_ec(const char *, const char *);
 char		*json_fmt_signed(const char *, const char *, const char *);
+char		*json_fmt_protected_eab(const char *, const char *);
 
 /*
  * Should we print debugging messages?

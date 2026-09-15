@@ -1,4 +1,4 @@
-/*	$OpenBSD: flowspec.c,v 1.5 2023/10/23 13:07:44 claudio Exp $ */
+/*	$OpenBSD: flowspec.c,v 1.7 2026/08/30 23:43:22 jsg Exp $ */
 
 /*
  * Copyright (c) 2023 Claudio Jeker <claudio@openbsd.org>
@@ -177,6 +177,10 @@ flowspec_valid(const uint8_t *buf, int len, int is_v6)
 	if (len == 0)
 		return -1;
 
+	/* flowspec rule is too large */
+	if (len > FLOWSPEC_SIZE_MAX)
+		return -1;
+
 	while (len > 0) {
 		l = flowspec_next_component(buf, len, is_v6, &type);
 		if (l == -1)
@@ -237,7 +241,7 @@ flowspec_cmp(const uint8_t *a, int alen, const uint8_t *b, int blen, int is_v6)
 			cmp = memcmp(a, b, MINIMUM(acomplen, bcomplen));
 			/*
 			 * Lowest common component prefix wins also
-			 * if both commponents are same length also lowest
+			 * if both components are same length also lowest
 			 * string has precedence.
 			 */
 			if (cmp < 0)
@@ -276,7 +280,7 @@ shift_right(uint8_t *dst, const uint8_t *src, int off, int len)
 	uint8_t carry = 0;
 	int i;
 
-	dst += off / 8;		/* go to inital start point */
+	dst += off / 8;		/* go to initial start point */
 	off %= 8;
 	len = (len + 7) / 8;	/* how much to copy in bytes */
 

@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.11 2024/02/08 20:28:54 miod Exp $
+# $OpenBSD: Makefile,v 1.13 2026/05/29 11:18:31 robert Exp $
 
 LIB=	clangAST
 NOPIC=
@@ -24,6 +24,7 @@ SRCS=	APValue.cpp \
 	ASTTypeTraits.cpp \
 	AttrDocTable.cpp \
 	AttrImpl.cpp \
+	Availability.cpp \
 	Comment.cpp \
 	CommentBriefParser.cpp \
 	CommentCommandTraits.cpp \
@@ -41,9 +42,11 @@ SRCS=	APValue.cpp \
 	DeclFriend.cpp \
 	DeclGroup.cpp \
 	DeclObjC.cpp \
+	DeclOpenACC.cpp \
 	DeclOpenMP.cpp \
 	DeclPrinter.cpp \
 	DeclTemplate.cpp \
+	DynamicRecursiveASTVisitor.cpp \
 	ParentMapContext.cpp \
 	Expr.cpp \
 	ExprClassification.cpp \
@@ -54,6 +57,7 @@ SRCS=	APValue.cpp \
 	ExternalASTMerger.cpp \
 	ExternalASTSource.cpp \
 	FormatString.cpp \
+	InferAlloc.cpp \
 	InheritViz.cpp \
 	ItaniumCXXABI.cpp \
 	ItaniumMangle.cpp \
@@ -65,6 +69,7 @@ SRCS=	APValue.cpp \
 	NSAPI.cpp \
 	ODRDiagsEmitter.cpp \
 	ODRHash.cpp \
+	OpenACCClause.cpp \
 	OpenMPClause.cpp \
 	OSLog.cpp \
 	ParentMap.cpp \
@@ -80,6 +85,7 @@ SRCS=	APValue.cpp \
 	StmtCXX.cpp \
 	StmtIterator.cpp \
 	StmtObjC.cpp \
+	StmtOpenACC.cpp \
 	StmtOpenMP.cpp \
 	StmtPrinter.cpp \
 	StmtProfile.cpp \
@@ -93,17 +99,22 @@ SRCS=	APValue.cpp \
 	VTableBuilder.cpp \
 	VTTBuilder.cpp
 
-# Interp
-SRCS+=	ByteCodeEmitter.cpp \
-	ByteCodeExprGen.cpp \
-	ByteCodeGenError.cpp \
-	ByteCodeStmtGen.cpp \
+# ByteCode
+SRCS+=	BitcastBuffer.cpp \
+	ByteCodeEmitter.cpp \
+	Compiler.cpp \
 	Context.cpp \
 	Descriptor.cpp \
 	Disasm.cpp \
 	EvalEmitter.cpp \
-	Frame.cpp \
 	Function.cpp \
+	FunctionPointer.cpp \
+	InterpBuiltin.cpp \
+	InterpBuiltinBitCast.cpp \
+	Floating.cpp \
+	EvaluationResult.cpp \
+	DynamicAllocator.cpp \
+	InitMap.cpp \
 	Interp.cpp \
 	InterpBlock.cpp \
 	InterpFrame.cpp \
@@ -114,10 +125,12 @@ SRCS+=	ByteCodeEmitter.cpp \
 	Program.cpp \
 	Record.cpp \
 	Source.cpp \
-	State.cpp
+	State.cpp \
+	MemberPointer.cpp \
+	InterpShared.cpp
 
 .PATH:	${.CURDIR}/../../../llvm/clang/lib/AST
-.PATH:	${.CURDIR}/../../../llvm/clang/lib/AST/Interp
+.PATH:	${.CURDIR}/../../../llvm/clang/lib/AST/ByteCode
 
 BUILDFIRST=	AttrDocTable.inc \
 		Opcodes.inc
@@ -129,7 +142,7 @@ AttrDocTable.inc:
 		-o ${.TARGET} ${.ALLSRC}
 
 Opcodes.inc:
-	${TBLGEN} -I${CLANG_INC} -gen-clang-opcodes ${.CURDIR}/../../../llvm/clang/lib/AST/Interp/Opcodes.td \
+	${TBLGEN} -I${CLANG_INC} -gen-clang-opcodes ${.CURDIR}/../../../llvm/clang/lib/AST/ByteCode/Opcodes.td \
 		-o ${.TARGET} ${.ALLSRC}
 
 install:

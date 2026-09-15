@@ -14,6 +14,13 @@
 #ifdef HAVE_IFADDRS_H
 #include <ifaddrs.h>
 #endif
+#ifdef HAVE_SSL
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
+#ifdef HAVE_STRINGS_H
+#include <strings.h>
+#endif
 #include "options.h"
 #include "query.h"
 #include "tsig.h"
@@ -22,6 +29,7 @@
 #include "rrl.h"
 #include "bitset.h"
 #include "xfrd.h"
+#include "metrics.h"
 
 #include "configparser.h"
 config_parser_state_type* cfg_parser = 0;
@@ -58,8 +66,8 @@ nsd_options_create(region_type* region)
 	opt->ip_addresses = NULL;
 	opt->ip_transparent = 0;
 	opt->ip_freebind = 0;
-	opt->send_buffer_size = 0;
-	opt->receive_buffer_size = 0;
+	opt->send_buffer_size = 4*1024*1024;
+	opt->receive_buffer_size = 1*1024*1024;
 	opt->debug_mode = 0;
 	opt->verbosity = 0;
 	opt->hide_version = 0;
@@ -73,6 +81,7 @@ nsd_options_create(region_type* region)
 	opt->logfile = 0;
 	opt->log_only_syslog = 0;
 	opt->log_time_ascii = 1;
+	opt->log_time_iso = 0;
 	opt->round_robin = 0; /* also packet.h::round_robin */
 	opt->minimal_responses = 1; /* also packet.h::minimal_responses */
 	opt->confine_to_zone = 0;
@@ -86,6 +95,7 @@ nsd_options_create(region_type* region)
 	opt->tcp_timeout = TCP_TIMEOUT;
 	opt->tcp_mss = 0;
 	opt->outgoing_tcp_mss = 0;
+	opt->tcp_listen_queue = TCP_BACKLOG;
 	opt->ipv4_edns_size = EDNS_MAX_MESSAGE_LEN;
 	opt->ipv6_edns_size = EDNS_MAX_MESSAGE_LEN;
 	opt->pidfile = PIDFILE;
@@ -130,6 +140,7 @@ nsd_options_create(region_type* region)
 	opt->dnstap_log_auth_query_messages = 0;
 	opt->dnstap_log_auth_response_messages = 0;
 #endif
+	opt->reload_config = 0;
 	opt->zonefiles_check = 1;
 	opt->zonefiles_write = ZONEFILES_WRITE_INTERVAL;
 	opt->xfrd_reload_timeout = 1;
@@ -137,11 +148,15 @@ nsd_options_create(region_type* region)
 	opt->tls_service_ocsp = NULL;
 	opt->tls_service_pem = NULL;
 	opt->tls_port = TLS_PORT;
+	opt->tls_auth_port = NULL;
 	opt->tls_cert_bundle = NULL;
+	opt->tls_auth_xfr_only = 0;
 	opt->proxy_protocol_port = NULL;
 	opt->answer_cookie = 1;
 	opt->cookie_secret = NULL;
-	opt->cookie_secret_file = CONFIGDIR"/nsd_cookiesecrets.txt";
+	opt->cookie_staging_secret = NULL;
+	opt->cookie_secret_file = NULL;
+	opt->cookie_secret_file_is_default = 1;
 	opt->control_enable = 0;
 	opt->control_interface = NULL;
 	opt->control_port = NSD_CONTROL_PORT;
@@ -149,6 +164,19 @@ nsd_options_create(region_type* region)
 	opt->server_cert_file = CONFIGDIR"/nsd_server.pem";
 	opt->control_key_file = CONFIGDIR"/nsd_control.key";
 	opt->control_cert_file = CONFIGDIR"/nsd_control.pem";
+#ifdef USE_XDP
+	opt->xdp_interface = NULL;
+	opt->xdp_program_path = SHAREDFILESDIR"/xdp-dns-redirect_kern.o";
+	opt->xdp_program_load = 1;
+	opt->xdp_bpffs_path = "/sys/fs/bpf";
+	opt->xdp_force_copy = 0;
+#endif
+#ifdef USE_METRICS
+	opt->metrics_enable = 0;
+	opt->metrics_interface = NULL;
+	opt->metrics_port = NSD_METRICS_PORT;
+	opt->metrics_path = "/metrics";
+#endif /* USE_METRICS */
 
 	opt->verify_enable = 0;
 	opt->verify_ip_addresses = NULL;
@@ -246,6 +274,16 @@ parse_options_file(struct nsd_options* opt, const char* file,
 
 	opt->configfile = region_strdup(opt->region, file);
 
+	/* Set default cookie_secret_file value */
+	if(opt->cookie_secret_file_is_default && !opt->cookie_secret_file) {
+		opt->cookie_secret_file =
+			region_strdup(opt->region, COOKIESECRETSFILE);
+	}
+	/* Semantic errors */
+	if(opt->cookie_staging_secret && !opt->cookie_secret) {
+		c_error("a cookie-staging-secret cannot be configured without "
+		        "also providing a cookie-secret");
+	}
 	RBTREE_FOR(pat, struct pattern_options*, opt->patterns)
 	{
 		struct pattern_options* old_pat =
@@ -290,6 +328,16 @@ parse_options_file(struct nsd_options* opt, const char* file,
 		}
 		for(acl=pat->provide_xfr; acl; acl=acl->next)
 		{
+			/* Find tls_auth */
+			if (acl->tls_auth_name) {
+				if (!(acl->tls_auth_options =
+			                tls_auth_options_find(opt, acl->tls_auth_name)))
+				    c_error("tls_auth %s in pattern %s could not be found",
+						acl->tls_auth_name, pat->pname);
+				else if (!opt->tls_auth_port)
+				    c_warning("provide-xfr has a tls-auth-name,"
+				         " but no tls-auth-port is configured");
+			}
 			if(acl->nokey || acl->blocked)
 				continue;
 			acl->key_options = key_options_find(opt, acl->key_name);
@@ -915,10 +963,11 @@ zone_list_close(struct nsd_options* opt)
 }
 
 static void
-c_error_va_list_pos(int showpos, const char* fmt, va_list args)
+c_error_va_list_pos(int showpos, int is_error, const char* fmt, va_list args)
 {
 	char* at = NULL;
-	cfg_parser->errors++;
+	if(is_error)
+		cfg_parser->errors++;
 	if(showpos && c_text && c_text[0]!=0) {
 		at = c_text;
 	}
@@ -931,7 +980,8 @@ c_error_va_list_pos(int showpos, const char* fmt, va_list args)
 			snprintf(m, sizeof(m), "at '%s': ", at);
 			(*cfg_parser->err)(cfg_parser->err_arg, m);
 		}
-		(*cfg_parser->err)(cfg_parser->err_arg, "error: ");
+		(*cfg_parser->err)(cfg_parser->err_arg,
+			is_error ? "error: " : "warning: ");
 		vsnprintf(m, sizeof(m), fmt, args);
 		(*cfg_parser->err)(cfg_parser->err_arg, m);
 		(*cfg_parser->err)(cfg_parser->err_arg, "\n");
@@ -939,7 +989,7 @@ c_error_va_list_pos(int showpos, const char* fmt, va_list args)
 	}
         fprintf(stderr, "%s:%d: ", cfg_parser->filename, cfg_parser->line);
 	if(at) fprintf(stderr, "at '%s': ", at);
-	fprintf(stderr, "error: ");
+	fprintf(stderr, is_error ? "error: " : "warning: ");
 	vfprintf(stderr, fmt, args);
 	fprintf(stderr, "\n");
 }
@@ -955,7 +1005,22 @@ c_error(const char *fmt, ...)
 	}
 
 	va_start(ap, fmt);
-	c_error_va_list_pos(showpos, fmt, ap);
+	c_error_va_list_pos(showpos, 1, fmt, ap);
+	va_end(ap);
+}
+
+void
+c_warning(const char *fmt, ...)
+{
+	va_list ap;
+	int showpos = 0;
+
+	if (strcmp(fmt, "syntax error") == 0 || strcmp(fmt, "parse error") == 0) {
+		showpos = 1;
+	}
+
+	va_start(ap, fmt);
+	c_error_va_list_pos(showpos, 0, fmt, ap);
 	va_end(ap);
 }
 
@@ -1940,9 +2005,26 @@ acl_check_incoming(struct acl_options* acl, struct query* q,
 
 	while(acl)
 	{
+#ifdef HAVE_SSL
+		DEBUG(DEBUG_XFRD,2, (LOG_INFO, "testing acl %s %s %s",
+			acl->ip_address_spec, acl->nokey?"NOKEY":
+			(acl->blocked?"BLOCKED":acl->key_name),
+			(acl->tls_auth_name && q->tls_auth)?acl->tls_auth_name:""));
+#else
 		DEBUG(DEBUG_XFRD,2, (LOG_INFO, "testing acl %s %s",
 			acl->ip_address_spec, acl->nokey?"NOKEY":
 			(acl->blocked?"BLOCKED":acl->key_name)));
+#endif
+#ifdef HAVE_SSL
+		if (acl->tls_auth_name && !q->tls_auth) {
+			/* the acl requires a TLS client cert with name, but
+			 * the connection did not came over a "tls-auth-port:"
+			 */
+			number++;
+			acl = acl->next;
+			continue;
+		}
+#endif
 		if(acl_addr_matches(acl, q) && acl_key_matches(acl, q)) {
 			if(!match)
 			{
@@ -1955,6 +2037,27 @@ acl_check_incoming(struct acl_options* acl, struct query* q,
 				return -1;
 			}
 		}
+#ifdef HAVE_SSL
+		/* we are in a acl with tls_auth */
+		if (acl->tls_auth_name) {
+			/* we have auth_domain_name in tls_auth */
+			if (acl->tls_auth_options && acl->tls_auth_options->auth_domain_name) {
+				if (!acl_tls_hostname_matches(q->tls_auth, acl->tls_auth_options->auth_domain_name)) {
+					VERBOSITY(3, (LOG_WARNING,
+							"client cert does not match %s %s",
+							acl->tls_auth_name, acl->tls_auth_options->auth_domain_name));
+					q->cert_cn = NULL;
+					return -1;
+				}
+				VERBOSITY(5, (LOG_INFO, "%s %s verified",
+					acl->tls_auth_name, acl->tls_auth_options->auth_domain_name));
+				q->cert_cn = acl->tls_auth_options->auth_domain_name;
+			} else {
+				/* nsd gives error on start for this, but check just in case */
+				log_msg(LOG_ERR, "auth-domain-name not defined in %s", acl->tls_auth_name);
+			}
+		}
+#endif
 		number++;
 		acl = acl->next;
 	}
@@ -2158,6 +2261,168 @@ acl_addr_match_range_v6(uint32_t* minval, uint32_t* x, uint32_t* maxval, size_t 
 }
 #endif /* INET6 */
 
+#ifdef HAVE_SSL
+/* Code in for matches_subject_alternative_name and matches_common_name
+ * functions is from https://wiki.openssl.org/index.php/Hostname_validation
+ * with modifications.
+ *
+ * Obtained from: https://github.com/iSECPartners/ssl-conservatory
+ * Copyright (C) 2012, iSEC Partners.
+ * License: MIT License
+ * Author:  Alban Diquet
+ */
+static int matches_subject_alternative_name(
+	const char *acl_cert_cn, size_t acl_cert_cn_len, const X509 *cert)
+{
+	int result = 0;
+	int san_names_nb = -1;
+	STACK_OF(GENERAL_NAME) *san_names = NULL;
+
+	/* Try to extract the names within the SAN extension from the certificate */
+	san_names = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+	if (san_names == NULL)
+		return 0;
+
+	san_names_nb = sk_GENERAL_NAME_num(san_names);
+
+	/* Check each name within the extension */
+	for (int i = 0; i < san_names_nb && !result; i++) {
+		int len;
+		const char *str;
+		const GENERAL_NAME *current_name = sk_GENERAL_NAME_value(san_names, i);
+		/* Skip non-DNS SAN entries. */
+		if (current_name->type != GEN_DNS)
+			continue;
+#if HAVE_ASN1_STRING_GET0_DATA
+		str = (const char *)ASN1_STRING_get0_data(current_name->d.dNSName);
+#else
+		str = (const char *)ASN1_STRING_data(current_name->d.dNSName);
+#endif
+		if (str == NULL)
+			continue;
+		len = ASN1_STRING_length(current_name->d.dNSName);
+		if (acl_cert_cn_len == (size_t)len &&
+		    strncasecmp(str, acl_cert_cn, len) == 0)
+		{
+			result = 1;
+		} else {
+			/* Make sure there isn't an embedded NUL character in the DNS name */
+			/* From the man page: In general it cannot be assumed that the data
+			 * returned by ASN1_STRING_data() is null terminated or does not
+			 * contain embedded nulls. */
+			int pos = 0;
+			while (pos < len && str[pos] != 0)
+				pos++;
+			if (pos == len) {
+				DEBUG(DEBUG_XFRD, 2, (LOG_INFO,
+					"SAN %*s does not match acl for %s", len, str, acl_cert_cn));
+			} else {
+				DEBUG(DEBUG_XFRD, 2, (LOG_INFO, "Malformed SAN in certificate"));
+				break;
+			}
+		}
+	}
+	sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
+
+	return result;
+}
+
+static int matches_common_name(
+	const char *acl_cert_cn, size_t acl_cert_cn_len, const X509 *cert)
+{
+	int len;
+	int common_name_loc = -1;
+	const char *common_name_str = NULL;
+	X509_NAME *subject_name = NULL;
+	X509_NAME_ENTRY *common_name_entry = NULL;
+	ASN1_STRING *common_name_asn1 = NULL;
+
+	if ((subject_name = X509_get_subject_name(cert)) == NULL)
+		return 0;
+
+	/* Find the position of the CN field in the Subject field of the certificate */
+	common_name_loc = X509_NAME_get_index_by_NID(subject_name, NID_commonName, -1);
+	if (common_name_loc < 0)
+		return 0;
+
+	/* Extract the CN field */
+	common_name_entry = X509_NAME_get_entry(subject_name, common_name_loc);
+	if (common_name_entry == NULL)
+		return 0;
+
+	/* Convert the CN field to a C string */
+	common_name_asn1 = X509_NAME_ENTRY_get_data(common_name_entry);
+	if (common_name_asn1 == NULL)
+		return 0;
+
+#if HAVE_ASN1_STRING_GET0_DATA
+	common_name_str = (const char *)ASN1_STRING_get0_data(common_name_asn1);
+#else
+	common_name_str = (const char *)ASN1_STRING_data(common_name_asn1);
+#endif
+
+	len = ASN1_STRING_length(common_name_asn1);
+	if (acl_cert_cn_len == (size_t)len &&
+	    strncasecmp(acl_cert_cn, common_name_str, len) == 0)
+	{
+		return 1;
+	} else {
+		/* Make sure there isn't an embedded NUL character in the CN */
+		int pos = 0;
+		while (pos < len && common_name_str[pos] != 0)
+			pos++;
+		if (pos == len) {
+			DEBUG(DEBUG_XFRD, 2, (LOG_INFO,
+				"CN %*s does not match acl for %s", len, common_name_str, acl_cert_cn));
+		} else {
+			DEBUG(DEBUG_XFRD, 2, (LOG_INFO, "Malformed CN in certificate"));
+		}
+	}
+
+	return 0;
+}
+
+int
+acl_tls_hostname_matches(SSL* tls_auth, const char *acl_cert_cn)
+{
+	int result = 0;
+	size_t acl_cert_cn_len;
+	X509 *client_cert;
+
+	assert(acl_cert_cn != NULL);
+
+#ifdef HAVE_SSL_GET1_PEER_CERTIFICATE
+	client_cert = SSL_get1_peer_certificate(tls_auth);
+#else
+	client_cert = SSL_get_peer_certificate(tls_auth);
+#endif
+
+	if (client_cert == NULL)
+		return 0;
+
+	/* OpenSSL provides functions for hostname checking from certificate
+	 * Following code should work but it doesn't.
+	 * Keep it for future test in order to not use custom code
+	 *
+	 * X509_VERIFY_PARAM *vpm = SSL_get0_param(tls_auth);
+	 * Hostname check is done here:
+	 * X509_VERIFY_PARAM_set1_host(vpm, acl_cert_cn, 0); // recommended
+	 * X509_check_host() // can also be used instead. Not recommended DANE-EE
+	 * SSL_get_verify_result(tls_auth) != X509_V_OK) // NOT ok
+	 * const char *peername = X509_VERIFY_PARAM_get0_peername(vpm); // NOT ok
+	 */
+
+	acl_cert_cn_len = strlen(acl_cert_cn);
+	/* semi follow RFC6125#section-6.4.4 check SAN DNS first */
+	if (!(result = matches_subject_alternative_name(acl_cert_cn, acl_cert_cn_len, client_cert)))
+		result = matches_common_name(acl_cert_cn, acl_cert_cn_len, client_cert);
+
+	X509_free(client_cert);
+
+	return result;
+}
+#endif
+
 int
 acl_key_matches(struct acl_options* acl, struct query* q)
 {
@@ -2293,6 +2558,20 @@ replace_str(char* str, size_t len, const char* one, const char* two)
 	}
 }
 
+/* replace occurences of '/' with "\047", as a way to escape the '/'.
+ * This is to escape the slash character when it is part of the domain
+ * name string. It can be used normally when it is in the config string. */
+const char*
+escape_slash_zonefile(const char* input)
+{
+	static char f[1024];
+	if(!strchr(input, '/'))
+		return input;
+	strlcpy(f, input, sizeof(f));
+	replace_str(f, sizeof(f), "/", "\\047");
+	return f;
+}
+
 const char*
 config_cook_string(struct zone_options* zone, const char* input)
 {
@@ -2315,7 +2594,8 @@ config_cook_string(struct zone_options* zone, const char* input)
 	if(strstr(f, "%x"))
 		replace_str(f, sizeof(f), "%x", get_end_label(zone, 3));
 	if(strstr(f, "%s"))
-		replace_str(f, sizeof(f), "%s", zone->name);
+		replace_str(f, sizeof(f), "%s", escape_slash_zonefile(
+		zone->name));
 	return f;
 }
 
@@ -2348,7 +2628,8 @@ config_make_zonefile(struct zone_options* zone, struct nsd* nsd)
 	if(strstr(f, "%x"))
 		replace_str(f, sizeof(f), "%x", get_end_label(zone, 3));
 	if(strstr(f, "%s"))
-		replace_str(f, sizeof(f), "%s", zone->name);
+		replace_str(f, sizeof(f), "%s", escape_slash_zonefile(
+		zone->name));
 	if (nsd->chrootdir && nsd->chrootdir[0] && f[0] == '/' &&
 		strncmp(f, nsd->chrootdir, strlen(nsd->chrootdir)) == 0)
 		/* -1 because chrootdir ends in trailing slash */
@@ -2553,8 +2834,8 @@ config_apply_pattern(struct pattern_options *dest, const char* name)
 		c_error("could not find pattern %s", name);
 		return;
 	}
-	if(strncmp(dest->pname, PATTERN_IMPLICIT_MARKER,
-				strlen(PATTERN_IMPLICIT_MARKER)) == 0
+	if( (!dest->pname || strncmp(dest->pname, PATTERN_IMPLICIT_MARKER,
+				strlen(PATTERN_IMPLICIT_MARKER)) == 0)
 	&& pat->catalog_producer_zone) {
 		c_error("patterns with an catalog-producer-zone option are to "
 		        "be used with \"nsd-control addzone\" only and cannot "
@@ -2691,12 +2972,30 @@ unsigned getzonestatid(struct nsd_options* opt, struct zone_options* zopt)
 {
 #ifdef USE_ZONE_STATS
 	const char* statname;
+	char* statname_valid;
+	int name_was_modified;
 	struct zonestatname* n;
 	rbnode_type* res;
 	/* try to find the instantiated zonestat name */
 	if(!zopt->pattern->zonestats || zopt->pattern->zonestats[0]==0)
 		return 0; /* no zone stats */
 	statname = config_cook_string(zopt, zopt->pattern->zonestats);
+
+	#ifdef USE_METRICS
+	/* warn when we will lossily change the zonestat name in metrics */
+	statname_valid = strdup(statname);
+	if(!statname_valid) {
+		log_msg(LOG_ERR, "malloc failed: %s", strerror(errno));
+		exit(1);
+	}
+	name_was_modified = metrics_make_label_value_valid(statname_valid);
+	if (name_was_modified) {
+		log_msg(LOG_WARNING, "zonestats name \"%s\" contains disallowed characters, using \"%s\" in metrics",
+			statname, statname_valid);
+	}
+	free(statname_valid);
+	#endif /* USE_METRICS */
+
 	res = rbtree_search(opt->zonestatnames, statname);
 	if(res)
 		return ((struct zonestatname*)res)->id;
@@ -2862,6 +3161,10 @@ resolve_interface_names(struct nsd_options* options)
 			addrs, options->region);
 	resolve_interface_names_for_ref(&options->control_interface, 
 			addrs, options->region);
+#ifdef USE_METRICS
+	resolve_interface_names_for_ref(&options->metrics_interface,
+			addrs, options->region);
+#endif /* USE_METRICS */
 
 	freeifaddrs(addrs);
 #else

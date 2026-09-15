@@ -1,4 +1,4 @@
-/*	$OpenBSD: rdate.c,v 1.37 2023/01/04 13:00:11 jsg Exp $	*/
+/*	$OpenBSD: rdate.c,v 1.39 2026/04/28 13:25:04 millert Exp $	*/
 /*	$NetBSD: rdate.c,v 1.4 1996/03/16 12:37:45 pk Exp $	*/
 
 /*
@@ -52,8 +52,7 @@
 #define logwtmp(a,b,c)
 #endif
 
-void rfc868time_client(const char *, int, struct timeval *, struct timeval *, int);
-void ntp_client(const char *, int, struct timeval *, struct timeval *, int);
+void ntp_client(const char *, int, struct timeval *, struct timeval *);
 
 extern char    *__progname;
 __dead void	usage(void);
@@ -67,20 +66,20 @@ struct {
 __dead void
 usage(void)
 {
-	(void) fprintf(stderr, "usage: %s [-46acnopsv] host\n", __progname);
+	(void) fprintf(stderr, "usage: %s [-46anpsv] host\n", __progname);
 	exit(1);
 }
 
 int
 main(int argc, char **argv)
 {
-	int             pr = 0, silent = 0, ntp = 1, verbose = 0;
-	int		slidetime = 0, corrleaps = 0;
+	int             pr = 0, silent = 0, verbose = 0;
+	int		slidetime = 0;
 	char           *hname;
 	int             c, p[2], pid;
 	int		family = PF_UNSPEC;
 
-	while ((c = getopt(argc, argv, "46psanocv")) != -1) {
+	while ((c = getopt(argc, argv, "46psanov")) != -1) {
 		switch (c) {
 		case '4':
 			family = PF_INET;
@@ -103,15 +102,7 @@ main(int argc, char **argv)
 			break;
 
 		case 'n':
-			ntp = 1;
-			break;
-
-		case 'o':
-			ntp = 0;
-			break;
-
-		case 'c':
-			corrleaps = 1;
+			/* noop */
 			break;
 
 		case 'v':
@@ -149,12 +140,7 @@ main(int argc, char **argv)
 		setvbuf(stdout, NULL, _IOFBF, 0);
 		setvbuf(stderr, NULL, _IOFBF, 0);
 
-		if (ntp)
-			ntp_client(hname, family, &pdata.new,
-			    &pdata.adjust, corrleaps);
-		else
-			rfc868time_client(hname, family, &pdata.new,
-			    &pdata.adjust, corrleaps);
+		ntp_client(hname, family, &pdata.new, &pdata.adjust);
 
 		if (write(STDOUT_FILENO, &pdata, sizeof pdata) != sizeof pdata)
 			exit(1);
@@ -207,14 +193,9 @@ main(int argc, char **argv)
 		adjsec  = pdata.adjust.tv_sec + pdata.adjust.tv_usec / 1.0e6;
 
 		if (slidetime || verbose) {
-			if (ntp)
-				(void) fprintf(stdout,
-				   "%s: adjust local clock by %.6f seconds\n",
-				   __progname, adjsec);
-			else
-				(void) fprintf(stdout,
-				   "%s: adjust local clock by %lld seconds\n",
-				   __progname, (long long)pdata.adjust.tv_sec);
+			(void) fprintf(stdout,
+			   "%s: adjust local clock by %.6f seconds\n",
+			   __progname, adjsec);
 		}
 	}
 

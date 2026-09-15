@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.8 2023/04/28 08:45:25 krw Exp $
+#	$OpenBSD: Makefile,v 1.9 2026/04/18 16:54:22 kettenis Exp $
 
 FS=		miniroot${OSrev}.img
 FSSIZE=		67584
@@ -36,6 +36,8 @@ ${FS}: bsd.rd
 	mount /dev/`cat vnd`a ${MOUNT_POINT}
 	install -c -m 555 -o root -g wheel bsd.rd ${MOUNT_POINT}/bsd
 	ln ${MOUNT_POINT}/bsd ${MOUNT_POINT}/bsd.rd
+	mkdir -p ${MOUNT_POINT}/etc/firmware/dtb/spacemit
+	cp /etc/firmware/dtb/spacemit/* ${MOUNT_POINT}/etc/firmware/dtb/spacemit
 	df -i ${MOUNT_POINT}
 	umount ${MOUNT_POINT}
 	vnconfig -u `cat vnd`

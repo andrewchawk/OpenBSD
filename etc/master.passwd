@@ -2,7 +2,7 @@ root::0:0:daemon:0:0:Charlie &:/root:/bin/ksh
 daemon:*:1:1::0:0:The devil himself:/root:/sbin/nologin
 operator:*:2:5::0:0:System &:/operator:/sbin/nologin
 bin:*:3:7::0:0:Binaries Commands and Source:/:/sbin/nologin
-build:*:21:21::0:0:base and xenocara build:/var/empty:/bin/ksh
+build:*:21:21:build:0:0:base and xenocara build:/var/empty:/bin/ksh
 sshd:*:27:27::0:0:sshd privsep:/var/empty:/sbin/nologin
 _portmap:*:28:28::0:0:portmap:/var/empty:/sbin/nologin
 _identd:*:29:29::0:0:identd:/var/empty:/sbin/nologin
@@ -10,6 +10,7 @@ _rstatd:*:30:30::0:0:rpc.rstatd:/var/empty:/sbin/nologin
 _rusersd:*:32:32::0:0:rpc.rusersd:/var/empty:/sbin/nologin
 _fingerd:*:33:33::0:0:fingerd:/var/empty:/sbin/nologin
 _x11:*:35:35::0:0:X Server:/var/empty:/sbin/nologin
+_fc-cache:*:36:36::0:0:Font configuration cache:/var/empty:/sbin/nologin
 _unwind:*:48:48::0:0:Unwind Daemon:/var/empty:/sbin/nologin
 _traceroute:*:50:50::0:0:traceroute privdrop user:/var/empty:/sbin/nologin
 _ping:*:51:51::0:0:ping privdrop user:/var/empty:/sbin/nologin
@@ -63,4 +64,5 @@ _sndiop:*:110:110::0:0:sndio privileged user:/var/empty:/sbin/nologin
 _syspatch:*:112:112::0:0:syspatch unprivileged user:/var/empty:/sbin/nologin
 _slaacd:*:115:115::0:0:SLAAC Daemon:/var/empty:/sbin/nologin
 _dhcp6leased:*:116:116::0:0:DHCP6Lease Daemon:/var/empty:/sbin/nologin
+_lldpd:*:119:119::0:0:LLDP Daemon:/var/empty:/sbin/nologin
 nobody:*:32767:32767::0:0:Unprivileged user:/nonexistent:/sbin/nologin

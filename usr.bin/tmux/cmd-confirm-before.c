@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-confirm-before.c,v 1.55 2024/05/15 08:39:30 nicm Exp $ */
+/* $OpenBSD: cmd-confirm-before.c,v 1.61 2026/06/24 10:55:39 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Tiago Cunha <me@tiagocunha.org>
@@ -33,8 +33,8 @@ static enum args_parse_type	cmd_confirm_before_args_parse(struct args *,
 static enum cmd_retval		cmd_confirm_before_exec(struct cmd *,
 				    struct cmdq_item *);
 
-static int	cmd_confirm_before_callback(struct client *, void *,
-		    const char *, int);
+static enum prompt_result cmd_confirm_before_callback(struct client *, void *,
+		    const char *, enum prompt_key_result);
 static void	cmd_confirm_before_free(void *);
 
 const struct cmd_entry cmd_confirm_before_entry = {
@@ -42,7 +42,7 @@ const struct cmd_entry cmd_confirm_before_entry = {
 	.alias = "confirm",
 
 	.args = { "bc:p:t:y", 1, 1, cmd_confirm_before_args_parse },
-	.usage = "[-by] [-c confirm_key] [-p prompt] " CMD_TARGET_CLIENT_USAGE
+	.usage = "[-by] [-c confirm-key] [-p prompt] " CMD_TARGET_CLIENT_USAGE
 		 " command",
 
 	.flags = CMD_CLIENT_TFLAG,
@@ -92,6 +92,7 @@ cmd_confirm_before_exec(struct cmd *self, struct cmdq_item *item)
 			cdata->confirm_key = confirm_key[0];
 		else {
 			cmdq_error(item, "invalid confirm key");
+			cmd_list_free(cdata->cmdlist);
 			free(cdata);
 			return (CMD_RETURN_ERROR);
 		}
@@ -117,9 +118,9 @@ cmd_confirm_before_exec(struct cmd *self, struct cmdq_item *item)
 	return (CMD_RETURN_WAIT);
 }
 
-static int
+static enum prompt_result
 cmd_confirm_before_callback(struct client *c, void *data, const char *s,
-    __unused int done)
+    __unused enum prompt_key_result key)
 {
 	struct cmd_confirm_before_data	*cdata = data;
 	struct cmdq_item		*item = cdata->item, *new_item;
@@ -130,7 +131,7 @@ cmd_confirm_before_callback(struct client *c, void *data, const char *s,
 
 	if (s == NULL)
 		goto out;
-	if (s[0] != cdata->confirm_key && (s[0] != '\0' || !cdata->default_yes))
+	if (s[0] != cdata->confirm_key && (s[0] != '\r' || !cdata->default_yes))
 		goto out;
 	retcode = 0;
 
@@ -150,7 +151,7 @@ out:
 			cmdq_get_client(item)->retval = retcode;
 		cmdq_continue(item);
 	}
-	return (0);
+	return (PROMPT_CLOSE);
 }
 
 static void

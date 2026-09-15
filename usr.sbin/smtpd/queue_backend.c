@@ -1,4 +1,4 @@
-/*	$OpenBSD: queue_backend.c,v 1.69 2023/05/31 16:51:46 op Exp $	*/
+/*	$OpenBSD: queue_backend.c,v 1.71 2026/07/12 23:32:39 gilles Exp $	*/
 
 /*
  * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
@@ -231,10 +231,9 @@ queue_message_commit(uint32_t msgid)
 		ofp = NULL;
 
 		if (rename(tmppath, msgpath) == -1) {
-			if (errno == ENOSPC)
-				return (0);
+			if (errno != ENOSPC)
+				log_warn("rename");
 			unlink(tmppath);
-			log_warn("rename");
 			return (0);
 		}
 	}
@@ -253,10 +252,9 @@ queue_message_commit(uint32_t msgid)
 		ofp = NULL;
 
 		if (rename(tmppath, msgpath) == -1) {
-			if (errno == ENOSPC)
-				return (0);
+			if (errno != ENOSPC)
+				log_warn("rename");
 			unlink(tmppath);
-			log_warn("rename");
 			return (0);
 		}
 	}
@@ -278,6 +276,7 @@ err:
 		fclose(ifp);
 	if (ofp)
 		fclose(ofp);
+	unlink(tmppath);
 	return 0;
 }
 
@@ -309,6 +308,7 @@ queue_message_fd_r(uint32_t msgid)
 		fd = -1;
 		if ((ofp = fdopen(fdout, "w+")) == NULL)
 			goto err;
+		fdout = -1;
 
 		if (!crypto_decrypt_file(ifp, ofp))
 			goto err;
@@ -331,6 +331,7 @@ queue_message_fd_r(uint32_t msgid)
 		fd = -1;
 		if ((ofp = fdopen(fdout, "w+")) == NULL)
 			goto err;
+		fdout = -1;
 
 		if (!uncompress_file(ifp, ofp))
 			goto err;
@@ -414,6 +415,8 @@ queue_envelope_load_buffer(struct envelope *ep, char *evpbuf, size_t evpbufsize)
 	char		 encbuf[sizeof(struct envelope)];
 	size_t		 enclen;
 
+	memset(compbuf, 0, sizeof compbuf);
+	memset(encbuf, 0, sizeof encbuf);
 	evp = evpbuf;
 	evplen = evpbufsize;
 

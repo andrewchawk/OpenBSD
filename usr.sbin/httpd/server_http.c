@@ -1,4 +1,4 @@
-/*	$OpenBSD: server_http.c,v 1.154 2024/02/13 14:00:24 claudio Exp $	*/
+/*	$OpenBSD: server_http.c,v 1.170 2026/07/26 14:46:32 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2020 Matthias Pressfreund <mpfr@fn.de>
@@ -42,18 +42,25 @@
 
 #include "httpd.h"
 #include "http.h"
+#include "log.h"
 #include "patterns.h"
 
 static int	 server_httpmethod_cmp(const void *, const void *);
 static int	 server_httperror_cmp(const void *, const void *);
 void		 server_httpdesc_free(struct http_descriptor *);
 int		 server_http_authenticate(struct server_config *,
-		    struct client *);
+    struct client *);
 static int	 http_version_num(char *);
+static int	 http_is_success(unsigned int code);
 char		*server_expand_http(struct client *, const char *,
-		    char *, size_t);
+    char *, size_t);
 char		*replace_var(char *, const char *, const char *);
 char		*read_errdoc(const char *, const char *);
+ssize_t		 server_create_builtin(struct server_config *, char **,
+    unsigned int, const char *);
+char		*server_create_errdoc(struct server_config *, unsigned int,
+    const char *);
+static char	*get_custom_headers(struct kvtree *);
 
 static struct http_method	 http_methods[] = HTTP_METHODS;
 static struct http_error	 http_errors[] = HTTP_ERRORS;
@@ -70,12 +77,6 @@ server_http(void)
 	qsort(http_errors, sizeof(http_errors) /
 	    sizeof(http_errors[0]) - 1,
 	    sizeof(http_errors[0]), server_httperror_cmp);
-}
-
-void
-server_http_init(struct server *srv)
-{
-	/* nothing */
 }
 
 int
@@ -123,6 +124,7 @@ server_httpdesc_free(struct http_descriptor *desc)
 	desc->http_lastheader = NULL;
 	desc->http_method = 0;
 	desc->http_chunked = 0;
+	desc->http_cl = 0;
 }
 
 int
@@ -204,9 +206,9 @@ done:
 static int
 http_version_num(char *version)
 {
-	if (strlen(version) != 8 || strncmp(version, "HTTP/", 5) != 0
-	    || !isdigit((unsigned char)version[5]) || version[6] != '.'
-	    || !isdigit((unsigned char)version[7]))
+	if (strlen(version) != 8 || strncmp(version, "HTTP/", 5) != 0 ||
+	    !isdigit((unsigned char)version[5]) || version[6] != '.' ||
+	    !isdigit((unsigned char)version[7]))
 		return (-1);
 	if (version[5] == '0' && version[7] == '9')
 		return (9);
@@ -218,6 +220,12 @@ http_version_num(char *version)
 			return (11);
 	}
 	return (0);
+}
+
+static int
+http_is_success(unsigned int code)
+{
+	return (code >= 200 && code < 400);
 }
 
 void
@@ -289,31 +297,21 @@ server_read_http(struct bufferevent *bev, void *arg)
 		 */
 		if (++clt->clt_line == 1)
 			value = strchr(key, ' ');
-		else if (*key == ' ' || *key == '\t')
-			/* Multiline headers wrap with a space or tab */
-			value = NULL;
-		else {
-			/* Not a multiline header, should have a : */
+		else if (*key == ' ' || *key == '\t') {
+			/*
+			 * RFC 9112 section 5.2 permits unconditional rejection
+			 */
+			server_abort_http(clt, 400, "malformed");
+			goto abort;
+		} else {
 			value = strchr(key, ':');
-			if (value == NULL) {
-				server_abort_http(clt, 400, "malformed");
-				goto abort;
-			}
 		}
+
 		if (value == NULL) {
-			if (clt->clt_line == 1) {
-				server_abort_http(clt, 400, "malformed");
-				goto abort;
-			}
-
-			/* Append line to the last header, if present */
-			if (kv_extend(&desc->http_headers,
-			    desc->http_lastheader, line) == NULL)
-				goto fail;
-
-			free(line);
-			continue;
+			server_abort_http(clt, 400, "malformed");
+			goto abort;
 		}
+
 		if (*value == ':') {
 			*value++ = '\0';
 			value += strspn(value, " \t\r\n");
@@ -328,8 +326,8 @@ server_read_http(struct bufferevent *bev, void *arg)
 		 * Identify and handle specific HTTP request methods
 		 */
 		if (clt->clt_line == 1) {
-			if ((desc->http_method = server_httpmethod_byname(key))
-			    == HTTP_METHOD_NONE) {
+			if ((desc->http_method = server_httpmethod_byname(
+			    key)) == HTTP_METHOD_NONE) {
 				server_abort_http(clt, 400, "malformed");
 				goto abort;
 			}
@@ -382,19 +380,8 @@ server_read_http(struct bufferevent *bev, void *arg)
 				if ((desc->http_query = strdup(query)) == NULL)
 					goto fail;
 			}
-
 		} else if (desc->http_method != HTTP_METHOD_NONE &&
 		    strcasecmp("Content-Length", key) == 0) {
-			if (desc->http_method == HTTP_METHOD_TRACE ||
-			    desc->http_method == HTTP_METHOD_CONNECT) {
-				/*
-				 * These method should not have a body
-				 * and thus no Content-Length header.
-				 */
-				server_abort_http(clt, 400, "malformed");
-				goto abort;
-			}
-
 			/*
 			 * Need to read data from the client after the
 			 * HTTP header.
@@ -408,6 +395,7 @@ server_read_http(struct bufferevent *bev, void *arg)
 				server_abort_http(clt, 500, errstr);
 				goto abort;
 			}
+			desc->http_cl = 1;
 		}
 
 		if (strcasecmp("Transfer-Encoding", key) == 0 &&
@@ -430,8 +418,24 @@ server_read_http(struct bufferevent *bev, void *arg)
 			return;
 		}
 
+		/*
+		 * RFC 9112 sections 6.1 and 6.3 forbid sending
+		 * Content-Length with Transfer-Encoding and identify
+		 * this framing ambiguity as request smuggling input.
+		 * httpd is an origin server, so reject it.
+		 */
+		if (desc->http_chunked && desc->http_cl) {
+			server_abort_http(clt, 400, "malformed");
+			return;
+		}
+
 		switch (desc->http_method) {
 		case HTTP_METHOD_CONNECT:
+			/* No body allowed */
+			if (clt->clt_toread > 0 || desc->http_chunked) {
+				server_abort_http(clt, 400, "malformed");
+				return;
+			}
 			/* Data stream */
 			clt->clt_toread = TOREAD_UNLIMITED;
 			bev->readcb = server_read;
@@ -441,6 +445,14 @@ server_read_http(struct bufferevent *bev, void *arg)
 		/* WebDAV methods */
 		case HTTP_METHOD_COPY:
 		case HTTP_METHOD_MOVE:
+			/*
+			 * These method should not have a body and thus no
+			 * Content-Length or Transfer-Encoding: chunked header.
+			 */
+			if (clt->clt_toread > 0 || desc->http_chunked) {
+				server_abort_http(clt, 400, "malformed");
+				return;
+			}
 			clt->clt_toread = 0;
 			break;
 		case HTTP_METHOD_DELETE:
@@ -478,6 +490,7 @@ server_read_http(struct bufferevent *bev, void *arg)
 				/* 7. of RFC 9112 Section 6.3 */
 				clt->clt_toread = 0;
 			break;
+		case HTTP_METHOD_TRACE:
 		default:
 			server_abort_http(clt, 405, "method not allowed");
 			return;
@@ -513,11 +526,11 @@ server_read_httpcontent(struct bufferevent *bev, void *arg)
 {
 	struct client		*clt = arg;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
-	size_t			 size;
+	const char		*buf = EVBUFFER_DATA(src);
+	size_t			 size = EVBUFFER_LENGTH(src);
 
 	getmonotime(&clt->clt_tv_last);
 
-	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
 	    clt->clt_id, size, clt->clt_toread);
 	if (!size)
@@ -525,21 +538,18 @@ server_read_httpcontent(struct bufferevent *bev, void *arg)
 
 	if (clt->clt_toread > 0) {
 		/* Read content data */
-		if ((off_t)size > clt->clt_toread) {
+		if ((off_t)size > clt->clt_toread)
 			size = clt->clt_toread;
-			if (fcgi_add_stdin(clt, src) == -1)
-				goto fail;
-			clt->clt_toread = 0;
-		} else {
-			if (fcgi_add_stdin(clt, src) == -1)
-				goto fail;
-			clt->clt_toread -= size;
-		}
+
+		if (fcgi_add_stdin(clt, buf, size) == -1)
+			goto fail;
+		evbuffer_drain(src, size);
+		clt->clt_toread -= size;
 		DPRINTF("%s: done, size %lu, to read %lld", __func__,
 		    size, clt->clt_toread);
 	}
 	if (clt->clt_toread == 0) {
-		fcgi_add_stdin(clt, NULL);
+		fcgi_add_stdin(clt, NULL, 0);
 		clt->clt_toread = TOREAD_HTTP_HEADER;
 		bufferevent_disable(bev, EV_READ);
 		bev->readcb = server_read_http;
@@ -562,13 +572,13 @@ server_read_httpchunks(struct bufferevent *bev, void *arg)
 {
 	struct client		*clt = arg;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
+	const char		*buf = EVBUFFER_DATA(src);
+	size_t			 size = EVBUFFER_LENGTH(src);
 	char			*line;
 	long long		 llval;
-	size_t			 size;
 
 	getmonotime(&clt->clt_tv_last);
 
-	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
 	    clt->clt_id, size, clt->clt_toread);
 	if (!size)
@@ -576,17 +586,15 @@ server_read_httpchunks(struct bufferevent *bev, void *arg)
 
 	if (clt->clt_toread > 0) {
 		/* Read chunk data */
-		if ((off_t)size > clt->clt_toread) {
+		if ((off_t)size > clt->clt_toread)
 			size = clt->clt_toread;
-			if (server_bufferevent_write_chunk(clt, src, size)
-			    == -1)
-				goto fail;
-			clt->clt_toread = 0;
-		} else {
-			if (server_bufferevent_write_buffer(clt, src) == -1)
-				goto fail;
-			clt->clt_toread -= size;
-		}
+		if (fcgi_add_stdin(clt, buf, size) == -1)
+			goto fail;
+		clt->clt_toread -= size;
+		evbuffer_drain(src, size);
+
+		if (clt->clt_toread == 0)
+			clt->clt_toread = TOREAD_HTTP_CHUNK_TRAILER;
 		DPRINTF("%s: done, size %lu, to read %lld", __func__,
 		    size, clt->clt_toread);
 	}
@@ -613,18 +621,15 @@ server_read_httpchunks(struct bufferevent *bev, void *arg)
 			return;
 		}
 
-		if (server_bufferevent_print(clt, line) == -1 ||
-		    server_bufferevent_print(clt, "\r\n") == -1) {
-			free(line);
-			goto fail;
-		}
 		free(line);
 
 		if ((clt->clt_toread = llval) == 0) {
 			DPRINTF("%s: last chunk", __func__);
-			clt->clt_toread = TOREAD_HTTP_CHUNK_TRAILER;
+			fcgi_add_stdin(clt, NULL, 0);
+			clt->clt_toread = TOREAD_HTTP_FINAL_CHUNK_TRAILER;
 		}
 		break;
+	case TOREAD_HTTP_FINAL_CHUNK_TRAILER:
 	case TOREAD_HTTP_CHUNK_TRAILER:
 		/* Last chunk is 0 bytes followed by trailer and empty line */
 		line = evbuffer_readln(src, NULL, EVBUFFER_EOL_CRLF_STRICT);
@@ -633,15 +638,15 @@ server_read_httpchunks(struct bufferevent *bev, void *arg)
 			bufferevent_enable(bev, EV_READ);
 			return;
 		}
-		if (server_bufferevent_print(clt, line) == -1 ||
-		    server_bufferevent_print(clt, "\r\n") == -1) {
-			free(line);
-			goto fail;
-		}
 		if (strlen(line) == 0) {
 			/* Switch to HTTP header mode */
-			clt->clt_toread = TOREAD_HTTP_HEADER;
-			bev->readcb = server_read_http;
+			if (clt->clt_toread == TOREAD_HTTP_CHUNK_TRAILER) {
+				clt->clt_toread = TOREAD_HTTP_CHUNK_LENGTH;
+			} else {
+				clt->clt_toread = TOREAD_HTTP_HEADER;
+				bufferevent_disable(bev, EV_READ);
+				bev->readcb = server_read_http;
+			}
 		}
 		free(line);
 		break;
@@ -649,8 +654,6 @@ server_read_httpchunks(struct bufferevent *bev, void *arg)
 		/* Chunk is terminated by an empty newline */
 		line = evbuffer_readln(src, NULL, EVBUFFER_EOL_CRLF_STRICT);
 		free(line);
-		if (server_bufferevent_print(clt, "\r\n") == -1)
-			goto fail;
 		clt->clt_toread = TOREAD_HTTP_CHUNK_LENGTH;
 		break;
 	}
@@ -660,7 +663,8 @@ server_read_httpchunks(struct bufferevent *bev, void *arg)
 		goto done;
 	if (EVBUFFER_LENGTH(src))
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
+	else
+		bufferevent_enable(bev, EV_READ);
 	return;
 
  done:
@@ -690,8 +694,8 @@ server_read_httprange(struct bufferevent *bev, void *arg)
 		/* Read chunk data */
 		if ((off_t)size > r->range_toread) {
 			size = r->range_toread;
-			if (server_bufferevent_write_chunk(clt, src, size)
-			    == -1)
+			if (server_bufferevent_write_chunk(clt, src, size) ==
+			    -1)
 				goto fail;
 			r->range_toread = 0;
 		} else {
@@ -726,7 +730,7 @@ server_read_httprange(struct bufferevent *bev, void *arg)
 			if (server_bufferevent_printf(clt,
 			    "\r\n--%llu\r\n"
 			    "Content-Type: %s/%s\r\n"
-			    "Content-Range: bytes %lld-%lld/%zu\r\n\r\n",
+			    "Content-Range: bytes %lld-%lld/%lld\r\n\r\n",
 			    clt->clt_boundary,
 			    media->media_type, media->media_subtype,
 			    range->start, range->end, r->range_total) == -1)
@@ -796,13 +800,13 @@ server_http_time(time_t t, char *tmbuf, size_t len)
 	if (t == -1 || gmtime_r(&t, &tm) == NULL)
 		return (-1);
 	else
-		return (strftime(tmbuf, len, "%a, %d %h %Y %T %Z", &tm));
+		return (strftime(tmbuf, len, "%a, %d %h %Y %T GMT", &tm));
 }
 
 const char *
 server_http_host(struct sockaddr_storage *ss, char *buf, size_t len)
 {
-	char		hbuf[HOST_NAME_MAX+1];
+	char		hbuf[HOST_NAME_MAX + 1];
 	in_port_t	port;
 
 	if (print_host(ss, buf, len) == NULL)
@@ -886,14 +890,20 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 	struct server_config	*srv_conf = clt->clt_srv_conf;
 	struct bufferevent	*bev = clt->clt_bev;
 	struct http_descriptor	*desc = clt->clt_descreq;
-	const char		*httperr = NULL, *style;
-	char			*httpmsg, *body = NULL, *extraheader = NULL;
+	const char		*httperr = NULL;
+	char			*httpmsg, *body = NULL;
 	char			 tmbuf[32], hbuf[128], *hstsheader = NULL;
-	char			*clenheader = NULL;
+	char			*headers = NULL;
 	char			 buf[IBUF_READ_SIZE];
 	char			*escapedmsg = NULL;
-	char			 cstr[5];
+	char			*basicrealm = NULL;
+	char			 hbodylen[32];
 	ssize_t			 bodylen;
+	ssize_t			 httpmsglen;
+	struct kvtree		 http_headers;
+	int			 has_body, ret;
+
+	RB_INIT(&http_headers);
 
 	if (code == 0) {
 		server_close(clt, "dropped");
@@ -913,9 +923,6 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 	if (print_host(&srv_conf->ss, hbuf, sizeof(hbuf)) == NULL)
 		goto done;
 
-	if (server_http_time(time(NULL), tmbuf, sizeof(tmbuf)) <= 0)
-		goto done;
-
 	/* Do not send details of the Internal Server Error */
 	switch (code) {
 	case 301:
@@ -928,9 +935,8 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 		memset(buf, 0, sizeof(buf));
 		if (server_expand_http(clt, msg, buf, sizeof(buf)) == NULL)
 			goto done;
-		if (asprintf(&extraheader, "Location: %s\r\n", buf) == -1) {
+		if (kv_add(&http_headers, "Location", buf) == NULL) {
 			code = 500;
-			extraheader = NULL;
 		}
 		msg = buf;
 		break;
@@ -939,22 +945,24 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 			break;
 		if (stravis(&escapedmsg, msg, VIS_DQ) == -1) {
 			code = 500;
-			extraheader = NULL;
-		} else if (asprintf(&extraheader,
-		    "WWW-Authenticate: Basic realm=\"%s\"\r\n", escapedmsg)
-		    == -1) {
+		} else if (asprintf(&basicrealm, "Basic realm=\"%s\"",
+		    escapedmsg) == -1) {
+			basicrealm = NULL;
 			code = 500;
-			extraheader = NULL;
+		} else if (kv_add(&http_headers, "WWW-Authenticate",
+		    basicrealm) == NULL) {
+			code = 500;
 		}
+		free(escapedmsg);
+		escapedmsg = NULL;
+		free(basicrealm);
+		basicrealm = NULL;
 		break;
 	case 416:
 		if (msg == NULL)
 			break;
-		if (asprintf(&extraheader,
-		    "Content-Range: %s\r\n", msg) == -1) {
+		if (kv_add(&http_headers, "Content-Range", msg) == NULL)
 			code = 500;
-			extraheader = NULL;
-		}
 		break;
 	default:
 		/*
@@ -967,25 +975,136 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 		break;
 	}
 
-	free(escapedmsg);
+	if ((body = server_create_errdoc(srv_conf, code, httperr)) != NULL) {
+		bodylen = strlen(body);
+	} else if ((bodylen = server_create_builtin(srv_conf, &body, code,
+	    httperr)) == -1)
+		goto done;
 
-	if ((srv_conf->flags & SRVFLAG_ERRDOCS) == 0)
-		goto builtin; /* errdocs not enabled */
+	if (srv_conf->flags & SRVFLAG_SERVER_HSTS &&
+	    srv_conf->flags & SRVFLAG_TLS) {
+		if (asprintf(&hstsheader, "max-age=%d%s%s",
+		    srv_conf->hsts_max_age,
+		    srv_conf->hsts_flags & HSTSFLAG_SUBDOMAINS ?
+		    "; includeSubDomains" : "",
+		    srv_conf->hsts_flags & HSTSFLAG_PRELOAD ?
+		    "; preload" : "") == -1) {
+			hstsheader = NULL;
+			goto done;
+		}
+
+		ret = kv_add(&http_headers, "Strict-Transport-Security",
+		    hstsheader) == NULL;
+		free(hstsheader);
+		hstsheader = NULL;
+		if (ret)
+			goto done;
+	}
+	has_body = !((code >= 100 && code < 200) || code == 204);
+	if (has_body) {
+		ret = snprintf(hbodylen, sizeof(hbodylen), "%zd", bodylen);
+		if (ret < 0 || (size_t)ret >= sizeof(hbodylen))
+			goto done;
+
+		if (kv_add(&http_headers, "Content-Length", hbodylen) == NULL)
+			goto done;
+	}
+
+	/* If banner is suppressed, don't write a Server header */
+	if ((srv_conf->flags & SRVFLAG_NO_BANNER) == 0)
+		if (kv_add(&http_headers, "Server", HTTPD_SERVERNAME) == NULL)
+			goto done;
+
+	if (kv_add(&http_headers, "Connection", "close") == NULL)
+		goto done;
+
+	if (kv_add(&http_headers, "Content-Type", "text/html") == NULL)
+		goto done;
+
+	/* Date header is mandatory and should be added as late as possible */
+	if (server_http_time(time(NULL), tmbuf, sizeof(tmbuf)) <= 0 ||
+	    kv_add(&http_headers, "Date", tmbuf) == NULL)
+		goto done;
+
+	if (server_custom_headers(srv_conf, &http_headers, code) == -1)
+		goto done;
+
+	if ((headers = get_custom_headers(&http_headers)) == NULL)
+		goto done;
+
+	/* Add basic HTTP headers */
+	if ((httpmsglen = asprintf(&httpmsg,
+	    "HTTP/1.0 %03d %s\r\n%s\r\n%s",
+	    code, httperr, headers,
+	    desc->http_method == HTTP_METHOD_HEAD || !has_body ? "" : body)) ==
+	    -1)
+		goto done;
+
+	free(clt->clt_close_msg);
+	if (asprintf(&clt->clt_close_msg, "%s (%03d %s)",
+	    msg == NULL ? "\"\"" : msg, code, httperr) == -1)
+		clt->clt_close_msg = NULL;
+
+	if (server_bufferevent_write_close(clt, httpmsg,
+	    (size_t)httpmsglen) == -1) {
+		/* fall back to synchronous close */
+		free(httpmsg);
+		goto done;
+	}
+	kv_purge(&http_headers);
+	free(httpmsg);
+	free(body);
+	free(headers);
+	return;
+
+ done:
+	kv_purge(&http_headers);
+	free(body);
+	free(headers);
+	if (msg == NULL)
+		msg = "\"\"";
+	if (asprintf(&httpmsg, "%s (%03d %s)", msg, code, httperr) == -1) {
+		server_close(clt, msg);
+	} else {
+		server_close(clt, httpmsg);
+		free(httpmsg);
+	}
+}
+
+char *
+server_create_errdoc(struct server_config *srv_conf, unsigned int code,
+    const char *httperr)
+{
+	char	 cstr[5];
+	char	*body;
+
+	if (!(srv_conf->flags & SRVFLAG_ERRDOCS))
+		return (NULL);
+
 	if ((size_t)snprintf(cstr, sizeof(cstr), "%03u", code) >= sizeof(cstr))
-		goto builtin;
+		return (NULL);
 
 	if ((body = read_errdoc(srv_conf->errdocroot, cstr)) == NULL &&
-	    (body = read_errdoc(srv_conf->errdocroot, HTTPD_ERRDOCTEMPLATE))
-	    == NULL)
-		goto builtin;
+	    (body = read_errdoc(srv_conf->errdocroot, HTTPD_ERRDOCTEMPLATE)) ==
+	    NULL)
+		return (NULL);
 
 	body = replace_var(body, "$HTTP_ERROR", httperr);
 	body = replace_var(body, "$RESPONSE_CODE", cstr);
-	body = replace_var(body, "$SERVER_SOFTWARE", HTTPD_SERVERNAME);
-	bodylen = strlen(body);
-	goto send;
+	body = replace_var(body, "$SERVER_SOFTWARE",
+	    (srv_conf->flags & SRVFLAG_NO_BANNER) ? "" : HTTPD_SERVERNAME);
 
- builtin:
+	return (body);
+}
+
+ssize_t
+server_create_builtin(struct server_config *srv_conf, char **body,
+    unsigned int code, const char *httperr)
+{
+	const char	*style;
+	char		*bannertoken = NULL;
+	ssize_t		 bodylen;
+
 	/* A CSS stylesheet allows minimal customization by the user */
 	style = "body { background-color: white; color: black; font-family: "
 	    "'Comic Sans MS', 'Chalkboard SE', 'Comic Neue', sans-serif; }\n"
@@ -994,8 +1113,15 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 	    "body { background-color: #1E1F21; color: #EEEFF1; }\n"
 	    "a { color: #BAD7FF; }\n}";
 
+	/* If banner is suppressed, don't write it to the error document */
+	if ((srv_conf->flags & SRVFLAG_NO_BANNER) == 0) {
+		if (asprintf(&bannertoken, "<hr>\n<address>%s</address>\n",
+		    HTTPD_SERVERNAME) == -1)
+			return (-1);
+	}
+
 	/* Generate simple HTML error document */
-	if ((bodylen = asprintf(&body,
+	bodylen = asprintf(body,
 	    "<!DOCTYPE html>\n"
 	    "<html>\n"
 	    "<head>\n"
@@ -1005,75 +1131,18 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 	    "</head>\n"
 	    "<body>\n"
 	    "<h1>%03d %s</h1>\n"
-	    "<hr>\n<address>%s</address>\n"
+	    "%s"
 	    "</body>\n"
 	    "</html>\n",
-	    code, httperr, style, code, httperr, HTTPD_SERVERNAME)) == -1) {
-		body = NULL;
-		goto done;
+	    code, httperr, style, code, httperr,
+	    bannertoken == NULL ? "" : bannertoken);
+
+	free(bannertoken);
+	if (bodylen == -1) {
+		*body = NULL;
+		return (-1);
 	}
-
- send:
-	if (srv_conf->flags & SRVFLAG_SERVER_HSTS &&
-	    srv_conf->flags & SRVFLAG_TLS) {
-		if (asprintf(&hstsheader, "Strict-Transport-Security: "
-		    "max-age=%d%s%s\r\n", srv_conf->hsts_max_age,
-		    srv_conf->hsts_flags & HSTSFLAG_SUBDOMAINS ?
-		    "; includeSubDomains" : "",
-		    srv_conf->hsts_flags & HSTSFLAG_PRELOAD ?
-		    "; preload" : "") == -1) {
-			hstsheader = NULL;
-			goto done;
-		}
-	}
-
-	if ((code >= 100 && code < 200) || code == 204)
-		clenheader = NULL;
-	else {
-		if (asprintf(&clenheader,
-		    "Content-Length: %zd\r\n", bodylen) == -1) {
-			clenheader = NULL;
-			goto done;
-		}
-	}
-
-	/* Add basic HTTP headers */
-	if (asprintf(&httpmsg,
-	    "HTTP/1.0 %03d %s\r\n"
-	    "Date: %s\r\n"
-	    "Server: %s\r\n"
-	    "Connection: close\r\n"
-	    "Content-Type: text/html\r\n"
-	    "%s"
-	    "%s"
-	    "%s"
-	    "\r\n"
-	    "%s",
-	    code, httperr, tmbuf, HTTPD_SERVERNAME,
-	    clenheader == NULL ? "" : clenheader,
-	    extraheader == NULL ? "" : extraheader,
-	    hstsheader == NULL ? "" : hstsheader,
-	    desc->http_method == HTTP_METHOD_HEAD || clenheader == NULL ?
-	    "" : body) == -1)
-		goto done;
-
-	/* Dump the message without checking for success */
-	server_dump(clt, httpmsg, strlen(httpmsg));
-	free(httpmsg);
-
- done:
-	free(body);
-	free(extraheader);
-	free(hstsheader);
-	free(clenheader);
-	if (msg == NULL)
-		msg = "\"\"";
-	if (asprintf(&httpmsg, "%s (%03d %s)", msg, code, httperr) == -1) {
-		server_close(clt, msg);
-	} else {
-		server_close(clt, httpmsg);
-		free(httpmsg);
-	}
+	return (bodylen);
 }
 
 void
@@ -1118,7 +1187,7 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 
 		/* Copy number, leading '%' char and add trailing \0 */
 		size = strspn(p + 1, "0123456789") + 2;
-		if (size  >= sizeof(ibuf))
+		if (size >= sizeof(ibuf))
 			return (NULL);
 		(void)strlcpy(ibuf, p, size);
 		n = strtonum(ibuf + 1, 0,
@@ -1148,7 +1217,8 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 		} else {
 			if ((query = url_encode(desc->http_query)) == NULL)
 				return (NULL);
-			ret = expand_string(buf, len, "$QUERY_STRING_ENC", query);
+			ret = expand_string(buf, len, "$QUERY_STRING_ENC",
+			    query);
 			free(query);
 		}
 		if (ret != 0)
@@ -1191,8 +1261,8 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 		if (strstr(val, "$REMOTE_USER") != NULL) {
 			if ((srv_conf->flags & SRVFLAG_AUTH) &&
 			    clt->clt_remote_user != NULL) {
-				if ((str = url_encode(clt->clt_remote_user))
-				    == NULL)
+				if ((str = url_encode(clt->clt_remote_user)) ==
+				    NULL)
 					return (NULL);
 			} else
 				str = strdup("");
@@ -1221,9 +1291,11 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 	}
 	if (strstr(val, "$REQUEST_SCHEME") != NULL) {
 		if (srv_conf->flags & SRVFLAG_TLS) {
-			ret = expand_string(buf, len, "$REQUEST_SCHEME", "https");
+			ret = expand_string(buf, len, "$REQUEST_SCHEME",
+			    "https");
 		} else {
-			ret = expand_string(buf, len, "$REQUEST_SCHEME", "http");
+			ret = expand_string(buf, len, "$REQUEST_SCHEME",
+			    "http");
 		}
 		if (ret != 0)
 			return (NULL);
@@ -1245,8 +1317,8 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 				return (NULL);
 		}
 		if (strstr(val, "$SERVER_NAME") != NULL) {
-			if ((str = url_encode(srv_conf->name))
-			     == NULL)
+			if ((str = url_encode(srv_conf->name)) ==
+			    NULL)
 				return (NULL);
 			ret = expand_string(buf, len, "$SERVER_NAME", str);
 			free(str);
@@ -1262,7 +1334,7 @@ int
 server_response(struct httpd *httpd, struct client *clt)
 {
 	char			 path[PATH_MAX];
-	char			 hostname[HOST_NAME_MAX+1];
+	char			 hostname[HOST_NAME_MAX + 1];
 	struct http_descriptor	*desc = clt->clt_descreq;
 	struct http_descriptor	*resp = clt->clt_descresp;
 	struct server		*srv = clt->clt_srv;
@@ -1368,6 +1440,10 @@ server_response(struct httpd *httpd, struct client *clt)
 		srv_conf = clt->clt_srv_conf;
 	}
 
+	/* Set request timeout from matching host configuration. */
+	bufferevent_settimeout(clt->clt_bev,
+	    srv_conf->requesttimeout.tv_sec, srv_conf->requesttimeout.tv_sec);
+
 	if (clt->clt_persist >= srv_conf->maxrequests)
 		clt->clt_persist = 0;
 
@@ -1433,6 +1509,11 @@ server_response(struct httpd *httpd, struct client *clt)
 	if (clt->clt_toread > 0 && (size_t)clt->clt_toread >
 	    srv_conf->maxrequestbody) {
 		server_abort_http(clt, 413, "request body too large");
+		return (-1);
+	}
+	if (desc->http_chunked && !srv_conf->fcgiallowchunked) {
+		server_abort_http(clt, 400,
+		    "Transfer-Encoding: chunked not allowed");
 		return (-1);
 	}
 
@@ -1531,6 +1612,79 @@ server_locationaccesstest(struct server_config *srv_conf, const char *path)
 }
 
 int
+server_custom_headers(struct server_config *srv_conf, struct kvtree *headers,
+    unsigned int code)
+{
+	struct custom_header	*hdr;
+	struct kv		*kv, search;
+
+	TAILQ_FOREACH(hdr, &srv_conf->headers, entry) {
+		/* Skip headers not marked ALWAYS on error responses. */
+		if (!(hdr->flags & HEADER_ALWAYS) && !http_is_success(code)) {
+			print_custom_header("skip", hdr);
+			continue;
+		}
+
+		search.kv_key = hdr->name;
+
+		/* deletes all existing headers of the same key */
+		if (hdr->flags & HEADER_REMOVE) {
+			print_custom_header("remove", hdr);
+			while ((kv = kv_find(headers, &search)) != NULL)
+				kv_delete(headers, kv);
+		/* replaces all existing headers of the same name */
+		} else if (hdr->flags & HEADER_SET) {
+			print_custom_header("set", hdr);
+			while ((kv = kv_find(headers, &search)) != NULL)
+				kv_delete(headers, kv);
+
+			if (kv_add(headers, hdr->name, hdr->value) == NULL)
+				return (-1);
+		/* appends a new header without checking for duplicates */
+		} else if (hdr->flags & HEADER_ADD) {
+			print_custom_header("add", hdr);
+			if (kv_add(headers, hdr->name, hdr->value) == NULL)
+				return (-1);
+		}
+	}
+	return (0);
+}
+
+/*
+ * Convert a kvtree with headers (name, value) into a raw HTTP header block.
+ */
+char *
+get_custom_headers(struct kvtree *headers)
+{
+	struct kv	*hdr, *child;
+	char		*nheaders = NULL, *tmp;
+
+	RB_FOREACH(hdr, kvtree, headers) {
+		if (asprintf(&tmp, "%s%s: %s\r\n",
+		    nheaders == NULL ? "" : nheaders,
+		    hdr->kv_key,
+		    hdr->kv_value == NULL ? "" : hdr->kv_value) == -1)
+			goto fail;
+		free(nheaders);
+		nheaders = tmp;
+
+		TAILQ_FOREACH(child, &hdr->kv_children, kv_entry) {
+			if (asprintf(&tmp, "%s%s: %s\r\n", nheaders,
+			    child->kv_key,
+			    child->kv_value == NULL ? "" : child->kv_value) ==
+			    -1)
+				goto fail;
+			free(nheaders);
+			nheaders = tmp;
+		}
+	}
+	return (nheaders);
+ fail:
+	free(nheaders);
+	return (NULL);
+}
+
+int
 server_response_http(struct client *clt, unsigned int code,
     struct media_type *media, off_t size, time_t mtime)
 {
@@ -1553,10 +1707,12 @@ server_response_http(struct client *clt, unsigned int code,
 	    kv_set(&resp->http_pathquery, "%s", error) == -1)
 		return (-1);
 
-	/* Add headers */
-	if (kv_add(&resp->http_headers, "Server", HTTPD_SERVERNAME) == NULL)
-		return (-1);
-
+	/* Add server banner header to response unless suppressed */
+	if ((srv_conf->flags & SRVFLAG_NO_BANNER) == 0) {
+		if (kv_add(&resp->http_headers, "Server",
+		    HTTPD_SERVERNAME) == NULL)
+			return (-1);
+	}
 	/* Is it a persistent connection? */
 	if (clt->clt_persist) {
 		if (kv_add(&resp->http_headers,
@@ -1576,6 +1732,16 @@ server_response_http(struct client *clt, unsigned int code,
 	    kv_set(cl, "%lld", (long long)size) == -1))
 		return (-1);
 
+	if (srv_conf->flags & SRVFLAG_STATIC_CACHE_CONTROL) {
+		if (kv_add(&resp->http_headers, "Cache-Control",
+		    "no-cache") == NULL)
+			return (-1);
+		if (srv_conf->flags & SRVFLAG_GZIP_STATIC &&
+		    kv_add(&resp->http_headers, "Vary",
+		    "Accept-Encoding") == NULL)
+			return (-1);
+	}
+
 	/* Set last modification time */
 	if (server_http_time(mtime, tmbuf, sizeof(tmbuf)) <= 0 ||
 	    kv_add(&resp->http_headers, "Last-Modified", tmbuf) == NULL)
@@ -1594,6 +1760,9 @@ server_response_http(struct client *clt, unsigned int code,
 		    "; preload" : "") == -1)
 			return (-1);
 	}
+
+	if (server_custom_headers(srv_conf, &resp->http_headers, code) == -1)
+		return (-1);
 
 	/* Date header is mandatory and should be added as late as possible */
 	if (server_http_time(time(NULL), tmbuf, sizeof(tmbuf)) <= 0 ||
@@ -1653,9 +1822,9 @@ server_writeheader_http(struct client *clt, struct kv *hdr, void *arg)
 	ptr = hdr->kv_value;
 	if (server_bufferevent_print(clt, key) == -1 ||
 	    (ptr != NULL &&
-	    (server_bufferevent_print(clt, ": ") == -1 ||
-	    server_bufferevent_print(clt, ptr) == -1 ||
-	    server_bufferevent_print(clt, "\r\n") == -1)))
+	     (server_bufferevent_print(clt, ": ") == -1 ||
+	      server_bufferevent_print(clt, ptr) == -1 ||
+	      server_bufferevent_print(clt, "\r\n") == -1)))
 		return (-1);
 	DPRINTF("%s: %s: %s", __func__, key,
 	    hdr->kv_value == NULL ? "" : hdr->kv_value);
@@ -1946,8 +2115,8 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 		xff = xfp = NULL;
 
 		key.kv_key = "X-Forwarded-For";
-		if ((xff = kv_find(&desc->http_headers, &key)) != NULL
-		    && xff->kv_value == NULL)
+		if ((xff = kv_find(&desc->http_headers, &key)) != NULL &&
+		    xff->kv_value == NULL)
 			xff = NULL;
 
 		if (xff &&

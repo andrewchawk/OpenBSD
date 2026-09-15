@@ -1,4 +1,4 @@
-/*	$OpenBSD: mem.h,v 1.10 2017/06/24 16:30:47 martijn Exp $	*/
+/*	$OpenBSD: mem.h,v 1.11 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -51,7 +51,7 @@
 	if (L__gp == NULL || F_ISSET(L__gp, G_TMP_INUSE)) {		\
 		(bp) = NULL;						\
 		(blen) = 0;						\
-		BINC_GOTO((sp), (bp), (blen), (nlen)); 			\
+		BINC_GOTO((sp), (bp), (blen), (nlen));			\
 	} else {							\
 		BINC_GOTO((sp), L__gp->tmp_bp, L__gp->tmp_blen, (nlen));\
 		(bp) = L__gp->tmp_bp;					\

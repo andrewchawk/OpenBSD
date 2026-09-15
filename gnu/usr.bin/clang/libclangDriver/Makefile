@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.11 2023/11/11 18:35:38 robert Exp $
+# $OpenBSD: Makefile,v 1.13 2026/05/29 11:18:31 robert Exp $
 
 LIB=	clangDriver
 NOPIC=
@@ -12,13 +12,14 @@ CPPFLAGS+=	-I${CLANG_SRCS}/lib/Driver
 # Driver
 SRCS=	Action.cpp \
 	Compilation.cpp \
+	CreateASTUnitFromArgs.cpp \
+	CreateInvocationFromArgs.cpp \
 	Distro.cpp \
 	Driver.cpp \
-	DriverOptions.cpp \
 	Job.cpp \
 	Multilib.cpp \
+	MultilibBuilder.cpp \
 	OffloadBundler.cpp \
-	OptionUtils.cpp \
 	Phases.cpp \
 	SanitizerArgs.cpp \
 	Tool.cpp \
@@ -28,18 +29,16 @@ SRCS=	Action.cpp \
 
 # Driver/Toolchains
 SRCS+=	AIX.cpp \
-	Ananas.cpp \
 	AMDGPU.cpp \
 	AMDGPUOpenMP.cpp \
 	AVR.cpp \
 	BareMetal.cpp \
 	Clang.cpp \
-	CloudABI.cpp \
 	CommonArgs.cpp \
-	Contiki.cpp \
 	CrossWindows.cpp \
 	CSKYToolChain.cpp \
 	Cuda.cpp \
+	Cygwin.cpp \
 	Darwin.cpp \
 	DragonFly.cpp \
 	Flang.cpp \
@@ -53,21 +52,23 @@ SRCS+=	AIX.cpp \
 	Hexagon.cpp \
 	HLSL.cpp \
 	Hurd.cpp \
+	LFILinux.cpp \
 	Linux.cpp \
+	Managarm.cpp \
 	MipsLinux.cpp \
 	MinGW.cpp \
-	Minix.cpp \
 	MSP430.cpp \
 	MSVC.cpp \
-	Myriad.cpp \
-	NaCl.cpp \
 	NetBSD.cpp \
+	OHOS.cpp \
 	OpenBSD.cpp \
 	PS4CPU.cpp \
-	RISCVToolchain.cpp \
 	Solaris.cpp \
 	SPIRV.cpp \
+	SPIRVOpenMP.cpp \
+	SYCL.cpp \
 	TCE.cpp \
+	UEFI.cpp \
 	VEToolchain.cpp \
 	WebAssembly.cpp \
 	XCore.cpp \

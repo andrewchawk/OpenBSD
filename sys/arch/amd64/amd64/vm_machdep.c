@@ -1,4 +1,4 @@
-/*	$OpenBSD: vm_machdep.c,v 1.47 2023/04/11 00:45:07 jsg Exp $	*/
+/*	$OpenBSD: vm_machdep.c,v 1.51 2025/07/07 18:33:36 kettenis Exp $	*/
 /*	$NetBSD: vm_machdep.c,v 1.1 2003/04/26 18:39:33 fvdl Exp $	*/
 
 /*-
@@ -53,8 +53,6 @@
 #include <machine/cpu.h>
 #include <machine/fpu.h>
 
-void setguardpage(struct proc *);
-
 /*
  * Finish a fork operation, with process p2 nearly set up.
  * Copy and update the kernel stack and pcb, making the child
@@ -98,8 +96,6 @@ cpu_fork(struct proc *p1, struct proc *p2, void *stack, void *tcb,
 	p2->p_md.md_regs = tf = (struct trapframe *)pcb->pcb_kstack - 1;
 	*tf = *p1->p_md.md_regs;
 
-	setguardpage(p2);
-
 	/*
 	 * If specified, give the child a different stack and/or TCB
 	 */
@@ -116,28 +112,9 @@ cpu_fork(struct proc *p1, struct proc *p2, void *stack, void *tcb,
 	pcb->pcb_rbp = 0;
 }
 
-/*
- * cpu_exit is called as the last action during exit.
- *
- * We clean up a little and then call sched_exit() with the old proc as an
- * argument.
- */
 void
 cpu_exit(struct proc *p)
 {
-	pmap_deactivate(p);
-	sched_exit(p);
-}
-
-/*
- * Set a red zone in the kernel stack after the u. area.
- */
-void
-setguardpage(struct proc *p)
-{
-	pmap_remove(pmap_kernel(), (vaddr_t)p->p_addr + PAGE_SIZE,
-	    (vaddr_t)p->p_addr + 2 * PAGE_SIZE);
-	pmap_update(pmap_kernel());
 }
 
 struct kmem_va_mode kv_physwait = {

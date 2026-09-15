@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.69 2024/07/09 09:31:37 dv Exp $	*/
+/*	$OpenBSD: parse.y,v 1.74 2026/04/14 21:41:19 dv Exp $	*/
 
 /*
  * Copyright (c) 2007-2016 Reyk Floeter <reyk@openbsd.org>
@@ -26,7 +26,6 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 
 #include <dev/vmm/vmm.h>
 
@@ -37,10 +36,8 @@
 
 #include <agentx.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <limits.h>
 #include <stdarg.h>
-#include <string.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <netdb.h>
@@ -91,11 +88,10 @@ int		 symset(const char *, const char *, int);
 char		*symget(const char *);
 
 ssize_t		 parse_size(char *, int64_t);
-int		 parse_disk(char *, int);
-unsigned int	 parse_format(const char *);
+int		 parse_disk(char *, enum vm_disk_fmt);
+enum vm_disk_fmt parse_format(const char *);
 
 static struct vmop_create_params vmc;
-static struct vm_create_params	*vcp;
 static struct vmd_switch	*vsw;
 static char			*kernel = NULL;
 static char			 vsw_type[IF_NAMESIZE];
@@ -108,6 +104,7 @@ extern const char		*vmd_descsw[];
 typedef struct {
 	union {
 		uint8_t		 lladdr[ETHER_ADDR_LEN];
+		enum vm_disk_fmt disk_format;
 		int64_t		 number;
 		char		*string;
 		struct {
@@ -126,13 +123,13 @@ typedef struct {
 %token	FORMAT GROUP
 %token	INET6 INSTANCE INTERFACE LLADDR LOCAL LOCKED MEMORY NET NIFS OWNER
 %token	PATH PREFIX RDOMAIN SIZE SOCKET SWITCH UP VM VMID STAGGERED START
-%token  PARALLEL DELAY
+%token  PARALLEL DELAY SEV SEVES
 %token	<v.number>	NUMBER
 %token	<v.string>	STRING
 %type	<v.lladdr>	lladdr
 %type	<v.number>	bootdevice
 %type	<v.number>	disable
-%type	<v.number>	image_format
+%type	<v.disk_format>	image_format
 %type	<v.number>	local
 %type	<v.number>	locked
 %type	<v.number>	updown
@@ -140,6 +137,8 @@ typedef struct {
 %type	<v.string>	optstring
 %type	<v.string>	string
 %type	<v.string>	vm_instance
+%type	<v.number>	sev;
+%type	<v.number>	seves;
 
 %%
 
@@ -324,7 +323,6 @@ vm		: VM string vm_instance		{
 			memset(&vmc, 0, sizeof(vmc));
 			vmc.vmc_kernel = -1;
 
-			vcp = &vmc.vmc_params;
 			vmc_disable = 0;
 			vmc_nnics = 0;
 
@@ -350,8 +348,8 @@ vm		: VM string vm_instance		{
 				vmc.vmc_ifflags[i] |= IFF_UP;
 			}
 
-			if (strlcpy(vcp->vcp_name, name,
-			    sizeof(vcp->vcp_name)) >= sizeof(vcp->vcp_name)) {
+			if (strlcpy(vmc.vmc_name, name,
+			    sizeof(vmc.vmc_name)) >= sizeof(vmc.vmc_name)) {
 				yyerror("vm name too long");
 				free($2);
 				free($3);
@@ -376,12 +374,12 @@ vm		: VM string vm_instance		{
 					log_debug("%s:%d: vm \"%s\""
 					    " skipped (%s)",
 					    file->name, yylval.lineno,
-					    vcp->vcp_name,
+					    vmc.vmc_name,
 					    (vm->vm_state & VM_STATE_RUNNING) ?
 					    "running" : "already exists");
 				} else if (ret == -1) {
 					yyerror("vm \"%s\" failed: %s",
-					    vcp->vcp_name, strerror(errno));
+					    vmc.vmc_name, strerror(errno));
 					YYERROR;
 				} else {
 					if (vmc_disable)
@@ -391,7 +389,7 @@ vm		: VM string vm_instance		{
 					log_debug("%s:%d: vm \"%s\" "
 					    "registered (%s)",
 					    file->name, yylval.lineno,
-					    vcp->vcp_name,
+					    vmc.vmc_name,
 					    vmc_disable ?
 					    "disabled" : "enabled");
 				}
@@ -413,6 +411,12 @@ vm_opts_l	: vm_opts_l vm_opts nl
 
 vm_opts		: disable			{
 			vmc_disable = $1;
+		}
+		| sev				{
+			vmc.vmc_sev = 1;
+		}
+		| seves				{
+			vmc.vmc_sev = vmc.vmc_seves = 1;
 		}
 		| DISK string image_format	{
 			if (parse_disk($2, $3) != 0) {
@@ -513,7 +517,7 @@ vm_opts		: disable			{
 		}
 		| MEMORY NUMBER			{
 			ssize_t	 res;
-			if (vcp->vcp_memranges[0].vmr_size != 0) {
+			if (vmc.vmc_memranges[0].vmr_size != 0) {
 				yyerror("memory specified more than once");
 				YYERROR;
 			}
@@ -521,12 +525,12 @@ vm_opts		: disable			{
 				yyerror("failed to parse size: %lld", $2);
 				YYERROR;
 			}
-			vcp->vcp_memranges[0].vmr_size = (size_t)res;
+			vmc.vmc_memranges[0].vmr_size = (size_t)res;
 			vmc.vmc_flags |= VMOP_CREATE_MEMORY;
 		}
 		| MEMORY STRING			{
 			ssize_t	 res;
-			if (vcp->vcp_memranges[0].vmr_size != 0) {
+			if (vmc.vmc_memranges[0].vmr_size != 0) {
 				yyerror("argument specified more than once");
 				free($2);
 				YYERROR;
@@ -536,7 +540,7 @@ vm_opts		: disable			{
 				free($2);
 				YYERROR;
 			}
-			vcp->vcp_memranges[0].vmr_size = (size_t)res;
+			vmc.vmc_memranges[0].vmr_size = (size_t)res;
 			vmc.vmc_flags |= VMOP_CREATE_MEMORY;
 		}
 		| OWNER owner_id		{
@@ -639,10 +643,10 @@ agentxopts	: /* none */
 		;
 
 image_format	: /* none 	*/	{
-			$$ = 0;
+			$$ = VMDF_AUTO;
 		}
 	     	| FORMAT string		{
-			if (($$ = parse_format($2)) == 0) {
+			if (($$ = parse_format($2)) == VMDF_INVALID) {
 				yyerror("unrecognized disk format %s", $2);
 				free($2);
 				YYERROR;
@@ -757,6 +761,12 @@ disable		: ENABLE			{ $$ = 0; }
 		| DISABLE			{ $$ = 1; }
 		;
 
+sev		: SEV				{ $$ = 1; }
+		;
+
+seves		: SEVES				{ $$ = 1; }
+		;
+
 bootdevice	: CDROM				{ $$ = VMBOOTDEV_CDROM; }
 		| DISK				{ $$ = VMBOOTDEV_DISK; }
 		| NET				{ $$ = VMBOOTDEV_NET; }
@@ -841,6 +851,8 @@ lookup(char *s)
 		{ "path",		PATH },
 		{ "prefix",		PREFIX },
 		{ "rdomain",		RDOMAIN },
+		{ "sev",		SEV },
+		{ "seves",		SEVES },
 		{ "size",		SIZE },
 		{ "socket",		SOCKET },
 		{ "staggered",		STAGGERED },
@@ -1344,11 +1356,9 @@ parse_size(char *word, int64_t val)
 }
 
 int
-parse_disk(char *word, int type)
+parse_disk(char *word, enum vm_disk_fmt type)
 {
-	char	 buf[BUFSIZ], path[PATH_MAX];
-	int	 fd;
-	ssize_t	 len;
+	char	 path[PATH_MAX];
 
 	if (vmc.vmc_ndisks >= VM_MAX_DISKS_PER_VM) {
 		log_warnx("too many disks");
@@ -1358,23 +1368,6 @@ parse_disk(char *word, int type)
 	if (realpath(word, path) == NULL) {
 		log_warn("disk %s", word);
 		return (-1);
-	}
-
-	if (!type) {
-		/* Use raw as the default format */
-		type = VMDF_RAW;
-
-		/* Try to derive the format from the file signature */
-		if ((fd = open(path, O_RDONLY)) != -1) {
-			len = read(fd, buf, sizeof(buf));
-			close(fd);
-			if (len >= (ssize_t)strlen(VM_MAGIC_QCOW) &&
-			    strncmp(buf, VM_MAGIC_QCOW,
-			    strlen(VM_MAGIC_QCOW)) == 0) {
-				/* The qcow version will be checked later */
-				type = VMDF_QCOW2;
-			}
-		}
 	}
 
 	if (strlcpy(vmc.vmc_disks[vmc.vmc_ndisks], path,
@@ -1390,14 +1383,14 @@ parse_disk(char *word, int type)
 	return (0);
 }
 
-unsigned int
+enum vm_disk_fmt
 parse_format(const char *word)
 {
 	if (strcasecmp(word, "raw") == 0)
 		return (VMDF_RAW);
 	else if (strcasecmp(word, "qcow2") == 0)
 		return (VMDF_QCOW2);
-	return (0);
+	return (VMDF_INVALID);
 }
 
 /*

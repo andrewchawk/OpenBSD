@@ -1,4 +1,4 @@
-/*	$OpenBSD: vm_agentx.c,v 1.2 2024/02/02 14:58:02 dv Exp $ */
+/*	$OpenBSD: vm_agentx.c,v 1.7 2026/01/14 03:09:05 dv Exp $ */
 
 /*
  * Copyright (c) 2022 Martijn van Duren <martijn@openbsd.org>
@@ -21,11 +21,9 @@
 #include <sys/un.h>
 
 #include <agentx.h>
-#include <errno.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -123,10 +121,9 @@ vm_agentx_run(struct privsep *ps, struct privsep_proc *p, void *arg)
 	/*
 	 * pledge in agentx process
 	 * stdio - for malloc and basic I/O including events.
-	 * recvfd - for the proc fd exchange.
 	 * unix - for access to the agentx master socket.
 	 */
-	if (pledge("stdio recvfd unix", NULL) == -1)
+	if (pledge("stdio unix", NULL) == -1)
 		fatal("pledge");
 }
 
@@ -143,8 +140,10 @@ vm_agentx_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	static int error = 0;
 	size_t i, j, index;
 	enum agentx_request_type rtype;
+	uint32_t type;
 
-	switch (imsg->hdr.type) {
+	type = imsg_get_type(imsg);
+	switch (type) {
 	case IMSG_VMDOP_GET_INFO_VM_DATA:
 		if (error)
 			break;
@@ -159,7 +158,7 @@ vm_agentx_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 			virlen += 10;
 			vir = tvir;
 		}
-                memcpy(&(vir[nvir++]), imsg->data, sizeof(vir[nvir]));
+		vmop_info_result_read(imsg, &(vir[nvir++]));
 		break;
 	case IMSG_VMDOP_GET_INFO_VM_END_DATA:
 		vmcollecting = 0;
@@ -184,14 +183,14 @@ vm_agentx_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 			    vmIndex);
 			rtype = agentx_varbind_request(vminfo[i]);
 			for (j = 0; j < nvir; j++) {
-				if (vir[j].vir_info.vir_id < index)
+				if (vir[j].vir_id < index)
 					continue;
-				if (vir[j].vir_info.vir_id == index &&
+				if (vir[j].vir_id == index &&
 				    (rtype == AGENTX_REQUEST_TYPE_GET ||
 				    rtype ==
 				    AGENTX_REQUEST_TYPE_GETNEXTINCLUSIVE))
 					break;
-				if (vir[j].vir_info.vir_id > index &&
+				if (vir[j].vir_id > index &&
 				    (rtype == AGENTX_REQUEST_TYPE_GETNEXT ||
 				    rtype ==
 				    AGENTX_REQUEST_TYPE_GETNEXTINCLUSIVE))
@@ -203,10 +202,10 @@ vm_agentx_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 			}
 			mvir = &(vir[j]);
 			agentx_varbind_set_index_integer(vminfo[i], vmIndex,
-			    mvir->vir_info.vir_id);
+			    mvir->vir_id);
 			if (reqObject == vmName)
 				agentx_varbind_string(vminfo[i],
-				    mvir->vir_info.vir_name);
+				    mvir->vir_name);
 			else if (reqObject == vmUUID)
 				agentx_varbind_string(vminfo[i], "");
 			else if (reqObject == vmOSType)
@@ -229,17 +228,17 @@ vm_agentx_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 			    reqObject == vmMinCpuNumber ||
 			    reqObject == vmMaxCpuNumber)
 				agentx_varbind_integer(vminfo[i],
-				    mvir->vir_info.vir_ncpus);
+				    mvir->vir_ncpus);
 			else if (reqObject == vmMemUnit)
 				agentx_varbind_integer(vminfo[i], MEM_SCALE);
 			else if (reqObject == vmCurMem)
 				agentx_varbind_integer(vminfo[i],
-				    mvir->vir_info.vir_used_size / MEM_SCALE);
+				    mvir->vir_used_size / MEM_SCALE);
 			else if (reqObject == vmMinMem)
 				agentx_varbind_integer(vminfo[i], -1);
 			else if (reqObject == vmMaxMem)
 				agentx_varbind_integer(vminfo[i],
-				    mvir->vir_info.vir_memory_size / MEM_SCALE);
+				    mvir->vir_memory_size / MEM_SCALE);
 /* We probably had a reload */
 			else
 				agentx_varbind_notfound(vminfo[i]);
@@ -434,8 +433,7 @@ vm_agentx_sortvir(const void *c1, const void *c2)
 {
 	const struct vmop_info_result *v1 = c1, *v2 = c2;
 
-	return (v1->vir_info.vir_id < v2->vir_info.vir_id ? -1 :
-	    v1->vir_info.vir_id > v2->vir_info.vir_id);
+	return (v1->vir_id < v2->vir_id ? -1 : v1->vir_id > v2->vir_id);
 }
 
 static int
@@ -523,7 +521,7 @@ vm_agentx_vminfo(struct agentx_varbind *vb)
 	}
 
 	if (!vmcollecting) {
-		if (proc_compose_imsg(&(env->vmd_ps), PROC_PARENT, -1,
+		if (proc_compose_imsg(&(env->vmd_ps), PROC_PARENT,
 		    IMSG_VMDOP_GET_INFO_VM_REQUEST, IMSG_AGENTX_PEERID,
 		    -1, NULL, 0) == -1) {
 			log_warn("%s: Couldn't retrieve vm information",

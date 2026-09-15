@@ -1,4 +1,4 @@
-/*	$OpenBSD: res_send_async.c,v 1.41 2022/06/20 06:45:31 jca Exp $	*/
+/*	$OpenBSD: res_send_async.c,v 1.45 2026/07/21 09:50:31 florian Exp $	*/
 /*
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
@@ -74,9 +74,11 @@ res_send_async(const unsigned char *buf, int buflen, void *asr)
 	as->as.dns.obufsize = buflen;
 
 	_asr_unpack_init(&p, buf, buflen);
-	_asr_unpack_header(&p, &h);
-	_asr_unpack_query(&p, &q);
-	if (p.err) {
+	if (_asr_unpack_header(&p, &h) == -1) {
+		errno = EINVAL;
+		goto err;
+	}
+	if (_asr_unpack_query(&p, &q) == -1) {
 		errno = EINVAL;
 		goto err;
 	}
@@ -308,7 +310,7 @@ sockaddr_connect(const struct sockaddr *sa, int socktype)
 	int errno_save, sock;
 
 	if ((sock = socket(sa->sa_family,
-	    socktype | SOCK_NONBLOCK | SOCK_DNS, 0)) == -1)
+	    socktype | SOCK_NONBLOCK | SOCK_DNS | SOCK_CLOEXEC, 0)) == -1)
 		goto fail;
 
 	if (connect(sock, sa, sa->sa_len) == -1) {
@@ -355,7 +357,7 @@ setup_query(struct asr_query *as, const char *name, const char *dom,
 		return (-1);
 	}
 
-	if (_asr_make_fqdn(name, dom, fqdn, sizeof(fqdn)) > sizeof(fqdn)) {
+	if (_asr_make_fqdn(name, dom, fqdn, sizeof(fqdn)) == 0) {
 		errno = EINVAL;
 		DPRINT("asr_make_fqdn: name too long\n");
 		return (-1);
@@ -684,11 +686,11 @@ validate_packet(struct asr_query *as)
 	struct asr_dns_query	 q;
 	struct asr_dns_rr	 rr;
 	int			 r;
+	char			 q_dname[MAXDNAME], as_dname[MAXDNAME];
 
 	_asr_unpack_init(&p, as->as.dns.ibuf, as->as.dns.ibuflen);
 
-	_asr_unpack_header(&p, &h);
-	if (p.err)
+	if (_asr_unpack_header(&p, &h) == -1)
 		goto inval;
 
 	if (h.id != as->as.dns.reqid) {
@@ -710,15 +712,17 @@ validate_packet(struct asr_query *as)
 	as->as.dns.rcode = RCODE(h.flags);
 	as->as.dns.ancount = h.ancount;
 
-	_asr_unpack_query(&p, &q);
-	if (p.err)
+	if (_asr_unpack_query(&p, &q) == -1)
 		goto inval;
+
+	_asr_strdname(q.q_dname, q_dname, sizeof(q_dname));
+	_asr_strdname(as->as.dns.dname, as_dname, sizeof(as_dname));
 
 	if (q.q_type != as->as.dns.type ||
 	    q.q_class != as->as.dns.class ||
-	    strcasecmp(q.q_dname, as->as.dns.dname)) {
+	    strcasecmp(q_dname, as_dname)) {
 		DPRINT("incorrect type/class/dname '%s' != '%s'\n",
-		    q.q_dname, as->as.dns.dname);
+		    q_dname, as_dname);
 		goto inval;
 	}
 
@@ -730,14 +734,13 @@ validate_packet(struct asr_query *as)
 	}
 
 	/* Validate the rest of the packet */
-	for (r = h.ancount + h.nscount + h.arcount; r; r--)
-		_asr_unpack_rr(&p, &rr);
-
-	/* Report any error found when unpacking the RRs. */
-	if (p.err) {
-		DPRINT("unpack: %s\n", strerror(p.err));
-		errno = p.err;
-		return (-1);
+	for (r = h.ancount + h.nscount + h.arcount; r; r--) {
+		if (_asr_unpack_rr(&p, &rr) == -1) {
+			/* Report any error found when unpacking the RRs. */
+			DPRINT("unpack: %s\n", strerror(p.err));
+			errno = p.err;
+			return (-1);
+		}
 	}
 
 	if (p.offset != as->as.dns.ibuflen) {

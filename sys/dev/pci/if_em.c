@@ -31,7 +31,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 ***************************************************************************/
 
-/* $OpenBSD: if_em.c,v 1.377 2024/05/24 06:02:53 jsg Exp $ */
+/* $OpenBSD: if_em.c,v 1.384 2026/08/14 06:40:24 jsg Exp $ */
 /* $FreeBSD: if_em.c,v 1.46 2004/09/29 18:28:28 mlaier Exp $ */
 
 #include <dev/pci/if_em.h>
@@ -171,6 +171,8 @@ const struct pci_matchid em_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_LM22 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_LM23 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_LM24 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_LM25 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_LM27 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V2 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V4 },
@@ -194,6 +196,8 @@ const struct pci_matchid em_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V22 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V23 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V24 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V25 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I219_V27 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82580_COPPER },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82580_FIBER },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82580_SERDES },
@@ -513,6 +517,8 @@ em_attach(struct device *parent, struct device *self, void *aux)
 		case em_pch_cnp:
 		case em_pch_tgp:
 		case em_pch_adp:
+		case em_pch_mtp:
+		case em_pch_ptp:
 		case em_80003es2lan:
 			/* 9K Jumbo Frame size */
 			sc->hw.max_frame_size = 9234;
@@ -533,6 +539,10 @@ em_attach(struct device *parent, struct device *self, void *aux)
 
 	sc->hw.min_frame_size = 
 	    ETHER_MIN_LEN + ETHER_CRC_LEN;
+
+	em_get_bus_info(&sc->hw);
+	if (sc->hw.bus_type == em_bus_type_pci_express)
+		sc->sc_dmaflags |= BUS_DMA_64BIT;
 
 	if (em_allocate_desc_rings(sc) != 0) {
 		printf("%s: Unable to allocate descriptor ring memory\n",
@@ -610,11 +620,10 @@ em_attach(struct device *parent, struct device *self, void *aux)
 		    DEVNAME(sc));
 
 	/* Identify 82544 on PCI-X */
-	em_get_bus_info(&sc->hw);
 	if (sc->hw.bus_type == em_bus_type_pcix &&
 	    sc->hw.mac_type == em_82544)
 		sc->pcix_82544 = TRUE;
-        else
+	else
 		sc->pcix_82544 = FALSE;
 
 	sc->hw.icp_xxxx_is_link_up = FALSE;
@@ -926,6 +935,8 @@ em_init(void *arg)
 	case em_pch_cnp:
 	case em_pch_tgp:
 	case em_pch_adp:
+	case em_pch_mtp:
+	case em_pch_ptp:
 		pba = E1000_PBA_26K;
 		break;
 	default:
@@ -1681,8 +1692,7 @@ em_legacy_irq_quirk_spt(struct em_softc *sc)
 	uint32_t	reg;
 
 	/* Legacy interrupt: SPT needs a quirk. */
-	if (sc->hw.mac_type != em_pch_spt && sc->hw.mac_type != em_pch_cnp &&
-	    sc->hw.mac_type != em_pch_tgp && sc->hw.mac_type != em_pch_adp) 
+	if (sc->hw.mac_type < em_pch_spt)
 		return;
 	if (sc->legacy_irq == 0)
 		return;
@@ -1991,6 +2001,8 @@ em_setup_interface(struct em_softc *sc)
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	ifp->if_xflags = IFXF_MPSAFE;
+	if (ISSET(sc->sc_dmaflags, BUS_DMA_64BIT))
+		ifp->if_xflags |= IFXF_MBUF_64BIT;
 	ifp->if_ioctl = em_ioctl;
 	ifp->if_qstart = em_start;
 	ifp->if_watchdog = em_watchdog;
@@ -2076,24 +2088,18 @@ em_activate(struct device *self, int act)
 {
 	struct em_softc *sc = (struct em_softc *)self;
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
-	int rv = 0;
 
 	switch (act) {
 	case DVACT_SUSPEND:
 		if (ifp->if_flags & IFF_RUNNING)
 			em_stop(sc, 0);
-		/* We have no children atm, but we will soon */
-		rv = config_activate_children(self, act);
 		break;
 	case DVACT_RESUME:
 		if (ifp->if_flags & IFF_UP)
 			em_init(sc);
 		break;
-	default:
-		rv = config_activate_children(self, act);
-		break;
 	}
-	return (rv);
+	return (0);
 }
 
 /*********************************************************************
@@ -2164,12 +2170,13 @@ em_dma_malloc(struct em_softc *sc, bus_size_t size, struct em_dma_alloc *dma)
 	int r;
 
 	r = bus_dmamap_create(sc->sc_dmat, size, 1,
-	    size, 0, BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &dma->dma_map);
+	    size, 0, BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW | sc->sc_dmaflags,
+	    &dma->dma_map);
 	if (r != 0)
 		return (r);
 
 	r = bus_dmamem_alloc(sc->sc_dmat, size, PAGE_SIZE, 0, &dma->dma_seg,
-	    1, &dma->dma_nseg, BUS_DMA_WAITOK | BUS_DMA_ZERO);
+	    1, &dma->dma_nseg, BUS_DMA_WAITOK | BUS_DMA_ZERO | sc->sc_dmaflags);
 	if (r != 0)
 		goto destroy;
 
@@ -2256,10 +2263,12 @@ em_setup_transmit_structures(struct em_softc *sc)
 			pkt = &que->tx.sc_tx_pkts_ring[i];
 			error = bus_dmamap_create(sc->sc_dmat, EM_TSO_SIZE,
 			    EM_MAX_SCATTER / (sc->pcix_82544 ? 2 : 1),
-			    EM_TSO_SEG_SIZE, 0, BUS_DMA_NOWAIT, &pkt->pkt_map);
+			    EM_TSO_SEG_SIZE, 0,
+			    BUS_DMA_NOWAIT | sc->sc_dmaflags,
+			    &pkt->pkt_map);
 			if (error != 0) {
-				printf("%s: Unable to create TX DMA map\n",
-				    DEVNAME(sc));
+				printf("%s: Unable to create TX DMA map, "
+				    "error %d\n", DEVNAME(sc), error);
 				goto fail;
 			}
 		}
@@ -2778,11 +2787,11 @@ em_allocate_receive_structures(struct em_softc *sc)
 			pkt = &que->rx.sc_rx_pkts_ring[i];
 
 			error = bus_dmamap_create(sc->sc_dmat, EM_MCLBYTES, 1,
-			    EM_MCLBYTES, 0, BUS_DMA_NOWAIT, &pkt->pkt_map);
+			    EM_MCLBYTES, 0, BUS_DMA_NOWAIT | sc->sc_dmaflags,
+			    &pkt->pkt_map);
 			if (error != 0) {
-				printf("%s: em_allocate_receive_structures: "
-				    "bus_dmamap_create failed; error %u\n",
-				    DEVNAME(sc), error);
+				printf("%s: Unable to create RX DMA map, "
+				    "error %d\n", DEVNAME(sc), error);
 				goto fail;
 			}
 
@@ -3122,13 +3131,14 @@ em_rxeof(struct em_queue *que)
 
 		if (status & E1000_RXD_STAT_EOP) {
 			eop = 1;
-			if (desc_len < ETHER_CRC_LEN) {
+			if (sc->hw.mac_type == em_i210 ||
+			    sc->hw.mac_type == em_i350) {
+				/* crc has already been stripped */
+				len = desc_len;
+			} else if (desc_len < ETHER_CRC_LEN) {
 				len = 0;
 				prev_len_adj = ETHER_CRC_LEN - desc_len;
-			} else if (sc->hw.mac_type == em_i210 ||
-			    sc->hw.mac_type == em_i350)
-				len = desc_len;
-			else
+			} else
 				len = desc_len - ETHER_CRC_LEN;
 		} else {
 			eop = 0;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: aplns.c,v 1.15 2022/11/11 11:45:10 kettenis Exp $ */
+/*	$OpenBSD: aplns.c,v 1.21 2026/09/06 19:27:01 kettenis Exp $ */
 /*
  * Copyright (c) 2014, 2021 David Gwynne <dlg@openbsd.org>
  *
@@ -51,8 +51,6 @@
 #define ANS_BOOT_STATUS		0x01300
 #define  ANS_BOOT_STATUS_OK	0xde71ce55
 #define ANS_MODESEL_REG		0x01304
-#define ANS_UNKNOWN_CTRL	0x24008
-#define  ANS_PRP_NULL_CHECK	(1 << 11)
 #define ANS_LINEAR_SQ_CTRL	0x24908
 #define  ANS_LINEAR_SQ_CTRL_EN	(1 << 0)
 #define ANS_LINEAR_ASQ_DB	0x2490c
@@ -100,8 +98,8 @@ aplns_match(struct device *parent, void *match, void *aux)
 {
 	struct fdt_attach_args *faa = aux;
 
-	return (OF_is_compatible(faa->fa_node, "apple,nvme-m1") ||
-	    OF_is_compatible(faa->fa_node, "apple,nvme-ans2"));
+	return OF_is_compatible(faa->fa_node, "apple,nvme-ans2") ||
+	    OF_is_compatible(faa->fa_node, "apple,t8103-nvme-ans2");
 }
 
 void
@@ -306,10 +304,6 @@ nvme_ans_init(struct nvme_ans_softc *asc)
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, ANS_MAX_PEND_CMDS_CTRL,
 	    (ANS_MAX_QUEUE_DEPTH << 16) | ANS_MAX_QUEUE_DEPTH);
 
-	ctrl = bus_space_read_4(sc->sc_iot, sc->sc_ioh, ANS_UNKNOWN_CTRL);
-	bus_space_write_4(sc->sc_iot, sc->sc_ioh, ANS_UNKNOWN_CTRL,
-	    ctrl & ~ANS_PRP_NULL_CHECK);
-
 	return 0;
 }
 
@@ -352,15 +346,6 @@ nvme_ans_q_alloc(struct nvme_softc *sc,
 {
 	bus_size_t db, base;
 
-	KASSERT(q->q_entries <= (ANS_NVMMU_TCB_SIZE / ANS_NVMMU_TCB_PITCH));
-
-	q->q_nvmmu_dmamem = nvme_dmamem_alloc(sc, ANS_NVMMU_TCB_SIZE);
-        if (q->q_nvmmu_dmamem == NULL)
-		return (-1);
-
-	memset(NVME_DMA_KVA(q->q_nvmmu_dmamem),
-	    0, NVME_DMA_LEN(q->q_nvmmu_dmamem));
-
 	switch (q->q_id) {
 	case NVME_IO_Q:
 		db = ANS_LINEAR_IOSQ_DB;
@@ -371,9 +356,17 @@ nvme_ans_q_alloc(struct nvme_softc *sc,
 		base = ANS_NVMMU_BASE_ASQ;
 		break;
 	default:
-		panic("unsupported queue id %u", q->q_id);
-		/* NOTREACHED */
+		return EINVAL;
 	}
+
+	KASSERT(q->q_entries <= (ANS_NVMMU_TCB_SIZE / ANS_NVMMU_TCB_PITCH));
+
+	q->q_nvmmu_dmamem = nvme_dmamem_alloc(sc, ANS_NVMMU_TCB_SIZE);
+        if (q->q_nvmmu_dmamem == NULL)
+		return (-1);
+
+	memset(NVME_DMA_KVA(q->q_nvmmu_dmamem),
+	    0, NVME_DMA_LEN(q->q_nvmmu_dmamem));
 
 	q->q_sqtdbl = db;
 
@@ -429,8 +422,10 @@ nvme_ans_sq_leave(struct nvme_softc *sc,
 	    ANS_NVMMU_TCB_PITCH * id, sizeof(*tcb), BUS_DMASYNC_POSTWRITE);
 
 	memset(tcb, 0, sizeof(*tcb));
-	tcb->tcb_opcode = sqe->opcode;
-	tcb->tcb_flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
+	if (sqe->opcode & NVM_CMD_WRITE)
+		tcb->tcb_flags |= ANS_NVMMU_TCB_READ;
+	if (sqe->opcode & NVM_CMD_READ)
+		tcb->tcb_flags |= ANS_NVMMU_TCB_WRITE;
 	tcb->tcb_cid = id;
 	tcb->tcb_prpl_len = sqe->nlb;
 	tcb->tcb_prp[0] = sqe->entry.prp[0];

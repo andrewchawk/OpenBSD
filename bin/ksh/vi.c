@@ -1,4 +1,4 @@
-/*	$OpenBSD: vi.c,v 1.60 2021/03/12 02:10:25 millert Exp $	*/
+/*	$OpenBSD: vi.c,v 1.71 2026/08/15 11:54:18 jtt Exp $	*/
 
 /*
  *	vi command editing
@@ -695,7 +695,6 @@ vi_cmd(int argcnt, const char *cmd)
 {
 	int		ncursor;
 	int		cur, c1, c2, c3 = 0;
-	int		any;
 	struct edstate	*t;
 
 	if (argcnt == 0 && !is_zerocount(*cmd))
@@ -820,7 +819,7 @@ vi_cmd(int argcnt, const char *cmd)
 						c2++;
 				}
 			}
-			if (*cmd != 'c' && c1 != c2)
+			if (c1 != c2)
 				yank_range(c1, c2);
 			if (*cmd != 'y') {
 				del_range(c1, c2);
@@ -834,29 +833,32 @@ vi_cmd(int argcnt, const char *cmd)
 
 		case 'p':
 			modified = 1; hnum = hlast;
-			if (es->linelen != 0)
-				es->cursor++;
+			while (es->cursor < es->linelen)
+				if (!isu8cont(es->cbuf[++es->cursor]))
+					break;
 			while (putbuf(ybuf, yanklen, 0) == 0 && --argcnt > 0)
 				;
-			if (es->cursor != 0)
-				es->cursor--;
+			while (es->cursor > 0)
+				if (!isu8cont(es->cbuf[--es->cursor]))
+					break;
 			if (argcnt != 0)
 				return -1;
 			break;
 
 		case 'P':
 			modified = 1; hnum = hlast;
-			any = 0;
 			while (putbuf(ybuf, yanklen, 0) == 0 && --argcnt > 0)
-				any = 1;
-			if (any && es->cursor != 0)
-				es->cursor--;
+				continue;
+			while (es->cursor > 0)
+				if (!isu8cont(es->cbuf[--es->cursor]))
+					break;
 			if (argcnt != 0)
 				return -1;
 			break;
 
 		case 'C':
 			modified = 1; hnum = hlast;
+			yank_range(es->cursor, es->linelen);
 			del_range(es->cursor, es->linelen);
 			insert = INSERT;
 			break;
@@ -864,8 +866,6 @@ vi_cmd(int argcnt, const char *cmd)
 		case 'D':
 			yank_range(es->cursor, es->linelen);
 			del_range(es->cursor, es->linelen);
-			if (es->cursor != 0)
-				es->cursor--;
 			break;
 
 		case 'g':
@@ -964,8 +964,6 @@ vi_cmd(int argcnt, const char *cmd)
 			break;
 
 		case 'v':
-			if (es->linelen == 0 && argcnt == 0)
-				return -1;
 			if (!argcnt) {
 				if (modified) {
 					es->cbuf[es->linelen] = '\0';
@@ -1236,7 +1234,8 @@ domove(int argcnt, const char *cmd, int sub)
 		if (!sub && es->cursor + 1 >= es->linelen)
 			return -1;
 		for (ncursor = es->cursor; ncursor < es->linelen; ncursor++)
-			if (!isu8cont(es->cbuf[ncursor]))
+			if (ncursor == es->cursor ||
+			    !isu8cont(es->cbuf[ncursor]))
 				if (argcnt-- == 0)
 					break;
 		break;
@@ -1739,6 +1738,8 @@ do_clear_screen(void)
 	int neednl = 1;
 
 #ifndef SMALL
+	if (cur_term == NULL && Flag(FTALKING))
+		initcurses();
 	if (cur_term != NULL && clear_screen != NULL) {
 		if (tputs(clear_screen, 1, x_putc) != ERR)
 			neednl = 0;
@@ -1789,25 +1790,61 @@ outofwin(void)
 static void
 rewindow(void)
 {
-	int	tcur, tcol;
-	int	holdcur1, holdcol1;
-	int	holdcur2, holdcol2;
+	int		cur;	/* byte# in the main command line buffer */
+	int		col;	/* corresponding display column */
+	int		tabc;	/* columns a tab character can take up */
+	int		thisc;	/* columns the current character requires */
+	unsigned char	uc;	/* the current byte */
 
-	holdcur1 = holdcur2 = tcur = 0;
-	holdcol1 = holdcol2 = tcol = 0;
-	while (tcur < es->cursor) {
-		if (tcol - holdcol2 > winwidth / 2) {
-			holdcur1 = holdcur2;
-			holdcol1 = holdcol2;
-			holdcur2 = tcur;
-			holdcol2 = tcol;
+	/* The desired cursor position is near the middle of the window. */
+	cur = es->cursor;
+	col = winwidth / 2;
+	tabc = 0;
+
+	/* Step left to find the desired left margin. */
+	while (cur > 0 && col > 0) {
+		uc = es->cbuf[--cur];
+
+		/* Never start the window on a continuation byte. */
+		if (isu8cont(uc))
+			continue;
+
+		if (uc == '\t') {
+			/*
+			 * If two tabs occur close together,
+			 * count the right one, including optional
+			 * characters between both, as 8 columns.
+			 */
+			if (tabc > 0) {
+				col -= 8;
+				/* Prefer starting after a tab. */
+				if (col <= 0)
+					cur++;
+			}
+
+			/*
+			 * A tab can be preceded by up to 7 characters
+			 * without taking up additional space.
+			 */
+			tabc = 7;
+			continue;
 		}
-		tcol = newcol((unsigned char) es->cbuf[tcur++], tcol);
+		thisc = char_len(uc);
+		if (tabc > 0) {
+			if (tabc > thisc) {
+				/* The character still fits in the tab. */
+				tabc -= thisc;
+				continue;
+			}
+			col -= 8;	/* The tab is now full. */
+			thisc -= tabc;	/* This may produce overflow. */
+			tabc = 0;
+		}
+
+		/* Handle a normal character or the overflow. */
+		col -= thisc;
 	}
-	while (tcol - holdcol1 > winwidth / 2)
-		holdcol1 = newcol((unsigned char) es->cbuf[holdcur1++],
-		    holdcol1);
-	es->winleft = holdcur1;
+	es->winleft = cur;
 }
 
 /* Printing the byte ch at display column col moves to which column? */
@@ -1870,7 +1907,7 @@ display(char *wb1, char *wb2, int leftside)
 					}
 				} else {
 					*twb1++ = ch;
-					if (!isu8cont(ch))
+					if (col == 0 || !isu8cont(ch))
 						col++;
 				}
 			}
@@ -1909,8 +1946,9 @@ display(char *wb1, char *wb2, int leftside)
 			 * the previous byte was the last one written.
 			 */
 
-			if (col > 0 && isu8cont(*twb1)) {
-				col--;
+			if (isu8cont(*twb1)) {
+				if (col > pwidth)
+					col--;
 				if (lastb >= 0 && twb1 == wb1 + lastb + 1)
 					cur_col = col;
 				else while (twb1 > wb1 && isu8cont(*twb1)) {
@@ -1934,7 +1972,7 @@ display(char *wb1, char *wb2, int leftside)
 			}
 			lastb = *twb1 & 0x80 ? twb1 - wb1 : -1;
 			cur_col++;
-		} else if (isu8cont(*twb1))
+		} else if (twb1 > wb1 && isu8cont(*twb1))
 			continue;
 
 		/*
@@ -2006,10 +2044,15 @@ ed_mov_opt(int col, char *wb)
 
 	/* Advance the cursor. */
 
-	for (ci = pwidth; ci < col || isu8cont(*wb);
-	     ci = newcol((unsigned char)*wb++, ci))
-		if (ci > cur_col || (ci == cur_col && !isu8cont(*wb)))
+	ci = pwidth;
+	while (ci < col || (ci > pwidth && isu8cont(*wb))) {
+		ci = newcol((unsigned char)*wb, ci);
+		if (ci == pwidth)
+			ci++;
+		if (ci > cur_col)
 			x_putc(*wb);
+		wb++;
+	}
 	cur_col = ci;
 }
 
@@ -2161,7 +2204,9 @@ complete_word(int command, int count)
 		expanded = NONE;
 
 		/* If not a directory, add a space to the end... */
-		if (match_len > 0 && match[match_len - 1] != '/')
+		if (match_len > 0 && match[match_len - 1] != '/' &&
+		    !x_is_tilde_user_completion(es->cbuf + start,
+		    end - start, match, match_len))
 			rval = putbuf(" ", 1, 0);
 	}
 	x_free_words(nwords, words);

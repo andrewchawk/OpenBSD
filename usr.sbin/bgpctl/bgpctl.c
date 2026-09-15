@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpctl.c,v 1.306 2024/05/22 08:42:34 claudio Exp $ */
+/*	$OpenBSD: bgpctl.c,v 1.324 2026/07/24 05:01:57 claudio Exp $ */
 
 /*
  * Copyright (c) 2003 Henning Brauer <henning@openbsd.org>
@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <arpa/inet.h>
 
 #include <endian.h>
 #include <err.h>
@@ -48,7 +49,6 @@
 
 int		 main(int, char *[]);
 int		 show(struct imsg *, struct parse_result *);
-void		 send_filterset(struct imsgbuf *, struct filter_set_head *);
 void		 show_mrt_dump_neighbors(struct mrt_rib *, struct mrt_peer *,
 		    void *);
 void		 show_mrt_dump(struct mrt_rib *, struct mrt_peer *, void *);
@@ -66,6 +66,7 @@ struct mrt_parser net_mrt = { network_mrt_dump, NULL, NULL };
 const struct output	*output = &show_output;
 int tableid;
 int nodescr;
+int abs_time;
 
 __dead void
 usage(void)
@@ -85,7 +86,7 @@ main(int argc, char *argv[])
 	struct imsg		 imsg;
 	struct network_config	 net;
 	struct parse_result	*res;
-	struct ctl_neighbor	 neighbor;
+	struct ctl_neighbor	 neighbor = { 0 };
 	struct ctl_show_rib_request	ribreq;
 	struct flowspec		*f;
 	char			*sockname;
@@ -134,6 +135,7 @@ main(int argc, char *argv[])
 		if (pledge("stdio", NULL) == -1)
 			err(1, "pledge");
 
+		abs_time = 1;
 		memset(&ribreq, 0, sizeof(ribreq));
 		if (res->as.type != AS_UNDEF)
 			ribreq.as = res->as;
@@ -176,7 +178,9 @@ main(int argc, char *argv[])
 
 	if ((imsgbuf = malloc(sizeof(struct imsgbuf))) == NULL)
 		err(1, NULL);
-	imsg_init(imsgbuf, fd);
+	if (imsgbuf_init(imsgbuf, fd) == -1 ||
+	    imsgbuf_set_maxsize(imsgbuf, MAX_BGPD_IMSGSIZE) == -1)
+		err(1, NULL);
 	done = 0;
 
 	switch (res->action) {
@@ -326,7 +330,7 @@ main(int argc, char *argv[])
 		if (res->action == NETWORK_ADD) {
 			imsg_compose(imsgbuf, IMSG_NETWORK_ADD, 0, 0, -1,
 			    &net, sizeof(net));
-			send_filterset(imsgbuf, &res->set);
+			imsg_send_filterset(imsgbuf, &res->set);
 			imsg_compose(imsgbuf, IMSG_NETWORK_DONE, 0, 0, -1,
 			    NULL, 0);
 		} else
@@ -370,7 +374,7 @@ main(int argc, char *argv[])
 		if (res->action == FLOWSPEC_ADD) {
 			imsg_compose(imsgbuf, IMSG_FLOWSPEC_ADD, 0, 0, -1,
 			    f, FLOWSPEC_SIZE + f->len);
-			send_filterset(imsgbuf, &res->set);
+			imsg_send_filterset(imsgbuf, &res->set);
 			imsg_compose(imsgbuf, IMSG_FLOWSPEC_DONE, 0, 0, -1,
 			    NULL, 0);
 		} else
@@ -418,14 +422,13 @@ main(int argc, char *argv[])
 	output->head(res);
 
  again:
-	while (imsgbuf->w.queued)
-		if (msgbuf_write(&imsgbuf->w) <= 0)
-			err(1, "write error");
+	if (imsgbuf_flush(imsgbuf) == -1)
+		err(1, "write error");
 
 	while (!done) {
 		while (!done) {
-			if ((n = imsg_get(imsgbuf, &imsg)) == -1)
-				err(1, "imsg_get error");
+			if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
+				err(1, "imsgbuf_get error");
 			if (n == 0)
 				break;
 
@@ -436,8 +439,8 @@ main(int argc, char *argv[])
 		if (done)
 			break;
 
-		if ((n = imsg_read(imsgbuf)) == -1)
-			err(1, "imsg_read error");
+		if ((n = imsgbuf_read(imsgbuf)) == -1)
+			err(1, "read error");
 		if (n == 0)
 			errx(1, "pipe closed");
 
@@ -459,7 +462,7 @@ main(int argc, char *argv[])
 int
 show(struct imsg *imsg, struct parse_result *res)
 {
-	struct peer		 p;
+	struct ctl_peer		 p;
 	struct ctl_timer	 t;
 	struct ctl_show_interface iface;
 	struct ctl_show_nexthop	 nh;
@@ -477,8 +480,8 @@ show(struct imsg *imsg, struct parse_result *res)
 	case IMSG_CTL_SHOW_NEIGHBOR:
 		if (output->neighbor == NULL)
 			break;
-		if (imsg_get_data(imsg, &p, sizeof(p)) == -1)
-			err(1, "imsg_get_data");
+		if (imsg_recv_ctl_peer(imsg, &p) == -1)
+			err(1, "imsg_recv_ctl_peer");
 		output->neighbor(&p, res);
 		break;
 	case IMSG_CTL_SHOW_TIMER:
@@ -587,17 +590,10 @@ show(struct imsg *imsg, struct parse_result *res)
 }
 
 time_t
-get_monotime(time_t t)
+get_rel_monotime(monotime_t mt)
 {
-	struct timespec ts;
-
-	if (t == 0)
-		return -1;
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		err(1, "clock_gettime");
-	if (t > ts.tv_sec)	/* time in the future is not possible */
-		t = ts.tv_sec;
-	return (ts.tv_sec - t);
+	mt = monotime_sub(getmonotime(), mt);
+	return monotime_to_sec(mt);
 }
 
 char *
@@ -646,17 +642,20 @@ fmt_auth_method(enum auth_method method)
 	}
 }
 
-#define TF_LEN	16
+#define TF_LEN	64
 
-const char *
+static const char *
 fmt_timeframe(time_t t)
 {
-	static char	 buf[TF_LEN];
-	unsigned int	 sec, min, hrs, day;
-	unsigned long long	 week;
+	static char		buf[TF_LEN];
+	unsigned long long	week;
+	unsigned int		sec, min, hrs, day;
+	const char		*due = "";
 
-	if (t < 0)
-		t = 0;
+	if (t < 0) {
+		due = "due in ";
+		t = -t;
+	}
 	week = t;
 
 	sec = week % 60;
@@ -669,26 +668,41 @@ fmt_timeframe(time_t t)
 	week /= 7;
 
 	if (week >= 1000)
-		snprintf(buf, TF_LEN, "%02lluw", week);
+		snprintf(buf, sizeof(buf), "%s%lluw", due, week);
 	else if (week > 0)
-		snprintf(buf, TF_LEN, "%02lluw%01ud%02uh", week, day, hrs);
+		snprintf(buf, sizeof(buf), "%s%02lluw%01ud%02uh",
+		    due, week, day, hrs);
 	else if (day > 0)
-		snprintf(buf, TF_LEN, "%01ud%02uh%02um", day, hrs, min);
+		snprintf(buf, sizeof(buf), "%s%01ud%02uh%02um",
+		    due, day, hrs, min);
 	else
-		snprintf(buf, TF_LEN, "%02u:%02u:%02u", hrs, min, sec);
+		snprintf(buf, sizeof(buf), "%s%02u:%02u:%02u",
+		    due, hrs, min, sec);
 
 	return (buf);
 }
 
 const char *
-fmt_monotime(time_t t)
+fmt_monotime(monotime_t mt)
 {
-	t = get_monotime(t);
+	time_t t;
+	monotime_t z = monotime_clear();
 
-	if (t == -1)
-		return ("Never");
+	if (abs_time) {
+		struct tm *tm;
+		static char buf[TF_LEN];
 
-	return (fmt_timeframe(t));
+		t = monotime_to_time(mt);
+		if ((tm = gmtime(&t)) == NULL)
+			return "invalid";
+		strftime(buf, sizeof(buf), "%FT%TZ", tm);
+		return (buf);
+	} else {
+		if (monotime_cmp(mt, z) == 0)
+			return ("Never");
+		t = get_rel_monotime(mt);
+		return (fmt_timeframe(t));
+	}
 }
 
 const char *
@@ -741,10 +755,12 @@ const char *
 fmt_flags(uint32_t flags, int sum)
 {
 	static char buf[80];
-	char	 flagstr[5];
+	char	 flagstr[12];
 	char	*p = flagstr;
 
 	if (sum) {
+		if (flags & F_PREF_FILTERED)
+			*p++ = 'F';
 		if (flags & F_PREF_INVALID)
 			*p++ = 'E';
 		if (flags & F_PREF_OTC_LEAK)
@@ -771,6 +787,8 @@ fmt_flags(uint32_t flags, int sum)
 		else
 			strlcpy(buf, "external", sizeof(buf));
 
+		if (flags & F_PREF_FILTERED)
+			strlcat(buf, ", filtered", sizeof(buf));
 		if (flags & F_PREF_INVALID)
 			strlcat(buf, ", invalid", sizeof(buf));
 		if (flags & F_PREF_OTC_LEAK)
@@ -1128,19 +1146,6 @@ fmt_set_type(struct ctl_show_set *set)
 }
 
 void
-send_filterset(struct imsgbuf *i, struct filter_set_head *set)
-{
-	struct filter_set	*s;
-
-	while ((s = TAILQ_FIRST(set)) != NULL) {
-		imsg_compose(i, IMSG_FILTER_SET, 0, 0, -1, s,
-		    sizeof(struct filter_set));
-		TAILQ_REMOVE(set, s, entry);
-		free(s);
-	}
-}
-
-void
 network_bulk(struct parse_result *res)
 {
 	struct network_config net;
@@ -1224,20 +1229,17 @@ show_mrt_dump(struct mrt_rib *mr, struct mrt_peer *mp, void *arg)
 	struct ctl_show_rib_request	*req = arg;
 	struct mrt_rib_entry		*mre;
 	struct ibuf			 ibuf;
-	time_t				 now;
 	uint16_t			 i, j;
 
 	memset(&res, 0, sizeof(res));
 	res.flags = req->flags;
-	now = time(NULL);
 
 	for (i = 0; i < mr->nentries; i++) {
 		mre = &mr->entries[i];
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.prefix = mr->prefix;
 		ctl.prefixlen = mr->prefixlen;
-		if (mre->originated <= now)
-			ctl.age = now - mre->originated;
+		ctl.lastchange = time_to_monotime(mre->originated);
 		ctl.true_nexthop = mre->nexthop;
 		ctl.exit_nexthop = mre->nexthop;
 		ctl.origin = mre->origin;
@@ -1309,21 +1311,18 @@ network_mrt_dump(struct mrt_rib *mr, struct mrt_peer *mp, void *arg)
 	struct ctl_show_rib_request	*req = arg;
 	struct mrt_rib_entry		*mre;
 	struct ibuf			*msg;
-	time_t				 now;
 	uint16_t			 i, j;
 
 	/* can't announce more than one path so ignore add-path */
 	if (mr->add_path)
 		return;
 
-	now = time(NULL);
 	for (i = 0; i < mr->nentries; i++) {
 		mre = &mr->entries[i];
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.prefix = mr->prefix;
 		ctl.prefixlen = mr->prefixlen;
-		if (mre->originated <= now)
-			ctl.age = now - mre->originated;
+		ctl.lastchange = time_to_monotime(mre->originated);
 		ctl.true_nexthop = mre->nexthop;
 		ctl.exit_nexthop = mre->nexthop;
 		ctl.origin = mre->origin;
@@ -1380,10 +1379,8 @@ network_mrt_dump(struct mrt_rib *mr, struct mrt_peer *mp, void *arg)
 			    mre->attrs[j].attr, mre->attrs[j].attr_len);
 		imsg_compose(imsgbuf, IMSG_NETWORK_DONE, 0, 0, -1, NULL, 0);
 
-		while (imsgbuf->w.queued) {
-			if (msgbuf_write(&imsgbuf->w) <= 0 && errno != EAGAIN)
-				err(1, "write error");
-		}
+		if (imsgbuf_flush(imsgbuf) == -1)
+			err(1, "write error");
 	}
 }
 
@@ -1461,6 +1458,9 @@ print_capability(uint8_t capa_code, struct ibuf *b)
 		break;
 	case CAPA_ENHANCED_RR:
 		printf("enhanced route refresh capability");
+		break;
+	case CAPA_EXT_MSG:
+		printf("extended message capability");
 		break;
 	default:
 		printf("unknown capability %u length %zu",
@@ -1685,7 +1685,7 @@ show_mrt_update(struct ibuf *b, int reqflags, int addpath)
 		uint16_t attrlen;
 		uint8_t flags;
 
-		ibuf_from_ibuf(&abuf, &attrbuf);
+		ibuf_from_ibuf(&attrbuf, &abuf);
 		if (ibuf_get_n8(&attrbuf, &flags) == -1 ||
 		    ibuf_skip(&attrbuf, 1) == -1)
 			goto trunc;
@@ -1770,7 +1770,7 @@ show_mrt_msg(struct mrt_bgp_msg *mm, void *arg)
 	}
 
 	switch (type) {
-	case OPEN:
+	case BGP_OPEN:
 		printf("%s ", msgtypenames[type]);
 		if (len < MSGSIZE_OPEN_MIN) {
 			printf("bad length: %u bytes\n", len);
@@ -1778,7 +1778,7 @@ show_mrt_msg(struct mrt_bgp_msg *mm, void *arg)
 		}
 		show_mrt_open(b);
 		break;
-	case NOTIFICATION:
+	case BGP_NOTIFICATION:
 		printf("%s ", msgtypenames[type]);
 		if (len < MSGSIZE_NOTIFICATION_MIN) {
 			printf("bad length: %u bytes\n", len);
@@ -1786,7 +1786,7 @@ show_mrt_msg(struct mrt_bgp_msg *mm, void *arg)
 		}
 		show_mrt_notification(b);
 		break;
-	case UPDATE:
+	case BGP_UPDATE:
 		printf("%s ", msgtypenames[type]);
 		if (len < MSGSIZE_UPDATE_MIN) {
 			printf("bad length: %u bytes\n", len);
@@ -1794,7 +1794,7 @@ show_mrt_msg(struct mrt_bgp_msg *mm, void *arg)
 		}
 		show_mrt_update(b, req->flags, mm->add_path);
 		break;
-	case KEEPALIVE:
+	case BGP_KEEPALIVE:
 		printf("%s ", msgtypenames[type]);
 		if (len != MSGSIZE_KEEPALIVE) {
 			printf("bad length: %u bytes\n", len);
@@ -1802,7 +1802,7 @@ show_mrt_msg(struct mrt_bgp_msg *mm, void *arg)
 		}
 		/* nothing */
 		break;
-	case RREFRESH:
+	case BGP_RREFRESH:
 		printf("%s ", msgtypenames[type]);
 		if (len != MSGSIZE_RREFRESH) {
 			printf("bad length: %u bytes\n", len);
@@ -1980,6 +1980,8 @@ res_to_flowspec(struct parse_result *r)
 
 	if (len == 0)
 		errx(1, "no flowspec rule defined");
+	if (len > FLOWSPEC_SIZE_MAX)
+		errx(1, "flowspec rule too long");
 
 	f = malloc(FLOWSPEC_SIZE + len);
 	if (f == NULL)

@@ -14,8 +14,8 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
+#include <linux/aperture.h>
 
-#include <drm/drm_aperture.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
@@ -34,6 +34,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
+#include <drm/clients/drm_client_setup.h>
 
 #include "dcp.h"
 
@@ -64,9 +65,9 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
+	DRM_FBDEV_DMA_DRIVER_OPS,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
-	.date			= "20221106",
 	.major			= 1,
 	.minor			= 0,
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
@@ -236,26 +237,6 @@ static void apple_crtc_atomic_begin(struct drm_crtc *crtc,
 	}
 }
 
-static void dcp_atomic_commit_tail(struct drm_atomic_state *old_state)
-{
-	struct drm_device *dev = old_state->dev;
-
-	drm_atomic_helper_commit_modeset_disables(dev, old_state);
-
-	drm_atomic_helper_commit_modeset_enables(dev, old_state);
-
-	drm_atomic_helper_commit_planes(dev, old_state,
-					DRM_PLANE_COMMIT_ACTIVE_ONLY);
-
-	drm_atomic_helper_fake_vblank(old_state);
-
-	drm_atomic_helper_commit_hw_done(old_state);
-
-	drm_atomic_helper_wait_for_flip_done(dev, old_state);
-
-	drm_atomic_helper_cleanup_planes(dev, old_state);
-}
-
 static void apple_crtc_cleanup(struct drm_crtc *crtc)
 {
 	drm_crtc_cleanup(crtc);
@@ -278,7 +259,7 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 };
 
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
-	.atomic_commit_tail	= dcp_atomic_commit_tail,
+	.atomic_commit_tail	= drm_atomic_helper_commit_tail_rpm,
 };
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)
@@ -482,8 +463,8 @@ static int apple_drm_init(struct device *dev)
 		return ret;
 
 	fb_size = fb_r.end - fb_r.start + 1;
-	ret = drm_aperture_remove_conflicting_framebuffers(fb_r.start, fb_size,
-						&apple_drm_driver);
+	ret = aperture_remove_conflicting_devices(fb_r.start, fb_size,
+						apple_drm_driver.name);
 	if (ret) {
 		dev_err(dev, "Failed remove fb: %d\n", ret);
 		goto err_unbind;
@@ -539,7 +520,7 @@ static int apple_drm_init(struct device *dev)
 	if (ret)
 		goto err_unbind;
 
-	drm_fbdev_dma_setup(&apple->drm, 32);
+	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	return 0;
 

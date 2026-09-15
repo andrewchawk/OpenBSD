@@ -190,7 +190,10 @@ is_deeply( [ uniqnum @in],
 # Hard to know for sure what an Inf is going to be. Lets make one
 my $Inf = 0 + 1E1000;
 my $NaN;
-$Inf **= 1000 while ( $NaN = $Inf - $Inf ) == $NaN;
+for (1..10) {
+    $Inf **= 1000;
+    last unless ( $NaN = $Inf - $Inf ) == $NaN;
+}
 
 is_deeply( [ uniqnum 0, 1, 12345, $Inf, -$Inf, $NaN, 0, $Inf, $NaN ],
            [ 0, 1, 12345, $Inf, -$Inf, $NaN ],
@@ -212,7 +215,7 @@ SKIP: {
         }
         if (eval {
             my $nanish = "$NaN" + 0;
-            $nanish != 0 && !$nanish != $NaN;
+            $nanish != 0 && $nanish != $NaN && $nanish != $nanish;
         }) {
             push @nums, $NaN;
         }
@@ -293,7 +296,7 @@ SKIP: {
 # uniqnum not confused by IV'ified floats
 SKIP: {
     # This fails on 5.6 and isn't fixable without breaking a lot of other tests
-    skip 'This perl version gets confused by IVNV dualvars', 1 if $] lt '5.008000';
+    skip 'This perl version gets confused by IVNV dualvars', 1 if "$]" <= 5.008000;
     my @nums = ( 2.1, 2.2, 2.3 );
     my $dummy = sprintf "%d", $_ for @nums;
 

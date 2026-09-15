@@ -1,4 +1,4 @@
-/*	$OpenBSD: delete.c,v 1.12 2017/11/26 09:59:41 mestre Exp $	*/
+/*	$OpenBSD: delete.c,v 1.14 2026/04/25 17:47:46 millert Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -54,7 +54,7 @@ del(SCR *sp, MARK *fm, MARK *tm, int lmode)
 	/*
 	 * Case 2 -- delete to EOF.  This is a special case because it's
 	 * easier to pick it off than try and find it in the other cases.
- 	 */
+	 */
 	if (db_last(sp, &lno))
 		return (1);
 	if (tm->lno >= lno) {
@@ -95,8 +95,8 @@ del(SCR *sp, MARK *fm, MARK *tm, int lmode)
 			if (db_set(sp, fm->lno,
 			    bp, len - ((tm->cno - fm->cno) + 1)))
 				goto err;
-			goto done;
 		}
+		goto done;
 	}
 
 	/*

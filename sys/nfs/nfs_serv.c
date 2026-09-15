@@ -1,4 +1,4 @@
-/*	$OpenBSD: nfs_serv.c,v 1.126 2024/05/01 13:15:59 jsg Exp $	*/
+/*	$OpenBSD: nfs_serv.c,v 1.150 2026/07/02 02:51:14 jsg Exp $	*/
 /*     $NetBSD: nfs_serv.c,v 1.34 1997/05/12 23:37:12 fvdl Exp $       */
 
 /*
@@ -86,50 +86,54 @@ extern struct nfsstats nfsstats;
 int nfsrv_access(struct vnode *, int, struct ucred *, int, struct proc *, int);
 
 static inline int
-nfsm_reply(struct nfsm_info *infop, struct nfsrv_descript *nfsd,
-    struct nfssvc_sock *slp, struct mbuf **mrq, int error, int statuslen)
+nfsm_reply(struct nfsrv_descript *nfsd,
+    struct nfssvc_sock *slp, struct mbuf **mrq, struct mbuf **mb,
+    int error, int statuslen)
 {
+	struct mbuf *mreq = NULL;
+	int v3 = nfsd->nd_flag & ND_NFSV3;
+
 	nfsd->nd_repstat = error;
-	if (error && !infop->nmi_v3)
+	if (error && !v3)
 		statuslen = 0;
 	(void)nfs_rephead(statuslen, nfsd, slp, error,
-		&infop->nmi_mreq, &infop->nmi_mb);
-	if (infop->nmi_mrep != NULL) {
-		m_freem(infop->nmi_mrep);
-		infop->nmi_mrep = NULL;
-	}
-	*mrq = infop->nmi_mreq;
-	if (error && (!infop->nmi_v3 || error == EBADRPC))
+		&mreq, mb);
+	m_freem(nfsd->nd_mrep);
+	nfsd->nd_mrep = NULL;
+	*mrq = mreq;
+	if (error && (!v3 || error == EBADRPC))
 		return error;
 	return 0;
 }
 
 static inline int
-nfsm_srvmtofh1(struct nfsm_info *infop, struct nfsrv_descript *nfsd,
-    struct nfssvc_sock *slp, struct mbuf **mrq)
+nfsm_srvmtofh1(struct nfsrv_descript *nfsd,
+    struct nfssvc_sock *slp, struct mbuf **mrq, struct mbuf **mb,
+    int *errorp)
 {
-	if (infop->nmi_v3) {
-		uint32_t *tl = (uint32_t *)nfsm_dissect(infop, NFSX_UNSIGNED);
+	if (nfsd->nd_flag & ND_NFSV3) {
+		uint32_t *tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED,
+		    errorp);
 		if (tl == NULL)
-			return 0; /* *infop->nmi_errorp set */
+			return 0; /* *errorp set */
 		if (fxdr_unsigned(int, *tl) != NFSX_V3FH) {
-			*infop->nmi_errorp = EBADRPC;
-			return nfsm_reply(infop, nfsd, slp, mrq,
-			    *infop->nmi_errorp, 0);
+			*errorp = EBADRPC;
+			return nfsm_reply(nfsd, slp, mrq, mb,
+			    *errorp, 0);
 		}
 	}
 	return 0;
 }
 
 static inline int
-nfsm_srvmtofh2(struct nfsm_info *infop, fhandle_t *fhp)
+nfsm_srvmtofh2(struct nfsrv_descript *nfsd, fhandle_t *fhp, int *errorp)
 {
-	uint32_t *tl = (uint32_t *)nfsm_dissect(infop, NFSX_V3FH);
+	uint32_t *tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_V3FH, errorp);
 	if (tl == NULL)
 		return 1;
 	bcopy(tl, fhp, NFSX_V3FH);
-	if (infop->nmi_v3 == 0) {
-		if (nfsm_adv(infop, NFSX_V2FH - NFSX_V3FH) != 0)
+	if ((nfsd->nd_flag & ND_NFSV3) == 0) {
+		if (nfsd_adv(nfsd, NFSX_V2FH - NFSX_V3FH, errorp) != 0)
 			return 1;
 	}
 	return 0;
@@ -143,7 +147,7 @@ nfsrv3_access(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
-	struct nfsm_info	info;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct vnode *vp;
 	nfsfh_t nfh;
@@ -153,29 +157,22 @@ nfsrv3_access(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	struct vattr va;
 	u_long testmode, nfsmode;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+	tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 	if (tl == NULL)
 		goto nfsmout;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, 1, NULL, &info);
+		nfsm_srvpostop_attr(nfsd, 1, NULL, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -200,11 +197,11 @@ nfsrv3_access(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		nfsmode &= ~testmode;
 	getret = VOP_GETATTR(vp, &va, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 	    NFSX_POSTOPATTR(1) + NFSX_UNSIGNED) != 0)
 		return 0;
-	nfsm_srvpostop_attr(nfsd, getret, &va, &info);
-	tl = nfsm_build(&info.nmi_mb, NFSX_UNSIGNED);
+	nfsm_srvpostop_attr(nfsd, getret, &va, &mb);
+	tl = nfsm_build(&mb, NFSX_UNSIGNED);
 	*tl = txdr_unsigned(nfsmode);
 nfsmout:
 	return(error);
@@ -218,7 +215,7 @@ nfsrv_getattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
-	struct nfsm_info	info;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct nfs_fattr *fp;
 	struct vattr va;
@@ -227,37 +224,31 @@ nfsrv_getattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	fhandle_t *fhp;
 	int error = 0, rdonly;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb,
+		    error, 0) != 0)
 			return 0;
 		error = 0;
 		goto nfsmout;
 	}
 	error = VOP_GETATTR(vp, &va, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 	    NFSX_FATTR(nfsd->nd_flag & ND_NFSV3)) != 0)
 		return 0;
 	if (error) {
 		error = 0;
 		goto nfsmout;
 	}
-	fp = nfsm_build(&info.nmi_mb, NFSX_FATTR(nfsd->nd_flag & ND_NFSV3));
+	fp = nfsm_build(&mb, NFSX_FATTR(nfsd->nd_flag & ND_NFSV3));
 	nfsm_srvfattr(nfsd, &va, fp);
 nfsmout:
 	return(error);
@@ -271,7 +262,7 @@ nfsrv_setattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
-	struct nfsm_info	info;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct vattr va, preat;
 	struct nfsv2_sattr *sp;
@@ -283,39 +274,37 @@ nfsrv_setattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	int error = 0, rdonly, preat_ret = 1, postat_ret = 1;
 	int gcheck = 0;
 	struct timespec guard;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	VATTR_NULL(&va);
-	if (info.nmi_v3) {
+	vattr_null(&va);
+	if (v3) {
 		va.va_vaflags |= VA_UTIMES_NULL;
-		error = nfsm_srvsattr(&info.nmi_md, &va, info.nmi_mrep, &info.nmi_dpos);
+		error = nfsm_srvsattr(nfsd, &va);
 		if (error)
 			goto nfsmout;
-		tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		gcheck = fxdr_unsigned(int, *tl);
 		if (gcheck) {
-			tl = (uint32_t *)nfsm_dissect(&info, 2 * NFSX_UNSIGNED);
+			tl = (uint32_t *)nfsd_dissect(nfsd, 2 * NFSX_UNSIGNED,
+			    &error);
 			if (tl == NULL)
 				goto nfsmout;
 			fxdr_nfsv3time(tl, &guard);
 		}
 	} else {
-		sp = (struct nfsv2_sattr *)nfsm_dissect(&info, NFSX_V2SATTR);
+		sp = (struct nfsv2_sattr *)nfsd_dissect(nfsd, NFSX_V2SATTR,
+		    &error);
 		if (sp == NULL)
 			goto nfsmout;
 		/*
@@ -352,14 +341,14 @@ nfsrv_setattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	 */
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    2 * NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvwcc(nfsd, preat_ret, &preat, postat_ret, &va, &info);
+		nfsm_srvwcc(nfsd, preat_ret, &preat, postat_ret, &va, &mb);
 		error = 0;
 		goto nfsmout;
 	}
-	if (info.nmi_v3) {
+	if (v3) {
 		error = preat_ret = VOP_GETATTR(vp, &preat, cred, procp);
 		if (!error && gcheck &&
 			(preat.va_ctime.tv_sec != guard.tv_sec ||
@@ -367,11 +356,11 @@ nfsrv_setattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 			error = NFSERR_NOT_SYNC;
 		if (error) {
 			vput(vp);
-			if (nfsm_reply(&info, nfsd, slp, mrq, error,
-			    NFSX_WCCDATA(info.nmi_v3)) != 0)
+			if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+			    NFSX_WCCDATA(v3)) != 0)
 				return 0;
 			nfsm_srvwcc(nfsd, preat_ret, &preat, postat_ret, &va,
-			    &info);
+			    &mb);
 			error = 0;
 			goto nfsmout;
 		}
@@ -400,16 +389,15 @@ nfsrv_setattr(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		error = postat_ret;
 out:
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_WCCORFATTR(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, NFSX_WCCORFATTR(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		nfsm_srvwcc(nfsd, preat_ret, &preat, postat_ret, &va,
-		    &info);
+		    &mb);
 		error = 0;
 		goto nfsmout;
 	} else {
-		fp = nfsm_build(&info.nmi_mb, NFSX_V2FATTR);
+		fp = nfsm_build(&mb, NFSX_V2FATTR);
 		nfsm_srvfattr(nfsd, &va, fp);
 	}
 nfsmout:
@@ -417,19 +405,21 @@ nfsmout:
 }
 
 static inline int
-nfsm_srvnamesiz(struct nfsm_info *infop, int *lenp)
+nfsm_srvnamesiz(struct nfsrv_descript *nfsd, int *lenp, int *errorp)
 {
 	int len;
-	uint32_t *tl = (uint32_t *)nfsm_dissect(infop, NFSX_UNSIGNED);
+	uint32_t *tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, errorp);
 	if (tl == NULL)
 		return 1;
 	len = fxdr_unsigned(int32_t, *tl);
-	if (len > NFS_MAXNAMLEN)
-		*infop->nmi_errorp = NFSERR_NAMETOL;
-	else if (len <= 0)
-		*infop->nmi_errorp = EBADRPC;
-	else {
-		*infop->nmi_errorp = 0;
+	if (len > NFS_MAXNAMLEN) {
+		*errorp = NFSERR_NAMETOL;
+		*lenp = 0;
+	} else if (len <= 0) {
+		*errorp = EBADRPC;
+		*lenp = 0;
+	} else {
+		*errorp = 0;
 		*lenp = len;
 	}
 	return 0;
@@ -443,52 +433,50 @@ nfsrv_lookup(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct nfs_fattr *fp;
 	struct nameidata nd;
 	struct vnode *vp, *dirp;
-	struct nfsm_info	info;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 	int error = 0, len, dirattr_ret = 1;
 	int v3 = (nfsd->nd_flag & ND_NFSV3);
 	struct vattr va, dirattr;
 
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_mreq = NULL;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
 		goto nfsmout;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	NDINIT(&nd, LOOKUP, LOCKLEAF | SAVESTART, UIO_SYSSPACE, NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md, &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md, &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
+		if (v3)
 			dirattr_ret = VOP_GETATTR(dirp, &dirattr, cred,
 				procp);
 		vrele(dirp);
 	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_POSTOPATTR(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_POSTOPATTR(v3)) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, dirattr_ret, &dirattr, &info);
+		nfsm_srvpostop_attr(nfsd, dirattr_ret, &dirattr, &mb);
 		return (0);
 	}
 	vrele(nd.ni_startdir);
@@ -500,21 +488,20 @@ nfsrv_lookup(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	if (!error)
 		error = VOP_GETATTR(vp, &va, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_SRVFH(info.nmi_v3) + NFSX_POSTOPORFATTR(info.nmi_v3) +
-	    NFSX_POSTOPATTR(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_SRVFH(v3) + NFSX_POSTOPORFATTR(v3) + NFSX_POSTOPATTR(v3)) != 0)
 		return 0;
 	if (error) {
-		nfsm_srvpostop_attr(nfsd, dirattr_ret, &dirattr, &info);
+		nfsm_srvpostop_attr(nfsd, dirattr_ret, &dirattr, &mb);
 		error = 0;
 		goto nfsmout;
 	}
-	nfsm_srvfhtom(&info.nmi_mb, fhp, info.nmi_v3);
+	nfsm_srvfhtom(&mb, fhp, v3);
 	if (v3) {
-		nfsm_srvpostop_attr(nfsd, 0, &va, &info);
-		nfsm_srvpostop_attr(nfsd, dirattr_ret, &dirattr, &info);
+		nfsm_srvpostop_attr(nfsd, 0, &va, &mb);
+		nfsm_srvpostop_attr(nfsd, dirattr_ret, &dirattr, &mb);
 	} else {
-		fp = nfsm_build(&info.nmi_mb, NFSX_V2FATTR);
+		fp = nfsm_build(&mb, NFSX_V2FATTR);
 		nfsm_srvfattr(nfsd, &va, fp);
 	}
 nfsmout:
@@ -529,10 +516,10 @@ nfsrv_readlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct iovec iov;
 	struct mbuf *mp = NULL;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	int error = 0, rdonly, tlen, len = 0, getret;
 	struct vnode *vp;
@@ -540,34 +527,30 @@ nfsrv_readlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 	struct uio uio;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
 	memset(&uio, 0, sizeof(uio));
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    2 * NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, 1, NULL, &info);
+		nfsm_srvpostop_attr(nfsd, 1, NULL, &mb);
 		error = 0;
 		goto nfsmout;
 	}
 	if (vp->v_type != VLNK) {
-		if (info.nmi_v3)
+		if (v3)
 			error = EINVAL;
 		else
 			error = ENXIO;
@@ -595,11 +578,11 @@ out:
 	vput(vp);
 	if (error)
 		m_freem(mp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_POSTOPATTR(info.nmi_v3) + NFSX_UNSIGNED) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_POSTOPATTR(v3) + NFSX_UNSIGNED) != 0)
 		return 0;
-	if (info.nmi_v3) {
-		nfsm_srvpostop_attr(nfsd, getret, &attr, &info);
+	if (v3) {
+		nfsm_srvpostop_attr(nfsd, getret, &attr, &mb);
 		if (error) {
 			error = 0;
 			goto nfsmout;
@@ -610,9 +593,9 @@ out:
 		tlen = nfsm_rndup(len);
 		nfsm_adj(mp, NFS_MAXPATHLEN-tlen, tlen-len);
 	}
-	tl = nfsm_build(&info.nmi_mb, NFSX_UNSIGNED);
+	tl = nfsm_build(&mb, NFSX_UNSIGNED);
 	*tl = txdr_unsigned(len);
-	info.nmi_mb->m_next = mp;
+	mb->m_next = mp;
 
 nfsmout:
 	return (error);
@@ -626,10 +609,10 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct mbuf *m;
 	struct nfs_fattr *fp;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	int i, reqlen;
 	int error = 0, rdonly, cnt, len, left, siz, tlen, getret = 1;
@@ -640,40 +623,37 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	struct uio io, *uiop = &io;
 	struct vattr va;
 	off_t off;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (info.nmi_v3) {
-		tl = (uint32_t *)nfsm_dissect(&info, 2 * NFSX_UNSIGNED);
+	if (v3) {
+		tl = (uint32_t *)nfsd_dissect(nfsd, 2 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		off = fxdr_hyper(tl);
 	} else {
-		tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		off = (off_t)fxdr_unsigned(u_int32_t, *tl);
 	}
 
-	tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+	tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 	if (tl == NULL)
 		goto nfsmout;
 	reqlen = fxdr_unsigned(int32_t, *tl);
 	if (reqlen > (NFS_SRVMAXDATA(nfsd)) || reqlen <= 0) {
 		error = EBADRPC;
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb,
+		    error, 0) != 0)
 			return 0;
 	}
 
@@ -682,7 +662,7 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		goto bad;
 
 	if (vp->v_type != VREG) {
-		if (info.nmi_v3)
+		if (v3)
 			error = EINVAL;
 		else
 			error = (vp->v_type == VDIR) ? EISDIR : EACCES;
@@ -703,17 +683,16 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		cnt = va.va_size - off;
 	else
 		cnt = reqlen;
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_POSTOPORFATTR(info.nmi_v3) +
-	    3 * NFSX_UNSIGNED+nfsm_rndup(cnt)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_POSTOPORFATTR(v3) + 3 * NFSX_UNSIGNED+nfsm_rndup(cnt)) != 0)
 		return 0;
-	if (info.nmi_v3) {
-		tl = nfsm_build(&info.nmi_mb, NFSX_V3FATTR + 4 * NFSX_UNSIGNED);
+	if (v3) {
+		tl = nfsm_build(&mb, NFSX_V3FATTR + 4 * NFSX_UNSIGNED);
 		*tl++ = nfs_true;
 		fp = (struct nfs_fattr *)tl;
 		tl += (NFSX_V3FATTR / sizeof (u_int32_t));
 	} else {
-		tl = nfsm_build(&info.nmi_mb, NFSX_V2FATTR + NFSX_UNSIGNED);
+		tl = nfsm_build(&mb, NFSX_V2FATTR + NFSX_UNSIGNED);
 		fp = (struct nfs_fattr *)tl;
 		tl += (NFSX_V2FATTR / sizeof (u_int32_t));
 	}
@@ -725,7 +704,7 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		 * Generate the mbuf list with the uio_iov ref. to it.
 		 */
 		i = 0;
-		m = m2 = info.nmi_mb;
+		m = m2 = mb;
 		while (left > 0) {
 			siz = min(m_trailingspace(m), left);
 			if (siz > 0) {
@@ -744,7 +723,7 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		iv = mallocarray(i, sizeof(*iv), M_TEMP, M_WAITOK);
 		ivlen = i * sizeof(*iv);
 		uiop->uio_iov = iv2 = iv;
-		m = info.nmi_mb;
+		m = mb;
 		left = len;
 		i = 0;
 		while (left > 0) {
@@ -772,7 +751,6 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		if (error || (getret = VOP_GETATTR(vp, &va, cred, procp)) != 0){
 			if (!error)
 				error = getret;
-			m_freem(info.nmi_mreq);
 			goto vbad;
 		}
 	} else
@@ -783,8 +761,8 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	cnt = cnt < tlen ? cnt : tlen;
 	tlen = nfsm_rndup (cnt);
 	if (len != tlen || tlen != cnt)
-		nfsm_adj(info.nmi_mb, len - tlen, tlen - cnt);
-	if (info.nmi_v3) {
+		nfsm_adj(mb, len - tlen, tlen - cnt);
+	if (v3) {
 		*tl++ = txdr_unsigned(cnt);
 		if (len < reqlen)
 			*tl++ = nfs_true;
@@ -798,9 +776,9 @@ nfsmout:
 vbad:
 	vput(vp);
 bad:
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, 0) != 0)
 		return 0;
-	nfsm_srvpostop_attr(nfsd, getret, &va, &info);
+	nfsm_srvpostop_attr(nfsd, getret, &va, &mb);
 	return (0);
 }
 
@@ -812,8 +790,8 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
-	struct nfsm_info	info;
 	int i, cnt;
 	struct mbuf *mp;
 	struct nfs_fattr *fp;
@@ -828,34 +806,30 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	fhandle_t *fhp;
 	struct uio io, *uiop = &io;
 	off_t off;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (info.nmi_mrep == NULL) {
+	if (nfsd->nd_mrep == NULL) {
 		*mrq = NULL;
 		return (0);
 	}
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (info.nmi_v3) {
-		tl = (uint32_t *)nfsm_dissect(&info, 5 * NFSX_UNSIGNED);
+	if (v3) {
+		tl = (uint32_t *)nfsd_dissect(nfsd, 5 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		off = fxdr_hyper(tl);
 		tl += 3;
 		stable = fxdr_unsigned(int, *tl++);
 	} else {
-		tl = (uint32_t *)nfsm_dissect(&info, 4 * NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nfsd, 4 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		off = (off_t)fxdr_unsigned(u_int32_t, *++tl);
@@ -871,11 +845,11 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	 */
 	if (len > 0) {
 	    zeroing = 1;
-	    mp = info.nmi_mrep;
+	    mp = nfsd->nd_mrep;
 	    while (mp) {
-		if (mp == info.nmi_md) {
+		if (mp == nfsd->nd_md) {
 			zeroing = 0;
-			adjust = info.nmi_dpos - mtod(mp, caddr_t);
+			adjust = nfsd->nd_dpos - mtod(mp, caddr_t);
 			mp->m_len -= adjust;
 			if (mp->m_len > 0 && adjust > 0)
 				mp->m_data += adjust;
@@ -901,10 +875,10 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error)
 		goto bad;
-	if (info.nmi_v3)
+	if (v3)
 		forat_ret = VOP_GETATTR(vp, &forat, cred, procp);
 	if (vp->v_type != VREG) {
-		if (info.nmi_v3)
+		if (v3)
 			error = EINVAL;
 		else
 			error = (vp->v_type == VDIR) ? EISDIR : EACCES;
@@ -922,7 +896,7 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	    ivlen = cnt * sizeof(*ivp);
 	    uiop->uio_iov = iv = ivp;
 	    uiop->uio_iovcnt = cnt;
-	    mp = info.nmi_mrep;
+	    mp = nfsd->nd_mrep;
 	    while (mp) {
 		if (mp->m_len > 0) {
 			ivp->iov_base = mtod(mp, caddr_t);
@@ -951,17 +925,17 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	vput(vp);
 	if (!error)
 		error = aftat_ret;
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_PREOPATTR(info.nmi_v3) + NFSX_POSTOPORFATTR(info.nmi_v3) +
-	    2 * NFSX_UNSIGNED + NFSX_WRITEVERF(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_PREOPATTR(v3) + NFSX_POSTOPORFATTR(v3) +
+	    2 * NFSX_UNSIGNED + NFSX_WRITEVERF(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
-		nfsm_srvwcc(nfsd, forat_ret, &forat, aftat_ret, &va, &info);
+	if (v3) {
+		nfsm_srvwcc(nfsd, forat_ret, &forat, aftat_ret, &va, &mb);
 		if (error) {
 			error = 0;
 			goto nfsmout;
 		}
-		tl = nfsm_build(&info.nmi_mb, 4 * NFSX_UNSIGNED);
+		tl = nfsm_build(&mb, 4 * NFSX_UNSIGNED);
 		*tl++ = txdr_unsigned(retlen);
 		if (stable == NFSV3WRITE_UNSTABLE)
 			*tl++ = txdr_unsigned(stable);
@@ -976,7 +950,7 @@ nfsrv_write(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		*tl++ = txdr_unsigned(boottime.tv_sec);
 		*tl = txdr_unsigned(boottime.tv_usec);
 	} else {
-		fp = nfsm_build(&info.nmi_mb, NFSX_V2FATTR);
+		fp = nfsm_build(&mb, NFSX_V2FATTR);
 		nfsm_srvfattr(nfsd, &va, fp);
 	}
 nfsmout:
@@ -985,18 +959,18 @@ nfsmout:
 vbad:
 	vput(vp);
 bad:
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, 0) != 0)
 		return 0;
-	nfsm_srvwcc(nfsd, forat_ret, &forat, aftat_ret, &va, &info);
+	nfsm_srvwcc(nfsd, forat_ret, &forat, aftat_ret, &va, &mb);
 	return (0);
 }
 
 static inline void
-nfsm_srvpostop_fh(struct nfsm_info *infop, fhandle_t *fhp)
+nfsm_srvpostop_fh(struct mbuf **mb, fhandle_t *fhp)
 {
 	uint32_t *tl;
 
-	tl = nfsm_build(&infop->nmi_mb, 2 * NFSX_UNSIGNED + NFSX_V3FH);
+	tl = nfsm_build(mb, 2 * NFSX_UNSIGNED + NFSX_V3FH);
 	*tl++ = nfs_true;
 	*tl++ = txdr_unsigned(NFSX_V3FH);
 	bcopy(fhp, tl, NFSX_V3FH);
@@ -1011,11 +985,11 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct nfs_fattr *fp;
 	struct vattr va, dirfor, diraft;
 	struct nfsv2_sattr *sp;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	struct nameidata nd;
 	caddr_t cp;
@@ -1027,35 +1001,36 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	fhandle_t *fhp;
 	u_quad_t tempsize;
 	u_char cverf[NFSX_V3CREATEVERF];
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
-		goto nfsmout;
+		return error;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
-		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
-		goto nfsmout;
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
+		return error;
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
+		return error;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	NDINIT(&nd, CREATE, LOCKPARENT | LOCKLEAF | SAVESTART, UIO_SYSSPACE,
 	    NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
+		if (v3)
 			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred, procp);
 		else {
 			vrele(dirp);
@@ -1063,19 +1038,19 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		}
 	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_WCCDATA(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_WCCDATA(v3)) != 0)
 			return 0;
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		if (dirp)
 			vrele(dirp);
 		return (0);
 	}
 
-	VATTR_NULL(&va);
-	if (info.nmi_v3) {
-		tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+	vattr_null(&va);
+	if (v3) {
+		tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		how = fxdr_unsigned(int, *tl);
@@ -1086,13 +1061,12 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 				break;
 			}
 		case NFSV3CREATE_UNCHECKED:
-			error = nfsm_srvsattr(&info.nmi_md, &va, info.nmi_mrep,
-			    &info.nmi_dpos);
+			error = nfsm_srvsattr(nfsd, &va);
 			if (error)
 				goto nfsmout;
 			break;
 		case NFSV3CREATE_EXCLUSIVE:
-			cp = (caddr_t)nfsm_dissect(&info, NFSX_V3CREATEVERF);
+			cp = (caddr_t)nfsd_dissect(nfsd, NFSX_V3CREATEVERF, &error);
 			if (cp == NULL)
 				goto nfsmout;
 			bcopy(cp, cverf, NFSX_V3CREATEVERF);
@@ -1100,10 +1074,10 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 			if (nd.ni_vp == NULL)
 				va.va_mode = 0;
 			break;
-		};
+		}
 		va.va_type = VREG;
 	} else {
-		sp = (struct nfsv2_sattr *)nfsm_dissect(&info, NFSX_V2SATTR);
+		sp = (struct nfsv2_sattr *)nfsd_dissect(nfsd, NFSX_V2SATTR, &error);
 		if (sp == NULL)
 			goto nfsmout;
 		va.va_type = IFTOVT(fxdr_unsigned(u_int32_t, sp->sa_mode));
@@ -1123,7 +1097,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 			break;
 		default:
 			break;
-		};
+		}
 	}
 
 	/*
@@ -1141,7 +1115,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 				pool_put(&namei_pool, nd.ni_cnd.cn_pnbuf);
 				if (exclusive_flag) {
 					exclusive_flag = 0;
-					VATTR_NULL(&va);
+					vattr_null(&va);
 					bcopy(cverf, (caddr_t)&va.va_atime,
 						NFSX_V3CREATEVERF);
 					error = VOP_SETATTR(nd.ni_vp, &va, cred,
@@ -1161,7 +1135,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 				}
 				VOP_ABORTOP(nd.ni_dvp, &nd.ni_cnd);
 				vput(nd.ni_dvp);
-				if (nfsm_reply(&info, nfsd, slp, mrq, error,
+				if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 				    0) != 0)
 					return 0;
 				error = 0;
@@ -1177,7 +1151,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 					pool_put(&namei_pool, nd.ni_cnd.cn_pnbuf);
 					nd.ni_cnd.cn_flags &= ~HASBUF;
 				}
-				if (nfsm_reply(&info, nfsd, slp, mrq, error,
+				if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 				    0) != 0)
 					return 0;
 				error = 0;
@@ -1192,7 +1166,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 					pool_put(&namei_pool, nd.ni_cnd.cn_pnbuf);
 					nd.ni_cnd.cn_flags &= ~HASBUF;
 				}
-				if (nfsm_reply(&info, nfsd, slp, mrq, error,
+				if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 				    0) != 0)
 					return 0;
 				error = 0;
@@ -1205,7 +1179,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 				vput(nd.ni_vp);
 				VOP_ABORTOP(nd.ni_dvp, &nd.ni_cnd);
 				error = EINVAL;
-				if (nfsm_reply(&info, nfsd, slp, mrq, error,
+				if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 				    0) != 0)
 					return 0;
 				error = 0;
@@ -1235,7 +1209,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 			    (nd.ni_cnd.cn_flags & RDONLY), procp, 0);
 			if (!error) {
 				tempsize = va.va_size;
-				VATTR_NULL(&va);
+				vattr_null(&va);
 				va.va_size = tempsize;
 				error = VOP_SETATTR(vp, &va, cred,
 					 procp);
@@ -1252,26 +1226,26 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 			error = VOP_GETATTR(vp, &va, cred, procp);
 		vput(vp);
 	}
-	if (info.nmi_v3) {
+	if (v3) {
 		if (exclusive_flag && !error &&
 			bcmp(cverf, (caddr_t)&va.va_atime, NFSX_V3CREATEVERF))
 			error = EEXIST;
 		diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 		vrele(dirp);
 	}
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, NFSX_SRVFH(info.nmi_v3) +
-	    NFSX_FATTR(info.nmi_v3) + NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_SRVFH(v3) + NFSX_FATTR(v3) + NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		if (!error) {
-			nfsm_srvpostop_fh(&info, fhp);
-			nfsm_srvpostop_attr(nfsd, 0, &va, &info);
+			nfsm_srvpostop_fh(&mb, fhp);
+			nfsm_srvpostop_attr(nfsd, 0, &va, &mb);
 		}
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 	} else {
-		nfsm_srvfhtom(&info.nmi_mb, fhp, info.nmi_v3);
-		fp = nfsm_build(&info.nmi_mb, NFSX_V2FATTR);
+		nfsm_srvfhtom(&mb, fhp, v3);
+		fp = nfsm_build(&mb, NFSX_V2FATTR);
 		nfsm_srvfattr(nfsd, &va, fp);
 	}
 	return (0);
@@ -1303,9 +1277,9 @@ nfsrv_mknod(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct vattr va, dirfor, diraft;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	struct nameidata nd;
 	int error = 0, len, dirfor_ret = 1, diraft_ret = 1;
@@ -1315,45 +1289,43 @@ nfsrv_mknod(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
-		goto nfsmout;
+		return error;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
-		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
-		goto nfsmout;
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
+		return error;
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
+		return error;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	NDINIT(&nd, CREATE, LOCKPARENT | LOCKLEAF | SAVESTART, UIO_SYSSPACE,
 	    NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md, &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md, &nfsd->nd_dpos, &dirp, procp);
 	if (dirp)
 		dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred, procp);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_WCCDATA(1)) != 0)
 			return 0;
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		if (dirp)
 			vrele(dirp);
 		return (0);
 	}
 
-	tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+	tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 	if (tl == NULL)
 		goto nfsmout;
 	vtyp = nfsv3tov_type(*tl);
@@ -1370,12 +1342,12 @@ nfsrv_mknod(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 			vput(nd.ni_vp);
 		goto out;
 	}
-	VATTR_NULL(&va);
-	error = nfsm_srvsattr(&info.nmi_md, &va, info.nmi_mrep, &info.nmi_dpos);
+	vattr_null(&va);
+	error = nfsm_srvsattr(nfsd, &va);
 	if (error)
 		goto nfsmout;
 	if (vtyp == VCHR || vtyp == VBLK) {
-		tl = (uint32_t *)nfsm_dissect(&info, 2 * NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nfsd, 2 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		major = fxdr_unsigned(u_int32_t, *tl++);
@@ -1447,14 +1419,14 @@ out:
 	}
 	diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 	vrele(dirp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 	    NFSX_SRVFH(1) + NFSX_POSTOPATTR(1) + NFSX_WCCDATA(1)) != 0)
 		return 0;
 	if (!error) {
-		nfsm_srvpostop_fh(&info, fhp);
-		nfsm_srvpostop_attr(nfsd, 0, &va, &info);
+		nfsm_srvpostop_fh(&mb, fhp);
+		nfsm_srvpostop_attr(nfsd, 0, &va, &mb);
 	}
-	nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft, &info);
+	nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft, &mb);
 	return (0);
 nfsmout:
 	if (dirp)
@@ -1481,43 +1453,43 @@ nfsrv_remove(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct nameidata nd;
-	struct nfsm_info	info;
 	int error = 0, len, dirfor_ret = 1, diraft_ret = 1;
 	struct vnode *vp, *dirp;
 	struct vattr dirfor, diraft;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 	vp = NULL;
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
 		goto nfsmout;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
  	NDINIT(&nd, DELETE, LOCKPARENT | LOCKLEAF, UIO_SYSSPACE, NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md, &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md, &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
+		if (v3)
 			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred, procp);
 		else {
 			vrele(dirp);
@@ -1551,16 +1523,15 @@ out:
 			vput(vp);
 		}
 	}
-	if (dirp && info.nmi_v3) {
+	if (dirp && v3) {
 		diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 		vrele(dirp);
 	}
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		return (0);
 	}
 
@@ -1576,8 +1547,8 @@ nfsrv_rename(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
-	struct nfsm_info	info;
 	int error = 0, len, len2, fdirfor_ret = 1, fdiraft_ret = 1;
 	int tdirfor_ret = 1, tdiraft_ret = 1;
 	struct nameidata fromnd, tond;
@@ -1587,26 +1558,27 @@ nfsrv_rename(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	nfsfh_t fnfh, tnfh;
 	fhandle_t *ffhp, *tfhp;
 	uid_t saved_uid;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
-		goto nfsmout;
+		return error;
 	ffhp = &fnfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, ffhp) != 0)
-		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
-		goto nfsmout;
+	if (nfsm_srvmtofh2(nfsd, ffhp, &error) != 0)
+		return error;
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
+		return error;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	/*
@@ -1618,10 +1590,10 @@ nfsrv_rename(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	NDINIT(&fromnd, DELETE, WANTPARENT | SAVESTART, UIO_SYSSPACE, NULL,
 	    procp);
 	fromnd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&fromnd, ffhp, len, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &fdirp, procp);
+	error = nfs_namei(&fromnd, ffhp, len, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &fdirp, procp);
 	if (fdirp) {
-		if (info.nmi_v3)
+		if (v3)
 			fdirfor_ret = VOP_GETATTR(fdirp, &fdirfor, cred,
 				procp);
 		else {
@@ -1630,39 +1602,39 @@ nfsrv_rename(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		}
 	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    2 * NFSX_WCCDATA(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    2 * NFSX_WCCDATA(v3)) != 0)
 			return 0;
 		nfsm_srvwcc(nfsd, fdirfor_ret, &fdirfor, fdiraft_ret, &fdiraft,
-		    &info);
+		    &mb);
 		nfsm_srvwcc(nfsd, tdirfor_ret, &tdirfor, tdiraft_ret, &tdiraft,
-		    &info);
+		    &mb);
 		if (fdirp)
 			vrele(fdirp);
 		return (0);
 	}
 
 	fvp = fromnd.ni_vp;
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
-		return 0;
-	else if (error != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0) {
+		error = 0;
+		goto nfsmout;
+	} else if (error != 0)
 		goto nfsmout;
 	tfhp = &tnfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, tfhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, tfhp, &error) != 0)
 		goto nfsmout;
-	if (nfsm_strsiz(&info, &len2, NFS_MAXNAMLEN) != 0)
+	if (nfsd_strsiz(nfsd, &len2, NFS_MAXNAMLEN, &error) != 0)
 		goto nfsmout;
 	cred->cr_uid = saved_uid;
 
 	NDINIT(&tond, RENAME, LOCKPARENT | LOCKLEAF| NOCACHE | SAVESTART,
 	    UIO_SYSSPACE, NULL, procp);
 	tond.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&tond, tfhp, len2, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &tdirp, procp);
+	error = nfs_namei(&tond, tfhp, len2, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &tdirp, procp);
 	if (tdirp) {
-		if (info.nmi_v3)
-			tdirfor_ret = VOP_GETATTR(tdirp, &tdirfor, cred,
-				procp);
+		if (v3)
+			tdirfor_ret = VOP_GETATTR(tdirp, &tdirfor, cred, procp);
 		else {
 			vrele(tdirp);
 			tdirp = NULL;
@@ -1678,27 +1650,27 @@ nfsrv_rename(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	tvp = tond.ni_vp;
 	if (tvp != NULL) {
 		if (fvp->v_type == VDIR && tvp->v_type != VDIR) {
-			error = info.nmi_v3 ? EEXIST : EISDIR;
+			error = v3 ? EEXIST : EISDIR;
 			goto out;
 		} else if (fvp->v_type != VDIR && tvp->v_type == VDIR) {
-			error = info.nmi_v3 ? EEXIST : ENOTDIR;
+			error = v3 ? EEXIST : ENOTDIR;
 			goto out;
 		}
 		if (tvp->v_type == VDIR && tvp->v_mountedhere) {
-			error = info.nmi_v3 ? EXDEV : ENOTEMPTY;
+			error = v3 ? EXDEV : ENOTEMPTY;
 			goto out;
 		}
 	}
 	if (fvp->v_type == VDIR && fvp->v_mountedhere) {
-		error = info.nmi_v3 ? EXDEV : ENOTEMPTY;
+		error = v3 ? EXDEV : ENOTEMPTY;
 		goto out;
 	}
 	if (fvp->v_mount != tdvp->v_mount) {
-		error = info.nmi_v3 ? EXDEV : ENOTEMPTY;
+		error = v3 ? EXDEV : ENOTEMPTY;
 		goto out;
 	}
 	if (fvp == tdvp)
-		error = info.nmi_v3 ? EINVAL : ENOTEMPTY;
+		error = v3 ? EINVAL : ENOTEMPTY;
 	/*
 	 * If source is the same as the destination (that is the
 	 * same vnode with the same name in the same directory),
@@ -1743,26 +1715,19 @@ out1:
 	}
 	vrele(fromnd.ni_startdir);
 	pool_put(&namei_pool, fromnd.ni_cnd.cn_pnbuf);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    2 * NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, 2 * NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		nfsm_srvwcc(nfsd, fdirfor_ret, &fdirfor, fdiraft_ret, &fdiraft,
-		    &info);
+		    &mb);
 		nfsm_srvwcc(nfsd, tdirfor_ret, &tdirfor, tdiraft_ret, &tdiraft,
-		    &info);
+		    &mb);
 	}
 	return (0);
 
 nfsmout:
 	if (fdirp)
 		vrele(fdirp);
-	if (tdirp)
-		vrele(tdirp);
-	if (tond.ni_cnd.cn_nameiop) {
-		vrele(tond.ni_startdir);
-		pool_put(&namei_pool, tond.ni_cnd.cn_pnbuf);
-	}
 	if (fromnd.ni_cnd.cn_nameiop) {
 		if (fromnd.ni_startdir)
 			vrele(fromnd.ni_startdir);
@@ -1788,7 +1753,7 @@ nfsrv_link(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
-	struct nfsm_info	info;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct nameidata nd;
 	int error = 0, rdonly, len, dirfor_ret = 1, diraft_ret = 1;
@@ -1797,44 +1762,44 @@ nfsrv_link(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	struct vattr dirfor, diraft, at;
 	nfsfh_t nfh, dnfh;
 	fhandle_t *fhp, *dfhp;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	dfhp = &dnfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, dfhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, dfhp, &error) != 0)
 		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
 		goto nfsmout;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	error = nfsrv_fhtovp(fhp, 0, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_POSTOPATTR(info.nmi_v3) +
-		    NFSX_WCCDATA(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_POSTOPATTR(v3) + NFSX_WCCDATA(v3)) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -1843,12 +1808,11 @@ nfsrv_link(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 
 	NDINIT(&nd, CREATE, LOCKPARENT, UIO_SYSSPACE, NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, dfhp, len, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, dfhp, len, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
-			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred,
-				procp);
+		if (v3)
+			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred, procp);
 		else {
 			vrele(dirp);
 			dirp = NULL;
@@ -1877,20 +1841,20 @@ out:
 			vrele(nd.ni_vp);
 	}
 out1:
-	if (info.nmi_v3)
+	if (v3)
 		getret = VOP_GETATTR(vp, &at, cred, procp);
 	if (dirp) {
 		diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 		vrele(dirp);
 	}
 	vrele(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_POSTOPATTR(info.nmi_v3) + NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_POSTOPATTR(v3) + NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+	if (v3) {
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		     &info);
+		     &mb);
 		error = 0;
 	}
 nfsmout:
@@ -1905,10 +1869,10 @@ nfsrv_symlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct vattr va, dirfor, diraft;
 	struct nameidata nd;
-	struct nfsm_info	info;
 	struct nfsv2_sattr *sp;
 	char *pathcp = NULL;
 	struct uio io;
@@ -1917,34 +1881,35 @@ nfsrv_symlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	struct vnode *dirp = NULL;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
-		goto nfsmout;
+		return error;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
-		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
-		goto nfsmout;
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
+		return error;
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
+		return error;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	NDINIT(&nd, CREATE, LOCKPARENT | SAVESTART, UIO_SYSSPACE, NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
+		if (v3)
 			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred,
 				procp);
 		else {
@@ -1954,14 +1919,13 @@ nfsrv_symlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	}
 	if (error)
 		goto out;
-	VATTR_NULL(&va);
-	if (info.nmi_v3) {
-		error = nfsm_srvsattr(&info.nmi_md, &va, info.nmi_mrep,
-		    &info.nmi_dpos);
+	vattr_null(&va);
+	if (v3) {
+		error = nfsm_srvsattr(nfsd, &va);
 		if (error)
 			goto nfsmout;
 	}
-	if (nfsm_strsiz(&info, &len2, NFS_MAXPATHLEN) != 0)
+	if (nfsd_strsiz(nfsd, &len2, NFS_MAXPATHLEN, &error) != 0)
 		goto nfsmout;
 	pathlen = len2 + 1;
 	pathcp = malloc(pathlen, M_TEMP, M_WAITOK);
@@ -1974,10 +1938,10 @@ nfsrv_symlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	io.uio_segflg = UIO_SYSSPACE;
 	io.uio_rw = UIO_READ;
 	io.uio_procp = NULL;
-	if (nfsm_mtouio(&info, &io, len2) != 0)
+	if (nfsd_mtouio(nfsd, &io, len2, &error) != 0)
 		goto nfsmout;
-	if (!info.nmi_v3) {
-		sp = (struct nfsv2_sattr *)nfsm_dissect(&info, NFSX_V2SATTR);
+	if (!v3) {
+		sp = (struct nfsv2_sattr *)nfsd_dissect(nfsd, NFSX_V2SATTR, &error);
 		if (sp == NULL)
 			goto nfsmout;
 		va.va_mode = nfstov_mode(sp->sa_mode);
@@ -1999,7 +1963,7 @@ nfsrv_symlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	if (error)
 		vrele(nd.ni_startdir);
 	else {
-		if (info.nmi_v3) {
+		if (v3) {
 			nd.ni_cnd.cn_nameiop = LOOKUP;
 			nd.ni_cnd.cn_flags &= ~(LOCKPARENT | SAVESTART |
 			    FOLLOW);
@@ -2028,16 +1992,16 @@ out:
 		diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 		vrele(dirp);
 	}
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, NFSX_SRVFH(info.nmi_v3) +
-	    NFSX_POSTOPATTR(info.nmi_v3) + NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_SRVFH(v3) + NFSX_POSTOPATTR(v3) + NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		if (!error) {
-			nfsm_srvpostop_fh(&info, fhp);
-			nfsm_srvpostop_attr(nfsd, 0, &va, &info);
+			nfsm_srvpostop_fh(&mb, fhp);
+			nfsm_srvpostop_attr(nfsd, 0, &va, &mb);
 		}
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 	}
 	return (0);
 nfsmout:
@@ -2067,44 +2031,45 @@ nfsrv_mkdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct vattr va, dirfor, diraft;
 	struct nfs_fattr *fp;
 	struct nameidata nd;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	int error = 0, len, dirfor_ret = 1, diraft_ret = 1;
 	struct vnode *vp, *dirp = NULL;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
-		goto nfsmout;
+		return error;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
-		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
-		goto nfsmout;
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
+		return error;
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
+		return error;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	NDINIT(&nd, CREATE, LOCKPARENT, UIO_SYSSPACE, NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
+		if (v3)
 			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred, procp);
 		else {
 			vrele(dirp);
@@ -2112,24 +2077,23 @@ nfsrv_mkdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		}
 	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_WCCDATA(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_WCCDATA(v3)) != 0)
 			return 0;
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		if (dirp)
 			vrele(dirp);
 		return (0);
 	}
 
-	VATTR_NULL(&va);
-	if (info.nmi_v3) {
-		error = nfsm_srvsattr(&info.nmi_md, &va, info.nmi_mrep,
-		    &info.nmi_dpos);
+	vattr_null(&va);
+	if (v3) {
+		error = nfsm_srvsattr(nfsd, &va);
 		if (error)
 			goto nfsmout;
 	} else {
-		tl = (uint32_t *)nfsm_dissect(&info, NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nfsd, NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		va.va_mode = nfstov_mode(*tl++);
@@ -2161,19 +2125,19 @@ out:
 		diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 		vrele(dirp);
 	}
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, NFSX_SRVFH(info.nmi_v3) +
-	    NFSX_POSTOPATTR(info.nmi_v3) + NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_SRVFH(v3) + NFSX_POSTOPATTR(v3) + NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		if (!error) {
-			nfsm_srvpostop_fh(&info, fhp);
-			nfsm_srvpostop_attr(nfsd, 0, &va, &info);
+			nfsm_srvpostop_fh(&mb, fhp);
+			nfsm_srvpostop_attr(nfsd, 0, &va, &mb);
 		}
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 	} else {
-		nfsm_srvfhtom(&info.nmi_mb, fhp, info.nmi_v3);
-		fp = nfsm_build(&info.nmi_mb, NFSX_V2FATTR);
+		nfsm_srvfhtom(&mb, fhp, v3);
+		fp = nfsm_build(&mb, NFSX_V2FATTR);
 		nfsm_srvfattr(nfsd, &va, fp);
 	}
 	return (0);
@@ -2198,42 +2162,43 @@ nfsrv_rmdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
-	struct nfsm_info	info;
 	int error = 0, len, dirfor_ret = 1, diraft_ret = 1;
 	struct vnode *vp, *dirp = NULL;
 	struct vattr dirfor, diraft;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 	struct nameidata nd;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (nfsm_srvnamesiz(&info, &len) != 0)
+	if (nfsm_srvnamesiz(nfsd, &len, &error) != 0)
 		goto nfsmout;
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
-			return 0;
+		/*
+		 * nfsm_reply would return zero if v3 and an error different
+		 * from EBADRPC. But it does not make sense to continue
+		 * anyway if the error set in nfsm_srvnamesiz is NFSERR_NAMETOL.
+		 */
+		(void)nfsm_reply(nfsd, slp, mrq, &mb, error, 0);
+		return 0;
 	}
 
 	NDINIT(&nd, DELETE, LOCKPARENT | LOCKLEAF, UIO_SYSSPACE, NULL, procp);
 	nd.ni_cnd.cn_cred = cred;
-	error = nfs_namei(&nd, fhp, len, slp, nam, &info.nmi_md,
-	    &info.nmi_dpos, &dirp, procp);
+	error = nfs_namei(&nd, fhp, len, slp, nam, &nfsd->nd_md,
+	    &nfsd->nd_dpos, &dirp, procp);
 	if (dirp) {
-		if (info.nmi_v3)
+		if (v3)
 			dirfor_ret = VOP_GETATTR(dirp, &dirfor, cred,
 				procp);
 		else {
@@ -2242,11 +2207,11 @@ nfsrv_rmdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		}
 	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_WCCDATA(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_WCCDATA(v3)) != 0)
 			return 0;
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		if (dirp)
 			vrele(dirp);
 		return (0);
@@ -2290,12 +2255,11 @@ out:
 		diraft_ret = VOP_GETATTR(dirp, &diraft, cred, procp);
 		vrele(dirp);
 	}
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_WCCDATA(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, NFSX_WCCDATA(v3)) != 0)
 		return 0;
-	if (info.nmi_v3) {
+	if (v3) {
 		nfsm_srvwcc(nfsd, dirfor_ret, &dirfor, diraft_ret, &diraft,
-		    &info);
+		    &mb);
 		error = 0;
 	}
 nfsmout:
@@ -2343,9 +2307,9 @@ nfsrv_readdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct dirent *dp;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	char *cpos, *cend, *rbuf;
 	struct vnode *vp;
@@ -2357,23 +2321,19 @@ nfsrv_readdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	int len, nlen, pad, xfer, error = 0, getret = 1;
 	int siz, cnt, fullsiz, eofflag, rdonly;
 	u_quad_t off, toff, verf;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	if (info.nmi_v3) {
-		tl = (uint32_t *)nfsm_dissect(&info, 5 * NFSX_UNSIGNED);
+	if (v3) {
+		tl = (uint32_t *)nfsd_dissect(nfsd, 5 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		toff = fxdr_hyper(tl);
@@ -2381,39 +2341,50 @@ nfsrv_readdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		verf = fxdr_hyper(tl);
 		tl += 2;
 	} else {
-		tl = (uint32_t *)nfsm_dissect(&info, 2 * NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nfsd, 2 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		toff = fxdr_unsigned(u_quad_t, *tl++);
 	}
 	off = toff;
 	cnt = fxdr_unsigned(int, *tl);
-	xfer = NFS_SRVMAXDATA(nfsd);
-	if (cnt > xfer || cnt < 0)
-		cnt = xfer;
-	siz = ((cnt + DIRBLKSIZ - 1) & ~(DIRBLKSIZ - 1));
-	if (siz > xfer)
-		siz = xfer;
-	fullsiz = siz;
-	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
+	if (cnt == 0) {
+		if (v3)
+			error = NFSERR_TOOSMALL;
+		else
+			error = EBADRPC;
+	} else {
+		xfer = NFS_SRVMAXDATA(nfsd);
+		if (cnt > xfer || cnt < 0)
+			cnt = xfer;
+		siz = ((cnt + DIRBLKSIZ - 1) & ~(DIRBLKSIZ - 1));
+		if (siz > xfer || siz <= 0)
+			siz = xfer;
+		fullsiz = siz;
+		error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
+		if (!error && vp->v_type != VDIR) {
+			error = ENOTDIR;
+			vput(vp);
+		}
+	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
-	if (info.nmi_v3)
+	if (v3)
 		error = getret = VOP_GETATTR(vp, &at, cred, procp);
 	if (!error)
 		error = nfsrv_access(vp, VEXEC, cred, rdonly, procp, 0);
 	if (error) {
 		vput(vp);
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_POSTOPATTR(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_POSTOPATTR(v3)) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2435,7 +2406,7 @@ again:
 	error = VOP_READDIR(vp, &io, cred, &eofflag);
 
 	off = (off_t)io.uio_offset;
-	if (info.nmi_v3) {
+	if (v3) {
 		getret = VOP_GETATTR(vp, &at, cred, procp);
 		if (!error)
 			error = getret;
@@ -2445,10 +2416,10 @@ again:
 	if (error) {
 		vrele(vp);
 		free(rbuf, M_TEMP, fullsiz);
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
-		    NFSX_POSTOPATTR(info.nmi_v3)) != 0)
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+		    NFSX_POSTOPATTR(v3)) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2461,18 +2432,17 @@ again:
 		 */
 		if (siz == 0) {
 			vrele(vp);
-			if (nfsm_reply(&info, nfsd, slp, mrq, error,
-			    NFSX_POSTOPATTR(info.nmi_v3) +
-			    NFSX_COOKIEVERF(info.nmi_v3) +
+			if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+			    NFSX_POSTOPATTR(v3) + NFSX_COOKIEVERF(v3) +
 			    2 * NFSX_UNSIGNED) != 0)
 				return 0;
-			if (info.nmi_v3) {
-				nfsm_srvpostop_attr(nfsd, getret, &at, &info);
-				tl = nfsm_build(&info.nmi_mb, 4 * NFSX_UNSIGNED);
+			if (v3) {
+				nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
+				tl = nfsm_build(&mb, 4 * NFSX_UNSIGNED);
 				txdr_hyper(at.va_filerev, tl);
 				tl += 2;
 			} else
-				tl = nfsm_build(&info.nmi_mb, 2 * NFSX_UNSIGNED);
+				tl = nfsm_build(&mb, 2 * NFSX_UNSIGNED);
 			*tl++ = nfs_false;
 			*tl = nfs_true;
 			free(rbuf, M_TEMP, fullsiz);
@@ -2500,13 +2470,12 @@ again:
 	}
 
 	len = 3 * NFSX_UNSIGNED;	/* paranoia, probably can be 0 */
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_POSTOPATTR(info.nmi_v3) +
-	    NFSX_COOKIEVERF(info.nmi_v3) + siz) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_POSTOPATTR(v3) + NFSX_COOKIEVERF(v3) + siz) != 0)
 		return 0;
-	if (info.nmi_v3) {
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
-		tl = nfsm_build(&info.nmi_mb, 2 * NFSX_UNSIGNED);
+	if (v3) {
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
+		tl = nfsm_build(&mb, 2 * NFSX_UNSIGNED);
 		txdr_hyper(at.va_filerev, tl);
 	}
 
@@ -2516,7 +2485,7 @@ again:
 			nlen = dp->d_namlen;
 			pad = nfsm_padlen(nlen);
 			len += (4 * NFSX_UNSIGNED + nlen + pad);
-			if (info.nmi_v3)
+			if (v3)
 				len += 2 * NFSX_UNSIGNED;
 			if (len > cnt) {
 				eofflag = 0;
@@ -2526,23 +2495,22 @@ again:
 			 * Build the directory record xdr from
 			 * the dirent entry.
 			 */
-			tl = nfsm_build(&info.nmi_mb,
-			    (info.nmi_v3 ? 3 : 2) * NFSX_UNSIGNED);
+			tl = nfsm_build(&mb, (v3 ? 3 : 2) * NFSX_UNSIGNED);
 			*tl++ = nfs_true;
-			if (info.nmi_v3)
+			if (v3)
 				txdr_hyper(dp->d_fileno, tl);
 			else
 				*tl = txdr_unsigned((u_int32_t)dp->d_fileno);
 
 			/* And copy the name */
-			nfsm_strtombuf(&info.nmi_mb, dp->d_name, nlen);
+			nfsm_strtombuf(&mb, dp->d_name, nlen);
 
 			/* Finish off the record */
-			if (info.nmi_v3) {
-				tl = nfsm_build(&info.nmi_mb, 2*NFSX_UNSIGNED);
+			if (v3) {
+				tl = nfsm_build(&mb, 2*NFSX_UNSIGNED);
 				txdr_hyper(dp->d_off, tl);
 			} else {
-				tl = nfsm_build(&info.nmi_mb, NFSX_UNSIGNED);
+				tl = nfsm_build(&mb, NFSX_UNSIGNED);
 				*tl = txdr_unsigned((u_int32_t)dp->d_off);
 			}
 		}
@@ -2550,7 +2518,7 @@ again:
 		dp = (struct dirent *)cpos;
 	}
 	vrele(vp);
-	tl = nfsm_build(&info.nmi_mb, 2 * NFSX_UNSIGNED);
+	tl = nfsm_build(&mb, 2 * NFSX_UNSIGNED);
 	*tl++ = nfs_false;
 	if (eofflag)
 		*tl = nfs_true;
@@ -2566,9 +2534,9 @@ nfsrv_readdirplus(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct dirent *dp;
-	struct nfsm_info	info;
 	u_int32_t *tl;
 	char *cpos, *cend, *rbuf;
 	struct vnode *vp, *nvp;
@@ -2583,21 +2551,14 @@ nfsrv_readdirplus(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	int siz, cnt, fullsiz, eofflag, rdonly, dirlen;
 	u_quad_t off, toff, verf;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	tl = (uint32_t *)nfsm_dissect(&info, 6 * NFSX_UNSIGNED);
+	tl = (uint32_t *)nfsd_dissect(nfsd, 6 * NFSX_UNSIGNED, &error);
 	if (tl == NULL)
 		goto nfsmout;
 	off = toff = fxdr_hyper(tl);
@@ -2606,19 +2567,27 @@ nfsrv_readdirplus(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	tl += 2;
 	siz = fxdr_unsigned(int, *tl++);
 	cnt = fxdr_unsigned(int, *tl);
-	xfer = NFS_SRVMAXDATA(nfsd);
-	if (cnt > xfer || cnt < 0)
-		cnt = xfer;
-	siz = ((siz + DIRBLKSIZ - 1) & ~(DIRBLKSIZ - 1));
-	if (siz > xfer)
-		siz = xfer;
-	fullsiz = siz;
-	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
+	if (siz == 0 || cnt == 0) {
+		error = NFSERR_TOOSMALL;
+	} else {
+		xfer = NFS_SRVMAXDATA(nfsd);
+		if (cnt > xfer || cnt < 0)
+			cnt = xfer;
+		siz = ((siz + DIRBLKSIZ - 1) & ~(DIRBLKSIZ - 1));
+		if (siz > xfer || siz <= 0)
+			siz = xfer;
+		fullsiz = siz;
+		error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
+		if (!error && vp->v_type != VDIR) {
+			error = ENOTDIR;
+			vput(vp);
+		}
+	}
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2627,10 +2596,10 @@ nfsrv_readdirplus(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		error = nfsrv_access(vp, VEXEC, cred, rdonly, procp, 0);
 	if (error) {
 		vput(vp);
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_V3POSTOPATTR) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2662,10 +2631,10 @@ again:
 	if (error) {
 		vrele(vp);
 		free(rbuf, M_TEMP, fullsiz);
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_V3POSTOPATTR) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2678,12 +2647,12 @@ again:
 		 */
 		if (siz == 0) {
 			vrele(vp);
-			if (nfsm_reply(&info, nfsd, slp, mrq, error,
+			if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 			    NFSX_V3POSTOPATTR + NFSX_V3COOKIEVERF +
 			    2 * NFSX_UNSIGNED) != 0)
 				return 0;
-			nfsm_srvpostop_attr(nfsd, getret, &at, &info);
-			tl = nfsm_build(&info.nmi_mb, 4 * NFSX_UNSIGNED);
+			nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
+			tl = nfsm_build(&mb, 4 * NFSX_UNSIGNED);
 			txdr_hyper(at.va_filerev, tl);
 			tl += 2;
 			*tl++ = nfs_false;
@@ -2725,10 +2694,10 @@ again:
 	 *  }
 	 */
 	dirlen = len = NFSX_V3POSTOPATTR + NFSX_V3COOKIEVERF + 2 * NFSX_UNSIGNED;
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, cnt) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, cnt) != 0)
 		return 0;
-	nfsm_srvpostop_attr(nfsd, getret, &at, &info);
-	tl = nfsm_build(&info.nmi_mb, 2 * NFSX_UNSIGNED);
+	nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
+	tl = nfsm_build(&mb, 2 * NFSX_UNSIGNED);
 	txdr_hyper(at.va_filerev, tl);
 
 	/* Loop through the records and build reply */
@@ -2781,12 +2750,12 @@ again:
 				break;
 			}
 
-			tl = nfsm_build(&info.nmi_mb, 3 * NFSX_UNSIGNED);
+			tl = nfsm_build(&mb, 3 * NFSX_UNSIGNED);
 			*tl++ = nfs_true;
 			txdr_hyper(dp->d_fileno, tl);
 
 			/* And copy the name */
-			nfsm_strtombuf(&info.nmi_mb, dp->d_name, nlen);
+			nfsm_strtombuf(&mb, dp->d_name, nlen);
 
 			/*
 			 * Build the directory record xdr from
@@ -2800,14 +2769,14 @@ again:
 			txdr_hyper(dp->d_off, fl.fl_off.nfsuquad);
 
 			/* Now copy the flrep structure out. */
-			nfsm_buftombuf(&info.nmi_mb, &fl, sizeof(struct flrep));
+			nfsm_buftombuf(&mb, &fl, sizeof(struct flrep));
 		}
 invalid:
 		cpos += dp->d_reclen;
 		dp = (struct dirent *)cpos;
 	}
 	vrele(vp);
-	tl = nfsm_build(&info.nmi_mb, 2 * NFSX_UNSIGNED);
+	tl = nfsm_build(&mb, 2 * NFSX_UNSIGNED);
 	*tl++ = nfs_false;
 	if (eofflag)
 		*tl = nfs_true;
@@ -2826,10 +2795,10 @@ nfsrv_commit(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct vattr bfor, aft;
 	struct vnode *vp;
-	struct nfsm_info	info;
 	struct timeval boottime;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
@@ -2837,21 +2806,14 @@ nfsrv_commit(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	int error = 0, rdonly, for_ret = 1, aft_ret = 1, cnt;
 	u_quad_t off;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
-	tl = (uint32_t *)nfsm_dissect(&info, 3 * NFSX_UNSIGNED);
+	tl = (uint32_t *)nfsd_dissect(nfsd, 3 * NFSX_UNSIGNED, &error);
 	if (tl == NULL)
 		goto nfsmout;
 
@@ -2866,10 +2828,10 @@ nfsrv_commit(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		cnt = 0;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    2 * NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvwcc(nfsd, for_ret, &bfor, aft_ret, &aft, &info);
+		nfsm_srvwcc(nfsd, for_ret, &bfor, aft_ret, &aft, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2877,12 +2839,12 @@ nfsrv_commit(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	error = VOP_FSYNC(vp, cred, MNT_WAIT, procp);
 	aft_ret = VOP_GETATTR(vp, &aft, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 	    NFSX_V3WCCDATA + NFSX_V3WRITEVERF) != 0)
 		return 0;
-	nfsm_srvwcc(nfsd, for_ret, &bfor, aft_ret, &aft, &info);
+	nfsm_srvwcc(nfsd, for_ret, &bfor, aft_ret, &aft, &mb);
 	if (!error) {
-		tl = nfsm_build(&info.nmi_mb, NFSX_V3WRITEVERF);
+		tl = nfsm_build(&mb, NFSX_V3WRITEVERF);
 		microboottime(&boottime);
 		*tl++ = txdr_unsigned(boottime.tv_sec);
 		*tl = txdr_unsigned(boottime.tv_usec);
@@ -2900,10 +2862,10 @@ nfsrv_statfs(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
 	struct statfs *sf;
 	struct nfs_statfs *sfp;
-	struct nfsm_info	info;
 	int error = 0, rdonly, getret = 1;
 	struct vnode *vp;
 	struct vattr at;
@@ -2911,27 +2873,23 @@ nfsrv_statfs(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	fhandle_t *fhp;
 	struct statfs statfs;
 	u_quad_t tval;
+	int v3;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
+	v3 = (nfsd->nd_flag & ND_NFSV3);
 
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -2939,17 +2897,17 @@ nfsrv_statfs(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	error = VFS_STATFS(vp->v_mount, sf, procp);
 	getret = VOP_GETATTR(vp, &at, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
-	    NFSX_POSTOPATTR(info.nmi_v3) + NFSX_STATFS(info.nmi_v3)) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
+	    NFSX_POSTOPATTR(v3) + NFSX_STATFS(v3)) != 0)
 		return 0;
-	if (info.nmi_v3)
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+	if (v3)
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 	if (error) {
 		error = 0;
 		goto nfsmout;
 	}
-	sfp = nfsm_build(&info.nmi_mb, NFSX_STATFS(info.nmi_v3));
-	if (info.nmi_v3) {
+	sfp = nfsm_build(&mb, NFSX_STATFS(v3));
+	if (v3) {
 		tval = (u_quad_t)sf->f_blocks;
 		tval *= (u_quad_t)sf->f_bsize;
 		txdr_hyper(tval, &sfp->sf_tbytes);
@@ -2984,8 +2942,8 @@ nfsrv_fsinfo(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
-	struct nfsm_info	info;
 	struct nfsv3_fsinfo *sip;
 	int error = 0, rdonly, getret = 1, pref;
 	struct vnode *vp;
@@ -2993,36 +2951,29 @@ nfsrv_fsinfo(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
 	getret = VOP_GETATTR(vp, &at, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 	    NFSX_V3POSTOPATTR + NFSX_V3FSINFO) != 0)
 		return 0;
-	nfsm_srvpostop_attr(nfsd, getret, &at, &info);
-	sip = nfsm_build(&info.nmi_mb, NFSX_V3FSINFO);
+	nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
+	sip = nfsm_build(&mb, NFSX_V3FSINFO);
 
 	/*
 	 * XXX
@@ -3059,8 +3010,8 @@ nfsrv_pathconf(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
 	struct mbuf *nam = nfsd->nd_nam;
+	struct mbuf *mb;
 	struct ucred *cred = &nfsd->nd_cr;
-	struct nfsm_info	info;
 	struct nfsv3_pathconf *pc;
 	int error = 0, rdonly, getret = 1;
 	register_t linkmax, namemax, chownres, notrunc;
@@ -3069,26 +3020,19 @@ nfsrv_pathconf(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_srvmtofh1(&info, nfsd, slp, mrq) != 0)
+	if (nfsm_srvmtofh1(nfsd, slp, mrq, &mb, &error) != 0)
 		return 0;
 	else if (error != 0)
 		goto nfsmout;
 	fhp = &nfh.fh_generic;
-	if (nfsm_srvmtofh2(&info, fhp) != 0)
+	if (nfsm_srvmtofh2(nfsd, fhp, &error) != 0)
 		goto nfsmout;
 	error = nfsrv_fhtovp(fhp, 1, &vp, cred, slp, nam, &rdonly);
 	if (error) {
-		if (nfsm_reply(&info, nfsd, slp, mrq, error,
+		if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 		    NFSX_UNSIGNED) != 0)
 			return 0;
-		nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+		nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 		error = 0;
 		goto nfsmout;
 	}
@@ -3101,15 +3045,15 @@ nfsrv_pathconf(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 		error = VOP_PATHCONF(vp, _PC_NO_TRUNC, &notrunc);
 	getret = VOP_GETATTR(vp, &at, cred, procp);
 	vput(vp);
-	if (nfsm_reply(&info, nfsd, slp, mrq, error,
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error,
 	    NFSX_V3POSTOPATTR + NFSX_V3PATHCONF) != 0)
 		return 0;
-	nfsm_srvpostop_attr(nfsd, getret, &at, &info);
+	nfsm_srvpostop_attr(nfsd, getret, &at, &mb);
 	if (error) {
 		error = 0;
 		goto nfsmout;
 	}
-	pc = nfsm_build(&info.nmi_mb, NFSX_V3PATHCONF);
+	pc = nfsm_build(&mb, NFSX_V3PATHCONF);
 
 	pc->pc_linkmax = txdr_unsigned(linkmax);
 	pc->pc_namemax = txdr_unsigned(namemax);
@@ -3134,17 +3078,10 @@ int
 nfsrv_null(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
-	struct nfsm_info	info;
+	struct mbuf *mb;
 	int error = NFSERR_RETVOID;
 
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
-
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, 0) != 0)
 		return 0;
 	return (0);
 }
@@ -3156,21 +3093,14 @@ int
 nfsrv_noop(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
     struct proc *procp, struct mbuf **mrq)
 {
-	struct nfsm_info	info;
+	struct mbuf *mb;
 	int error;
-
-	info.nmi_mreq = NULL;
-	info.nmi_mrep = nfsd->nd_mrep;
-	info.nmi_md = nfsd->nd_md;
-	info.nmi_dpos = nfsd->nd_dpos;
-	info.nmi_v3 = (nfsd->nd_flag & ND_NFSV3);
-	info.nmi_errorp = &error;
 
 	if (nfsd->nd_repstat)
 		error = nfsd->nd_repstat;
 	else
 		error = EPROCUNAVAIL;
-	if (nfsm_reply(&info, nfsd, slp, mrq, error, 0) != 0)
+	if (nfsm_reply(nfsd, slp, mrq, &mb, error, 0) != 0)
 		return 0;
 	return (0);
 }

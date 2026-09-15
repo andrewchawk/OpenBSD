@@ -1,4 +1,4 @@
-/*	$OpenBSD: locore0.S,v 1.25 2024/07/21 19:41:31 bluhm Exp $	*/
+/*	$OpenBSD: locore0.S,v 1.36 2026/08/19 08:56:28 hshoexer Exp $	*/
 /*	$NetBSD: locore.S,v 1.13 2004/03/25 18:33:17 drochner Exp $	*/
 
 /*
@@ -111,6 +111,9 @@
 #include <machine/param.h>
 #include <machine/segments.h>
 #include <machine/specialreg.h>
+#include <machine/trap.h>
+#include <machine/ghcb.h>
+#include <machine/vmmvar.h>
 
 /*
  * override user-land alignment before including asm.h
@@ -193,7 +196,38 @@ bi_size_ok:
 	pushl	$PSL_MBO
 	popfl
 
+	/*
+	 * Setup temporary #VC trap handler, in case we are running
+	 * on an AMD CPU in SEV-ES guest mode.  Will be reset by
+	 * init_x86_64().
+	 */
+	movl	$RELOC(early_idt), %ecx
+	movl	$T_VC, %edx
+	leal	(%ecx, %edx, 8), %ecx		/* 32bit #VC IDT slot */
+
+	pushl	%cs				/* get current %cs */
+	popl	%ebx
+	shll	$16, %ebx
+
+	movl	$RELOC(locore_vc_trap32), %eax
+	andl	$0x0000ffff, %eax
+	orl	%ebx, %eax			/* use current %cs */
+	movl	%eax, (%ecx)
+
+	movl	$RELOC(locore_vc_trap32), %eax
+	andl	$0xffff0000, %eax
+	orl	$((0x80 | SDT_SYS386IGT) << 8), %eax
+	movl	%eax, 4(%ecx)
+
+	movl	$RELOC(idtlc), %eax
+	lidt	(%eax)
+
+	/* Reset debug control registers */
 	xorl	%eax,%eax
+	movl	%eax,%dr6
+	movl	%eax,%dr7
+
+	/* %eax still zero from above */
 	cpuid
 	movl	%eax,RELOC(cpuid_level)
 	movl	$RELOC(cpu_vendor),%ebp
@@ -269,37 +303,34 @@ cont:
 	orl	%edx, RELOC(cpu_feature)
 
 	/*
-	 * Determine AMD SME and SEV capabilities.
+	 * Determine AMD SEV capability.
 	 */
 	movl	$RELOC(cpu_vendor),%ebp
 	cmpl $0x68747541, (%ebp)	/* "Auth" */
-	jne	.Lno_smesev
+	jne	.Lno_sev
 	cmpl $0x69746e65, 4(%ebp)	/* "enti" */
-	jne	.Lno_smesev
+	jne	.Lno_sev
 	cmpl $0x444d4163, 8(%ebp)	/* "cAMD" */
-	jne	.Lno_smesev
+	jne	.Lno_sev
 
-	/* AMD CPU, check for SME and SEV. */
+	/* AMD CPU, check for SEV. */
 	movl	$0x8000001f, %eax
 	cpuid
-	pushl	%eax
-	andl	$CPUIDEAX_SME, %eax	/* SME */
-	popl	%eax
-	jz	.Lno_smesev
 	andl	$CPUIDEAX_SEV, %eax	/* SEV */
-	jz	.Lno_smesev
+	jz	.Lno_sev
 
 	/* Are we in guest mode with SEV enabled? */
 	movl	$MSR_SEV_STATUS, %ecx
 	rdmsr
-	andl	$SEV_STAT_ENABLED, %eax
-	jz	.Lno_smesev
+	testl	$SEV_STAT_ENABLED, %eax
+	jz	.Lno_sev
+	movl	%eax, RELOC(cpu_sev_guestmode)	/* we are a SEV-* guest */
 
 	/* Determine C bit position */
 	movl	%ebx, %ecx	/* %ebx from previous cpuid */
 	andl	$0x3f, %ecx
 	cmpl	$0x20, %ecx	/* must be at least bit 32 (counting from 0) */
-	jl	.Lno_smesev
+	jl	.Lno_sev
 	xorl	%eax, %eax
 	movl	%eax, RELOC(pg_crypt)
 	subl	$0x20, %ecx
@@ -336,9 +367,7 @@ cont:
 	andl	%eax, RELOC(pg_frame + 4)	/* apply mask */
 	andl	%eax, RELOC(pg_lgframe + 4)
 
-	movl	$0x1, RELOC(cpu_sev_guestmode)	/* we are a SEV guest */
-
-.Lno_smesev:
+.Lno_sev:
 
 	/*
 	 * Finished with old stack; load new %esp now instead of later so we
@@ -383,7 +412,9 @@ cont:
 #define PROC0_DMP2_OFF	(PROC0_DMP3_OFF + NDML3_ENTRIES * NBPG)
 #define TABLESIZE \
     ((NKL4_KIMG_ENTRIES + TABLE_L3_ENTRIES + TABLE_L2_ENTRIES + 1 + UPAGES + \
-	NDML3_ENTRIES + NDML2_ENTRIES + 3) * NBPG)
+	NDML3_ENTRIES + NDML2_ENTRIES + 5) * NBPG)
+#define PROC0_GHCB_OFF	(TABLESIZE - 5 * NBPG)
+#define GHCB_SIZE	(2 * NBPG)
 
 #define fillkpt \
 	pushl	%ebp				;	/* save */ \
@@ -400,6 +431,17 @@ cont:
 	pushl	%ebp				;	/* save */ \
 	movl	RELOC((pg_nx + 4)), %ebp	;	/* NX bit? */ \
 	orl	RELOC((pg_crypt + 4)), %ebp	;	/* C bit? */ \
+1:	movl	%eax,(%ebx)			;	/* store phys addr */ \
+	movl	%ebp,4(%ebx)			;	/* upper 32 bits */ \
+	addl	$8,%ebx				;	/* next pte/pde */ \
+	addl	$NBPG,%eax			;	/* next phys page */ \
+	loop	1b				;	/* till finished */ \
+	popl	%ebp
+
+
+#define fillkpt_nx_nc \
+	pushl	%ebp				;	/* save */ \
+	movl	RELOC((pg_nx + 4)), %ebp	;	/* NX bit? */ \
 1:	movl	%eax,(%ebx)			;	/* store phys addr */ \
 	movl	%ebp,4(%ebx)			;	/* upper 32 bits */ \
 	addl	$8,%ebx				;	/* next pte/pde */ \
@@ -513,6 +555,19 @@ map_tables:
 	shrl	$PGSHIFT,%ecx
 	fillkpt_nx
 
+	/* When in SEV-ES guestmode, remap GHCB shared (ie. unencrypted) */
+	movl	RELOC(cpu_sev_guestmode),%eax
+	testl	$SEV_STAT_ES_ENABLED,%eax
+	jz	.Lnoghcb
+	pushl	%ebx			/* save current slot */
+	subl	$(5 << 3),%ebx		/* move back to slot of GHCB */
+	leal	(PROC0_GHCB_OFF)(%esi),%eax
+	orl	$(PG_V|PG_KW), %eax
+	movl	$(GHCB_SIZE>>PGSHIFT), %ecx
+	fillkpt_nx_nc
+	popl	%ebx			/* continue with slot saved above */
+
+.Lnoghcb:
 	/* Map ISA I/O mem (later atdevbase) RW, NX */
 	movl	$(IOM_BEGIN|PG_V|PG_KW/*|PG_N*/),%eax
 	movl	$(IOM_SIZE>>PGSHIFT),%ecx
@@ -600,6 +655,10 @@ store_pte:
 	fillkpt_nx
 
 	leal	(PROC0_PML4_OFF + PDIR_SLOT_DIRECT * 8)(%esi), %ebx
+	movb	RELOC((pmap_direct_rand)), %al
+	andl	$DIRECT_MAP_START_MASK, %eax
+	shll	$0x3, %eax
+	addl	%eax, %ebx
 	leal	(PROC0_DMP3_OFF)(%esi), %eax
 	orl	$(PG_V|PG_KW), %eax
 	movl	$NDML3_ENTRIES, %ecx
@@ -630,8 +689,14 @@ store_pte:
 	 */
 	movl	$MSR_EFER,%ecx
 	rdmsr
+	movl	%eax,%ebx
 	xorl	%eax,%eax	/* XXX */
 	orl	$(EFER_LME|EFER_SCE),%eax
+	/* If set, preserve LMA */
+	testl	$EFER_LMA,%ebx
+	jz	efer_nxe
+	orl	$EFER_LMA,%eax
+efer_nxe:
 	movl	RELOC((pg_nx + 4)), %ebx
 	cmpl	$0, %ebx
 	je	write_efer
@@ -738,11 +803,85 @@ longmode_hi:
 	movw	%ax,%fs
 
 	leaq	TABLESIZE(%rsi),%rdi
-	subq	$(NBPG*3), %rdi
+	subq	$(NBPG*5), %rdi
 
 	/* XXX merge these */
 	call	init_x86_64
 	call	main
+
+	.code32
+	.globl	locore_vc_trap32
+locore_vc_trap32:
+#ifdef AMDSEV
+	pushl	%eax
+	pushl	%ebx
+	pushl	%ecx
+	pushl	%edx
+
+	cmpl	$SVM_VMEXIT_DR6_WRITE, 16(%esp)
+	je	.Lskip_movdb32
+	cmpl	$SVM_VMEXIT_DR7_WRITE, 16(%esp)
+	je	.Lskip_movdb32
+
+	cmpl	$SVM_VMEXIT_CPUID, 16(%esp)
+	jne	.Lterminate32
+
+	movl	%eax, %ebx		/* save CPUID function */
+
+	movl	$0, %eax		/* request cpuid, get %eax */
+	call	vc_cpuid32
+	movl	%edx, 12(%esp)
+
+	movl	$1, %eax		/* get %ebx */
+	call	vc_cpuid32
+	movl	%edx, 8(%esp)
+
+	movl	$2, %eax		/* get %ecx */
+	call	vc_cpuid32
+	movl	%edx, 4(%esp)
+
+	movl	$3, %eax		/* get %edx */
+	call	vc_cpuid32
+	movl	%edx, 0(%esp)
+
+	popl	%edx
+	popl	%ecx
+	popl	%ebx
+	popl	%eax
+	addl	$4, %esp
+	addl	$2, (%esp)		/* skip cpuid */
+	iret
+
+.Lskip_movdb32:
+	popl	%edx
+	popl	%ecx
+	popl	%ebx
+	popl	%eax
+	addl	$4, %esp
+	addl	$3, (%esp)		/* skip mov,%db */
+	iret
+
+vc_cpuid32:
+	shll	$30, %eax		/* requested register */
+	orl	$MSR_PROTO_CPUID_REQ, %eax
+	movl	%ebx, %edx		/* CPUID function */
+	movl	$MSR_SEV_GHCB, %ecx
+	wrmsr
+	rep vmmcall
+	rdmsr
+	ret
+	lfence
+#endif	/* AMDSEV */
+	/* !AMDSEV: FALLTHROUGH and graceful termination */
+
+.Lterminate32:
+	movl	$MSR_PROTO_TERMINATION_REQ, %eax
+	movl	$MSR_SEV_GHCB, %ecx
+	wrmsr
+	rep vmmcall
+.Lterm_loop32:
+	hlt
+	jmp	.Lterm_loop32
 
 	.section .codepatch,"a"
 	.align	8, 0xcc
@@ -756,6 +895,20 @@ codepatch_end:
 	.previous
 
 	.data
+	.globl	idtlc			/* temporary locore IDT */
+idtlc:
+	.word	early_idt_end-early_idt-1
+	.long	_RELOC(early_idt)
+	.align 64, 0xcc
+
+	.globl	early_idt
+early_idt:
+	.rept	NIDT
+	.quad	0x0000000000000000
+	.quad	0x0000000000000000
+	.endr
+early_idt_end:
+
 	.globl	gdt64
 gdt64:
 	.word	gdt64_end-gdt64_start-1
@@ -775,4 +928,3 @@ farjmp64:
 	.align 8, 0xcc
 	.space 512
 tmpstk:
-

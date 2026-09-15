@@ -1,4 +1,4 @@
-﻿//===- GenericUniformAnalysis.cpp --------------------*- C++ -*------------===//
+//===- GenericUniformityImpl.h -----------------------*- C++ -*------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -33,6 +33,12 @@
 /// the propagation of the impact of divergent control flow on the divergence of
 /// values (sync dependencies).
 ///
+/// NOTE: In general, no interface exists for a transform to update
+/// (Machine)UniformityInfo. Additionally, (Machine)CycleAnalysis is a
+/// transitive dependence, but it also does not provide an interface for
+/// updating itself. Given that, transforms should not preserve uniformity in
+/// their getAnalysisUsage() callback.
+///
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_ADT_GENERICUNIFORMITYIMPL_H
@@ -40,22 +46,19 @@
 
 #include "llvm/ADT/GenericUniformityInfo.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SparseBitVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <set>
-
 #define DEBUG_TYPE "uniformity"
-
-using namespace llvm;
 
 namespace llvm {
 
-template <typename Range> auto unique(Range &&R) {
-  return std::unique(adl_begin(R), adl_end(R));
-}
+// Forward decl from llvm/CodeGen/MachineInstr.h
+class MachineInstr;
 
 /// Construct a specially modified post-order traversal of cycles.
 ///
@@ -129,11 +132,11 @@ private:
   const ContextT &Context;
 
   void computeCyclePO(const CycleInfoT &CI, const CycleT *Cycle,
-                      SmallPtrSetImpl<BlockT *> &Finalized);
+                      SmallPtrSetImpl<const BlockT *> &Finalized);
 
-  void computeStackPO(SmallVectorImpl<BlockT *> &Stack, const CycleInfoT &CI,
-                      const CycleT *Cycle,
-                      SmallPtrSetImpl<BlockT *> &Finalized);
+  void computeStackPO(SmallVectorImpl<const BlockT *> &Stack,
+                      const CycleInfoT &CI, const CycleT *Cycle,
+                      SmallPtrSetImpl<const BlockT *> &Finalized);
 };
 
 template <typename> class DivergencePropagator;
@@ -307,7 +310,7 @@ public:
   const DivergenceDescriptor &getJoinBlocks(const BlockT *DivTermBlock);
 
 private:
-  static DivergenceDescriptor EmptyDivergenceDesc;
+  static inline DivergenceDescriptor EmptyDivergenceDesc;
 
   ModifiedPO CyclePO;
 
@@ -330,6 +333,7 @@ public:
   using FunctionT = typename ContextT::FunctionT;
   using ValueRefT = typename ContextT::ValueRefT;
   using ConstValueRefT = typename ContextT::ConstValueRefT;
+  using UseT = typename ContextT::UseT;
   using InstructionT = typename ContextT::InstructionT;
   using DominatorTreeT = typename ContextT::DominatorTreeT;
 
@@ -341,11 +345,13 @@ public:
       typename SyncDependenceAnalysisT::DivergenceDescriptor;
   using BlockLabelMapT = typename SyncDependenceAnalysisT::BlockLabelMap;
 
-  GenericUniformityAnalysisImpl(const FunctionT &F, const DominatorTreeT &DT,
-                                const CycleInfoT &CI,
+  using TemporalDivergenceTuple =
+      std::tuple<ConstValueRefT, InstructionT *, const CycleT *>;
+
+  GenericUniformityAnalysisImpl(const DominatorTreeT &DT, const CycleInfoT &CI,
                                 const TargetTransformInfo *TTI)
-      : Context(CI.getSSAContext()), F(F), CI(CI), TTI(TTI), DT(DT),
-        SDA(Context, DT, CI) {}
+      : Context(CI.getSSAContext()), F(*Context.getFunction()), CI(CI),
+        TTI(TTI), DT(DT), SDA(Context, DT, CI) {}
 
   void initialize();
 
@@ -354,12 +360,16 @@ public:
   /// \brief Mark \p UniVal as a value that is always uniform.
   void addUniformOverride(const InstructionT &Instr);
 
-  /// \brief Mark \p DivVal as a value that is always divergent.
+  /// \brief Examine \p I for divergent outputs and add to the worklist.
+  void markDivergent(const InstructionT &I);
+
+  /// \brief Mark \p DivVal as a divergent value.
   /// \returns Whether the tracked divergence state of \p DivVal changed.
-  bool markDivergent(const InstructionT &I);
   bool markDivergent(ConstValueRefT DivVal);
-  bool markDefsDivergent(const InstructionT &Instr,
-                         bool AllDefsDivergent = true);
+
+  /// \brief Mark outputs of \p Instr as divergent.
+  /// \returns Whether the tracked divergence state of any output has changed.
+  bool markDefsDivergent(const InstructionT &Instr);
 
   /// \brief Propagate divergence to all instructions in the region.
   /// Divergence is seeded by calls to \p markDivergent.
@@ -384,29 +394,27 @@ public:
   /// \brief Whether \p Val is divergent at its definition.
   bool isDivergent(ConstValueRefT V) const { return DivergentValues.count(V); }
 
+  bool isDivergentUse(const UseT &U) const;
+
   bool hasDivergentTerminator(const BlockT &B) const {
     return DivergentTermBlocks.contains(&B);
   }
 
   void print(raw_ostream &out) const;
 
+  SmallVector<TemporalDivergenceTuple, 8> TemporalDivergenceList;
+
+  void recordTemporalDivergence(ConstValueRefT, const InstructionT *,
+                                const CycleT *);
+
 protected:
-  /// \brief Value/block pair representing a single phi input.
-  struct PhiInput {
-    ConstValueRefT value;
-    BlockT *predBlock;
-
-    PhiInput(ConstValueRefT value, BlockT *predBlock)
-        : value(value), predBlock(predBlock) {}
-  };
-
   const ContextT &Context;
   const FunctionT &F;
   const CycleInfoT &CI;
   const TargetTransformInfo *TTI = nullptr;
 
   // Detected/marked divergent values.
-  std::set<ConstValueRefT> DivergentValues;
+  DenseSet<ConstValueRefT> DivergentValues;
   SmallPtrSet<const BlockT *, 32> DivergentTermBlocks;
 
   // Internal worklist for divergence propagation.
@@ -448,13 +456,12 @@ private:
   void propagateCycleExitDivergence(const BlockT &DivExit,
                                     const CycleT &DivCycle);
 
-  /// \brief Internal implementation function for propagateCycleExitDivergence.
-  void analyzeCycleExitDivergence(const CycleT &OuterDivCycle);
+  /// Mark as divergent all external uses of values defined in \p DefCycle.
+  void analyzeCycleExitDivergence(const CycleT &DefCycle);
 
-  /// \brief Mark all instruction as divergent that use a value defined in \p
-  /// OuterDivCycle. Push their users on the worklist.
-  void analyzeTemporalDivergence(const InstructionT &I,
-                                 const CycleT &OuterDivCycle);
+  /// \brief Mark as divergent all uses of \p I that are outside \p DefCycle.
+  void propagateTemporalDivergence(const InstructionT &I,
+                                   const CycleT &DefCycle);
 
   /// \brief Push all users of \p Val (in the region) to the worklist.
   void pushUsers(const InstructionT &I);
@@ -462,9 +469,9 @@ private:
 
   bool usesValueFromCycle(const InstructionT &I, const CycleT &DefCycle) const;
 
-  /// \brief Whether \p Val is divergent when read in \p ObservingBlock.
+  /// \brief Whether \p Def is divergent when read in \p ObservingBlock.
   bool isTemporalDivergent(const BlockT &ObservingBlock,
-                           ConstValueRefT Val) const;
+                           const InstructionT &Def) const;
 };
 
 template <typename ImplT>
@@ -594,13 +601,28 @@ public:
     LLVM_DEBUG(dbgs() << "SDA:computeJoinPoints: "
                       << Context.print(&DivTermBlock) << "\n");
 
-    // Early stopping criterion
-    int FloorIdx = CyclePOT.size() - 1;
-    const BlockT *FloorLabel = nullptr;
     int DivTermIdx = CyclePOT.getIndex(&DivTermBlock);
+    auto const *DivTermCycle = CI.getCycle(&DivTermBlock);
+
+    // Locate the largest ancestor cycle that is not reducible and does not
+    // contain a reducible ancestor. This is done with a lambda that is defined
+    // and invoked in the same statement.
+    const CycleT *IrreducibleAncestor = [](const CycleT *C) -> const CycleT * {
+      if (!C)
+        return nullptr;
+      if (C->isReducible())
+        return nullptr;
+      while (const CycleT *P = C->getParentCycle()) {
+        if (P->isReducible())
+          return C;
+        C = P;
+      }
+      assert(!C->getParentCycle());
+      assert(!C->isReducible());
+      return C;
+    }(DivTermCycle);
 
     // Bootstrap with branch targets
-    auto const *DivTermCycle = CI.getCycle(&DivTermBlock);
     for (const auto *SuccBlock : successors(&DivTermBlock)) {
       if (DivTermCycle && !DivTermCycle->contains(SuccBlock)) {
         // If DivTerm exits the cycle immediately, computeJoin() might
@@ -610,14 +632,24 @@ public:
         LLVM_DEBUG(dbgs() << "\tImmediate divergent cycle exit: "
                           << Context.print(SuccBlock) << "\n");
       }
-      auto SuccIdx = CyclePOT.getIndex(SuccBlock);
       visitEdge(*SuccBlock, *SuccBlock);
-      FloorIdx = std::min<int>(FloorIdx, SuccIdx);
     }
 
+    // Technically propagation can continue until it reaches the last node.
+    //
+    // For efficiency, propagation can stop if FreshLabels.count()==1. But
+    // For irreducible cycles, let propagation continue until it reaches
+    // out of irreducible cycles (see code for details.)
     while (true) {
       auto BlockIdx = FreshLabels.find_last();
-      if (BlockIdx == -1 || BlockIdx < FloorIdx)
+      if (BlockIdx == -1)
+        break;
+
+      const auto *Block = CyclePOT[BlockIdx];
+      // If no irreducible cycle, stop if freshLable.count() = 1 and Block
+      // is the IPD. If it is in any irreducible cycle, continue propagation.
+      if (FreshLabels.count() == 1 &&
+          (!IrreducibleAncestor || !IrreducibleAncestor->contains(Block)))
         break;
 
       LLVM_DEBUG(dbgs() << "Current labels:\n"; printDefs(dbgs()));
@@ -628,65 +660,43 @@ public:
         continue;
       }
 
-      const auto *Block = CyclePOT[BlockIdx];
       LLVM_DEBUG(dbgs() << "visiting " << Context.print(Block) << " at index "
                         << BlockIdx << "\n");
 
       const auto *Label = BlockLabels[Block];
       assert(Label);
 
-      bool CausedJoin = false;
-      int LoweredFloorIdx = FloorIdx;
-
-      // If the current block is the header of a reducible cycle that
-      // contains the divergent branch, then the label should be
-      // propagated to the cycle exits. Such a header is the "last
-      // possible join" of any disjoint paths within this cycle. This
-      // prevents detection of spurious joins at the entries of any
-      // irreducible child cycles.
-      //
-      // This conclusion about the header is true for any choice of DFS:
+      // If the current block is the header of a reducible cycle, then the label
+      // should be propagated to the cycle exits. If this cycle contains the
+      // branch, then those exits are divergent exits. This is true for any DFS.
       //
       //   If some DFS has a reducible cycle C with header H, then for
       //   any other DFS, H is the header of a cycle C' that is a
-      //   superset of C. For a divergent branch inside the subgraph
-      //   C, any join node inside C is either H, or some node
-      //   encountered without passing through H.
+      //   superset of C.
       //
-      auto getReducibleParent = [&](const BlockT *Block) -> const CycleT * {
-        if (!CyclePOT.isReducibleCycleHeader(Block))
-          return nullptr;
+      //   - For a divergent branch inside the subgraph C, any join node inside
+      //     C is either H, or some node encountered by paths within C, without
+      //     passing through H.
+      //
+      //   - For a divergent branch outside the subgraph C, H is the only node
+      //     in C reachable from multiple paths since it is the only entry to C.
+      LLVM_DEBUG(dbgs() << "Check for reducible cycle: " << Context.print(Block)
+                        << '\n');
+      if (CyclePOT.isReducibleCycleHeader(Block)) {
         const auto *BlockCycle = CI.getCycle(Block);
-        if (BlockCycle->contains(&DivTermBlock))
-          return BlockCycle;
-        return nullptr;
-      };
-
-      if (const auto *BlockCycle = getReducibleParent(Block)) {
+        LLVM_DEBUG(dbgs() << BlockCycle->print(Context) << '\n');
         SmallVector<BlockT *, 4> BlockCycleExits;
         BlockCycle->getExitBlocks(BlockCycleExits);
+        bool BranchIsInside = BlockCycle->contains(&DivTermBlock);
         for (auto *BlockCycleExit : BlockCycleExits) {
-          CausedJoin |= visitCycleExitEdge(*BlockCycleExit, *Label);
-          LoweredFloorIdx =
-              std::min<int>(LoweredFloorIdx, CyclePOT.getIndex(BlockCycleExit));
+          if (BranchIsInside)
+            visitCycleExitEdge(*BlockCycleExit, *Label);
+          else
+            visitEdge(*BlockCycleExit, *Label);
         }
       } else {
-        for (const auto *SuccBlock : successors(Block)) {
-          CausedJoin |= visitEdge(*SuccBlock, *Label);
-          LoweredFloorIdx =
-              std::min<int>(LoweredFloorIdx, CyclePOT.getIndex(SuccBlock));
-        }
-      }
-
-      // Floor update
-      if (CausedJoin) {
-        // 1. Different labels pushed to successors
-        FloorIdx = LoweredFloorIdx;
-      } else if (FloorLabel != Label) {
-        // 2. No join caused BUT we pushed a label that is different than the
-        // last pushed label
-        FloorIdx = LoweredFloorIdx;
-        FloorLabel = Label;
+        for (const auto *SuccBlock : successors(Block))
+          visitEdge(*SuccBlock, *Label);
       }
     }
 
@@ -719,10 +729,6 @@ public:
     return std::move(DivDesc);
   }
 };
-
-template <typename ContextT>
-typename llvm::GenericSyncDependenceAnalysis<ContextT>::DivergenceDescriptor
-    llvm::GenericSyncDependenceAnalysis<ContextT>::EmptyDivergenceDesc;
 
 template <typename ContextT>
 llvm::GenericSyncDependenceAnalysis<ContextT>::GenericSyncDependenceAnalysis(
@@ -773,18 +779,23 @@ auto llvm::GenericSyncDependenceAnalysis<ContextT>::getJoinBlocks(
 }
 
 template <typename ContextT>
-bool GenericUniformityAnalysisImpl<ContextT>::markDivergent(
+void GenericUniformityAnalysisImpl<ContextT>::markDivergent(
     const InstructionT &I) {
+  if (isAlwaysUniform(I))
+    return;
+  bool Marked = false;
   if (I.isTerminator()) {
-    if (DivergentTermBlocks.insert(I.getParent()).second) {
+    Marked = DivergentTermBlocks.insert(I.getParent()).second;
+    if (Marked) {
       LLVM_DEBUG(dbgs() << "marked divergent term block: "
                         << Context.print(I.getParent()) << "\n");
-      return true;
     }
-    return false;
+  } else {
+    Marked = markDefsDivergent(I);
   }
 
-  return markDefsDivergent(I);
+  if (Marked)
+    Worklist.push_back(&I);
 }
 
 template <typename ContextT>
@@ -803,101 +814,38 @@ void GenericUniformityAnalysisImpl<ContextT>::addUniformOverride(
   UniformOverrides.insert(&Instr);
 }
 
-template <typename ContextT>
-void GenericUniformityAnalysisImpl<ContextT>::analyzeTemporalDivergence(
-    const InstructionT &I, const CycleT &OuterDivCycle) {
-  if (isDivergent(I))
-    return;
-
-  LLVM_DEBUG(dbgs() << "Analyze temporal divergence: " << Context.print(&I)
-                    << "\n");
-  if (!usesValueFromCycle(I, OuterDivCycle))
-    return;
-
-  if (isAlwaysUniform(I))
-    return;
-
-  if (markDivergent(I))
-    Worklist.push_back(&I);
-}
-
-// Mark all external users of values defined inside \param
-// OuterDivCycle as divergent.
+// Mark as divergent all external uses of values defined in \p DefCycle.
 //
-// This follows all live out edges wherever they may lead. Potential
-// users of values defined inside DivCycle could be anywhere in the
-// dominance region of DivCycle (including its fringes for phi nodes).
-// A cycle C dominates a block B iff every path from the entry block
-// to B must pass through a block contained in C. If C is a reducible
-// cycle (or natural loop), C dominates B iff the header of C
-// dominates B. But in general, we iteratively examine cycle cycle
-// exits and their successors.
+// A value V defined by a block B inside \p DefCycle may be used outside the
+// cycle only if the use is a PHI in some exit block, or B dominates some exit
+// block. Thus, we check uses as follows:
+//
+// - Check all PHIs in all exit blocks for inputs defined inside \p DefCycle.
+// - For every block B inside \p DefCycle that dominates at least one exit
+//   block, check all uses outside \p DefCycle.
+//
+// FIXME: This function does not distinguish between divergent and uniform
+// exits. For each divergent exit, only the values that are live at that exit
+// need to be propagated as divergent at their use outside the cycle.
 template <typename ContextT>
 void GenericUniformityAnalysisImpl<ContextT>::analyzeCycleExitDivergence(
-    const CycleT &OuterDivCycle) {
-  // Set of blocks that are dominated by the cycle, i.e., each is only
-  // reachable from paths that pass through the cycle.
-  SmallPtrSet<BlockT *, 16> DomRegion;
-
-  // The boundary of DomRegion, formed by blocks that are not
-  // dominated by the cycle.
-  SmallVector<BlockT *> DomFrontier;
-  OuterDivCycle.getExitBlocks(DomFrontier);
-
-  // Returns true if BB is dominated by the cycle.
-  auto isInDomRegion = [&](BlockT *BB) {
-    for (auto *P : predecessors(BB)) {
-      if (OuterDivCycle.contains(P))
-        continue;
-      if (DomRegion.count(P))
-        continue;
-      return false;
-    }
-    return true;
-  };
-
-  // Keep advancing the frontier along successor edges, while
-  // promoting blocks to DomRegion.
-  while (true) {
-    bool Promoted = false;
-    SmallVector<BlockT *> Temp;
-    for (auto *W : DomFrontier) {
-      if (!isInDomRegion(W)) {
-        Temp.push_back(W);
-        continue;
+    const CycleT &DefCycle) {
+  SmallVector<BlockT *> Exits;
+  DefCycle.getExitBlocks(Exits);
+  for (auto *Exit : Exits) {
+    for (auto &Phi : Exit->phis()) {
+      if (usesValueFromCycle(Phi, DefCycle)) {
+        markDivergent(Phi);
       }
-      DomRegion.insert(W);
-      Promoted = true;
-      for (auto *Succ : successors(W)) {
-        if (DomRegion.contains(Succ))
-          continue;
-        Temp.push_back(Succ);
-      }
-    }
-    if (!Promoted)
-      break;
-    DomFrontier = Temp;
-  }
-
-  // At DomFrontier, only the PHI nodes are affected by temporal
-  // divergence.
-  for (const auto *UserBlock : DomFrontier) {
-    LLVM_DEBUG(dbgs() << "Analyze phis after cycle exit: "
-                      << Context.print(UserBlock) << "\n");
-    for (const auto &Phi : UserBlock->phis()) {
-      LLVM_DEBUG(dbgs() << "  " << Context.print(&Phi) << "\n");
-      analyzeTemporalDivergence(Phi, OuterDivCycle);
     }
   }
 
-  // All instructions inside the dominance region are affected by
-  // temporal divergence.
-  for (const auto *UserBlock : DomRegion) {
-    LLVM_DEBUG(dbgs() << "Analyze non-phi users after cycle exit: "
-                      << Context.print(UserBlock) << "\n");
-    for (const auto &I : *UserBlock) {
-      LLVM_DEBUG(dbgs() << "  " << Context.print(&I) << "\n");
-      analyzeTemporalDivergence(I, OuterDivCycle);
+  for (auto *BB : DefCycle.blocks()) {
+    if (!llvm::any_of(Exits,
+                     [&](BlockT *Exit) { return DT.dominates(BB, Exit); }))
+      continue;
+    for (auto &II : *BB) {
+      propagateTemporalDivergence(II, DefCycle);
     }
   }
 }
@@ -947,12 +895,7 @@ void GenericUniformityAnalysisImpl<ContextT>::taintAndPushAllDefs(
     if (I.isTerminator())
       break;
 
-    // Mark this as divergent. We don't check if the instruction is
-    // always uniform. In a cycle where the thread convergence is not
-    // statically known, the instruction is not statically converged,
-    // and its outputs cannot be statically uniform.
-    if (markDivergent(I))
-      Worklist.push_back(&I);
+    markDivergent(I);
   }
 }
 
@@ -963,10 +906,16 @@ void GenericUniformityAnalysisImpl<ContextT>::taintAndPushPhiNodes(
   LLVM_DEBUG(dbgs() << "taintAndPushPhiNodes in " << Context.print(&JoinBlock)
                     << "\n");
   for (const auto &Phi : JoinBlock.phis()) {
-    if (ContextT::isConstantValuePhi(Phi))
+    // FIXME: The non-undef value is not constant per se; it just happens to be
+    // uniform and may not dominate this PHI. So assuming that the same value
+    // reaches along all incoming edges may itself be undefined behaviour. This
+    // particular interpretation of the undef value was added to
+    // DivergenceAnalysis in the following review:
+    //
+    // https://reviews.llvm.org/D19013
+    if (ContextT::isConstantOrUndefValuePhi(Phi))
       continue;
-    if (markDivergent(Phi))
-      Worklist.push_back(&Phi);
+    markDivergent(Phi);
   }
 }
 
@@ -998,19 +947,22 @@ static const CycleT *getExtDivCycle(const CycleT *Cycle,
   if (Cycle->contains(DivTermBlock))
     return nullptr;
 
+  const auto *OriginalCycle = Cycle;
+  const auto *Parent = Cycle->getParentCycle();
+  while (Parent && !Parent->contains(DivTermBlock)) {
+    Cycle = Parent;
+    Parent = Cycle->getParentCycle();
+  }
+
+  // If the original cycle is not the outermost cycle, then the outermost cycle
+  // is irreducible. If the outermost cycle were reducible, then external
+  // diverged paths would not reach the original inner cycle.
+  (void)OriginalCycle;
+  assert(Cycle == OriginalCycle || !Cycle->isReducible());
+
   if (Cycle->isReducible()) {
     assert(Cycle->getHeader() == JoinBlock);
     return nullptr;
-  }
-
-  const auto *Parent = Cycle->getParentCycle();
-  while (Parent && !Parent->contains(DivTermBlock)) {
-    // If the join is inside a child, then the parent must be
-    // irreducible. The only join in a reducible cyle is its own
-    // header.
-    assert(!Parent->isReducible());
-    Cycle = Parent;
-    Parent = Cycle->getParentCycle();
   }
 
   LLVM_DEBUG(dbgs() << "cycle made divergent by external branch\n");
@@ -1028,7 +980,7 @@ getIntDivCycle(const CycleT *Cycle, const BlockT *DivTermBlock,
                const BlockT *JoinBlock, const DominatorTreeT &DT,
                ContextT &Context) {
   LLVM_DEBUG(dbgs() << "examine join " << Context.print(JoinBlock)
-                    << "for internal branch " << Context.print(DivTermBlock)
+                    << " for internal branch " << Context.print(DivTermBlock)
                     << "\n");
   if (DT.properlyDominates(DivTermBlock, JoinBlock))
     return nullptr;
@@ -1078,6 +1030,20 @@ getOutermostDivergentCycle(const CycleT *Cycle, const BlockT *DivTermBlock,
   if (Int)
     return Int;
   return Ext;
+}
+
+template <typename ContextT>
+bool GenericUniformityAnalysisImpl<ContextT>::isTemporalDivergent(
+    const BlockT &ObservingBlock, const InstructionT &Def) const {
+  const BlockT *DefBlock = Def.getParent();
+  for (const CycleT *Cycle = CI.getCycle(DefBlock);
+       Cycle && !Cycle->contains(&ObservingBlock);
+       Cycle = Cycle->getParentCycle()) {
+    if (DivergentExitCycles.contains(Cycle)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 template <typename ContextT>
@@ -1165,6 +1131,13 @@ void GenericUniformityAnalysisImpl<ContextT>::compute() {
 }
 
 template <typename ContextT>
+void GenericUniformityAnalysisImpl<ContextT>::recordTemporalDivergence(
+    ConstValueRefT Val, const InstructionT *User, const CycleT *Cycle) {
+  TemporalDivergenceList.emplace_back(Val, const_cast<InstructionT *>(User),
+                                      Cycle);
+}
+
+template <typename ContextT>
 bool GenericUniformityAnalysisImpl<ContextT>::isAlwaysUniform(
     const InstructionT &Instr) const {
   return UniformOverrides.contains(&Instr);
@@ -1172,21 +1145,26 @@ bool GenericUniformityAnalysisImpl<ContextT>::isAlwaysUniform(
 
 template <typename ContextT>
 GenericUniformityInfo<ContextT>::GenericUniformityInfo(
-    FunctionT &Func, const DominatorTreeT &DT, const CycleInfoT &CI,
-    const TargetTransformInfo *TTI)
-    : F(&Func) {
-  DA.reset(new ImplT{Func, DT, CI, TTI});
-  DA->initialize();
-  DA->compute();
+    const DominatorTreeT &DT, const CycleInfoT &CI,
+    const TargetTransformInfo *TTI) {
+  DA.reset(new ImplT{DT, CI, TTI});
 }
 
 template <typename ContextT>
 void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
   bool haveDivergentArgs = false;
 
-  if (DivergentValues.empty()) {
-    assert(DivergentTermBlocks.empty());
-    assert(DivergentExitCycles.empty());
+  // When we print Value, LLVM IR instruction, we want to print extra new line.
+  // In LLVM IR print function for Value does not print new line at the end.
+  // In MIR print for MachineInstr prints new line at the end.
+  constexpr bool IsMIR = std::is_same<InstructionT, MachineInstr>::value;
+  std::string NewLine = IsMIR ? "" : "\n";
+
+  // Control flow instructions may be divergent even if their inputs are
+  // uniform. Thus, although exceedingly rare, it is possible to have a program
+  // with no divergent values but with divergent control structures.
+  if (DivergentValues.empty() && DivergentTermBlocks.empty() &&
+      DivergentExitCycles.empty()) {
     OS << "ALL VALUES UNIFORM\n";
     return;
   }
@@ -1203,7 +1181,7 @@ void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
   }
 
   if (!AssumedDivergent.empty()) {
-    OS << "CYCLES ASSSUMED DIVERGENT:\n";
+    OS << "CYCLES ASSUMED DIVERGENT:\n";
     for (const CycleT *cycle : AssumedDivergent) {
       OS << "  " << cycle->print(Context) << '\n';
     }
@@ -1213,6 +1191,16 @@ void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
     OS << "CYCLES WITH DIVERGENT EXIT:\n";
     for (const CycleT *cycle : DivergentExitCycles) {
       OS << "  " << cycle->print(Context) << '\n';
+    }
+  }
+
+  if (!TemporalDivergenceList.empty()) {
+    OS << "\nTEMPORAL DIVERGENCE LIST:\n";
+
+    for (auto [Val, UseInst, Cycle] : TemporalDivergenceList) {
+      OS << "Value         :" << Context.print(Val) << NewLine
+         << "Used by       :" << Context.print(UseInst) << NewLine
+         << "Outside cycle :" << Cycle->print(Context) << "\n\n";
     }
   }
 
@@ -1227,7 +1215,7 @@ void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
         OS << "  DIVERGENT: ";
       else
         OS << "             ";
-      OS << Context.print(value) << '\n';
+      OS << Context.print(value) << NewLine;
     }
 
     OS << "TERMINATORS\n";
@@ -1239,7 +1227,7 @@ void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
         OS << "  DIVERGENT: ";
       else
         OS << "             ";
-      OS << Context.print(T) << '\n';
+      OS << Context.print(T) << NewLine;
     }
 
     OS << "END BLOCK\n";
@@ -1247,14 +1235,38 @@ void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
 }
 
 template <typename ContextT>
+iterator_range<
+    typename GenericUniformityInfo<ContextT>::TemporalDivergenceTuple *>
+GenericUniformityInfo<ContextT>::getTemporalDivergenceList() const {
+  return make_range(DA->TemporalDivergenceList.begin(),
+                    DA->TemporalDivergenceList.end());
+}
+
+template <typename ContextT>
 bool GenericUniformityInfo<ContextT>::hasDivergence() const {
   return DA->hasDivergence();
+}
+
+template <typename ContextT>
+const typename ContextT::FunctionT &
+GenericUniformityInfo<ContextT>::getFunction() const {
+  return DA->getFunction();
 }
 
 /// Whether \p V is divergent at its definition.
 template <typename ContextT>
 bool GenericUniformityInfo<ContextT>::isDivergent(ConstValueRefT V) const {
   return DA->isDivergent(V);
+}
+
+template <typename ContextT>
+bool GenericUniformityInfo<ContextT>::isDivergent(const InstructionT *I) const {
+  return DA->isDivergent(*I);
+}
+
+template <typename ContextT>
+bool GenericUniformityInfo<ContextT>::isDivergentUse(const UseT &U) const {
+  return DA->isDivergentUse(U);
 }
 
 template <typename ContextT>
@@ -1270,8 +1282,8 @@ void GenericUniformityInfo<ContextT>::print(raw_ostream &out) const {
 
 template <typename ContextT>
 void llvm::ModifiedPostOrder<ContextT>::computeStackPO(
-    SmallVectorImpl<BlockT *> &Stack, const CycleInfoT &CI, const CycleT *Cycle,
-    SmallPtrSetImpl<BlockT *> &Finalized) {
+    SmallVectorImpl<const BlockT *> &Stack, const CycleInfoT &CI,
+    const CycleT *Cycle, SmallPtrSetImpl<const BlockT *> &Finalized) {
   LLVM_DEBUG(dbgs() << "inside computeStackPO\n");
   while (!Stack.empty()) {
     auto *NextBB = Stack.back();
@@ -1340,9 +1352,9 @@ void llvm::ModifiedPostOrder<ContextT>::computeStackPO(
 template <typename ContextT>
 void ModifiedPostOrder<ContextT>::computeCyclePO(
     const CycleInfoT &CI, const CycleT *Cycle,
-    SmallPtrSetImpl<BlockT *> &Finalized) {
+    SmallPtrSetImpl<const BlockT *> &Finalized) {
   LLVM_DEBUG(dbgs() << "inside computeCyclePO\n");
-  SmallVector<BlockT *> Stack;
+  SmallVector<const BlockT *> Stack;
   auto *CycleHeader = Cycle->getHeader();
 
   LLVM_DEBUG(dbgs() << "  noted header: "
@@ -1379,11 +1391,11 @@ void ModifiedPostOrder<ContextT>::computeCyclePO(
 /// \brief Generically compute the modified post order.
 template <typename ContextT>
 void llvm::ModifiedPostOrder<ContextT>::compute(const CycleInfoT &CI) {
-  SmallPtrSet<BlockT *, 32> Finalized;
-  SmallVector<BlockT *> Stack;
+  SmallPtrSet<const BlockT *, 32> Finalized;
+  SmallVector<const BlockT *> Stack;
   auto *F = CI.getFunction();
   Stack.reserve(24); // FIXME made-up number
-  Stack.push_back(GraphTraits<FunctionT *>::getEntryNode(F));
+  Stack.push_back(&F->front());
   computeStackPO(Stack, CI, nullptr, Finalized);
 }
 

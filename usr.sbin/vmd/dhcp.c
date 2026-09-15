@@ -1,4 +1,4 @@
-/*	$OpenBSD: dhcp.c,v 1.13 2023/07/13 18:31:59 dv Exp $	*/
+/*	$OpenBSD: dhcp.c,v 1.15 2026/01/14 03:09:05 dv Exp $	*/
 
 /*
  * Copyright (c) 2017 Reyk Floeter <reyk@openbsd.org>
@@ -17,7 +17,6 @@
  */
 
 #include <sys/types.h>
-#include <sys/socket.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
@@ -140,13 +139,13 @@ dhcp_request(struct virtio_dev *dev, char *buf, size_t buflen, char **obuf)
 
 	if (vionet->pxeboot) {
 		strlcpy(resp.file, "auto_install", sizeof resp.file);
-		vm = vm_getbyvmid(dev->vm_vmid);
-		if (vm && res_hnok(vm->vm_params.vmc_params.vcp_name))
-			hostname = vm->vm_params.vmc_params.vcp_name;
+		vm = vm_getbyid(dev->vmm_id);
+		if (vm && res_hnok(vm->vm_params.vmc_name))
+			hostname = vm->vm_params.vmc_name;
 	}
 
 	if ((client_addr.s_addr = vm_priv_addr(&vionet->local_prefix,
-	    dev->vm_vmid, vionet->idx, 1)) == 0)
+	    dev->vm_id, vionet->idx, 1)) == 0)
 		return (-1);
 	memcpy(&resp.yiaddr, &client_addr,
 	    sizeof(client_addr));
@@ -155,7 +154,7 @@ dhcp_request(struct virtio_dev *dev, char *buf, size_t buflen, char **obuf)
 	ss2sin(&pc.pc_dst)->sin_port = htons(CLIENT_PORT);
 
 	if ((server_addr.s_addr = vm_priv_addr(&vionet->local_prefix,
-	    dev->vm_vmid, vionet->idx, 0)) == 0)
+	    dev->vm_id, vionet->idx, 0)) == 0)
 		return (-1);
 	memcpy(&resp.siaddr, &server_addr, sizeof(server_addr));
 	memcpy(&ss2sin(&pc.pc_src)->sin_addr, &server_addr,

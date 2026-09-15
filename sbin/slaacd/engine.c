@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.91 2024/07/13 16:06:34 florian Exp $	*/
+/*	$OpenBSD: engine.c,v 1.105 2026/08/04 12:48:01 claudio Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -242,7 +242,7 @@ void			 engine_dispatch_frontend(int, short, void *);
 void			 engine_dispatch_main(int, short, void *);
 #ifndef	SMALL
 void			 send_interface_info(struct slaacd_iface *, pid_t);
-void			 engine_showinfo_ctl(struct imsg *, uint32_t);
+void			 engine_showinfo_ctl(pid_t, uint32_t);
 void			 debug_log_ra(struct imsg_ra *);
 int			 in6_mask2prefixlen(struct in6_addr *);
 #endif	/* SMALL */
@@ -396,7 +396,9 @@ engine(int debug, int verbose)
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
 
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = engine_dispatch_main;
 
 	/* Setup event handlers. */
@@ -416,9 +418,9 @@ __dead void
 engine_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	free(iev_frontend);
@@ -457,62 +459,63 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsg_del_addr		 del_addr;
 	struct imsg_del_route		 del_route;
 	struct imsg_dup_addr		 dup_addr;
-	ssize_t				 n;
-	int				 shut = 0;
+	int				 n, shut = 0;
 #ifndef	SMALL
 	int				 verbose;
 #endif	/* SMALL */
-	uint32_t			 if_index;
+	uint32_t			 if_index, type;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+
+		switch (type) {
 #ifndef	SMALL
 		case IMSG_CTL_LOG_VERBOSE:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(verbose))
-				fatalx("%s: IMSG_CTL_LOG_VERBOSE wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&verbose, imsg.data, sizeof(verbose));
+			if (imsg_get_data(&imsg, &verbose,
+			    sizeof(verbose)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			log_setverbose(verbose);
 			break;
 		case IMSG_CTL_SHOW_INTERFACE_INFO:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(if_index))
-				fatalx("%s: IMSG_CTL_SHOW_INTERFACE_INFO wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&if_index, imsg.data, sizeof(if_index));
-			engine_showinfo_ctl(&imsg, if_index);
+			if (imsg_get_data(&imsg, &if_index,
+			    sizeof(if_index)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
+			engine_showinfo_ctl(imsg_get_pid(&imsg), if_index);
 			break;
 #endif	/* SMALL */
 		case IMSG_REMOVE_IF:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(if_index))
-				fatalx("%s: IMSG_REMOVE_IF wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&if_index, imsg.data, sizeof(if_index));
+			if (imsg_get_data(&imsg, &if_index,
+			    sizeof(if_index)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			remove_slaacd_iface(if_index);
 			break;
 		case IMSG_RA:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(ra))
-				fatalx("%s: IMSG_RA wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&ra, imsg.data, sizeof(ra));
+			if (imsg_get_data(&imsg, &ra, sizeof(ra)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			iface = get_slaacd_iface_by_id(ra.if_index);
 
 			/*
@@ -524,11 +527,10 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 				parse_ra(iface, &ra);
 			break;
 		case IMSG_CTL_SEND_SOLICITATION:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(if_index))
-				fatalx("%s: IMSG_CTL_SEND_SOLICITATION wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&if_index, imsg.data, sizeof(if_index));
+			if (imsg_get_data(&imsg, &if_index,
+			    sizeof(if_index)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			iface = get_slaacd_iface_by_id(if_index);
 			if (iface == NULL)
 				log_warnx("requested to send solicitation on "
@@ -539,10 +541,10 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 			}
 			break;
 		case IMSG_DEL_ADDRESS:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(del_addr))
-				fatalx("%s: IMSG_DEL_ADDRESS wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&del_addr, imsg.data, sizeof(del_addr));
+			if (imsg_get_data(&imsg, &del_addr,
+			    sizeof(del_addr)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			iface = get_slaacd_iface_by_id(del_addr.if_index);
 			if (iface == NULL) {
 				log_debug("IMSG_DEL_ADDRESS: unknown interface"
@@ -562,10 +564,10 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 				free_address_proposal(addr_proposal);
 			break;
 		case IMSG_DEL_ROUTE:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(del_route))
-				fatalx("%s: IMSG_DEL_ROUTE wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&del_route, imsg.data, sizeof(del_route));
+			if (imsg_get_data(&imsg, &del_route,
+			    sizeof(del_route)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			iface = get_slaacd_iface_by_id(del_route.if_index);
 			if (iface == NULL) {
 				log_debug("IMSG_DEL_ROUTE: unknown interface"
@@ -582,10 +584,10 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 			}
 			break;
 		case IMSG_DUP_ADDRESS:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(dup_addr))
-				fatalx("%s: IMSG_DUP_ADDRESS wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&dup_addr, imsg.data, sizeof(dup_addr));
+			if (imsg_get_data(&imsg, &dup_addr,
+			    sizeof(dup_addr)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			iface = get_slaacd_iface_by_id(dup_addr.if_index);
 			if (iface == NULL) {
 				log_debug("IMSG_DUP_ADDRESS: unknown interface"
@@ -606,8 +608,7 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 				    iface->rdomain);
 			break;
 		default:
-			log_debug("%s: unexpected imsg %d", __func__,
-			    imsg.hdr.type);
+			log_debug("%s: unexpected imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -628,29 +629,33 @@ engine_dispatch_main(int fd, short event, void *bula)
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg_ifinfo	 imsg_ifinfo;
-	ssize_t			 n;
-	int			 shut = 0;
+	uint32_t		 type;
+	int			 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+
+		switch (type) {
 		case IMSG_SOCKET_IPC:
 			/*
 			 * Setup pipe and event handler to the frontend
@@ -668,7 +673,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 			if (iev_frontend == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_frontend->ibuf, fd);
+			if (imsgbuf_init(&iev_frontend->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_frontend->handler = engine_dispatch_frontend;
 			iev_frontend->events = EV_READ;
 
@@ -681,15 +687,14 @@ engine_dispatch_main(int fd, short event, void *bula)
 				fatal("pledge");
 			break;
 		case IMSG_UPDATE_IF:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_ifinfo))
-				fatalx("%s: IMSG_UPDATE_IF wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&imsg_ifinfo, imsg.data, sizeof(imsg_ifinfo));
+			if (imsg_get_data(&imsg, &imsg_ifinfo,
+			    sizeof(imsg_ifinfo)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			engine_update_iface(&imsg_ifinfo);
 			break;
 		default:
-			log_debug("%s: unexpected imsg %d", __func__,
-			    imsg.hdr.type);
+			log_debug("%s: unexpected imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -862,26 +867,18 @@ send_interface_info(struct slaacd_iface *iface, pid_t pid)
 }
 
 void
-engine_showinfo_ctl(struct imsg *imsg, uint32_t if_index)
+engine_showinfo_ctl(pid_t pid, uint32_t if_index)
 {
 	struct slaacd_iface			*iface;
 
-	switch (imsg->hdr.type) {
-	case IMSG_CTL_SHOW_INTERFACE_INFO:
-		if (if_index == 0) {
-			LIST_FOREACH (iface, &slaacd_interfaces, entries)
-				send_interface_info(iface, imsg->hdr.pid);
-		} else {
-			if ((iface = get_slaacd_iface_by_id(if_index)) != NULL)
-				send_interface_info(iface, imsg->hdr.pid);
-		}
-		engine_imsg_compose_frontend(IMSG_CTL_END, imsg->hdr.pid, NULL,
-		    0);
-		break;
-	default:
-		log_debug("%s: error handling imsg", __func__);
-		break;
+	if (if_index == 0) {
+		LIST_FOREACH (iface, &slaacd_interfaces, entries)
+			send_interface_info(iface, pid);
+	} else {
+		if ((iface = get_slaacd_iface_by_id(if_index)) != NULL)
+			send_interface_info(iface, pid);
 	}
+	engine_imsg_compose_frontend(IMSG_CTL_END, pid, NULL, 0);
 }
 
 #endif	/* SMALL */
@@ -1475,6 +1472,8 @@ parse_ra(struct slaacd_iface *iface, struct imsg_ra *ra)
 		struct in6_addr *in6;
 		int i;
 
+		if (nd_opt_hdr->nd_opt_len == 0)
+			goto err;
 		len -= sizeof(struct nd_opt_hdr);
 		p += sizeof(struct nd_opt_hdr);
 
@@ -1492,10 +1491,17 @@ parse_ra(struct slaacd_iface *iface, struct imsg_ra *ra)
 				goto err;
 			}
 
+			prf = (struct nd_opt_prefix_info*) nd_opt_hdr;
+
+			if (prf->nd_opt_pi_prefix_len > 128) {
+				log_debug("%s: invalid prefix length(%d)",
+				    __func__, prf->nd_opt_pi_prefix_len);
+				goto err;
+			}
+
 			if ((prefix = calloc(1, sizeof(*prefix))) == NULL)
 				fatal("calloc");
 
-			prf = (struct nd_opt_prefix_info*) nd_opt_hdr;
 			prefix->prefix = prf->nd_opt_pi_prefix;
 			prefix->prefix_len = prf->nd_opt_pi_prefix_len;
 			prefix->onlink = prf->nd_opt_pi_flags_reserved &
@@ -1646,8 +1652,10 @@ in6_prefixlen2mask(struct in6_addr *maskp, int len)
 	u_char maskarray[8] = {0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff};
 	int bytelen, bitlen, i;
 
-	if (0 > len || len > 128)
-		fatalx("%s: invalid prefix length(%d)\n", __func__, len);
+	if (0 > len || len > 128) {
+		log_debug("%s: invalid prefix length(%d)", __func__, len);
+		len = 128;
+	}
 
 	bzero(maskp, sizeof(*maskp));
 	bytelen = len / 8;
@@ -1761,6 +1769,8 @@ debug_log_ra(struct imsg_ra *ra)
 		struct in6_addr *in6;
 		int i;
 
+		if (nd_opt_hdr->nd_opt_len == 0)
+			return;
 		len -= sizeof(struct nd_opt_hdr);
 		p += sizeof(struct nd_opt_hdr);
 		if (nd_opt_hdr->nd_opt_len * 8 - 2 > len) {
@@ -2082,7 +2092,7 @@ update_iface_ra_rdns(struct slaacd_iface *iface, struct radv *ra)
 	LIST_FOREACH(radv_rdns, &ra->rdns_servers, entries) {
 		memcpy(&rdns[rdns_count++],
 		    &radv_rdns->rdns, sizeof(struct in6_addr));
-		if (rdns_proposal->rdns_count == MAX_RDNS_COUNT)
+		if (rdns_count == MAX_RDNS_COUNT)
 			break;
 	}
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpicmos.c,v 1.2 2022/04/06 18:59:27 naddy Exp $	*/
+/*	$OpenBSD: acpicmos.c,v 1.4 2025/11/06 21:23:33 kettenis Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis
  *
@@ -37,7 +37,7 @@ const struct cfattach acpicmos_ca = {
 };
 
 struct cfdriver acpicmos_cd = {
-	NULL, "acpicmos", DV_DULL
+	NULL, "acpicmos", DV_DULL, CD_COCOVM
 };
 
 const char *acpicmos_hids[] = {
@@ -84,7 +84,6 @@ acpicmos_opreg_handler(void *cookie, int iodir, uint64_t address, int size,
 		*value = mc146818_read(NULL, address);
 	else
 		mc146818_write(NULL, address, *value);
-
 
 	return 0;
 }

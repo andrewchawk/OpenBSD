@@ -1,4 +1,4 @@
-/*	$OpenBSD: qcpas.c,v 1.6 2024/08/05 18:36:28 kettenis Exp $	*/
+/*	$OpenBSD: qcpas.c,v 1.14 2026/09/08 13:56:53 kettenis Exp $	*/
 /*
  * Copyright (c) 2023 Patrick Wildt <patrick@blueri.se>
  *
@@ -36,6 +36,11 @@
 #include <dev/ofw/fdt.h>
 
 #include "apm.h"
+
+#if NAPM > 0
+struct apm_power_info qcpas_pmic_rtr_apm_power_info;
+void *qcpas_pmic_rtr_apm_cookie;
+#endif
 
 extern int qcscm_pas_init_image(uint32_t, paddr_t);
 extern int qcscm_pas_mem_setup(uint32_t, paddr_t, size_t);
@@ -80,6 +85,7 @@ struct qcpas_softc {
 	uint32_t		sc_dtb_pas_id;
 	uint32_t		sc_lite_pas_id;
 	char			*sc_load_state;
+	int			sc_chg_ctrl;
 
 	struct qcpas_dmamem	*sc_metadata[2];
 
@@ -110,14 +116,17 @@ struct qcpas_softc {
 	uint32_t		sc_low_capacity;
 	struct ksensor		sc_sens[11];
 	struct ksensordev	sc_sensdev;
+	struct sensor_task	*sc_senstask;
 #endif
 };
 
 int	qcpas_match(struct device *, void *, void *);
 void	qcpas_attach(struct device *, struct device *, void *);
+int	qcpas_activate(struct device *, int);
 
 const struct cfattach qcpas_ca = {
-	sizeof (struct qcpas_softc), qcpas_match, qcpas_attach
+	sizeof (struct qcpas_softc), qcpas_match, qcpas_attach,
+	NULL, qcpas_activate
 };
 
 struct cfdriver qcpas_cd = {
@@ -126,8 +135,10 @@ struct cfdriver qcpas_cd = {
 
 void	qcpas_mountroot(struct device *);
 int	qcpas_map_memory(struct qcpas_softc *);
+int	qcpas_init(struct qcpas_softc *sc);
 int	qcpas_mdt_init(struct qcpas_softc *, int, u_char *, size_t);
 void	qcpas_glink_attach(struct qcpas_softc *, int);
+void	qcpas_glink_detach(struct qcpas_softc *);
 
 struct qcpas_dmamem *
 	qcpas_dmamem_alloc(struct qcpas_softc *, bus_size_t, bus_size_t);
@@ -186,6 +197,7 @@ qcpas_attach(struct device *parent, struct device *self, void *aux)
 		sc->sc_dtb_pas_id = 36;
 		sc->sc_lite_pas_id = 31;
 		sc->sc_load_state = "adsp";
+		sc->sc_chg_ctrl = 1;
 	}
 
 	qcpas_intr_establish(sc, 0, "wdog", qcpas_intr_wdog);
@@ -200,82 +212,48 @@ qcpas_attach(struct device *parent, struct device *self, void *aux)
 	config_mountroot(self, qcpas_mountroot);
 }
 
+int
+qcpas_activate(struct device *self, int act)
+{
+#ifdef SUSPEND
+	struct qcpas_softc *sc = (struct qcpas_softc *)self;
+	int node;
+
+	switch (act) {
+	case DVACT_QUIESCE:
+		if (sleep_mode == SLEEP_HIBERNATE) {
+			node = OF_getnodebyname(sc->sc_node, "glink-edge");
+			if (node)
+				qcpas_glink_detach(sc);
+		}
+		break;
+	case DVACT_WAKEUP:
+		if (sleep_mode == SLEEP_HIBERNATE) {
+			qcpas_init(sc);
+			node = OF_getnodebyname(sc->sc_node, "glink-edge");
+			if (node)
+				qcpas_glink_attach(sc, node);
+		}
+		break;
+	}
+#endif
+
+	return 0;
+}
+
 extern int qcaoss_send(char *, size_t);
 
 void
 qcpas_mountroot(struct device *self)
 {
 	struct qcpas_softc *sc = (struct qcpas_softc *)self;
-	char fwname[128];
-	size_t fwlen, dtb_fwlen;
-	u_char *fw, *dtb_fw;
-	int node, ret;
-	int error;
+	int node;
 
 	if (qcpas_map_memory(sc) != 0)
 		return;
 
-	if (OF_getproplen(sc->sc_node, "firmware-name") <= 0)
+	if (qcpas_init(sc))
 		return;
-	OF_getprop(sc->sc_node, "firmware-name", fwname, sizeof(fwname));
-	fwname[sizeof(fwname) - 1] = '\0';
-
-	/* If we need a second firmware, make sure we have a name for it. */
-	if (sc->sc_dtb_pas_id && strlen(fwname) == sizeof(fwname) - 1)
-		return;
-
-	error = loadfirmware(fwname, &fw, &fwlen);
-	if (error) {
-		printf("%s: failed to load %s: %d\n",
-		    sc->sc_dev.dv_xname, fwname, error);
-		return;
-	}
-
-	if (sc->sc_lite_pas_id) {
-		if (qcscm_pas_shutdown(sc->sc_lite_pas_id)) {
-			printf("%s: failed to shutdown lite firmware\n",
-			    sc->sc_dev.dv_xname);
-		}
-	}
-
-	if (sc->sc_dtb_pas_id) {
-		error = loadfirmware(fwname + strlen(fwname) + 1,
-		    &dtb_fw, &dtb_fwlen);
-		if (error) {
-			printf("%s: failed to load %s: %d\n",
-			    sc->sc_dev.dv_xname, fwname, error);
-			return;
-		}
-	}
-
-	if (sc->sc_load_state) {
-		char buf[64];
-		snprintf(buf, sizeof(buf),
-		    "{class: image, res: load_state, name: %s, val: on}",
-		    sc->sc_load_state);
-		ret = qcaoss_send(buf, sizeof(buf));
-		if (ret != 0) {
-			printf("%s: failed to toggle load state\n",
-			    sc->sc_dev.dv_xname);
-			return;
-		}
-	}
-
-	power_domain_enable_all(sc->sc_node);
-	clock_enable(sc->sc_node, "xo");
-
-	if (sc->sc_dtb_pas_id) {
-		qcpas_mdt_init(sc, sc->sc_dtb_pas_id, dtb_fw, dtb_fwlen);
-		free(dtb_fw, M_DEVBUF, dtb_fwlen);
-	}
-
-	ret = qcpas_mdt_init(sc, sc->sc_pas_id, fw, fwlen);
-	free(fw, M_DEVBUF, fwlen);
-	if (ret != 0) {
-		printf("%s: failed to boot coprocessor\n",
-		    sc->sc_dev.dv_xname);
-		return;
-	}
 
 	node = OF_getnodebyname(sc->sc_node, "glink-edge");
 	if (node)
@@ -392,6 +370,80 @@ qcpas_map_memory(struct qcpas_softc *sc)
 			    sc->sc_mem_phys[i] + off, PROT_READ | PROT_WRITE,
 			    PMAP_CACHE_DEV_NGNRNE);
 		}
+	}
+
+	return 0;
+}
+
+int
+qcpas_init(struct qcpas_softc *sc)
+{
+	char fwname[128];
+	size_t fwlen, dtb_fwlen;
+	u_char *fw, *dtb_fw;
+	int error, ret;
+
+	if (OF_getproplen(sc->sc_node, "firmware-name") <= 0)
+		return EINVAL;
+	OF_getprop(sc->sc_node, "firmware-name", fwname, sizeof(fwname));
+	fwname[sizeof(fwname) - 1] = '\0';
+
+	/* If we need a second firmware, make sure we have a name for it. */
+	if (sc->sc_dtb_pas_id && strlen(fwname) == sizeof(fwname) - 1)
+		return EINVAL;
+
+	error = loadfirmware(fwname, &fw, &fwlen);
+	if (error) {
+		printf("%s: failed to load %s: %d\n",
+		    sc->sc_dev.dv_xname, fwname, error);
+		return error;
+	}
+
+	if (sc->sc_lite_pas_id) {
+		if (qcscm_pas_shutdown(sc->sc_lite_pas_id)) {
+			printf("%s: failed to shutdown lite firmware\n",
+			    sc->sc_dev.dv_xname);
+		}
+	}
+
+	if (sc->sc_dtb_pas_id) {
+		error = loadfirmware(fwname + strlen(fwname) + 1,
+		    &dtb_fw, &dtb_fwlen);
+		if (error) {
+			printf("%s: failed to load %s: %d\n",
+			    sc->sc_dev.dv_xname, fwname + strlen(fwname) + 1,
+			    error);
+			return error;
+		}
+	}
+
+	if (sc->sc_load_state) {
+		char buf[64];
+		snprintf(buf, sizeof(buf),
+		    "{class: image, res: load_state, name: %s, val: on}",
+		    sc->sc_load_state);
+		ret = qcaoss_send(buf, sizeof(buf));
+		if (ret != 0) {
+			printf("%s: failed to toggle load state\n",
+			    sc->sc_dev.dv_xname);
+			return EIO;
+		}
+	}
+
+	power_domain_enable_all(sc->sc_node);
+	clock_enable(sc->sc_node, "xo");
+
+	if (sc->sc_dtb_pas_id) {
+		qcpas_mdt_init(sc, sc->sc_dtb_pas_id, dtb_fw, dtb_fwlen);
+		free(dtb_fw, M_DEVBUF, dtb_fwlen);
+	}
+
+	ret = qcpas_mdt_init(sc, sc->sc_pas_id, fw, fwlen);
+	free(fw, M_DEVBUF, fwlen);
+	if (ret != 0) {
+		printf("%s: failed to boot coprocessor\n",
+		    sc->sc_dev.dv_xname);
+		return EIO;
 	}
 
 	return 0;
@@ -727,6 +779,9 @@ qcpas_glink_attach(struct qcpas_softc *sc, int node)
 	sc->sc_rx_tail = &descs[2];
 	sc->sc_rx_head = &descs[3];
 
+	sc->sc_tx_off = 0;
+	sc->sc_rx_off = 0;
+
 	sc->sc_tx_fifo = qcsmem_get(remote, SMEM_GLINK_NATIVE_XPRT_FIFO_0,
 	    &sc->sc_tx_fifolen);
 	if (sc->sc_tx_fifo == NULL)
@@ -749,6 +804,43 @@ qcpas_glink_attach(struct qcpas_softc *sc, int node)
 		return;
 
 	/* Expect peer to send initial message */
+}
+
+void
+qcpas_glink_detach(struct qcpas_softc *sc)
+{
+	struct qcpas_glink_channel *ch;
+	struct qcpas_glink_intent *it;
+
+#if NAPM > 0
+	qcpas_pmic_rtr_apm_cookie = NULL;
+#endif
+
+#ifndef SMALL_KERNEL
+	if (sc->sc_senstask)
+		sensor_task_unregister(sc->sc_senstask);
+#endif
+
+	if (sc->sc_glink_ih) {
+		fdt_intr_disestablish(sc->sc_glink_ih);
+		sc->sc_glink_ih = NULL;
+
+		task_del(systq, &sc->sc_glink_rx);
+	}
+
+	while ((ch = TAILQ_FIRST(&sc->sc_glink_channels))) {
+		TAILQ_REMOVE(&sc->sc_glink_channels, ch, ch_q);
+		while ((it = TAILQ_FIRST(&ch->ch_l_intents))) {
+			TAILQ_REMOVE(&ch->ch_l_intents, it, it_q);
+			free(it, M_DEVBUF, sizeof(*it));
+		}
+		while ((it = TAILQ_FIRST(&ch->ch_r_intents))) {
+			TAILQ_REMOVE(&ch->ch_r_intents, it, it_q);
+			free(it, M_DEVBUF, sizeof(*it));
+		}
+		free(ch, M_DEVBUF, sizeof(*ch));
+	}
+	sc->sc_glink_max_channel = 0;
 }
 
 void
@@ -945,7 +1037,7 @@ qcpas_glink_recv_open(struct qcpas_softc *sc, uint32_t rcid, uint32_t namelen)
 	err = proto->init(ch);
 	if (err) {
 		TAILQ_REMOVE(&sc->sc_glink_channels, ch, ch_q);
-		free(ch, M_TEMP, sizeof(*ch));
+		free(ch, M_DEVBUF, sizeof(*ch));
 		free(name, M_TEMP, namelen);
 		return;
 	}
@@ -1200,12 +1292,16 @@ struct pmic_glink_hdr {
 #define BATTMGR_OPCODE_BAT_INFO			0x9
 #define BATTMGR_OPCODE_BAT_DISCHARGE_TIME	0xc
 #define BATTMGR_OPCODE_BAT_CHARGE_TIME		0xd
+#define BATTMGR_OPCODE_CHG_CTRL_LIMIT		0x48
 
 #define BATTMGR_NOTIF_BAT_PROPERTY		0x30
 #define BATTMGR_NOTIF_USB_PROPERTY		0x32
 #define BATTMGR_NOTIF_WLS_PROPERTY		0x34
 #define BATTMGR_NOTIF_BAT_STATUS		0x80
 #define BATTMGR_NOTIF_BAT_INFO			0x81
+#define BATTMGR_NOTIF_CHG_CTRL			0x83
+#define BATTMGR_NOTIF_CHG_CTRL_STOP		0x183
+#define BATTMGR_NOTIF_CHG_CTRL_START		0x583
 
 #define BATTMGR_CHEMISTRY_LEN			4
 #define BATTMGR_STRING_LEN			128
@@ -1223,7 +1319,7 @@ struct battmgr_bat_info {
 	uint32_t max_sample_time_ms;
 	uint32_t min_sample_time_ms;
 	uint32_t max_average_interval_ms;
-	uint32_t min_averae_interval_ms;
+	uint32_t min_average_interval_ms;
 	uint32_t capacity_granularity1;
 	uint32_t capacity_granularity2;
 	uint32_t swappable;
@@ -1264,6 +1360,14 @@ void	qcpas_pmic_rtr_bat_info(struct qcpas_softc *,
 void	qcpas_pmic_rtr_bat_status(struct qcpas_softc *,
 	    struct battmgr_bat_status *);
 
+extern int (*hw_battery_setchargestart)(int);
+extern int (*hw_battery_setchargestop)(int);
+extern int hw_battery_chargestart;
+extern int hw_battery_chargestop;
+
+int	qcpas_pmic_rtr_setchargestart(int);
+int	qcpas_pmic_rtr_setchargestop(int);
+
 void
 qcpas_pmic_rtr_battmgr_req_info(void *cookie)
 {
@@ -1295,14 +1399,32 @@ qcpas_pmic_rtr_battmgr_req_status(void *cookie)
 }
 
 #if NAPM > 0
-struct apm_power_info qcpas_pmic_rtr_apm_power_info;
-void *qcpas_pmic_rtr_apm_cookie;
+void
+qcpas_pmic_rtr_battmgr_charge_ctrl(void *cookie)
+{
+	struct {
+		struct pmic_glink_hdr hdr;
+		uint32_t enable;
+		uint32_t target_soc;
+		uint32_t delta_soc;
+	} msg;
+
+	msg.hdr.owner = PMIC_GLINK_OWNER_BATTMGR;
+	msg.hdr.type = PMIC_GLINK_TYPE_REQ_RESP;
+	msg.hdr.opcode = BATTMGR_OPCODE_CHG_CTRL_LIMIT;
+	msg.enable = 1;
+	msg.target_soc = hw_battery_chargestop;
+	msg.delta_soc = hw_battery_chargestop - hw_battery_chargestart;
+	qcpas_glink_send(cookie, &msg, sizeof(msg));
+}
 #endif
 
 int
 qcpas_pmic_rtr_init(void *cookie)
 {
 #if NAPM > 0
+	struct qcpas_glink_channel *ch = cookie;
+	struct qcpas_softc *sc = ch->ch_sc;
 	struct apm_power_info *info;
 
 	info = &qcpas_pmic_rtr_apm_power_info;
@@ -1313,9 +1435,17 @@ qcpas_pmic_rtr_init(void *cookie)
 
 	qcpas_pmic_rtr_apm_cookie = cookie;
 	apm_setinfohook(qcpas_pmic_rtr_apminfo);
+
+	if (ch->ch_sc->sc_chg_ctrl) {
+		hw_battery_chargestart = 95;
+		hw_battery_chargestop = 100;
+		hw_battery_setchargestart = qcpas_pmic_rtr_setchargestart;
+		hw_battery_setchargestop = qcpas_pmic_rtr_setchargestop;
+	}
 #endif
 #ifndef SMALL_KERNEL
-	sensor_task_register(cookie, qcpas_pmic_rtr_refresh, 5);
+	sc->sc_senstask =
+	    sensor_task_register(cookie, qcpas_pmic_rtr_refresh, 5);
 #endif
 	return 0;
 }
@@ -1355,6 +1485,10 @@ qcpas_pmic_rtr_recv(void *cookie, uint8_t *buf, int len)
 			case BATTMGR_NOTIF_BAT_PROPERTY:
 				qcpas_pmic_rtr_battmgr_req_status(cookie);
 				break;
+			case BATTMGR_NOTIF_CHG_CTRL:
+			case BATTMGR_NOTIF_CHG_CTRL_STOP:
+			case BATTMGR_NOTIF_CHG_CTRL_START:
+				break;
 			default:
 				printf("%s: unknown battmgr notification"
 				    " 0x%02x\n", __func__, notification);
@@ -1387,6 +1521,8 @@ qcpas_pmic_rtr_recv(void *cookie, uint8_t *buf, int len)
 			free(bat, M_TEMP, sizeof(*bat));
 			break;
 		}
+		case BATTMGR_OPCODE_CHG_CTRL_LIMIT:
+			break;
 		default:
 			printf("%s: unknown battmgr opcode 0x%02x\n",
 			    __func__, hdr.opcode);
@@ -1408,11 +1544,13 @@ qcpas_pmic_rtr_apminfo(struct apm_power_info *info)
 {
 	int error;
 
-	qcpas_pmic_rtr_battmgr_req_status(qcpas_pmic_rtr_apm_cookie);
-	error = tsleep_nsec(&qcpas_pmic_rtr_apm_power_info, PWAIT | PCATCH,
-	    "qcapm", SEC_TO_NSEC(5));
-	if (error)
-		return error;
+	if (qcpas_pmic_rtr_apm_cookie) {
+		qcpas_pmic_rtr_battmgr_req_status(qcpas_pmic_rtr_apm_cookie);
+		error = tsleep_nsec(&qcpas_pmic_rtr_apm_power_info,
+		    PWAIT | PCATCH, "qcapm", SEC_TO_NSEC(5));
+		if (error)
+			return error;
+	}
 
 	memcpy(info, &qcpas_pmic_rtr_apm_power_info, sizeof(*info));
 	return 0;
@@ -1461,6 +1599,7 @@ qcpas_pmic_rtr_bat_status(struct qcpas_softc *sc,
 	extern int hw_power;
 	struct apm_power_info *info = &qcpas_pmic_rtr_apm_power_info;
 	uint32_t delta;
+	u_char nblife;
 #endif
 
 #ifndef SMALL_KERNEL
@@ -1503,14 +1642,16 @@ qcpas_pmic_rtr_bat_status(struct qcpas_softc *sc,
 #endif
 
 #if NAPM > 0
-	/* Needs BAT_INFO fist */
+	/* Needs BAT_INFO first */
 	if (sc->sc_last_full_capacity == 0) {
 		wakeup(&qcpas_pmic_rtr_apm_power_info);
 		return;
 	}
 
-	info->battery_life =
-	    ((bat->capacity * 100) / sc->sc_last_full_capacity);
+	nblife = ((bat->capacity * 100) / sc->sc_last_full_capacity);
+	if (info->battery_life != nblife)
+		apm_record_event(APM_POWER_CHANGE);
+	info->battery_life = nblife;
 	if (info->battery_life > 50)
 		info->battery_state = APM_BATT_HIGH;
 	else if (info->battery_life > 25)
@@ -1532,9 +1673,13 @@ qcpas_pmic_rtr_bat_status(struct qcpas_softc *sc,
 		info->minutes_left = (60 * delta) / abs(bat->rate);
 
 	if (bat->power_state & BATTMGR_PWR_STATE_AC_ON) {
+		if (info->ac_state != APM_AC_ON)
+			apm_record_event(APM_POWER_CHANGE);
 		info->ac_state = APM_AC_ON;
 		hw_power = 1;
 	} else {
+		if (info->ac_state != APM_AC_OFF)
+			apm_record_event(APM_POWER_CHANGE);
 		info->ac_state = APM_AC_OFF;
 		hw_power = 0;
 	}
@@ -1542,3 +1687,27 @@ qcpas_pmic_rtr_bat_status(struct qcpas_softc *sc,
 	wakeup(&qcpas_pmic_rtr_apm_power_info);
 #endif
 }
+
+#if NAPM > 0
+int
+qcpas_pmic_rtr_setchargestart(int start)
+{
+	if (start < 50 || start > hw_battery_chargestop - 5)
+		return EINVAL;
+
+	hw_battery_chargestart = start;
+	qcpas_pmic_rtr_battmgr_charge_ctrl(qcpas_pmic_rtr_apm_cookie);
+	return 0;
+}
+
+int
+qcpas_pmic_rtr_setchargestop(int stop)
+{
+	if (stop < 55 || stop < hw_battery_chargestart + 5)
+		return EINVAL;
+
+	hw_battery_chargestop = stop;
+	qcpas_pmic_rtr_battmgr_charge_ctrl(qcpas_pmic_rtr_apm_cookie);
+	return 0;
+}
+#endif

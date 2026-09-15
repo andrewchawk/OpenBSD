@@ -1,4 +1,4 @@
-/*	$OpenBSD: output_json.c,v 1.44 2024/05/22 08:42:34 claudio Exp $ */
+/*	$OpenBSD: output_json.c,v 1.66 2026/08/30 23:43:23 jsg Exp $ */
 
 /*
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -16,6 +16,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 #include <endian.h>
 #include <err.h>
 #include <math.h>
@@ -24,7 +27,6 @@
 #include <string.h>
 
 #include "bgpd.h"
-#include "session.h"
 #include "rde.h"
 
 #include "bgpctl.h"
@@ -50,13 +52,15 @@ json_neighbor_capabilities(struct capabilities *capa)
 			hascapaap = 1;
 	}
 	if (!hascapamp && !hascapaap && !capa->grestart.restart &&
-	    !capa->refresh && !capa->enhanced_rr && !capa->as4byte)
+	    !capa->refresh && !capa->enhanced_rr && !capa->as4byte &&
+	    !capa->ext_msg)
 		return;
 
 	json_do_object("capabilities", 0);
 	json_do_bool("as4byte", capa->as4byte);
 	json_do_bool("refresh", capa->refresh);
 	json_do_bool("enhanced_refresh", capa->enhanced_rr);
+	json_do_bool("extended_message", capa->ext_msg);
 
 	if (hascapamp) {
 		json_do_array("multiprotocol");
@@ -81,6 +85,8 @@ json_neighbor_capabilities(struct capabilities *capa)
 
 		if (capa->grestart.timeout)
 			json_do_uint("timeout", capa->grestart.timeout);
+		if (capa->grestart.grnotification)
+			json_do_bool("graceful_notification", 1);
 
 		if (present) {
 			json_do_array("protocols");
@@ -133,17 +139,17 @@ json_neighbor_capabilities(struct capabilities *capa)
 }
 
 static void
-json_neighbor_stats(struct peer *p)
+json_neighbor_stats(struct ctl_peer *p)
 {
 	json_do_object("stats", 0);
 	json_do_string("last_read", fmt_monotime(p->stats.last_read));
-	json_do_int("last_read_sec", get_monotime(p->stats.last_read));
+	json_do_int("last_read_sec", get_rel_monotime(p->stats.last_read));
 	json_do_string("last_write", fmt_monotime(p->stats.last_write));
-	json_do_int("last_write_sec", get_monotime(p->stats.last_write));
+	json_do_int("last_write_sec", get_rel_monotime(p->stats.last_write));
 
 	json_do_object("prefixes", 1);
-	json_do_uint("sent", p->stats.prefix_out_cnt);
-	json_do_uint("received", p->stats.prefix_cnt);
+	json_do_uint("sent", p->rde_stats.prefix_out_cnt);
+	json_do_uint("received", p->rde_stats.prefix_cnt);
 	json_do_end();
 
 	json_do_object("message", 0);
@@ -177,20 +183,20 @@ json_neighbor_stats(struct peer *p)
 	json_do_object("update", 0);
 
 	json_do_object("sent", 1);
-	json_do_uint("updates", p->stats.prefix_sent_update);
-	json_do_uint("withdraws", p->stats.prefix_sent_withdraw);
-	json_do_uint("eor", p->stats.prefix_sent_eor);
+	json_do_uint("updates", p->rde_stats.prefix_sent_update);
+	json_do_uint("withdraws", p->rde_stats.prefix_sent_withdraw);
+	json_do_uint("eor", p->rde_stats.prefix_sent_eor);
 	json_do_end();
 
 	json_do_object("received", 1);
-	json_do_uint("updates", p->stats.prefix_rcvd_update);
-	json_do_uint("withdraws", p->stats.prefix_rcvd_withdraw);
-	json_do_uint("eor", p->stats.prefix_rcvd_eor);
+	json_do_uint("updates", p->rde_stats.prefix_rcvd_update);
+	json_do_uint("withdraws", p->rde_stats.prefix_rcvd_withdraw);
+	json_do_uint("eor", p->rde_stats.prefix_rcvd_eor);
 	json_do_end();
 
 	json_do_object("pending", 1);
-	json_do_uint("updates", p->stats.pending_update);
-	json_do_uint("withdraws", p->stats.pending_withdraw);
+	json_do_uint("updates", p->rde_stats.pending_update);
+	json_do_uint("withdraws", p->rde_stats.pending_withdraw);
 	json_do_end();
 
 	json_do_end();
@@ -211,18 +217,30 @@ json_neighbor_stats(struct peer *p)
 
 	json_do_end();
 
+	json_do_object("queue", 0);
+
+	json_do_object("count", 1);
+	json_do_uint("ibuf_queue", p->rde_stats.ibufq_msg_count);
+	json_do_uint("rib_entry", p->rde_stats.rib_entry_count);
+	json_do_end();
+	json_do_object("size", 1);
+	json_do_uint("ibuf_queue", p->rde_stats.ibufq_payload_size);
+	json_do_end();
+
+	json_do_end();
+
 	json_do_end();
 }
 
 static void
-json_neighbor_full(struct peer *p)
+json_neighbor_full(struct ctl_peer *p)
 {
 	const char *errstr;
 
 	/* config */
 	json_do_object("config", 0);
 	json_do_bool("template", p->conf.template);
-	json_do_bool("cloned", p->template != NULL);
+	json_do_bool("cloned", p->template);
 	json_do_bool("passive", p->conf.passive);
 	json_do_bool("down", p->conf.down);
 	json_do_bool("multihop", p->conf.ebgp && p->conf.distance > 1);
@@ -240,9 +258,9 @@ json_neighbor_full(struct peer *p)
 			json_do_uint("max_out_prefix_restart",
 			    p->conf.max_out_prefix_restart);
 	}
-	if (p->auth.method != AUTH_NONE)
+	if (p->auth_method != AUTH_NONE)
 		json_do_string("authentication",
-		    fmt_auth_method(p->auth.method));
+		    fmt_auth_method(p->auth_method));
 	json_do_bool("ttl_security", p->conf.ttlsec);
 	json_do_uint("holdtime", p->conf.holdtime);
 	json_do_uint("min_holdtime", p->conf.min_holdtime);
@@ -306,7 +324,7 @@ json_neighbor_full(struct peer *p)
 }
 
 static void
-json_neighbor(struct peer *p, struct parse_result *res)
+json_neighbor(struct ctl_peer *p, struct parse_result *res)
 {
 	json_do_array("neighbors");
 
@@ -329,7 +347,7 @@ json_neighbor(struct peer *p, struct parse_result *res)
 	}
 	json_do_string("state", statenames[p->state]);
 	json_do_string("last_updown", fmt_monotime(p->stats.last_updown));
-	json_do_int("last_updown_sec", get_monotime(p->stats.last_updown));
+	json_do_int("last_updown_sec", get_rel_monotime(p->stats.last_updown));
 
 	switch (res->action) {
 	case SHOW:
@@ -356,7 +374,7 @@ json_timer(struct ctl_timer *t)
 
 	json_do_object("timer", 1);
 	json_do_string("name", timernames[t->type]);
-	json_do_int("due", t->val);
+	json_do_int("due", -get_rel_monotime(t->val));
 	json_do_end();
 }
 
@@ -834,6 +852,8 @@ json_rib(struct ctl_show_rib *r, struct ibuf *asbuf, struct parse_result *res)
 
 	/* flags */
 	json_do_bool("valid", r->flags & F_PREF_ELIGIBLE);
+	if (r->flags & F_PREF_FILTERED)
+		json_do_bool("filtered", 1);
 	if (r->flags & F_PREF_BEST)
 		json_do_bool("best", 1);
 	if (r->flags & F_PREF_ECMP)
@@ -849,7 +869,7 @@ json_rib(struct ctl_show_rib *r, struct ibuf *asbuf, struct parse_result *res)
 	if (r->flags & F_PREF_ANNOUNCE)
 		json_do_bool("announced", 1);
 
-	/* various attribibutes */
+	/* various attributes */
 	json_do_string("ovs", fmt_ovs(r->roa_validation_state, 0));
 	json_do_string("avs", fmt_avs(r->aspa_validation_state, 0));
 	json_do_string("origin", fmt_origin(r->origin, 0));
@@ -857,8 +877,8 @@ json_rib(struct ctl_show_rib *r, struct ibuf *asbuf, struct parse_result *res)
 	json_do_uint("localpref", r->local_pref);
 	json_do_uint("weight", r->weight);
 	json_do_int("dmetric", r->dmetric);
-	json_do_string("last_update", fmt_timeframe(r->age));
-	json_do_int("last_update_sec", r->age);
+	json_do_string("last_update", fmt_monotime(r->lastchange));
+	json_do_int("last_update_sec", get_rel_monotime(r->lastchange));
 
 	/* keep the object open for communities and attributes */
 }
@@ -895,6 +915,15 @@ json_rib_mem(struct rde_memstats *stats)
 	    stats->rib_cnt * sizeof(struct rib_entry), UINT64_MAX);
 	json_rib_mem_element("prefix", stats->prefix_cnt,
 	    stats->prefix_cnt * sizeof(struct prefix), UINT64_MAX);
+	json_rib_mem_element("adjout_prefix", stats->adjout_prefix_cnt,
+	    stats->adjout_prefix_size, UINT64_MAX);
+	json_rib_mem_element("adjout_attr", stats->adjout_attr_cnt,
+	    stats->adjout_attr_cnt * sizeof(struct adjout_attr),
+	    stats->adjout_attr_refs);
+	json_rib_mem_element("pend_attr", stats->pend_attr_cnt,
+	    stats->pend_attr_cnt * sizeof(struct pend_attr), UINT64_MAX);
+	json_rib_mem_element("pend_prefix", stats->pend_prefix_cnt,
+	    stats->pend_prefix_cnt * sizeof(struct pend_prefix), UINT64_MAX);
 	json_rib_mem_element("rde_aspath", stats->path_cnt,
 	    stats->path_cnt * sizeof(struct rde_aspath),
 	    stats->path_refs);
@@ -908,12 +937,30 @@ json_rib_mem(struct rde_memstats *stats)
 	    stats->attr_cnt * sizeof(struct attr), stats->attr_refs);
 	json_rib_mem_element("attributes", stats->attr_dcnt,
 	    stats->attr_data, UINT64_MAX);
+	json_rib_mem_element("bitmaps", stats->bitmap_cnt,
+	    stats->bitmap_size, UINT64_MAX);
+	json_rib_mem_element("hashtables", stats->hash_cnt,
+	    stats->hash_size, stats->hash_refs);
 	json_rib_mem_element("total", UINT64_MAX,
 	    pts + stats->prefix_cnt * sizeof(struct prefix) +
+	    stats->adjout_prefix_cnt * sizeof(struct adjout_prefix) +
+	    stats->adjout_attr_cnt * sizeof(struct adjout_attr) +
+	    stats->pend_prefix_cnt * sizeof(struct pend_prefix) +
+	    stats->pend_attr_cnt * sizeof(struct pend_attr) +
 	    stats->rib_cnt * sizeof(struct rib_entry) +
 	    stats->path_cnt * sizeof(struct rde_aspath) +
 	    stats->aspath_size + stats->attr_cnt * sizeof(struct attr) +
-	    stats->attr_data, UINT64_MAX);
+	    stats->attr_data + stats->bitmap_size + stats->hash_size,
+	    UINT64_MAX);
+	json_do_end();
+
+	json_do_object("filters", 0);
+	json_rib_mem_element("filter", stats->filter_cnt,
+	    stats->filter_size, stats->filter_refs);
+	json_rib_mem_element("filter_set", stats->filter_set_cnt,
+	    stats->filter_set_size, stats->filter_set_refs);
+	json_rib_mem_element("total", UINT64_MAX,
+	    stats->filter_size + stats->filter_set_size, UINT64_MAX);
 	json_do_end();
 
 	json_do_object("sets", 0);
@@ -923,8 +970,28 @@ json_rib_mem(struct rde_memstats *stats)
 	    UINT64_MAX);
 	json_rib_mem_element("prefix_set", stats->pset_cnt, stats->pset_size,
 	    UINT64_MAX);
+	json_rib_mem_element("aspa_set", stats->aspa_cnt, stats->aspa_size,
+	    UINT64_MAX);
 	json_rib_mem_element("total", UINT64_MAX,
-	    stats->aset_size + stats->pset_size, UINT64_MAX);
+	    stats->aset_size + stats->pset_size + stats->aspa_size, UINT64_MAX);
+	json_do_end();
+
+	json_do_object("queue", 0);
+	json_rib_mem_element("ibuf_queue", stats->rde_ibufq_msg_count,
+	    stats->rde_ibufq_payload_size, UINT64_MAX);
+	json_rib_mem_element("rib_entry", stats->rde_rib_entry_count,
+	    UINT64_MAX, UINT64_MAX);
+	json_do_end();
+
+	json_do_object("evloop", 0);
+	json_do_uint("count", stats->rde_event_loop_count);
+	json_do_uint("loop_usec", stats->rde_event_loop_usec);
+	json_do_uint("io_usec", stats->rde_event_io_usec);
+	json_do_uint("peer_usec", stats->rde_event_peer_usec);
+	json_do_uint("adjout_usec", stats->rde_event_adjout_usec);
+	json_do_uint("ribdump_usec", stats->rde_event_ribdump_usec);
+	json_do_uint("nexthop_usec", stats->rde_event_nexthop_usec);
+	json_do_uint("update_usec", stats->rde_event_update_usec);
 	json_do_end();
 }
 
@@ -937,7 +1004,7 @@ json_rib_set(struct ctl_show_set *set)
 	json_do_string("name", set->name);
 	json_do_string("type", fmt_set_type(set));
 	json_do_string("last_change", fmt_monotime(set->lastchange));
-	json_do_int("last_change_sec", get_monotime(set->lastchange));
+	json_do_int("last_change_sec", get_rel_monotime(set->lastchange));
 	if (set->type == ASNUM_SET || set->type == ASPA_SET) {
 		json_do_uint("num_ASnum", set->as_cnt);
 	} else {
@@ -963,6 +1030,7 @@ json_rtr(struct ctl_show_rtr *rtr)
 
 	if (rtr->session_id != -1) {
 		json_do_uint("version", rtr->version);
+		json_do_uint("minimal_version", rtr->min_version);
 		json_do_uint("session_id", rtr->session_id);
 		json_do_uint("serial", rtr->serial);
 	}

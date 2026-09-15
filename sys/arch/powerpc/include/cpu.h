@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.78 2024/06/22 10:22:29 jsg Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.80 2025/04/07 15:43:00 gkoehler Exp $	*/
 /*	$NetBSD: cpu.h,v 1.1 1996/09/30 16:34:21 ws Exp $	*/
 
 /*
@@ -65,7 +65,7 @@ struct cpu_info {
 	struct srp_hazard ci_srp_hazards[SRP_HAZARD_NUM];
 #endif
 
-	int ci_intrdepth;
+	int ci_idepth;
 	char *ci_intstk;
 #define CPUSAVE_LEN	8
 	register_t ci_tempsave[CPUSAVE_LEN];
@@ -155,7 +155,7 @@ extern struct cpu_info cpu_info[PPC_MAXPROCS];
 
 #define	CLKF_USERMODE(frame)	(((frame)->srr1 & PSL_PR) != 0)
 #define	CLKF_PC(frame)		((frame)->srr0)
-#define	CLKF_INTR(frame)	((frame)->depth != 0)
+#define	CLKF_INTR(frame)	((frame)->depth > 1)
 
 extern int ppc_cpuidle;
 extern int ppc_proc_is_64b;

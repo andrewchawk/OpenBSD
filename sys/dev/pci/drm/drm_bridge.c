@@ -21,7 +21,9 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <linux/debugfs.h>
 #include <linux/err.h>
+#include <linux/export.h>
 #include <linux/media-bus-format.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -198,14 +200,117 @@
 static DEFINE_MUTEX(bridge_lock);
 static DRM_LIST_HEAD(bridge_list);
 
+static void __drm_bridge_free(struct kref *kref)
+{
+	struct drm_bridge *bridge = container_of(kref, struct drm_bridge, refcount);
+
+	if (bridge->funcs->destroy)
+		bridge->funcs->destroy(bridge);
+	kfree(bridge->container);
+}
+
+/**
+ * drm_bridge_get - Acquire a bridge reference
+ * @bridge: DRM bridge
+ *
+ * This function increments the bridge's refcount.
+ *
+ * Returns:
+ * Pointer to @bridge.
+ */
+struct drm_bridge *drm_bridge_get(struct drm_bridge *bridge)
+{
+	if (bridge)
+		kref_get(&bridge->refcount);
+
+	return bridge;
+}
+EXPORT_SYMBOL(drm_bridge_get);
+
+/**
+ * drm_bridge_put - Release a bridge reference
+ * @bridge: DRM bridge
+ *
+ * This function decrements the bridge's reference count and frees the
+ * object if the reference count drops to zero.
+ */
+void drm_bridge_put(struct drm_bridge *bridge)
+{
+	if (bridge)
+		kref_put(&bridge->refcount, __drm_bridge_free);
+}
+EXPORT_SYMBOL(drm_bridge_put);
+
+#ifdef notyet
+/**
+ * drm_bridge_put_void - wrapper to drm_bridge_put() taking a void pointer
+ *
+ * @data: pointer to @struct drm_bridge, cast to a void pointer
+ *
+ * Wrapper of drm_bridge_put() to be used when a function taking a void
+ * pointer is needed, for example as a devm action.
+ */
+static void drm_bridge_put_void(void *data)
+{
+	struct drm_bridge *bridge = (struct drm_bridge *)data;
+
+	drm_bridge_put(bridge);
+}
+#endif
+
+void *__devm_drm_bridge_alloc(struct device *dev, size_t size, size_t offset,
+			      const struct drm_bridge_funcs *funcs)
+{
+	STUB();
+	return ERR_PTR(-ENOSYS);
+#ifdef notyet
+	void *container;
+	struct drm_bridge *bridge;
+	int err;
+
+	if (!funcs) {
+		dev_warn(dev, "Missing funcs pointer\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	container = kzalloc(size, GFP_KERNEL);
+	if (!container)
+		return ERR_PTR(-ENOMEM);
+
+	bridge = container + offset;
+	bridge->container = container;
+	bridge->funcs = funcs;
+	kref_init(&bridge->refcount);
+
+	err = devm_add_action_or_reset(dev, drm_bridge_put_void, bridge);
+	if (err)
+		return ERR_PTR(err);
+
+	return container;
+#endif
+}
+EXPORT_SYMBOL(__devm_drm_bridge_alloc);
+
 /**
  * drm_bridge_add - add the given bridge to the global bridge list
  *
  * @bridge: bridge control structure
+ *
+ * The bridge to be added must have been allocated by
+ * devm_drm_bridge_alloc().
  */
 void drm_bridge_add(struct drm_bridge *bridge)
 {
+	if (!bridge->container)
+		DRM_WARN("DRM bridge corrupted or not allocated by devm_drm_bridge_alloc()\n");
+
+	drm_bridge_get(bridge);
+
 	rw_init(&bridge->hpd_mutex, "brhpd");
+
+	if (bridge->ops & DRM_BRIDGE_OP_HDMI)
+		bridge->ycbcr_420_allowed = !!(bridge->supported_formats &
+					       BIT(HDMI_COLORSPACE_YUV420));
 
 	mutex_lock(&bridge_lock);
 	list_add_tail(&bridge->list, &bridge_list);
@@ -255,6 +360,8 @@ void drm_bridge_remove(struct drm_bridge *bridge)
 	mutex_unlock(&bridge_lock);
 
 	mutex_destroy(&bridge->hpd_mutex);
+
+	drm_bridge_put(bridge);
 }
 EXPORT_SYMBOL(drm_bridge_remove);
 
@@ -282,6 +389,11 @@ static const struct drm_private_state_funcs drm_bridge_priv_state_funcs = {
 	.atomic_duplicate_state = drm_bridge_atomic_duplicate_priv_state,
 	.atomic_destroy_state = drm_bridge_atomic_destroy_priv_state,
 };
+
+static bool drm_bridge_is_atomic(struct drm_bridge *bridge)
+{
+	return bridge->funcs->atomic_reset != NULL;
+}
 
 /**
  * drm_bridge_attach - attach the bridge to an encoder's chain
@@ -315,11 +427,17 @@ int drm_bridge_attach(struct drm_encoder *encoder, struct drm_bridge *bridge,
 	if (!encoder || !bridge)
 		return -EINVAL;
 
-	if (previous && (!previous->dev || previous->encoder != encoder))
-		return -EINVAL;
+	drm_bridge_get(bridge);
 
-	if (bridge->dev)
-		return -EBUSY;
+	if (previous && (!previous->dev || previous->encoder != encoder)) {
+		ret = -EINVAL;
+		goto err_put_bridge;
+	}
+
+	if (bridge->dev) {
+		ret = -EBUSY;
+		goto err_put_bridge;
+	}
 
 	bridge->dev = encoder->dev;
 	bridge->encoder = encoder;
@@ -330,12 +448,12 @@ int drm_bridge_attach(struct drm_encoder *encoder, struct drm_bridge *bridge,
 		list_add(&bridge->chain_node, &encoder->bridge_chain);
 
 	if (bridge->funcs->attach) {
-		ret = bridge->funcs->attach(bridge, flags);
+		ret = bridge->funcs->attach(bridge, encoder, flags);
 		if (ret < 0)
 			goto err_reset_bridge;
 	}
 
-	if (bridge->funcs->atomic_reset) {
+	if (drm_bridge_is_atomic(bridge)) {
 		struct drm_bridge_state *state;
 
 		state = bridge->funcs->atomic_reset(bridge);
@@ -360,14 +478,16 @@ err_reset_bridge:
 	bridge->encoder = NULL;
 	list_del(&bridge->chain_node);
 
-#ifdef CONFIG_OF
-	DRM_ERROR("failed to attach bridge %pOF to encoder %s: %d\n",
-		  bridge->of_node, encoder->name, ret);
-#else
-	DRM_ERROR("failed to attach bridge to encoder %s: %d\n",
-		  encoder->name, ret);
-#endif
+	if (ret != -EPROBE_DEFER)
+		DRM_ERROR("failed to attach bridge %pOF to encoder %s: %d\n",
+			  bridge->of_node, encoder->name, ret);
+	else
+		dev_err_probe(encoder->dev->dev, -EPROBE_DEFER,
+			      "failed to attach bridge %pOF to encoder %s\n",
+			      bridge->of_node, encoder->name);
 
+err_put_bridge:
+	drm_bridge_put(bridge);
 	return ret;
 }
 EXPORT_SYMBOL(drm_bridge_attach);
@@ -380,7 +500,7 @@ void drm_bridge_detach(struct drm_bridge *bridge)
 	if (WARN_ON(!bridge->dev))
 		return;
 
-	if (bridge->funcs->atomic_reset)
+	if (drm_bridge_is_atomic(bridge))
 		drm_atomic_private_obj_fini(&bridge->base);
 
 	if (bridge->funcs->detach)
@@ -388,6 +508,7 @@ void drm_bridge_detach(struct drm_bridge *bridge)
 
 	list_del(&bridge->chain_node);
 	bridge->dev = NULL;
+	drm_bridge_put(bridge);
 }
 
 /**
@@ -480,43 +601,6 @@ void drm_bridge_detach(struct drm_bridge *bridge)
  */
 
 /**
- * drm_bridge_chain_mode_fixup - fixup proposed mode for all bridges in the
- *				 encoder chain
- * @bridge: bridge control structure
- * @mode: desired mode to be set for the bridge
- * @adjusted_mode: updated mode that works for this bridge
- *
- * Calls &drm_bridge_funcs.mode_fixup for all the bridges in the
- * encoder chain, starting from the first bridge to the last.
- *
- * Note: the bridge passed should be the one closest to the encoder
- *
- * RETURNS:
- * true on success, false on failure
- */
-bool drm_bridge_chain_mode_fixup(struct drm_bridge *bridge,
-				 const struct drm_display_mode *mode,
-				 struct drm_display_mode *adjusted_mode)
-{
-	struct drm_encoder *encoder;
-
-	if (!bridge)
-		return true;
-
-	encoder = bridge->encoder;
-	list_for_each_entry_from(bridge, &encoder->bridge_chain, chain_node) {
-		if (!bridge->funcs->mode_fixup)
-			continue;
-
-		if (!bridge->funcs->mode_fixup(bridge, mode, adjusted_mode))
-			return false;
-	}
-
-	return true;
-}
-EXPORT_SYMBOL(drm_bridge_chain_mode_fixup);
-
-/**
  * drm_bridge_chain_mode_valid - validate the mode against all bridges in the
  *				 encoder chain.
  * @bridge: bridge control structure
@@ -590,7 +674,7 @@ EXPORT_SYMBOL(drm_bridge_chain_mode_set);
 /**
  * drm_atomic_bridge_chain_disable - disables all bridges in the encoder chain
  * @bridge: bridge control structure
- * @old_state: old atomic state
+ * @state: atomic state being committed
  *
  * Calls &drm_bridge_funcs.atomic_disable (falls back on
  * &drm_bridge_funcs.disable) op for all the bridges in the encoder chain,
@@ -600,7 +684,7 @@ EXPORT_SYMBOL(drm_bridge_chain_mode_set);
  * Note: the bridge passed should be the one closest to the encoder
  */
 void drm_atomic_bridge_chain_disable(struct drm_bridge *bridge,
-				     struct drm_atomic_state *old_state)
+				     struct drm_atomic_state *state)
 {
 	struct drm_encoder *encoder;
 	struct drm_bridge *iter;
@@ -611,15 +695,7 @@ void drm_atomic_bridge_chain_disable(struct drm_bridge *bridge,
 	encoder = bridge->encoder;
 	list_for_each_entry_reverse(iter, &encoder->bridge_chain, chain_node) {
 		if (iter->funcs->atomic_disable) {
-			struct drm_bridge_state *old_bridge_state;
-
-			old_bridge_state =
-				drm_atomic_get_old_bridge_state(old_state,
-								iter);
-			if (WARN_ON(!old_bridge_state))
-				return;
-
-			iter->funcs->atomic_disable(iter, old_bridge_state);
+			iter->funcs->atomic_disable(iter, state);
 		} else if (iter->funcs->disable) {
 			iter->funcs->disable(iter);
 		}
@@ -631,29 +707,19 @@ void drm_atomic_bridge_chain_disable(struct drm_bridge *bridge,
 EXPORT_SYMBOL(drm_atomic_bridge_chain_disable);
 
 static void drm_atomic_bridge_call_post_disable(struct drm_bridge *bridge,
-						struct drm_atomic_state *old_state)
+						struct drm_atomic_state *state)
 {
-	if (old_state && bridge->funcs->atomic_post_disable) {
-		struct drm_bridge_state *old_bridge_state;
-
-		old_bridge_state =
-			drm_atomic_get_old_bridge_state(old_state,
-							bridge);
-		if (WARN_ON(!old_bridge_state))
-			return;
-
-		bridge->funcs->atomic_post_disable(bridge,
-						   old_bridge_state);
-	} else if (bridge->funcs->post_disable) {
+	if (state && bridge->funcs->atomic_post_disable)
+		bridge->funcs->atomic_post_disable(bridge, state);
+	else if (bridge->funcs->post_disable)
 		bridge->funcs->post_disable(bridge);
-	}
 }
 
 /**
  * drm_atomic_bridge_chain_post_disable - cleans up after disabling all bridges
  *					  in the encoder chain
  * @bridge: bridge control structure
- * @old_state: old atomic state
+ * @state: atomic state being committed
  *
  * Calls &drm_bridge_funcs.atomic_post_disable (falls back on
  * &drm_bridge_funcs.post_disable) op for all the bridges in the encoder chain,
@@ -664,10 +730,17 @@ static void drm_atomic_bridge_call_post_disable(struct drm_bridge *bridge,
  * bridge will be called before the previous one to reverse the @pre_enable
  * calling direction.
  *
+ * Example:
+ * Bridge A ---> Bridge B ---> Bridge C ---> Bridge D ---> Bridge E
+ *
+ * With pre_enable_prev_first flag enable in Bridge B, D, E then the resulting
+ * @post_disable order would be,
+ * Bridge B, Bridge A, Bridge E, Bridge D, Bridge C.
+ *
  * Note: the bridge passed should be the one closest to the encoder
  */
 void drm_atomic_bridge_chain_post_disable(struct drm_bridge *bridge,
-					  struct drm_atomic_state *old_state)
+					  struct drm_atomic_state *state)
 {
 	struct drm_encoder *encoder;
 	struct drm_bridge *next, *limit;
@@ -714,12 +787,12 @@ void drm_atomic_bridge_chain_post_disable(struct drm_bridge *bridge,
 						break;
 
 					drm_atomic_bridge_call_post_disable(next,
-									    old_state);
+									    state);
 				}
 			}
 		}
 
-		drm_atomic_bridge_call_post_disable(bridge, old_state);
+		drm_atomic_bridge_call_post_disable(bridge, state);
 
 		if (limit)
 			/* Jump all bridges that we have already post_disabled */
@@ -729,28 +802,19 @@ void drm_atomic_bridge_chain_post_disable(struct drm_bridge *bridge,
 EXPORT_SYMBOL(drm_atomic_bridge_chain_post_disable);
 
 static void drm_atomic_bridge_call_pre_enable(struct drm_bridge *bridge,
-					      struct drm_atomic_state *old_state)
+					      struct drm_atomic_state *state)
 {
-	if (old_state && bridge->funcs->atomic_pre_enable) {
-		struct drm_bridge_state *old_bridge_state;
-
-		old_bridge_state =
-			drm_atomic_get_old_bridge_state(old_state,
-							bridge);
-		if (WARN_ON(!old_bridge_state))
-			return;
-
-		bridge->funcs->atomic_pre_enable(bridge, old_bridge_state);
-	} else if (bridge->funcs->pre_enable) {
+	if (state && bridge->funcs->atomic_pre_enable)
+		bridge->funcs->atomic_pre_enable(bridge, state);
+	else if (bridge->funcs->pre_enable)
 		bridge->funcs->pre_enable(bridge);
-	}
 }
 
 /**
  * drm_atomic_bridge_chain_pre_enable - prepares for enabling all bridges in
  *					the encoder chain
  * @bridge: bridge control structure
- * @old_state: old atomic state
+ * @state: atomic state being committed
  *
  * Calls &drm_bridge_funcs.atomic_pre_enable (falls back on
  * &drm_bridge_funcs.pre_enable) op for all the bridges in the encoder chain,
@@ -760,10 +824,17 @@ static void drm_atomic_bridge_call_pre_enable(struct drm_bridge *bridge,
  * If a bridge sets @pre_enable_prev_first, then the pre_enable for the
  * prev bridge will be called before pre_enable of this bridge.
  *
+ * Example:
+ * Bridge A ---> Bridge B ---> Bridge C ---> Bridge D ---> Bridge E
+ *
+ * With pre_enable_prev_first flag enable in Bridge B, D, E then the resulting
+ * @pre_enable order would be,
+ * Bridge C, Bridge D, Bridge E, Bridge A, Bridge B.
+ *
  * Note: the bridge passed should be the one closest to the encoder
  */
 void drm_atomic_bridge_chain_pre_enable(struct drm_bridge *bridge,
-					struct drm_atomic_state *old_state)
+					struct drm_atomic_state *state)
 {
 	struct drm_encoder *encoder;
 	struct drm_bridge *iter, *next, *limit;
@@ -802,11 +873,11 @@ void drm_atomic_bridge_chain_pre_enable(struct drm_bridge *bridge,
 					 */
 					break;
 
-				drm_atomic_bridge_call_pre_enable(next, old_state);
+				drm_atomic_bridge_call_pre_enable(next, state);
 			}
 		}
 
-		drm_atomic_bridge_call_pre_enable(iter, old_state);
+		drm_atomic_bridge_call_pre_enable(iter, state);
 
 		if (iter->pre_enable_prev_first)
 			/* Jump all bridges that we have already pre_enabled */
@@ -821,7 +892,7 @@ EXPORT_SYMBOL(drm_atomic_bridge_chain_pre_enable);
 /**
  * drm_atomic_bridge_chain_enable - enables all bridges in the encoder chain
  * @bridge: bridge control structure
- * @old_state: old atomic state
+ * @state: atomic state being committed
  *
  * Calls &drm_bridge_funcs.atomic_enable (falls back on
  * &drm_bridge_funcs.enable) op for all the bridges in the encoder chain,
@@ -831,7 +902,7 @@ EXPORT_SYMBOL(drm_atomic_bridge_chain_pre_enable);
  * Note: the bridge passed should be the one closest to the encoder
  */
 void drm_atomic_bridge_chain_enable(struct drm_bridge *bridge,
-				    struct drm_atomic_state *old_state)
+				    struct drm_atomic_state *state)
 {
 	struct drm_encoder *encoder;
 
@@ -841,15 +912,7 @@ void drm_atomic_bridge_chain_enable(struct drm_bridge *bridge,
 	encoder = bridge->encoder;
 	list_for_each_entry_from(bridge, &encoder->bridge_chain, chain_node) {
 		if (bridge->funcs->atomic_enable) {
-			struct drm_bridge_state *old_bridge_state;
-
-			old_bridge_state =
-				drm_atomic_get_old_bridge_state(old_state,
-								bridge);
-			if (WARN_ON(!old_bridge_state))
-				return;
-
-			bridge->funcs->atomic_enable(bridge, old_bridge_state);
+			bridge->funcs->atomic_enable(bridge, state);
 		} else if (bridge->funcs->enable) {
 			bridge->funcs->enable(bridge);
 		}
@@ -891,11 +954,11 @@ static int select_bus_fmt_recursive(struct drm_bridge *first_bridge,
 {
 	unsigned int i, num_in_bus_fmts = 0;
 	struct drm_bridge_state *cur_state;
-	struct drm_bridge *prev_bridge;
+	struct drm_bridge *prev_bridge __free(drm_bridge_put) =
+		drm_bridge_get_prev_bridge(cur_bridge);
 	u32 *in_bus_fmts;
 	int ret;
 
-	prev_bridge = drm_bridge_get_prev_bridge(cur_bridge);
 	cur_state = drm_atomic_get_new_bridge_state(crtc_state->state,
 						    cur_bridge);
 
@@ -1177,6 +1240,7 @@ EXPORT_SYMBOL(drm_atomic_bridge_chain_check);
 /**
  * drm_bridge_detect - check if anything is attached to the bridge output
  * @bridge: bridge control structure
+ * @connector: attached connector
  *
  * If the bridge supports output detection, as reported by the
  * DRM_BRIDGE_OP_DETECT bridge ops flag, call &drm_bridge_funcs.detect for the
@@ -1187,12 +1251,13 @@ EXPORT_SYMBOL(drm_atomic_bridge_chain_check);
  * The detection status on success, or connector_status_unknown if the bridge
  * doesn't support output detection.
  */
-enum drm_connector_status drm_bridge_detect(struct drm_bridge *bridge)
+enum drm_connector_status
+drm_bridge_detect(struct drm_bridge *bridge, struct drm_connector *connector)
 {
 	if (!(bridge->ops & DRM_BRIDGE_OP_DETECT))
 		return connector_status_unknown;
 
-	return bridge->funcs->detect(bridge);
+	return bridge->funcs->detect(bridge, connector);
 }
 EXPORT_SYMBOL_GPL(drm_bridge_detect);
 
@@ -1229,9 +1294,6 @@ EXPORT_SYMBOL_GPL(drm_bridge_get_modes);
  * DRM_BRIDGE_OP_EDID bridge ops flag, call &drm_bridge_funcs.edid_read to get
  * the EDID and return it. Otherwise return NULL.
  *
- * If &drm_bridge_funcs.edid_read is not set, fall back to using
- * drm_bridge_get_edid() and wrapping it in struct drm_edid.
- *
  * RETURNS:
  * The retrieved EDID on success, or NULL otherwise.
  */
@@ -1241,49 +1303,9 @@ const struct drm_edid *drm_bridge_edid_read(struct drm_bridge *bridge,
 	if (!(bridge->ops & DRM_BRIDGE_OP_EDID))
 		return NULL;
 
-	/* Transitional: Fall back to ->get_edid. */
-	if (!bridge->funcs->edid_read) {
-		const struct drm_edid *drm_edid;
-		struct edid *edid;
-
-		edid = drm_bridge_get_edid(bridge, connector);
-		if (!edid)
-			return NULL;
-
-		drm_edid = drm_edid_alloc(edid, (edid->extensions + 1) * EDID_LENGTH);
-
-		kfree(edid);
-
-		return drm_edid;
-	}
-
 	return bridge->funcs->edid_read(bridge, connector);
 }
 EXPORT_SYMBOL_GPL(drm_bridge_edid_read);
-
-/**
- * drm_bridge_get_edid - get the EDID data of the connected display
- * @bridge: bridge control structure
- * @connector: the connector to read EDID for
- *
- * If the bridge supports output EDID retrieval, as reported by the
- * DRM_BRIDGE_OP_EDID bridge ops flag, call &drm_bridge_funcs.get_edid to
- * get the EDID and return it. Otherwise return NULL.
- *
- * Deprecated. Prefer using drm_bridge_edid_read().
- *
- * RETURNS:
- * The retrieved EDID on success, or NULL otherwise.
- */
-struct edid *drm_bridge_get_edid(struct drm_bridge *bridge,
-				 struct drm_connector *connector)
-{
-	if (!(bridge->ops & DRM_BRIDGE_OP_EDID))
-		return NULL;
-
-	return bridge->funcs->get_edid(bridge, connector);
-}
-EXPORT_SYMBOL_GPL(drm_bridge_get_edid);
 
 /**
  * drm_bridge_hpd_enable - enable hot plug detection for the bridge
@@ -1404,49 +1426,101 @@ struct drm_bridge *of_drm_find_bridge(struct device_node *np)
 EXPORT_SYMBOL(of_drm_find_bridge);
 #endif
 
-#ifdef CONFIG_DEBUG_FS
-static int drm_bridge_chains_info(struct seq_file *m, void *data)
+/**
+ * devm_drm_put_bridge - Release a bridge reference obtained via devm
+ * @dev: device that got the bridge via devm
+ * @bridge: pointer to a struct drm_bridge obtained via devm
+ *
+ * Same as drm_bridge_put() for bridge pointers obtained via devm functions
+ * such as devm_drm_bridge_alloc().
+ *
+ * This function is a temporary workaround and MUST NOT be used. Manual
+ * handling of bridge lifetime is inherently unsafe.
+ */
+void devm_drm_put_bridge(struct device *dev, struct drm_bridge *bridge)
 {
-	struct drm_debugfs_entry *entry = m->private;
-	struct drm_device *dev = entry->dev;
-	struct drm_printer p = drm_seq_file_printer(m);
-	struct drm_mode_config *config = &dev->mode_config;
-	struct drm_encoder *encoder;
-	unsigned int bridge_idx = 0;
-
-	list_for_each_entry(encoder, &config->encoder_list, head) {
-		struct drm_bridge *bridge;
-
-		drm_printf(&p, "encoder[%u]\n", encoder->base.id);
-
-		drm_for_each_bridge_in_chain(encoder, bridge) {
-			drm_printf(&p, "\tbridge[%u] type: %u, ops: %#x",
-				   bridge_idx, bridge->type, bridge->ops);
-
-#ifdef CONFIG_OF
-			if (bridge->of_node)
-				drm_printf(&p, ", OF: %pOFfc", bridge->of_node);
+	STUB();
+#ifdef notyet
+	devm_release_action(dev, drm_bridge_put_void, bridge);
 #endif
+}
+EXPORT_SYMBOL(devm_drm_put_bridge);
 
-			drm_printf(&p, "\n");
+#ifdef notyet
 
-			bridge_idx++;
-		}
-	}
+static void drm_bridge_debugfs_show_bridge(struct drm_printer *p,
+					   struct drm_bridge *bridge,
+					   unsigned int idx)
+{
+	drm_printf(p, "bridge[%u]: %ps\n", idx, bridge->funcs);
+
+	drm_printf(p, "\trefcount: %u\n", kref_read(&bridge->refcount));
+
+	drm_printf(p, "\ttype: [%d] %s\n",
+		   bridge->type,
+		   drm_get_connector_type_name(bridge->type));
+
+	if (bridge->of_node)
+		drm_printf(p, "\tOF: %pOFfc\n", bridge->of_node);
+
+	drm_printf(p, "\tops: [0x%x]", bridge->ops);
+	if (bridge->ops & DRM_BRIDGE_OP_DETECT)
+		drm_puts(p, " detect");
+	if (bridge->ops & DRM_BRIDGE_OP_EDID)
+		drm_puts(p, " edid");
+	if (bridge->ops & DRM_BRIDGE_OP_HPD)
+		drm_puts(p, " hpd");
+	if (bridge->ops & DRM_BRIDGE_OP_MODES)
+		drm_puts(p, " modes");
+	if (bridge->ops & DRM_BRIDGE_OP_HDMI)
+		drm_puts(p, " hdmi");
+	drm_puts(p, "\n");
+}
+
+static int allbridges_show(struct seq_file *m, void *data)
+{
+	struct drm_printer p = drm_seq_file_printer(m);
+	struct drm_bridge *bridge;
+	unsigned int idx = 0;
+
+	mutex_lock(&bridge_lock);
+
+	list_for_each_entry(bridge, &bridge_list, list)
+		drm_bridge_debugfs_show_bridge(&p, bridge, idx++);
+
+	mutex_unlock(&bridge_lock);
 
 	return 0;
 }
+DEFINE_SHOW_ATTRIBUTE(allbridges);
 
-static const struct drm_debugfs_info drm_bridge_debugfs_list[] = {
-	{ "bridge_chains", drm_bridge_chains_info, 0 },
-};
-
-void drm_bridge_debugfs_init(struct drm_minor *minor)
+static int encoder_bridges_show(struct seq_file *m, void *data)
 {
-	drm_debugfs_add_files(minor->dev, drm_bridge_debugfs_list,
-			      ARRAY_SIZE(drm_bridge_debugfs_list));
+	struct drm_encoder *encoder = m->private;
+	struct drm_printer p = drm_seq_file_printer(m);
+	struct drm_bridge *bridge;
+	unsigned int idx = 0;
+
+	drm_for_each_bridge_in_chain(encoder, bridge)
+		drm_bridge_debugfs_show_bridge(&p, bridge, idx++);
+
+	return 0;
 }
-#endif
+DEFINE_SHOW_ATTRIBUTE(encoder_bridges);
+
+#endif /* notyet */
+
+void drm_bridge_debugfs_params(struct dentry *root)
+{
+	debugfs_create_file("bridges", 0444, root, NULL, &allbridges_fops);
+}
+
+void drm_bridge_debugfs_encoder_params(struct dentry *root,
+				       struct drm_encoder *encoder)
+{
+	/* bridges list */
+	debugfs_create_file("bridges", 0444, root, encoder, &encoder_bridges_fops);
+}
 
 MODULE_AUTHOR("Ajay Kumar <ajaykumar.rs@samsung.com>");
 MODULE_DESCRIPTION("DRM bridge infrastructure");

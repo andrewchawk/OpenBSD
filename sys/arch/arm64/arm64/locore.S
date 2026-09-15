@@ -1,4 +1,4 @@
-/* $OpenBSD: locore.S,v 1.47 2024/07/27 13:31:26 kettenis Exp $ */
+/* $OpenBSD: locore.S,v 1.53 2026/09/09 16:08:18 deraadt Exp $ */
 /*-
  * Copyright (c) 2012-2014 Andrew Turner
  * All rights reserved.
@@ -31,6 +31,7 @@
 #include <sys/syscall.h>
 #include <machine/asm.h>
 #include <machine/armreg.h>
+#include <machine/codepatch.h>
 #include <machine/hypervisor.h>
 #include <machine/param.h>
 
@@ -51,10 +52,28 @@ drop_to_el1:
 	RETGUARD_CHECK(drop_to_el1, x15)
 	ret
 2:
-	/* Check for EL2 Host mode */
-	mrs	x2, hcr_el2
-	tbnz	x2, #34, 1b	/* HCR_E2H */
+	/*
+	 * Check for EL2 Host mode by testing aliasing between
+	 * EL1 and EL2 accessors of the FAR_EL2 register.
+	 */
+	msr	hcr_el2, xzr
+	isb
+	mov	x2, #1
+	msr	far_el1, x2
+	isb
+	mov	x2, #2
+	msr	far_el2, x2
+	isb
+	mrs	x2, far_el1
+	cmp	x2, #2
+	b.ne	3f
 
+	mov	x2, #HCR_E2H
+	orr	x2, x2, #HCR_TGE
+	msr	hcr_el2, x2
+	isb
+	b	1b
+3:
 	/* Configure the Hypervisor */
 	mov	x2, #(HCR_RW)
 	orr	x2, x2, #(HCR_API | HCR_APK)
@@ -80,8 +99,7 @@ drop_to_el1:
 	msr	hstr_el2, xzr
 
 	/* Enable access to the physical timers at EL1 */
-	mrs	x2, cnthctl_el2
-	orr	x2, x2, #(CNTHCTL_EL1PCTEN | CNTHCTL_EL1PCEN)
+	mov	x2, #(CNTHCTL_EL1PCTEN | CNTHCTL_EL1PCEN)
 	msr	cnthctl_el2, x2
 
 	/* Set the counter offset to a known value */
@@ -101,13 +119,13 @@ drop_to_el1:
 	ubfx	x2, x2, #ID_AA64PFR0_GIC_SHIFT, #ID_AA64PFR0_GIC_BITS
 	/* GIC[3:0] == 0001 - GIC CPU interface via special regs. supported */
 	cmp	x2, #(ID_AA64PFR0_GIC_CPUIF_EN >> ID_AA64PFR0_GIC_SHIFT)
-	b.ne	3f
+	b.ne	4f
 
 	mrs	x2, icc_sre_el2
 	orr	x2, x2, #ICC_SRE_EL2_EN	/* Enable access from insecure EL1 */
 	orr	x2, x2, #ICC_SRE_EL2_SRE	/* Enable system registers */
 	msr	icc_sre_el2, x2
-3:
+4:
 
 	/* Set the address to return to our return address */
 	msr	elr_el2, x30
@@ -197,6 +215,10 @@ start_mmu:
 	dsb	ishst
 	tlbi	vmalle1is
 	dsb	ish
+	CODEPATCH_START
+	tlbi	vmalle1is
+	dsb	ish
+	CODEPATCH_END(CPTAG_REPEAT_TLBI)
 	isb
 
 	ldr	x2, mair
@@ -238,6 +260,10 @@ switch_mmu_kernel:
 	dsb	ishst
 	tlbi	vmalle1is
 	dsb	ish
+	CODEPATCH_START
+	tlbi	vmalle1is
+	dsb	ish
+	CODEPATCH_END(CPTAG_REPEAT_TLBI)
 	isb
 
 	RETGUARD_CHECK(switch_mmu_kernel, x15)
@@ -441,7 +467,58 @@ cpu_hatch_ci:
 	.xword   0
 
 	.text
-#endif
+
+#ifdef HIBERNATE
+	.globl cpu_park
+cpu_park:
+	sev
+1:	wfe
+	adrp	x1, cpu_parked
+	ldr	w1, [x1, :lo12:cpu_parked]
+	cbnz	x1, 1b
+
+	/* Invalidate the TLB */
+	dsb	ishst
+	tlbi	vmalle1is
+	dsb	ish
+	CODEPATCH_START
+	tlbi	vmalle1is
+	dsb	ish
+	CODEPATCH_END(CPTAG_REPEAT_TLBI)
+	isb
+
+	mrs	x2, mpidr_el1
+	mov	x3, #(MPIDR_AFF0 | MPIDR_AFF1)
+	movk	x3, #(MPIDR_AFF2 >> 16), lsl #16
+	movk	x3, #(MPIDR_AFF3 >> 32), lsl #32
+	and	x2, x2, x3
+
+	/* Lookup our struct cpu_info */
+	adrp	x0, cpu_info_list
+	ldr	x0, [x0, :lo12:cpu_info_list]
+2:
+	ldr	x1, [x0, #CI_MPIDR]
+	cmp	x1, x2
+	b.eq	3f
+	ldr	x0, [x0, #CI_NEXT]
+	b	2b
+
+3:
+	/* Set up CPU info */
+	msr	tpidr_el1, x0
+
+	ldr	x1, [x0, #CI_EL1_STKEND]
+	mov	sp, x1
+
+	bl	hibernate_dcache_flush_machdep
+
+	mrs	x0, tpidr_el1
+	adr	x1, .Lcpu_init_secondary
+	ldr	x1, [x1]
+	blr	x1
+	b	.
+#endif	/* HIBERNATE */
+#endif	/* MULTIPROCESSOR */
 
 #ifdef SUSPEND
 	.globl cpu_hatch_primary
@@ -476,7 +553,7 @@ cpu_hatch_primary:
 	.align 3
 .Lcpu_init_primary:
 	.xword	cpu_init_primary
-#endif
+#endif /* SUSPEND */
 
 	.align 3
 .Lpagetable_l0_ttbr0:

@@ -1,4 +1,4 @@
-/*	$OpenBSD: agentx.c,v 1.24 2023/10/29 11:10:07 martijn Exp $ */
+/*	$OpenBSD: agentx.c,v 1.26 2025/12/08 10:22:19 jsg Exp $ */
 /*
  * Copyright (c) 2019 Martijn van Duren <martijn@openbsd.org>
  *
@@ -402,6 +402,7 @@ agentx_session(struct agentx *ax, uint32_t oid[],
 #ifdef AX_DEBUG
 			agentx_log_ax_fatalx(ax, "%s: %s", __func__, errstr);
 #else
+			free(axs);
 			return NULL;
 #endif
 		}
@@ -894,6 +895,7 @@ agentx_agentcaps(struct agentx_context *axc, uint32_t oid[],
 		agentx_log_axc_fatalx(axc, "%s: %s", __func__, errstr);
 #else
 		agentx_log_axc_warnx(axc, "%s: %s", __func__, errstr);
+		free(axa);
 		return NULL;
 #endif
 	}
@@ -1050,11 +1052,13 @@ agentx_agentcaps_close_finalize(struct ax_pdu *pdu, void *cookie)
 void
 agentx_agentcaps_free(struct agentx_agentcaps *axa)
 {
-	struct agentx *ax = axa->axa_axc->axc_axs->axs_ax;
+	struct agentx *ax;
 	int axfree;
 
 	if (axa == NULL)
 		return;
+
+	ax = axa->axa_axc->axc_axs->axs_ax;
 
 	axfree = ax->ax_free;
 	ax->ax_free = 1;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_igc.c,v 1.25 2024/05/24 06:02:53 jsg Exp $	*/
+/*	$OpenBSD: if_igc.c,v 1.32 2026/06/23 14:40:40 bluhm Exp $	*/
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
@@ -81,6 +81,7 @@ const struct pci_matchid igc_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_BLANK_NVM },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_IT },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_LM },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_LMVP },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_K },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_I226_V }
 };
@@ -202,6 +203,7 @@ igc_attach(struct device *parent, struct device *self, void *aux)
 	/* Determine hardware and mac info */
 	igc_identify_hardware(sc);
 
+	sc->rx_mbuf_sz = MCLBYTES;
 	sc->num_tx_desc = IGC_DEFAULT_TXD;
 	sc->num_rx_desc = IGC_DEFAULT_RXD;
 
@@ -723,8 +725,8 @@ igc_setup_msix(struct igc_softc *sc)
 	/* Give one vector to events. */
 	nmsix--;
 
-	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix, IGC_MAX_VECTORS,
-	    INTRMAP_POWEROF2);
+	sc->sc_intrmap = intrmap_create(&sc->sc_dev, nmsix,
+	    MIN(IGC_MAX_VECTORS, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 	sc->sc_nqueues = intrmap_count(sc->sc_intrmap);
 }
 
@@ -735,11 +737,11 @@ igc_dma_malloc(struct igc_softc *sc, bus_size_t size, struct igc_dma_alloc *dma)
 
 	dma->dma_tag = os->os_pa.pa_dmat;
 
-	if (bus_dmamap_create(dma->dma_tag, size, 1, size, 0, BUS_DMA_NOWAIT,
-	    &dma->dma_map))
+	if (bus_dmamap_create(dma->dma_tag, size, 1, size, 0,
+	    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &dma->dma_map))
 		return 1;
 	if (bus_dmamem_alloc(dma->dma_tag, size, PAGE_SIZE, 0, &dma->dma_seg,
-	    1, &dma->dma_nseg, BUS_DMA_NOWAIT))
+	    1, &dma->dma_nseg, BUS_DMA_NOWAIT | BUS_DMA_64BIT))
 		goto destroy;
 	if (bus_dmamem_map(dma->dma_tag, &dma->dma_seg, dma->dma_nseg, size,
 	    &dma->dma_vaddr, BUS_DMA_NOWAIT | BUS_DMA_COHERENT))
@@ -794,7 +796,7 @@ igc_setup_interface(struct igc_softc *sc)
 	ifp->if_softc = sc;
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
-	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
 	ifp->if_ioctl = igc_ioctl;
 	ifp->if_qstart = igc_start;
 	ifp->if_watchdog = igc_watchdog;
@@ -881,7 +883,6 @@ igc_init(void *arg)
 	}
 	igc_initialize_transmit_unit(sc);
 
-	sc->rx_mbuf_sz = MCLBYTES + ETHER_ALIGN;
 	/* Prepare receive descriptors and buffers. */
 	if (igc_setup_receive_structures(sc)) {
 		printf("%s: Could not setup receive structures\n",
@@ -1119,7 +1120,7 @@ igc_txeof(struct igc_txring *txr)
 
 	txr->next_to_clean = cons;
 
-	if (ifq_is_oactive(ifq))
+	if (done && ifq_is_oactive(ifq))
 		ifq_restart(ifq);
 
 	return (done);
@@ -1232,7 +1233,7 @@ igc_rxrinfo(struct igc_softc *sc, struct if_rxrinfo *ifri)
 
 	for (i = 0; i < sc->sc_nqueues; i++) {
 		rxr = &sc->rx_rings[i];
-		ifr[n].ifr_size = MCLBYTES;
+		ifr[n].ifr_size = sc->rx_mbuf_sz;
 		snprintf(ifr[n].ifr_name, sizeof(ifr[n].ifr_name), "%d", i);
 		ifr[n].ifr_info = rxr->rx_ring;
 		n++;
@@ -1673,11 +1674,11 @@ igc_get_buf(struct igc_rxring *rxr, int i)
 		return ENOBUFS;
 	}
 
-	m = MCLGETL(NULL, M_DONTWAIT, sc->rx_mbuf_sz);
+	m = MCLGETL(NULL, M_DONTWAIT, sc->rx_mbuf_sz + ETHER_ALIGN);
 	if (!m)
 		return ENOBUFS;
 
-	m->m_data += (m->m_ext.ext_size - sc->rx_mbuf_sz);
+	m->m_data += ETHER_ALIGN;
 	m->m_len = m->m_pkthdr.len = sc->rx_mbuf_sz;
 
 	error = bus_dmamap_load_mbuf(rxr->rxdma.dma_tag, rxbuf->map, m,
@@ -1854,10 +1855,11 @@ igc_allocate_transmit_buffers(struct igc_txring *txr)
 	for (i = 0; i < sc->num_tx_desc; i++) {
 		txbuf = &txr->tx_buffers[i];
 		error = bus_dmamap_create(txr->txdma.dma_tag, IGC_TSO_SIZE,
-		    IGC_MAX_SCATTER, PAGE_SIZE, 0, BUS_DMA_NOWAIT, &txbuf->map);
+		    IGC_MAX_SCATTER, PAGE_SIZE, 0,
+		    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &txbuf->map);
 		if (error != 0) {
-			printf("%s: Unable to create TX DMA map\n",
-			    DEVNAME(sc));
+			printf("%s: Unable to create TX DMA map, error %d\n",
+			    DEVNAME(sc), error);
 			goto fail;
 		}
 	}
@@ -2159,11 +2161,11 @@ igc_allocate_receive_buffers(struct igc_rxring *rxr)
 	rxbuf = rxr->rx_buffers;
 	for (i = 0; i < sc->num_rx_desc; i++, rxbuf++) {
 		error = bus_dmamap_create(rxr->rxdma.dma_tag,
-		    MAX_JUMBO_FRAME_SIZE, 1, MAX_JUMBO_FRAME_SIZE, 0,
-		    BUS_DMA_NOWAIT, &rxbuf->map);
+		    sc->rx_mbuf_sz, 1, sc->rx_mbuf_sz, 0,
+		    BUS_DMA_NOWAIT | BUS_DMA_64BIT, &rxbuf->map);
 		if (error) {
-			printf("%s: Unable to create RX DMA map\n",
-			    DEVNAME(sc));
+			printf("%s: Unable to create RX DMA map, error %d\n",
+			    DEVNAME(sc), error);
 			goto fail;
 		}
 	}
@@ -2223,7 +2225,8 @@ igc_setup_receive_ring(struct igc_rxring *rxr)
 	rxr->next_to_check = 0;
 	rxr->last_desc_filled = sc->num_rx_desc - 1;
 
-	if_rxr_init(&rxr->rx_ring, 2 * ((ifp->if_hardmtu / MCLBYTES) + 1),
+	if_rxr_init(&rxr->rx_ring,
+	    2 * howmany(ifp->if_hardmtu, sc->rx_mbuf_sz) + 1,
 	    sc->num_rx_desc - 1);
 
 	return 0;

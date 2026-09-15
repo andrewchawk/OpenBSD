@@ -18,12 +18,6 @@ get_random_u32_below(uint32_t x)
 	return arc4random_uniform(x);
 }
 
-static inline unsigned int
-get_random_int(void)
-{
-	return arc4random();
-}
-
 static inline uint64_t
 get_random_u64(void)
 {
@@ -42,14 +36,8 @@ get_random_long(void)
 #endif
 }
 
-static inline uint32_t
-prandom_u32_max(uint32_t x)
-{
-	return arc4random_uniform(x + 1);
-}
-
 static inline void
-get_random_bytes(void *buf, int nbytes)
+get_random_bytes(void *buf, size_t nbytes)
 {
 	arc4random_buf(buf, nbytes);
 }

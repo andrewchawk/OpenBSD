@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_txt.c,v 1.36 2022/12/26 19:16:04 jmc Exp $	*/
+/*	$OpenBSD: v_txt.c,v 1.38 2026/08/18 02:00:00 millert Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -221,7 +221,7 @@ txt_map_end(SCR *sp)
 #define	UNMAP_TST							\
 	FL_ISSET(ec_flags, EC_MAPINPUT) && LF_ISSET(TXT_INFOLINE)
 
-/* 
+/*
  * Internally, we maintain tp->lno and tp->cno, externally, everyone uses
  * sp->lno and sp->cno.  Make them consistent as necessary.
  */
@@ -476,6 +476,8 @@ next:	if (v_event_get(sp, evp, 0, ec_flags))
 	 * line and there's no reason to enter explicit characters to continue.
 	 */
 	if (filec_redraw && !F_ISSET(sp, SC_SCR_EXWROTE)) {
+		int stinput;
+
 		filec_redraw = 0;
 
 		fc.e_event = E_REPAINT;
@@ -483,8 +485,13 @@ next:	if (v_event_get(sp, evp, 0, ec_flags))
 		    sp->rows ? 1 : sp->rows - vip->totalcount;
 		fc.e_tlno = sp->rows;
 		vip->linecount = vip->lcontinue = vip->totalcount = 0;
+		stinput = F_ISSET(sp, SC_TINPUT_INFO);
+		if (stinput)
+		    F_CLR(sp, SC_TINPUT_INFO);
 		(void)vs_repaint(sp, &fc);
 		(void)vs_refresh(sp, 1);
+		if (stinput)
+		    F_SET(sp, SC_TINPUT_INFO);
 	}
 
 	/* Deal with all non-character events. */
@@ -2549,7 +2556,7 @@ txt_isrch(SCR *sp, VICMD *vp, TEXT *tp, u_int8_t *is_flagsp)
 		FL_CLR(*is_flagsp, IS_RUNNING);
 		return (0);
 	}
-		
+
 	/*
 	 * Remember the input line and discard the special input map,
 	 * but don't overwrite the input line on the screen.
@@ -2563,7 +2570,7 @@ txt_isrch(SCR *sp, VICMD *vp, TEXT *tp, u_int8_t *is_flagsp)
 	/*
 	 * Specify a starting point and search.  If we find a match, move to
 	 * it and refresh the screen.  If we didn't find the match, then we
-	 * beep the screen.  When searching from the original cursor position, 
+	 * beep the screen.  When searching from the original cursor position,
 	 * we have to move the cursor, otherwise, we don't want to move the
 	 * cursor in case the text at the current position continues to match.
 	 */
@@ -2596,7 +2603,7 @@ txt_isrch(SCR *sp, VICMD *vp, TEXT *tp, u_int8_t *is_flagsp)
 	F_SET(sp, SC_TINPUT | SC_TINPUT_INFO);
 
 	/* Reset the line number of the input line. */
-	tp->lno = TMAP[0].lno; 
+	tp->lno = TMAP[0].lno;
 
 	/*
 	 * If the colon command-line moved, i.e. the screen scrolled,

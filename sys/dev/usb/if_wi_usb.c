@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_wi_usb.c,v 1.77 2024/05/23 03:21:09 jsg Exp $ */
+/*	$OpenBSD: if_wi_usb.c,v 1.79 2025/06/10 13:32:26 claudio Exp $ */
 
 /*
  * Copyright (c) 2003 Dale Rahn. All rights reserved.
@@ -245,10 +245,6 @@ const struct wi_usb_type {
 int wi_usb_match(struct device *, void *, void *);
 void wi_usb_attach(struct device *, struct device *, void *);
 int wi_usb_detach(struct device *, int);
-
-struct cfdriver wi_usb_cd = {
-	NULL, "wi_usb", DV_IFNET
-};
 
 const struct cfattach wi_usb_ca = {
 	sizeof(struct wi_usb_softc), wi_usb_match, wi_usb_attach, wi_usb_detach
@@ -1614,7 +1610,7 @@ void
 wi_usb_start_thread(void *arg)
 {
 	struct wi_usb_softc	*sc = arg;
-	kthread_create (wi_usb_thread, arg, NULL, sc->wi_usb_dev.dv_xname);
+	kthread_create(wi_usb_thread, arg, NULL, sc->wi_usb_dev.dv_xname);
 }
 
 void

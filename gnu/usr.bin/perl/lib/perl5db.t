@@ -1838,7 +1838,6 @@ DebugWrap->new({
             [
                 'n',
                 'w $foo',
-                'W $foo',
                 'c',
                 'print "\nIDX=<$idx>\n"',
                 'q',
@@ -1847,16 +1846,45 @@ DebugWrap->new({
         }
     );
 
-    $wrapper->contents_unlike(qr#
-        \$foo\ changed:
+
+    $wrapper->contents_like(qr#
+        \$foo\ changed:\n
+        \s+old\ value:\s+'1'\n
+        \s+new\ value:\s+'2'\n
         #msx,
-        'W command - watchpoint was deleted',
+        'w command - watchpoint changed',
+    );
+    $wrapper->output_like(qr#
+        \nIDX=<20>\n
+        #msx,
+        "w command - correct output from IDX",
+    );
+}
+
+{
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'w @foo',
+                'c',
+                'q',
+            ],
+            prog => \<<'PROG',
+my @foo;
+push @foo, undef;
+push @foo, "x";
+print @foo;
+PROG
+        }
     );
 
-    $wrapper->output_like(qr#
-        \nIDX=<>\n
+    $wrapper->contents_like(qr#
+        Watchpoint\ 0:\s+\@foo\ changed:\n
+        \s+old\ value:\s+\n
+        \s+new\ value:\s+undef\n
         #msx,
-        "W command - stopped at end.",
+        'w command - distinguish () from (undef)',
     );
 }
 
@@ -3294,6 +3322,344 @@ EOS
     $wrapper->output_unlike(qr/AddressSanitizer/, "[github #19198] no bad access");
     $wrapper->contents_like(qr/^Test::AUTOLOAD\(.*?\):\s+\d+:\s+my \$sub = \$AUTOLOAD;/m,
                           "[github #19198] check we stopped correctly");
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #1
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l ...',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '...'/,
+        q/gh-21350: multiple periods rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #2
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l $',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '\$'/,
+        q/gh-21350: $ rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #3
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l 2.71828',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '2\.71828'/,
+        q/gh-21350: floating-point rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #4
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l 1.1.1.1',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '1\.1\.1\.1'/,
+        q/gh-21350: IPv4 address rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #5
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l -.',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '-\.'/,
+        q/gh-21350: invalid partial range rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #6
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l -$.',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '\-\$\.'/,
+        q/gh-21350: formerly acceptable nonsense rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #7
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l -12',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '-12'/,
+        q/gh-21350: negative line number rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #8
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l 17$',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '17\$'/,
+        q/gh-21350: line number with trailing $ rejected/,
+    );
+}
+
+{
+    # gh-21350: verify that nonsense linespecs are rejected #9
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'l $2250$',
+                'q',
+            ],
+            prog => '../lib/perl5db/t/gh-21350',
+        }
+    );
+
+    $wrapper->contents_like(
+        qr/Invalid line specification '\$2250\$'/,
+        q/gh-21350: match variable with trailing $ rejected/,
+    );
+}
+
+{
+    # https://github.com/Perl/perl5/issues/21564
+    # not a debugger bug, but with the way the fix for #19198 was broken
+    # this needs to be tested with a debugger of some sort (even a no-op
+    # debugger) so test it here.
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                'c', # just run it, we check the output of the code
+                'q'
+            ],
+            prog => \<<'EOS',
+use v5.12;
+no strict;
+use B qw(svref_2object SVf_IOK);
+my $sv = svref_2object(\(${"_<$0"}[3])); # the "use B;" line
+say +($sv->FLAGS & SVf_IOK) ? "OK" : "FAIL";
+EOS
+        }
+    );
+    $wrapper->output_like(qr/\bOK\b/, "check the line is IOK");
+}
+
+{
+    # https://github.com/Perl/perl5/issues/799
+    my $prog = <<'EOS';
+sub problem {
+    $SIG{__DIE__} = sub {
+        die "<b problem> will set a break point here.\n";
+    };    # The break point _should_ be set here.
+    warn "This line will run even if you enter <c problem>.\n";
+}
+&problem;
+EOS
+
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                "b problem",
+                "c",
+                "q"
+            ],
+            prog => \$prog
+        }
+    );
+    $wrapper->contents_like(qr/The break point _should_/, "break at right place (b)");
+    $wrapper->output_unlike(qr/This line will run even if you enter <c problem>\./,
+                            "didn't run the wrong code (b)");
+
+    $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                "c problem",
+                "q"
+            ],
+            prog => \$prog
+        }
+    );
+    $wrapper->contents_like(qr/The break point _should_/, "break at right place (c)");
+    $wrapper->output_unlike(qr/This line will run even if you enter <c problem>\./,
+                            "didn't run the wrong code (c)");
+
+    $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                "c unknown",
+                "q"
+            ],
+            prog => \$prog
+        }
+    );
+    $wrapper->contents_like(qr/Subroutine main::unknown not found/, "fail to continue to unknown");
+    $wrapper->contents_unlike(qr/DB::subroutine_first_breakable_line/,
+                              "no backtrace for the error message");
+
+}
+
+{
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                "b B::svref_2object",
+                "q"
+            ],
+            prog => \<<'EOS'
+use B;
+print "Hello\n";
+EOS
+        }
+    );
+    $wrapper->contents_like(qr/Cannot break on XSUB B::svref_2object/, "can't break on XSUB");
+}
+
+{
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                "b problem", # should fail
+                "b postpone problem",
+                "L",
+                "c",
+                "q"
+            ],
+            prog => \<<'EOS'
+print "1\n";
+eval <<'EOC';
+sub problem {
+    $SIG{__DIE__} = sub {
+        die "<b problem> will set a break point here.\n";
+    };    # The break point _should_ be set here.
+    warn "This line will run even if you enter <c problem>.\n";
+}
+EOC
+print "2\n";
+problem();
+print "3\n";
+EOS
+        }
+    );
+    $wrapper->contents_like(qr/Subroutine main::problem not found/,
+                            "problem not defined yet");
+    $wrapper->contents_like(qr/Postponed\ breakpoints\ in\ subroutines:
+                               \s+main::problem\s+break\s\+0\sif\s1/x,
+                            "check postponed breakpoint present");
+    $wrapper->contents_like(qr/The break point _should_/, "break at right place (c)");
+    $wrapper->output_unlike(qr/This line will run even if you enter <c problem>\./,
+                            "didn't run the wrong code");
+}
+
+{
+    my $wrapper = DebugWrap->new(
+        {
+            cmds =>
+            [
+                "b compile problem",
+                "L",
+                "c",
+                "q"
+            ],
+            prog => \<<'EOS'
+print "1\n";
+eval <<'EOC';
+sub problem {
+    $SIG{__DIE__} = sub {
+        die "<b problem> will set a break point here.\n";
+    };    # The break point _should_ be set here.
+    warn "This line will run even if you enter <c problem>.\n";
+}
+EOC
+print "2\n";
+problem();
+print "3\n";
+EOS
+        }
+    );
+    $wrapper->contents_like(qr/Postponed\ breakpoints\ in\ subroutines:
+                               \s+main::problem\s+compile/x,
+                            "check compiled breakpoint present");
+    $wrapper->contents_like(qr/print "2\\n"/, "break immediately after defining problem");
 }
 
 done_testing();

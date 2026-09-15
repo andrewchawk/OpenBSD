@@ -1,4 +1,4 @@
-/*	$OpenBSD: workqueue.h,v 1.11 2024/01/06 09:33:08 kettenis Exp $	*/
+/*	$OpenBSD: workqueue.h,v 1.13 2026/08/06 05:31:03 jsg Exp $	*/
 /*
  * Copyright (c) 2015 Mark Kettenis
  *
@@ -27,6 +27,7 @@
 #include <linux/rcupdate.h>
 #include <linux/lockdep.h>
 #include <linux/timer.h>
+#include <linux/workqueue_types.h>
 
 struct workqueue_struct;
 
@@ -69,13 +70,6 @@ destroy_workqueue(struct workqueue_struct *wq)
 	taskq_destroy((struct taskq *)wq);
 }
 
-struct work_struct {
-	struct task task;
-	struct taskq *tq;
-};
-
-typedef void (*work_func_t)(struct work_struct *);
-
 static inline void
 INIT_WORK(struct work_struct *work, work_func_t func)
 {
@@ -92,6 +86,12 @@ queue_work(struct workqueue_struct *wq, struct work_struct *work)
 	return task_add(work->tq, &work->task);
 }
 
+static inline bool
+queue_work_node(int node, struct workqueue_struct *wq, struct work_struct *work)
+{
+	return queue_work(wq, work);
+}
+
 static inline void
 cancel_work(struct work_struct *work)
 {
@@ -99,11 +99,12 @@ cancel_work(struct work_struct *work)
 		task_del(work->tq, &work->task);
 }
 
-static inline void
+static inline bool
 cancel_work_sync(struct work_struct *work)
 {
 	if (work->tq != NULL)
-		task_del(work->tq, &work->task);
+		return task_del(work->tq, &work->task);
+	return false;
 }
 
 #define work_pending(work)	task_pending(&(work)->task)

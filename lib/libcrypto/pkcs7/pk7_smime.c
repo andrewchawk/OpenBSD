@@ -1,4 +1,4 @@
-/* $OpenBSD: pk7_smime.c,v 1.27 2024/04/20 10:11:55 tb Exp $ */
+/* $OpenBSD: pk7_smime.c,v 1.30 2026/06/09 12:34:08 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project.
  */
@@ -60,10 +60,10 @@
 
 #include <stdio.h>
 
-#include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "err_local.h"
 #include "x509_local.h"
 
 static int pkcs7_copy_existing_digest(PKCS7 *p7, PKCS7_SIGNER_INFO *si);
@@ -259,7 +259,7 @@ PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store, BIO *indata,
 	char buf[4096];
 	int i, j = 0, k, ret = 0;
 	BIO *p7bio;
-	BIO *tmpin, *tmpout;
+	BIO *next, *tmpin, *tmpout;
 
 	if (!p7) {
 		PKCS7error(PKCS7_R_INVALID_NULL_POINTER);
@@ -277,14 +277,19 @@ PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store, BIO *indata,
 		return 0;
 	}
 
-	/*
-	 * Very old Netscape illegally included empty content with
-	 * a detached signature.  Very old users should upgrade.
-	 */
-	/* Check for data and content: two sets of data */
-	if (!PKCS7_get_detached(p7) && indata) {
-		PKCS7error(PKCS7_R_CONTENT_AND_DATA_PRESENT);
-		return 0;
+	if ((flags & PKCS7_NO_DUAL_CONTENT) != 0) {
+		/*
+		 * This was originally "#if 0" because we thought that only old
+		 * broken Netscape did this.  It turns out that Authenticode
+		 * uses this kind of "extended" PKCS7 format, and things like
+		 * UEFI secure boot and tools like osslsigncode need it.  In
+		 * Authenticode the verification process is different, but the
+		 * existing PKCS7 verification works.
+		 */
+		if (!PKCS7_get_detached(p7) && indata != NULL) {
+			PKCS7error(PKCS7_R_CONTENT_AND_DATA_PRESENT);
+			return 0;
+		}
 	}
 
 	sinfos = PKCS7_get_signer_info(p7);
@@ -404,12 +409,12 @@ PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store, BIO *indata,
 
 	ret = 1;
 
-err:
-	if (tmpin == indata) {
-		if (indata)
-			BIO_pop(p7bio);
+ err:
+	while (p7bio != NULL && p7bio != indata) {
+		next = BIO_pop(p7bio);
+		BIO_free(p7bio);
+		p7bio = next;
 	}
-	BIO_free_all(p7bio);
 	sk_X509_free(signers);
 
 	return ret;

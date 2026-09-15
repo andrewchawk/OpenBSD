@@ -1,4 +1,4 @@
-/*	$OpenBSD: gencode.c,v 1.66 2024/04/08 02:51:14 jsg Exp $	*/
+/*	$OpenBSD: gencode.c,v 1.69 2025/10/30 04:20:05 dlg Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998
@@ -175,7 +175,6 @@ static void *
 newchunk(size_t n)
 {
 	struct membag *m;
-	int k, size;
 	void *p;
 
 	m = &membag[cur_membag];
@@ -749,7 +748,7 @@ init_linktype(int type)
 		return;
 
 	case DLT_ENC:
-		off_linktype = -1;
+		off_linktype = 12; /* ENC_HDRLEN */
 		off_nl = 12;
 		return;
 
@@ -769,9 +768,11 @@ init_linktype(int type)
 		off_nl = 12;
 		return;
 
-	case DLT_USBPCAP:
-		/* FALLTHROUGH */
 	case DLT_RAW:
+		off_linktype = 0;
+		off_nl = 0;
+		return;
+	case DLT_USBPCAP:
 		off_linktype = -1;
 		off_nl = 0;
 		return;
@@ -882,7 +883,6 @@ gen_linktype(int proto)
 		break;
 
 	case DLT_LOOP:
-	case DLT_ENC:
 	case DLT_NULL:
 	{
 		int v;
@@ -911,6 +911,39 @@ gen_linktype(int proto)
 		return (gen_cmp(0, BPF_W, (bpf_int32)v));
 		break;
 	}
+	case DLT_ENC:
+	case DLT_RAW: {
+		struct slist *s0, *s1;
+		int ipv;
+
+		switch (proto) {
+		case ETHERTYPE_IP:
+			ipv = 4;
+			break;
+		case ETHERTYPE_IPV6:
+			ipv = 6;
+			break;
+		default:
+			return gen_false();
+		}
+
+		/* A = p[X+off_linktype] */
+		s0 = new_stmt(BPF_LD|BPF_ABS|BPF_B);
+		s0->s.k = off_linktype;
+
+		/* A = A >> 4 */
+		s1 = new_stmt(BPF_ALU|BPF_RSH|BPF_K);
+		s1->s.k = 4;
+		sappend(s0, s1);
+
+		/* if (A == ipv) ... */
+		b0 = new_block(JMP(BPF_JEQ));
+		b0->stmts = s0;
+		b0->s.k = ipv;
+
+		return (b0);
+	}
+
 	case DLT_PFLOG:
 		if (proto == ETHERTYPE_IP)
 			return (gen_cmp(offsetof(struct pfloghdr, af), BPF_B,

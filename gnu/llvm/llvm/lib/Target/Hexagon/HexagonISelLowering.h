@@ -21,105 +21,13 @@
 #include "llvm/CodeGen/SelectionDAGNodes.h"
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/ValueTypes.h"
+#include "llvm/CodeGenTypes/MachineValueType.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/InlineAsm.h"
-#include "llvm/Support/MachineValueType.h"
 #include <cstdint>
 #include <utility>
 
 namespace llvm {
-
-namespace HexagonISD {
-
-enum NodeType : unsigned {
-  OP_BEGIN = ISD::BUILTIN_OP_END,
-
-  CONST32 = OP_BEGIN,
-  CONST32_GP,  // For marking data present in GP.
-  ADDC,        // Add with carry: (X, Y, Cin) -> (X+Y, Cout).
-  SUBC,        // Sub with carry: (X, Y, Cin) -> (X+~Y+Cin, Cout).
-  ALLOCA,
-
-  AT_GOT,      // Index in GOT.
-  AT_PCREL,    // Offset relative to PC.
-
-  CALL,        // Function call.
-  CALLnr,      // Function call that does not return.
-  CALLR,
-
-  RET_FLAG,    // Return with a flag operand.
-  BARRIER,     // Memory barrier.
-  JT,          // Jump table.
-  CP,          // Constant pool.
-
-  COMBINE,
-  VASL,        // Vector shifts by a scalar value
-  VASR,
-  VLSR,
-  MFSHL,       // Funnel shifts with the shift amount guaranteed to be
-  MFSHR,       // within the range of the bit width of the element.
-
-  SSAT,        // Signed saturate.
-  USAT,        // Unsigned saturate.
-  SMUL_LOHI,   // Same as ISD::SMUL_LOHI, but opaque to the combiner.
-  UMUL_LOHI,   // Same as ISD::UMUL_LOHI, but opaque to the combiner.
-               // We want to legalize MULH[SU] to [SU]MUL_LOHI, but the
-               // combiner will keep rewriting it back to MULH[SU].
-  USMUL_LOHI,  // Like SMUL_LOHI, but unsigned*signed.
-
-  TSTBIT,
-  INSERT,
-  EXTRACTU,
-  VEXTRACTW,
-  VINSERTW0,
-  VROR,
-  TC_RETURN,
-  EH_RETURN,
-  DCFETCH,
-  READCYCLE,
-  PTRUE,
-  PFALSE,
-  D2P,         // Convert 8-byte value to 8-bit predicate register. [*]
-  P2D,         // Convert 8-bit predicate register to 8-byte value. [*]
-  V2Q,         // Convert HVX vector to a vector predicate reg. [*]
-  Q2V,         // Convert vector predicate to an HVX vector. [*]
-               // [*] The equivalence is defined as "Q <=> (V != 0)",
-               //     where the != operation compares bytes.
-               // Note: V != 0 is implemented as V >u 0.
-  QCAT,
-  QTRUE,
-  QFALSE,
-
-  TL_EXTEND,   // Wrappers for ISD::*_EXTEND and ISD::TRUNCATE to prevent DAG
-  TL_TRUNCATE, // from auto-folding operations, e.g.
-               // (i32 ext (i16 ext i8)) would be folded to (i32 ext i8).
-               // To simplify the type legalization, we want to keep these
-               // single steps separate during type legalization.
-               // TL_[EXTEND|TRUNCATE] Inp, i128 _, i32 Opc
-               // * Inp is the original input to extend/truncate,
-               // * _ is a dummy operand with an illegal type (can be undef),
-               // * Opc is the original opcode.
-               // The legalization process (in Hexagon lowering code) will
-               // first deal with the "real" types (i.e. Inp and the result),
-               // and once all of them are processed, the wrapper node will
-               // be replaced with the original ISD node. The dummy illegal
-               // operand is there to make sure that the legalization hooks
-               // are called again after everything else is legal, giving
-               // us the opportunity to undo the wrapping.
-
-  TYPECAST,    // No-op that's used to convert between different legal
-               // types in a register.
-  VALIGN,      // Align two vectors (in Op0, Op1) to one that would have
-               // been loaded from address in Op2.
-  VALIGNADDR,  // Align vector address: Op0 & -Op1, except when it is
-               // an address in a vector load, then it's a no-op.
-  ISEL,        // Marker for nodes that were created during ISel, and
-               // which need explicit selection (would have been left
-               // unselected otherwise).
-  OP_END
-};
-
-} // end namespace HexagonISD
 
 class HexagonSubtarget;
 
@@ -141,7 +49,7 @@ public:
       const SmallVectorImpl<SDValue> &OutVals,
       const SmallVectorImpl<ISD::InputArg> &Ins, SelectionDAG& DAG) const;
 
-  bool getTgtMemIntrinsic(IntrinsicInfo &Info, const CallInst &I,
+  bool getTgtMemIntrinsic(IntrinsicInfo &Info, const CallBase &I,
                           MachineFunction &MF,
                           unsigned Intrinsic) const override;
 
@@ -155,6 +63,10 @@ public:
   bool hasBitTest(SDValue X, SDValue Y) const override;
 
   bool allowTruncateForTailCall(Type *Ty1, Type *Ty2) const override;
+
+  bool isMaskAndCmp0FoldingBeneficial(const Instruction &AndI) const override;
+
+  bool isUsedByReturnOnly(SDNode *N, SDValue &Chain) const override;
 
   /// Return true if an FMA operation is faster than a pair of mul and add
   /// instructions. fmuladd intrinsics will be expanded to FMAs when this
@@ -181,7 +93,9 @@ public:
   void ReplaceNodeResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
                           SelectionDAG &DAG) const override;
 
-  const char *getTargetNodeName(unsigned Opcode) const override;
+  std::pair<MVT, unsigned>
+  handleMaskRegisterForCallingConv(const HexagonSubtarget &Subtarget,
+                                   EVT VT) const;
 
   SDValue LowerBUILD_VECTOR(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerCONCAT_VECTORS(SDValue Op, SelectionDAG &DAG) const;
@@ -200,12 +114,14 @@ public:
   SDValue LowerStore(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerUnalignedLoad(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerUAddSubO(SDValue Op, SelectionDAG &DAG) const;
-  SDValue LowerAddSubCarry(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerUAddSubOCarry(SDValue Op, SelectionDAG &DAG) const;
 
   SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerINLINEASM(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerFDIV(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerPREFETCH(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerREADCYCLECOUNTER(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerREADSTEADYCOUNTER(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerEH_LABEL(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerEH_RETURN(SDValue Op, SelectionDAG &DAG) const;
   SDValue
@@ -223,13 +139,13 @@ public:
   SDValue LowerToTLSLocalExecModel(GlobalAddressSDNode *GA,
       SelectionDAG &DAG) const;
   SDValue GetDynamicTLSAddr(SelectionDAG &DAG, SDValue Chain,
-      GlobalAddressSDNode *GA, SDValue InFlag, EVT PtrVT,
-      unsigned ReturnReg, unsigned char OperandFlags) const;
+      GlobalAddressSDNode *GA, SDValue InGlue, EVT PtrVT,
+      unsigned ReturnReg, unsigned char OperandGlues) const;
   SDValue LowerGLOBAL_OFFSET_TABLE(SDValue Op, SelectionDAG &DAG) const;
 
   SDValue LowerCall(TargetLowering::CallLoweringInfo &CLI,
       SmallVectorImpl<SDValue> &InVals) const override;
-  SDValue LowerCallResult(SDValue Chain, SDValue InFlag,
+  SDValue LowerCallResult(SDValue Chain, SDValue InGlue,
                           CallingConv::ID CallConv, bool isVarArg,
                           const SmallVectorImpl<ISD::InputArg> &Ins,
                           const SDLoc &dl, SelectionDAG &DAG,
@@ -246,7 +162,7 @@ public:
   bool CanLowerReturn(CallingConv::ID CallConv,
                       MachineFunction &MF, bool isVarArg,
                       const SmallVectorImpl<ISD::OutputArg> &Outs,
-                      LLVMContext &Context) const override;
+                      LLVMContext &Context, const Type *RetTy) const override;
 
   SDValue LowerReturn(SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
                       const SmallVectorImpl<ISD::OutputArg> &Outs,
@@ -260,6 +176,14 @@ public:
   Register getRegisterByName(const char* RegName, LLT VT,
                              const MachineFunction &MF) const override;
 
+  unsigned getVectorTypeBreakdownForCallingConv(LLVMContext &Context,
+                                                CallingConv::ID CC, EVT VT,
+                                                EVT &IntermediateVT,
+                                                unsigned &NumIntermediates,
+                                                MVT &RegisterVT) const override;
+
+  MVT getRegisterTypeForCallingConv(LLVMContext &Context, CallingConv::ID CC,
+                                    EVT VT) const override;
   /// If a physical register, this returns the register that receives the
   /// exception address on entry to an EH pad.
   Register
@@ -322,7 +246,7 @@ public:
   /// the immediate into a register.
   bool isLegalICmpImmediate(int64_t Imm) const override;
 
-  EVT getOptimalMemOpType(const MemOp &Op,
+  EVT getOptimalMemOpType(LLVMContext &Context, const MemOp &Op,
                           const AttributeList &FuncAttributes) const override;
 
   bool allowsMemoryAccess(LLVMContext &Context, const DataLayout &DL, EVT VT,
@@ -339,8 +263,13 @@ public:
   SDValue getPICJumpTableRelocBase(SDValue Table, SelectionDAG &DAG)
                                    const override;
 
-  bool shouldReduceLoadWidth(SDNode *Load, ISD::LoadExtType ExtTy,
-                             EVT NewVT) const override;
+  /// Returns true if it is beneficial to convert a load of a constant
+  /// to just the constant itself.
+  bool shouldConvertConstantLoadToIntImm(const APInt &Imm,
+                                         Type *Ty) const override;
+
+  bool shouldReduceLoadWidth(SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
+                             std::optional<unsigned> ByteOffset) const override;
 
   void AdjustInstrPostInstrSelection(MachineInstr &MI,
                                      SDNode *Node) const override;
@@ -545,7 +474,6 @@ private:
   SDValue LowerHvxCttz(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxMulh(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxMulLoHi(SDValue Op, SelectionDAG &DAG) const;
-  SDValue LowerHvxSetCC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxExtend(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxSelect(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxShift(SDValue Op, SelectionDAG &DAG) const;
@@ -555,6 +483,8 @@ private:
   SDValue LowerHvxFpExtend(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxFpToInt(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerHvxIntToFp(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerHvxPred32ToFp(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerHvxPred64ToFp(SDValue Op, SelectionDAG &DAG) const;
   SDValue ExpandHvxFpToInt(SDValue Op, SelectionDAG &DAG) const;
   SDValue ExpandHvxIntToFp(SDValue Op, SelectionDAG &DAG) const;
 
@@ -565,12 +495,12 @@ private:
   SDValue WidenHvxStore(SDValue Op, SelectionDAG &DAG) const;
   SDValue WidenHvxSetCC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LegalizeHvxResize(SDValue Op, SelectionDAG &DAG) const;
-  SDValue WidenHvxFpIntConv(SDValue Op, SelectionDAG &DAG) const;
   SDValue ExpandHvxResizeIntoSteps(SDValue Op, SelectionDAG &DAG) const;
   SDValue EqualizeFpIntConversion(SDValue Op, SelectionDAG &DAG) const;
 
   SDValue CreateTLWrapper(SDValue Op, SelectionDAG &DAG) const;
   SDValue RemoveTLWrapper(SDValue Op, SelectionDAG &DAG) const;
+  SDValue WidenHvxTruncateToBool(SDValue Op, SelectionDAG &DAG) const;
 
   std::pair<const TargetRegisterClass*, uint8_t>
   findRepresentativeClass(const TargetRegisterInfo *TRI, MVT VT)
@@ -586,6 +516,10 @@ private:
                              SelectionDAG &DAG) const;
 
   SDValue combineTruncateBeforeLegal(SDValue Op, DAGCombinerInfo &DCI) const;
+
+  SDValue combineConcatOfShuffles(SDValue Op, SelectionDAG &DAG) const;
+  SDValue combineConcatOfScalarPreds(SDValue Op, unsigned BitBytes,
+                                     SelectionDAG &DAG) const;
   SDValue combineConcatVectorsBeforeLegal(SDValue Op, DAGCombinerInfo & DCI)
       const;
   SDValue combineVectorShuffleBeforeLegal(SDValue Op, DAGCombinerInfo & DCI)

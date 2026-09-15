@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.29 2024/07/21 16:49:26 jca Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.31 2026/07/21 19:37:06 gkoehler Exp $	*/
 
 /*
  * Copyright (c) 2020 Mark Kettenis <kettenis@openbsd.org>
@@ -58,8 +58,6 @@ struct cpu_version cpu_version[] = {
 };
 
 char cpu_model[64];
-uint32_t cpu_features;
-uint32_t cpu_features2;
 
 uint64_t tb_freq = 512000000;	/* POWER8, POWER9 */
 
@@ -180,7 +178,7 @@ cpu_attach(struct device *parent, struct device *dev, void *aux)
 		level++;
 	}
 
-	if (CPU_IS_PRIMARY(ci) && (cpu_features2 & PPC_FEATURE2_DARN)) {
+	if (CPU_IS_PRIMARY(ci) && (hwcap2 & PPC_FEATURE2_DARN)) {
 		timeout_set(&cpu_darn_to, cpu_darn, NULL);
 		cpu_darn(NULL);
 	}
@@ -226,20 +224,19 @@ cpu_init_features(void)
 {
 	uint32_t pvr = mfpvr();
 
-	cpu_features = PPC_FEATURE_32 | PPC_FEATURE_64 | PPC_FEATURE_HAS_FPU |
-	    PPC_FEATURE_HAS_MMU | PPC_FEATURE_HAS_ALTIVEC |
-	    PPC_FEATURE_HAS_VSX;
+	hwcap = PPC_FEATURE_32 | PPC_FEATURE_64 | PPC_FEATURE_HAS_ALTIVEC |
+	    PPC_FEATURE_HAS_FPU | PPC_FEATURE_HAS_MMU |
+	    PPC_FEATURE_ARCH_2_06 | PPC_FEATURE_HAS_VSX;
+	hwcap2 = PPC_FEATURE2_ARCH_2_07 | PPC_FEATURE2_ISEL |
+	    PPC_FEATURE2_VEC_CRYPTO;
 
 	switch (CPU_VERSION(pvr)) {
 	case CPU_IBMPOWER9:
 	case CPU_IBMPOWER9P:
-		cpu_features2 |= PPC_FEATURE2_ARCH_3_00;
-		cpu_features2 |= PPC_FEATURE2_DARN;
+		hwcap2 |= PPC_FEATURE2_ARCH_3_00;
+		hwcap2 |= PPC_FEATURE2_DARN;
 		break;
 	}
-
-	hwcap = cpu_features;
-	hwcap2 = cpu_features2;
 }
 
 void
@@ -247,7 +244,7 @@ cpu_init(void)
 {
 	uint64_t lpcr = LPCR_LPES;
 
-	if (cpu_features2 & PPC_FEATURE2_ARCH_3_00)
+	if (hwcap2 & PPC_FEATURE2_ARCH_3_00)
 		lpcr |= LPCR_PECE | LPCR_HVICE;
 
 	mtlpcr(lpcr);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: wait.h,v 1.11 2023/07/28 09:46:13 claudio Exp $	*/
+/*	$OpenBSD: wait.h,v 1.15 2025/12/01 09:25:03 jsg Exp $	*/
 /*
  * Copyright (c) 2013, 2014, 2015 Mark Kettenis
  * Copyright (c) 2017 Martin Pieuchot
@@ -35,6 +35,8 @@ struct wait_queue_entry {
 	struct list_head entry;
 };
 
+#define WQ_FLAG_WOKEN	(1 << 1)
+
 typedef struct wait_queue_entry wait_queue_entry_t;
 
 struct wait_queue_head {
@@ -56,6 +58,7 @@ init_waitqueue_head(wait_queue_head_t *wqh)
 #define __init_waitqueue_head(wqh, name, key)	init_waitqueue_head(wqh)
 
 int autoremove_wake_function(struct wait_queue_entry *, unsigned int, int, void *);
+int woken_wake_function(struct wait_queue_entry *, unsigned int, int, void *);
 
 static inline void
 init_wait_entry(wait_queue_entry_t *wqe, int flags)
@@ -100,6 +103,32 @@ remove_wait_queue(wait_queue_head_t *head, wait_queue_entry_t *old)
 	mtx_leave(&head->lock);
 }
 
+#define __wait_event_intr(wqh, condition, prio)				\
+({									\
+	long __ret = 0;							\
+	struct wait_queue_entry __wq_entry;				\
+									\
+	init_wait_entry(&__wq_entry, 0);				\
+	do {								\
+		int __error, __wait;					\
+									\
+		KASSERT(!cold);						\
+									\
+		prepare_to_wait(&wqh, &__wq_entry, prio);		\
+									\
+		__wait = !(condition);					\
+									\
+		__error = sleep_finish(INFSLP, __wait);			\
+									\
+		if (__error == ERESTART || __error == EINTR) {		\
+			__ret = -ERESTARTSYS;				\
+			break;						\
+		}							\
+	} while (!(condition));						\
+	finish_wait(&wqh, &__wq_entry);					\
+	__ret;								\
+})
+
 #define __wait_event_intr_timeout(wqh, condition, timo, prio)		\
 ({									\
 	long __ret = timo;						\
@@ -109,6 +138,7 @@ remove_wait_queue(wait_queue_head_t *head, wait_queue_entry_t *old)
 	do {								\
 		int __error, __wait;					\
 		unsigned long deadline;					\
+		uint64_t nsecs = jiffies_to_nsecs(__ret);		\
 									\
 		KASSERT(!cold);						\
 									\
@@ -117,7 +147,7 @@ remove_wait_queue(wait_queue_head_t *head, wait_queue_entry_t *old)
 									\
 		__wait = !(condition);					\
 									\
-		__error = sleep_finish(__ret, __wait);			\
+		__error = sleep_finish(nsecs, __wait);			\
 		if ((timo) > 0)						\
 			__ret = deadline - jiffies;			\
 									\
@@ -140,14 +170,14 @@ remove_wait_queue(wait_queue_head_t *head, wait_queue_entry_t *old)
 #define wait_event(wqh, condition) 		\
 do {						\
 	if (!(condition))			\
-		__wait_event_intr_timeout(wqh, condition, 0, 0); \
+		__wait_event_intr(wqh, condition, 0); \
 } while (0)
 
 #define wait_event_killable(wqh, condition) 		\
 ({						\
 	int __ret = 0;				\
 	if (!(condition))			\
-		__ret = __wait_event_intr_timeout(wqh, condition, 0, PCATCH); \
+		__ret = __wait_event_intr(wqh, condition, PCATCH); \
 	__ret;					\
 })
 
@@ -155,7 +185,7 @@ do {						\
 ({						\
 	int __ret = 0;				\
 	if (!(condition))			\
-		__ret = __wait_event_intr_timeout(wqh, condition, 0, PCATCH); \
+		__ret = __wait_event_intr(wqh, condition, PCATCH); \
 	__ret;					\
 })
 
@@ -173,7 +203,7 @@ do {						\
 		set_current_state(TASK_INTERRUPTIBLE);			\
 									\
 		mtx_leave(&(wqh).lock);					\
-		__error = sleep_finish(0, 1);				\
+		__error = sleep_finish(INFSLP, 1);			\
 		mtx_enter(&(wqh).lock);					\
 		if (__error == ERESTART || __error == EINTR) {		\
 			__error = -ERESTARTSYS;				\
@@ -238,7 +268,7 @@ do {						\
 		__wait = !(condition);					\
 									\
 		mtx_leave(&(mtx));					\
-		sleep_finish(0, __wait);				\
+		sleep_finish(INFSLP, __wait);				\
 		mtx_enter(&(mtx));					\
 	} while (!(condition));						\
 	finish_wait(&wqh, &__wq_entry);					\
@@ -292,6 +322,12 @@ wake_up_all_locked(wait_queue_head_t *wqh)
 		.private = curproc,			\
 		.func = autoremove_wake_function,	\
 		.entry = LIST_HEAD_INIT((name).entry),	\
-	}						
+	}
 
+#define	DEFINE_WAIT_FUNC(name, fn)			\
+	struct wait_queue_entry name = {		\
+		.private = curproc,			\
+		.func = fn,				\
+		.entry = LIST_HEAD_INIT((name).entry),	\
+	}
 #endif

@@ -1,4 +1,4 @@
-/* $OpenBSD: machdep.c,v 1.92 2024/07/24 21:24:18 kettenis Exp $ */
+/* $OpenBSD: machdep.c,v 1.101 2026/09/06 18:25:22 mglocker Exp $ */
 /*
  * Copyright (c) 2014 Patrick Wildt <patrick@blueri.se>
  * Copyright (c) 2021 Mark Kettenis <kettenis@openbsd.org>
@@ -18,6 +18,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/kernel.h>
 #include <sys/sched.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
@@ -35,16 +36,14 @@
 #include <sys/malloc.h>
 
 #include <net/if.h>
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
 #include <dev/cons.h>
 #include <dev/ofw/fdt.h>
 #include <dev/ofw/openfirm.h>
-#include <machine/param.h>
 #include <machine/kcore.h>
 #include <machine/bootconfig.h>
 #include <machine/bus.h>
 #include <machine/fpu.h>
-#include <arm64/arm64/arm64var.h>
 
 #include <machine/db_machdep.h>
 #include <ddb/db_extern.h>
@@ -55,6 +54,11 @@
 #if NSOFTRAID > 0
 #include <dev/softraidvar.h>
 #endif
+
+#ifdef HIBERNATE
+#include <machine/hibernate_var.h>
+#include <sys/hibernate.h>
+#endif /* HIBERNATE */
 
 extern vaddr_t virtual_avail;
 extern uint64_t esym;
@@ -90,6 +94,9 @@ struct uvm_constraint_range *uvm_md_constraints[] = {
 	&dma_constraint,
 	NULL,
 };
+
+void blink_led_timeout(void *);
+int led_blink = 1;
 
 /* the following is used externally (sysctl_hw) */
 char    machine[] = MACHINE;            /* from <machine/param.h> */
@@ -184,6 +191,7 @@ void	exuart_init_cons(void);
 void	imxuart_init_cons(void);
 void	mvuart_init_cons(void);
 void	pluart_init_cons(void);
+void	qcuart_init_cons(void);
 void	simplefb_init_cons(bus_space_tag_t);
 
 void
@@ -203,6 +211,7 @@ consinit(void)
 	imxuart_init_cons();
 	mvuart_init_cons();
 	pluart_init_cons();
+	qcuart_init_cons();
 	simplefb_init_cons(&arm64_bs_tag);
 }
 
@@ -292,6 +301,8 @@ cpu_startup(void)
 	curpcb->pcb_flags = 0;
 	curpcb->pcb_tf = &proc0tf;
 
+	sched_blockcpu = CPUTYP_L;
+
 	if (boothowto & RB_CONFIG) {
 #ifdef BOOT_CONFIG
 		user_config();
@@ -299,6 +310,9 @@ cpu_startup(void)
 		printf("kernel does not support -c; continuing..\n");
 #endif
 	}
+#ifdef HIBERNATE
+	preallocate_hibernate_memory();
+#endif /* HIBERNATE */
 }
 
 void    cpu_switchto_asm(struct proc *, struct proc *);
@@ -332,6 +346,7 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 {
 	char *compatible;
 	int node, len, error;
+	int oldval;
 
 	/* all sysctl names at this level are terminal */
 	if (namelen != 1)
@@ -366,8 +381,18 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case CPU_ID_AA64MMFR2:
 		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64mmfr2);
 	case CPU_ID_AA64SMFR0:
-	case CPU_ID_AA64ZFR0:
 		return sysctl_rdquad(oldp, oldlenp, newp, 0);
+	case CPU_ID_AA64ZFR0:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64zfr0);
+	case CPU_LED_BLINK:
+		oldval = led_blink;
+		error = sysctl_int(oldp, oldlenp, newp, newlen, &led_blink);
+		/*
+		 * If we were false and are now true, start the timer.
+		 */
+		if (!oldval && led_blink > oldval)
+			blink_led_timeout(NULL);
+		return error;
 	default:
 		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen));
@@ -461,7 +486,7 @@ setregs(struct proc *p, struct exec_package *pack, u_long stack,
 
 	/* If we were using the FPU, forget about it. */
 	memset(&pcb->pcb_fpstate, 0, sizeof(pcb->pcb_fpstate));
-	pcb->pcb_flags &= ~PCB_FPU;
+	pcb->pcb_flags &= ~(PCB_FPU | PCB_SVE);
 	fpu_drop();
 
 	memset(tf, 0, sizeof *tf);
@@ -628,10 +653,6 @@ dumpsys(void)
 	}
 	printf("\ndumping to dev %u,%u offset %ld\n", major(dumpdev),
 	    minor(dumpdev), dumplo);
-
-#ifdef UVM_SWAP_ENCRYPT
-	uvm_swap_finicrypt_all();
-#endif
 
 	error = (*bdevsw[major(dumpdev)].d_psize)(dumpdev);
 	printf("dump ");
@@ -1073,6 +1094,11 @@ initarm(struct arm64_bootparams *abp)
 
 	kmeminit_nkmempages();
 
+	/* Add the initial 64MB block back. */
+	reg.addr = memstart;
+	reg.size = memend - memstart;
+	memreg_add(&reg);
+
 	/*
 	 * Make sure that we have enough KVA to initialize UVM.  In
 	 * particular, we need enough KVA to be able to allocate the
@@ -1246,4 +1272,51 @@ memreg_remove(const struct fdt_reg *reg)
 			nmemreg--;
 		}
 	}
+}
+
+struct blink_led_softc {
+	SLIST_HEAD(, blink_led) bls_head;
+	int bls_on;
+	struct timeout bls_to;
+} blink_sc = { SLIST_HEAD_INITIALIZER(blink_sc.bls_head), 0 };
+
+void
+blink_led_register(struct blink_led *l)
+{
+	if (SLIST_EMPTY(&blink_sc.bls_head)) {
+		timeout_set(&blink_sc.bls_to, blink_led_timeout, &blink_sc);
+		blink_sc.bls_on = 0;
+		if (led_blink)
+			timeout_add(&blink_sc.bls_to, 1);
+	}
+	SLIST_INSERT_HEAD(&blink_sc.bls_head, l, bl_next);
+}
+
+void
+blink_led_timeout(void *vsc)
+{
+	struct blink_led_softc *sc = &blink_sc;
+	struct blink_led *l;
+	int t;
+
+	if (SLIST_EMPTY(&sc->bls_head))
+		return;
+
+	SLIST_FOREACH(l, &sc->bls_head, bl_next) {
+		(*l->bl_func)(l->bl_arg, sc->bls_on);
+	}
+	sc->bls_on = !sc->bls_on;
+
+	if (!led_blink)
+		return;
+
+	/*
+	 * Blink rate is:
+	 *      full cycle every second if completely idle (loadav = 0)
+	 *      full cycle every 2 seconds if loadav = 1
+	 *      full cycle every 3 seconds if loadav = 2
+	 * etc.
+	 */
+	t = (((averunnable.ldavg[0] + FSCALE) * hz) >> (FSHIFT + 1));
+	timeout_add(&sc->bls_to, t);
 }

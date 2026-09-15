@@ -1,4 +1,4 @@
-/* $OpenBSD: hidmt.c,v 1.13 2022/10/16 20:17:08 bru Exp $ */
+/* $OpenBSD: hidmt.c,v 1.16 2025/07/21 21:46:40 bru Exp $ */
 /*
  * HID multitouch driver for devices conforming to Windows Precision Touchpad
  * standard
@@ -41,6 +41,9 @@
 #else
 #define DPRINTF(x)
 #endif
+
+#define IS_REPORT_LEVEL_USAGE(u) ((((u) >> 16) & 0xffff) == HUP_BUTTON || \
+    (u) == HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACTCOUNT))
 
 #define HID_UNIT_CM	0x11
 #define HID_UNIT_INCH	0x13
@@ -125,6 +128,11 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 
 	capsize = hid_report_size(desc, dlen, hid_feature, mt->sc_rep_cap);
 	rep = malloc(capsize, M_DEVBUF, M_NOWAIT | M_ZERO);
+	if (rep == NULL) {
+		printf("\n%s: could not allocate capability report buffer\n",
+		    self->dv_xname);
+		return 1;
+	}
 
 	if (mt->hidev_report_type_conv == NULL)
 		panic("no report type conversion function");
@@ -134,6 +142,7 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 	    rep, capsize)) {
 		printf("\n%s: failed getting capability report\n",
 		    self->dv_xname);
+		free(rep, M_DEVBUF, capsize);
 		return 1;
 	}
 
@@ -211,6 +220,12 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 		}
 
 		input = malloc(sizeof(*input), M_DEVBUF, M_NOWAIT | M_ZERO);
+		if (input == NULL) {
+			printf("\n%s: could not allocate input report buffer\n",
+			    self->dv_xname);
+			hid_end_parse(hd);
+			goto fail;
+		}
 		memcpy(&input->loc, &h.loc, sizeof(struct hid_location));
 		input->usage = h.usage;
 
@@ -221,16 +236,27 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 	if (mt->sc_maxx <= 0 || mt->sc_maxy <= 0) {
 		printf("\n%s: invalid max X/Y %d/%d\n", self->dv_xname,
 		    mt->sc_maxx, mt->sc_maxy);
-		return 1;
+		goto fail;
 	}
 
 	if (hidmt_set_input_mode(mt, HIDMT_INPUT_MODE_MT_TOUCHPAD)) {
 		printf("\n%s: switch to multitouch mode failed\n",
 		    self->dv_xname);
-		return 1;
+		goto fail;
 	}
 
+	free(rep, M_DEVBUF, capsize);
 	return 0;
+
+fail:
+	while (!SIMPLEQ_EMPTY(&mt->sc_inputs)) {
+		struct hidmt_data *input = SIMPLEQ_FIRST(&mt->sc_inputs);
+		SIMPLEQ_REMOVE_HEAD(&mt->sc_inputs, entry);
+		free(input, M_DEVBUF, sizeof(*input));
+	}
+
+	free(rep, M_DEVBUF, capsize);
+	return 1;
 }
 
 void
@@ -373,7 +399,7 @@ hidmt_input(struct hidmt *mt, uint8_t *data, u_int len)
 
 			bzero(&hc, sizeof(struct hidmt_contact));
 		}
-		else if (!firstu)
+		else if (!firstu && !IS_REPORT_LEVEL_USAGE(hi->usage))
 			firstu = hi->usage;
 
 		switch (hi->usage) {
@@ -530,4 +556,41 @@ void
 hidmt_disable(struct hidmt *mt)
 {
 	mt->sc_enabled = 0;
+}
+
+int
+hidmt_find_winptp_reports(const void *desc, int len, int *input_rid,
+    int *config_rid, int *cap_rid)
+{
+	static int32_t ptp_collections[] = {
+		HID_USAGE2(HUP_DIGITIZERS, HUD_FINGER), 0
+	};
+	static int32_t input_usages[] = {
+		/* report-level */
+		HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACTCOUNT),
+		/* contact-level */
+		HID_USAGE2(HUP_GENERIC_DESKTOP, HUG_X),
+		HID_USAGE2(HUP_GENERIC_DESKTOP, HUG_Y),
+		HID_USAGE2(HUP_DIGITIZERS, HUD_CONFIDENCE),
+		HID_USAGE2(HUP_DIGITIZERS, HUD_TIP_SWITCH),
+		HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACTID),
+	};
+	static int32_t cfg_usages[] = {
+		HID_USAGE2(HUP_DIGITIZERS, HUD_INPUT_MODE),
+	};
+	static int32_t cap_usages[] = {
+		HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACT_MAX),
+	};
+
+	*input_rid = hid_find_report(desc, len, hid_input,
+	    HID_USAGE2(HUP_DIGITIZERS, HUD_TOUCHPAD),
+	    nitems(input_usages), input_usages, ptp_collections);
+	*config_rid = hid_find_report(desc, len, hid_feature,
+	    HID_USAGE2(HUP_DIGITIZERS, HUD_CONFIG),
+	    nitems(cfg_usages), cfg_usages, ptp_collections);
+	*cap_rid = hid_find_report(desc, len, hid_feature,
+	    HID_USAGE2(HUP_DIGITIZERS, HUD_TOUCHPAD),
+	    nitems(cap_usages), cap_usages, ptp_collections);
+
+	return (*input_rid > 0 && *config_rid > 0 && *cap_rid > 0);
 }

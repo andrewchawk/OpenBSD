@@ -1,4 +1,4 @@
-/*	$OpenBSD: extern.h,v 1.24 2022/09/01 21:15:54 job Exp $	*/
+/*	$OpenBSD: extern.h,v 1.29 2025/07/14 02:40:15 deraadt Exp $	*/
 /*	$NetBSD: extern.h,v 1.10 1995/05/21 13:38:27 mycroft Exp $	*/
 
 /*-
@@ -37,7 +37,7 @@ struct var;
 struct varent;
 
 extern fixpt_t ccpu;
-extern int eval, fscale, nlistread, maxslp;
+extern int eval, fscale, maxslp, pagesize;
 extern u_int mempages;
 extern int sumrusage, termwidth, totwidth, kvm_sysctl_only, needheader;
 extern VAR var[];
@@ -46,10 +46,9 @@ extern VARENT *vhead;
 __BEGIN_DECLS
 void	 command(const struct pinfo *, VARENT *);
 void	 cputime(const struct pinfo *, VARENT *);
-int	 donlist(void);
+int	 getkernvars(void);
 void	 elapsed(const struct pinfo *, VARENT *);
 double	 getpcpu(const struct kinfo_proc *);
-double	 getpmem(const struct kinfo_proc *);
 void	 gname(const struct pinfo *, VARENT *);
 void	 supgid(const struct pinfo *, VARENT *);
 void	 supgrp(const struct pinfo *, VARENT *);
@@ -60,7 +59,7 @@ void	 maxrss(const struct pinfo *, VARENT *);
 void	 nlisterr(struct nlist *);
 void	 p_rssize(const struct pinfo *, VARENT *);
 void	 pagein(const struct pinfo *, VARENT *);
-void	 parsefmt(char *);
+int	 parsefmt(char *);
 void	 pcpu(const struct pinfo *, VARENT *);
 void	 pmem(const struct pinfo *, VARENT *);
 void	 pri(const struct pinfo *, VARENT *);
@@ -68,7 +67,6 @@ void	 printheader(void);
 void	 pvar(const struct pinfo *, VARENT *);
 void	 pnice(const struct pinfo *, VARENT *);
 void	 rgname(const struct pinfo *, VARENT *);
-void	 rssize(const struct pinfo *, VARENT *);
 void	 runame(const struct pinfo *, VARENT *);
 void	 showkey(void);
 void	 started(const struct pinfo *, VARENT *);

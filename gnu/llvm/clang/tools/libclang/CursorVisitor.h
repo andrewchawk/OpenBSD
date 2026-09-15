@@ -255,12 +255,12 @@ public:
 
   // Name visitor
   bool VisitDeclarationNameInfo(DeclarationNameInfo Name);
-  bool VisitNestedNameSpecifier(NestedNameSpecifier *NNS, SourceRange Range);
   bool VisitNestedNameSpecifierLoc(NestedNameSpecifierLoc NNS);
 
   // Template visitors
   bool VisitTemplateParameters(const TemplateParameterList *Params);
-  bool VisitTemplateName(TemplateName Name, SourceLocation Loc);
+  bool VisitTemplateName(TemplateName Name, SourceLocation NameLoc,
+                         NestedNameSpecifierLoc NNS);
   bool VisitTemplateArgumentLoc(const TemplateArgumentLoc &TAL);
 
   // Type visitors
@@ -276,7 +276,9 @@ public:
   bool IsInRegionOfInterest(CXCursor C);
   bool RunVisitorWorkList(VisitorWorkList &WL);
   void EnqueueWorkList(VisitorWorkList &WL, const Stmt *S);
+  void EnqueueWorkList(VisitorWorkList &WL, const Attr *A);
   LLVM_ATTRIBUTE_NOINLINE bool Visit(const Stmt *S);
+  LLVM_ATTRIBUTE_NOINLINE bool Visit(const Attr *A);
 
 private:
   std::optional<bool> handleDeclForVisitation(const Decl *D);

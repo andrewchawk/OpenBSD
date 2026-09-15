@@ -1,4 +1,4 @@
-/*	$OpenBSD: pcidump.c,v 1.71 2024/04/23 13:34:51 jsg Exp $	*/
+/*	$OpenBSD: pcidump.c,v 1.73 2025/12/25 10:59:26 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2006, 2007 David Gwynne <loki@animata.net>
@@ -545,11 +545,28 @@ print_pcie_ls(uint8_t speed)
 }
 
 void
+print_pcie_aspm(uint8_t aspm)
+{
+	switch (aspm) {
+	case 1:
+		printf("L0s");
+		break;
+	case 2:
+		printf("L1");
+		break;
+	case 3:
+		printf("L0s, L1");
+		break;
+	}
+}
+
+void
 dump_pcie_linkspeed(int bus, int dev, int func, uint8_t ptr)
 {
 	u_int32_t dcap, dcsr;
 	u_int32_t lcap, lcsr;
 	u_int8_t cwidth, cspeed, swidth, sspeed;
+	u_int8_t caspm, saspm;
 
 	if (pci_read(bus, dev, func, ptr + PCI_PCIE_DCAP, &dcap) != 0)
 		return;
@@ -566,6 +583,7 @@ dump_pcie_linkspeed(int bus, int dev, int func, uint8_t ptr)
 		return;
 	cspeed = lcap & 0x0f;
 	cwidth = (lcap >> 4) & 0x3f;
+	caspm = (lcap >> 10) & 0x03;
 	if (cwidth == 0)
 		return;
 
@@ -573,6 +591,7 @@ dump_pcie_linkspeed(int bus, int dev, int func, uint8_t ptr)
 		return;
 	sspeed = (lcsr >> 16) & 0x0f;
 	swidth = (lcsr >> 20) & 0x3f;
+	saspm = lcsr & 0x03;
 
 	printf("\t\tLink Speed: ");
 	print_pcie_ls(sspeed);
@@ -581,6 +600,19 @@ dump_pcie_linkspeed(int bus, int dev, int func, uint8_t ptr)
 	printf(" GT/s\n");
 
 	printf("\t\tLink Width: x%d / x%d\n", swidth, cwidth);
+
+	if (caspm) {
+		printf("\t\tASPM: ");
+		print_pcie_aspm(caspm);
+		if (saspm) {
+			printf(" (");
+			print_pcie_aspm(saspm);
+			printf(" enabled)");
+		} else {
+			printf(" (disabled)");
+		}
+		printf("\n");
+	}
 }
 
 void
@@ -810,10 +842,18 @@ dump_type0(int bus, int dev, int func)
 	    PCI_INTERRUPT_LINE(reg), PCI_MIN_GNT(reg), PCI_MAX_LAT(reg));
 }
 
+#undef PCI_PMBASEH_1
+#define PCI_PMBASEH_1	0x28
+#undef PCI_PMLIMITH_1
+#define PCI_PMLIMITH_1	0x2c
+#undef PCI_IOBASEH_1
+#define PCI_IOBASEH_1	0x30
+
 void
 dump_type1(int bus, int dev, int func)
 {
-	u_int32_t reg;
+	u_int32_t reg, iobaseh, pmbaseh, pmlimith;
+	u_int64_t base, limit;
 
 	dump_bars(bus, dev, func, PCI_MAPREG_PPB_END);
 
@@ -826,46 +866,53 @@ dump_type1(int bus, int dev, int func)
 
 	if (pci_read(bus, dev, func, PCI_IOBASEL_1, &reg) != 0)
 		warn("unable to read PCI_IOBASEL_1");
+	if (pci_read(bus, dev, func, PCI_IOBASEH_1, &iobaseh) != 0)
+		warn("unable to read PCI_IOBASEH_1");
 	printf("\t0x%04x: I/O Base: %02x, I/O Limit: %02x, "
 	    "Secondary Status: %04x\n", PCI_IOBASEL_1, (reg >> 0 ) & 0xff,
 	    (reg >> 8) & 0xff, (reg >> 16) & 0xffff);
+	base = (reg & 0x00f0) << 8 | (iobaseh & 0xffff) << 16;
+	limit = (reg & 0xf000) | (iobaseh & 0xffff0000) | 0xfff;
+	if (limit > base)
+		printf("\t\tI/O Window: 0x%08llx-0x%08llx\n", base, limit);
 
 	if (pci_read(bus, dev, func, PCI_MEMBASE_1, &reg) != 0)
 		warn("unable to read PCI_MEMBASE_1");
 	printf("\t0x%04x: Memory Base: %04x, Memory Limit: %04x\n",
 	    PCI_MEMBASE_1, (reg >> 0) & 0xffff, (reg >> 16) & 0xffff);
+	base = (reg & 0xfff0) << 16;
+	limit = (reg & 0xfff00000) | 0xfffff;
+	if (limit > base)
+		printf("\t\tMemory Window: 0x%08llx-0x%08llx\n", base, limit);
 
 	if (pci_read(bus, dev, func, PCI_PMBASEL_1, &reg) != 0)
 		warn("unable to read PCI_PMBASEL_1");
+	if (pci_read(bus, dev, func, PCI_PMBASEH_1, &pmbaseh) != 0)
+		warn("unable to read PCI_PMBASEH_1");
+	if (pci_read(bus, dev, func, PCI_PMLIMITH_1, &pmlimith) != 0)
+		warn("unable to read PCI_PMLIMITH_1");
 	printf("\t0x%04x: Prefetch Memory Base: %04x, "
 	    "Prefetch Memory Limit: %04x\n", PCI_PMBASEL_1,
 	    (reg >> 0) & 0xffff, (reg >> 16) & 0xffff);
+	base = (reg & 0xfff0) << 16 | (u_int64_t)pmbaseh << 32;
+	limit = (reg & 0xfff00000) | (u_int64_t)pmlimith << 32 | 0xfffff;
+	if (limit > base) {
+		printf("\t\tPrefetch Memory Window: 0x%016llx-0x%016llx\n",
+		    base, limit);
+	}
 
-#undef PCI_PMBASEH_1
-#define PCI_PMBASEH_1	0x28
-	if (pci_read(bus, dev, func, PCI_PMBASEH_1, &reg) != 0)
-		warn("unable to read PCI_PMBASEH_1");
 	printf("\t0x%04x: Prefetch Memory Base Upper 32 Bits: %08x\n",
-	    PCI_PMBASEH_1, reg);
-
-#undef PCI_PMLIMITH_1
-#define PCI_PMLIMITH_1	0x2c
-	if (pci_read(bus, dev, func, PCI_PMLIMITH_1, &reg) != 0)
-		warn("unable to read PCI_PMLIMITH_1");
+	    PCI_PMBASEH_1, pmbaseh);
 	printf("\t0x%04x: Prefetch Memory Limit Upper 32 Bits: %08x\n",
-	    PCI_PMLIMITH_1, reg);
+	    PCI_PMLIMITH_1, pmlimith);
 
-#undef PCI_IOBASEH_1
-#define PCI_IOBASEH_1	0x30
-	if (pci_read(bus, dev, func, PCI_IOBASEH_1, &reg) != 0)
-		warn("unable to read PCI_IOBASEH_1");
 	printf("\t0x%04x: I/O Base Upper 16 Bits: %04x, "
 	    "I/O Limit Upper 16 Bits: %04x\n", PCI_IOBASEH_1,
-	    (reg >> 0) & 0xffff, (reg >> 16) & 0xffff);
+	    (iobaseh >> 0) & 0xffff, (iobaseh >> 16) & 0xffff);
 
 #define PCI_PPB_ROM_REG		0x38
-	if (pci_read(bus, dev, func, PCI_PPB_ROM_REG, &reg) != 0)
-		warn("unable to read PCI_PPB_ROM_REG");
+	if (pci_read(bus, dev, func, PCI_EXROMADDR_1, &reg) != 0)
+		warn("unable to read PCI_EXROMADDR_1");
 	printf("\t0x%04x: Expansion ROM Base Address: %08x\n",
 	    PCI_PPB_ROM_REG, reg);
 

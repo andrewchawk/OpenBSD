@@ -15,7 +15,6 @@
 #include <asm/set_memory.h>
 #include <asm/smp.h>
 
-#include "display/intel_frontbuffer.h"
 #include "gt/intel_gt.h"
 #include "gt/intel_gt_requests.h"
 
@@ -28,7 +27,6 @@
 int i915_gem_gtt_prepare_pages(struct drm_i915_gem_object *obj,
 			       struct sg_table *pages)
 {
-#ifdef __linux__
 	do {
 		if (dma_map_sg_attrs(obj->base.dev->dev,
 				     pages->sgl, pages->nents,
@@ -52,9 +50,6 @@ int i915_gem_gtt_prepare_pages(struct drm_i915_gem_object *obj,
 				 I915_SHRINK_UNBOUND));
 
 	return -ENOSPC;
-#else
-	return 0;
-#endif
 }
 
 void i915_gem_gtt_finish_pages(struct drm_i915_gem_object *obj,
@@ -68,17 +63,15 @@ void i915_gem_gtt_finish_pages(struct drm_i915_gem_object *obj,
 		/* Wait a bit, in the hope it avoids the hang */
 		usleep_range(100, 250);
 
-#ifdef notyet
 	dma_unmap_sg(i915->drm.dev, pages->sgl, pages->nents,
 		     DMA_BIDIRECTIONAL);
-#endif
 }
 
 /**
  * i915_gem_gtt_reserve - reserve a node in an address_space (GTT)
  * @vm: the &struct i915_address_space
  * @ww: An optional struct i915_gem_ww_ctx.
- * @node: the &struct drm_mm_node (typically i915_vma.mode)
+ * @node: the &struct drm_mm_node (typically i915_vma.node)
  * @size: how much space to allocate inside the GTT,
  *        must be #I915_GTT_PAGE_SIZE aligned
  * @offset: where to insert inside the GTT,

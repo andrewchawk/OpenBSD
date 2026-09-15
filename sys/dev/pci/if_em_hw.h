@@ -31,7 +31,7 @@
 
 *******************************************************************************/
 
-/* $OpenBSD: if_em_hw.h,v 1.95 2024/06/09 05:18:12 jsg Exp $ */
+/* $OpenBSD: if_em_hw.h,v 1.103 2026/08/14 07:21:33 jsg Exp $ */
 /* $FreeBSD: if_em_hw.h,v 1.15 2005/05/26 23:32:02 tackerman Exp $ */
 
 /* if_em_hw.h
@@ -85,14 +85,12 @@ typedef enum {
     em_pch_cnp,
     em_pch_tgp,
     em_pch_adp,
+    em_pch_mtp,
+    em_pch_ptp,
     em_num_macs
 } em_mac_type;
 
-#define IS_ICH8(t) \
-	(t == em_ich8lan || t == em_ich9lan || t == em_ich10lan || \
-	 t == em_pchlan || t == em_pch2lan || t == em_pch_lpt || \
-	 t == em_pch_spt || t == em_pch_cnp || t == em_pch_tgp || \
-	 t == em_pch_adp)
+#define IS_ICH8(t)	(t >= em_ich8lan)
 
 typedef enum {
     em_eeprom_uninitialized = 0,
@@ -596,6 +594,11 @@ uint32_t em_translate_82542_register(uint32_t);
 #define E1000_DEV_ID_PCH_RPL_I219_V23    0x0DC6
 #define E1000_DEV_ID_PCH_ARL_I219_LM24   0x57A0
 #define E1000_DEV_ID_PCH_ARL_I219_V24    0x57A1
+#define E1000_DEV_ID_PCH_PTP_I219_LM25   0x57B3
+#define E1000_DEV_ID_PCH_PTP_I219_V25    0x57B4
+#define E1000_DEV_ID_PCH_WCL_I219_LM27   0x57B7
+#define E1000_DEV_ID_PCH_WCL_I219_V27    0x57B8
+
 #define E1000_DEV_ID_82575EB_PT          0x10A7
 #define E1000_DEV_ID_82575EB_PF          0x10A9
 #define E1000_DEV_ID_82575GB_QP          0x10D6
@@ -608,8 +611,6 @@ uint32_t em_translate_82542_register(uint32_t);
 #define E1000_DEV_ID_82583V              0x150C
 #define E1000_DEV_ID_82576_NS_SERDES     0x1518
 #define E1000_DEV_ID_82576_SERDES_QUAD   0x150D
-#define E1000_DEV_ID_PCH2_LV_LM          0x1502
-#define E1000_DEV_ID_PCH2_LV_V           0x1503
 #define E1000_DEV_ID_82580_COPPER        0x150E
 #define E1000_DEV_ID_82580_FIBER         0x150F
 #define E1000_DEV_ID_82580_SERDES        0x1510
@@ -1041,6 +1042,7 @@ struct em_ffvt_entry {
 #define E1000_FEXTNVM3 0x0003C  /* Future Extended NVM 3 - RW */
 #define E1000_FEXTNVM4 0x00024  /* Future Extended NVM 4 - RW */
 #define E1000_FEXTNVM6 0x00010  /* Future Extended NVM 6 - RW */
+#define E1000_FEXTNVM12 0x5BC0  /* Future Extended NVM 12 - RW */
 #define E1000_FCAL     0x00028  /* Flow Control Address Low - RW */
 #define E1000_FCAH     0x0002C  /* Flow Control Address High -RW */
 #define E1000_FCT      0x00030  /* Flow Control Type - RW */
@@ -1319,6 +1321,9 @@ struct em_ffvt_entry {
 #define E1000_FEXTNVM6_REQ_PLL_CLK	0x00000100
 #define E1000_FEXTNVM6_ENABLE_K1_ENTRY_CONDITION	0x00000200
 
+#define E1000_FEXTNVM12_PHYPD_CTRL_MASK	0x00C00000
+#define E1000_FEXTNVM12_PHYPD_CTRL_P1	0x00800000
+
 /* Statistics counters collected by the MAC */
 struct em_hw_stats {
     uint64_t crcerrs;
@@ -1526,6 +1531,7 @@ struct em_hw {
 #define E1000_CTRL_FORCE_PHY_RESET 0x00008000 /* Reset both PHY ports, through PHYRST_N pin */
 #define E1000_CTRL_LANPHYPC_OVERRIDE 0x00010000 /* SW control of LANPHYPC */
 #define E1000_CTRL_LANPHYPC_VALUE    0x00020000 /* SW value of LANPHYPC */
+#define E1000_CTRL_EXT_DPG_EN        0x00000008 /* Dynamic Power Gating Enable */
 #define E1000_CTRL_EXT_FORCE_SMBUS   0x00000800 /* Force SMBus mode */
 #define E1000_CTRL_EXT_PHYPDEN       0x00100000
 #define E1000_I2CCMD_REG_ADDR_SHIFT	16
@@ -1672,12 +1678,12 @@ struct em_hw {
 #define E1000_CTRL_EXT_GPI2_EN   0x00000004 /* Maps SDP6 to GPI2 */
 #define E1000_CTRL_EXT_LPCD      0x00000004 /* LCD Power Cycle Done */
 #define E1000_CTRL_EXT_GPI3_EN   0x00000008 /* Maps SDP7 to GPI3 */
-#define E1000_CTRL_EXT_SDP4_DATA 0x00000010 /* Value of SW Defineable Pin 4 */
-#define E1000_CTRL_EXT_SDP5_DATA 0x00000020 /* Value of SW Defineable Pin 5 */
+#define E1000_CTRL_EXT_SDP4_DATA 0x00000010 /* Value of SW Definable Pin 4 */
+#define E1000_CTRL_EXT_SDP5_DATA 0x00000020 /* Value of SW Definable Pin 5 */
 #define E1000_CTRL_EXT_PHY_INT   E1000_CTRL_EXT_SDP5_DATA
-#define E1000_CTRL_EXT_SDP6_DATA 0x00000040 /* Value of SW Defineable Pin 6 */
-#define E1000_CTRL_EXT_SDP7_DATA 0x00000080 /* Value of SW Defineable Pin 7 */
-#define E1000_CTRL_EXT_SDP3_DATA 0x00000080 /* Value of SW Defineable Pin 3 */
+#define E1000_CTRL_EXT_SDP6_DATA 0x00000040 /* Value of SW Definable Pin 6 */
+#define E1000_CTRL_EXT_SDP7_DATA 0x00000080 /* Value of SW Definable Pin 7 */
+#define E1000_CTRL_EXT_SDP3_DATA 0x00000080 /* Value of SW Definable Pin 3 */
 #define E1000_CTRL_EXT_SDP4_DIR  0x00000100 /* Direction of SDP4 0=in 1=out */
 #define E1000_CTRL_EXT_SDP5_DIR  0x00000200 /* Direction of SDP5 0=in 1=out */
 #define E1000_CTRL_EXT_SDP6_DIR  0x00000400 /* Direction of SDP6 0=in 1=out */
@@ -2436,7 +2442,7 @@ struct em_host_command_info {
 #define EEPROM_WRITE_OPCODE_MICROWIRE 0x5  /* EEPROM write opcode */
 #define EEPROM_ERASE_OPCODE_MICROWIRE 0x7  /* EEPROM erase opcode */
 #define EEPROM_EWEN_OPCODE_MICROWIRE  0x13 /* EEPROM erase/write enable */
-#define EEPROM_EWDS_OPCODE_MICROWIRE  0x10 /* EEPROM erast/write disable */
+#define EEPROM_EWDS_OPCODE_MICROWIRE  0x10 /* EEPROM erase/write disable */
 
 /* EEPROM Commands - SPI */
 #define EEPROM_MAX_RETRY_SPI        5000 /* Max wait of 5ms, for RDY signal */
@@ -3782,6 +3788,10 @@ union ich8_hws_flash_regacc {
 #define I217_INBAND_CTRL				PHY_REG(770, 18)
 #define I217_INBAND_CTRL_LINK_STAT_TX_TIMEOUT_MASK	0x3F00
 #define I217_INBAND_CTRL_LINK_STAT_TX_TIMEOUT_SHIFT	8
+
+/* PHY Timeouts */
+#define E1000_PHY_TIMEOUTS_REG				PHY_REG(770, 21)
+#define E1000_PHY_TIMEOUTS_K1_EXIT_TO_MASK		0x0FC0
 
 /* PHY Low Power Idle Control */
 #define I82579_LPI_CTRL				PHY_REG(772, 20)

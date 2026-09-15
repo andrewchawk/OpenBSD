@@ -24,8 +24,7 @@
 
 #define DEBUG_TYPE "lld"
 
-namespace lld {
-namespace wasm {
+namespace lld::wasm {
 
 // An init entry to be written to either the synthetic init func or the
 // linking metadata.
@@ -57,7 +56,6 @@ public:
 
   void finalizeContents() override {
     writeBody();
-    bodyOutputStream.flush();
     createHeader(body.size());
   }
 
@@ -127,8 +125,7 @@ inline bool operator==(const ImportKey<T> &lhs, const ImportKey<T> &rhs) {
          lhs.importName == rhs.importName && lhs.type == rhs.type;
 }
 
-} // namespace wasm
-} // namespace lld
+} // namespace wasm::lld
 
 // `ImportKey<T>` can be used as a key in a `DenseMap` if `T` can be used as a
 // key in a `DenseMap`.
@@ -231,7 +228,7 @@ class MemorySection : public SyntheticSection {
 public:
   MemorySection() : SyntheticSection(llvm::wasm::WASM_SEC_MEMORY) {}
 
-  bool isNeeded() const override { return !config->memoryImport.has_value(); }
+  bool isNeeded() const override { return !ctx.arg.memoryImport.has_value(); }
   void writeBody() override;
 
   uint64_t numMemoryPages = 0;
@@ -289,7 +286,7 @@ public:
   // transform a `global.get` to an `i32.const`.
   void addInternalGOTEntry(Symbol *sym);
   bool needsRelocations() {
-    if (config->extendedConst)
+    if (ctx.arg.extendedConst)
       return false;
     return llvm::any_of(internalGotSymbols,
                         [=](Symbol *sym) { return !sym->isTLS(); });
@@ -357,7 +354,7 @@ public:
       : SyntheticSection(llvm::wasm::WASM_SEC_CUSTOM, "linking"),
         initFunctions(initFunctions), dataSegments(dataSegments) {}
   bool isNeeded() const override {
-    return config->relocatable || config->emitRelocs;
+    return ctx.arg.relocatable || ctx.arg.emitRelocs;
   }
   void writeBody() override;
   void addToSymtab(Symbol *sym);
@@ -375,9 +372,17 @@ public:
   NameSection(ArrayRef<OutputSegment *> segments)
       : SyntheticSection(llvm::wasm::WASM_SEC_CUSTOM, "name"),
         segments(segments) {}
-  bool isNeeded() const override { return !config->stripAll && numNames() > 0; }
+  bool isNeeded() const override {
+    if (ctx.arg.stripAll && !ctx.arg.keepSections.count(name))
+      return false;
+    return numNames() > 0;
+  }
   void writeBody() override;
-  unsigned numNames() const { return numNamedGlobals() + numNamedFunctions(); }
+  unsigned numNames() const {
+    // We always write at least one name which is the name of the
+    // module itself.
+    return 1 + numNamedGlobals() + numNamedFunctions();
+  }
   unsigned numNamedGlobals() const;
   unsigned numNamedFunctions() const;
   unsigned numNamedDataSegments() const;
@@ -391,7 +396,9 @@ public:
   ProducersSection()
       : SyntheticSection(llvm::wasm::WASM_SEC_CUSTOM, "producers") {}
   bool isNeeded() const override {
-    return !config->stripAll && fieldCount() > 0;
+    if (ctx.arg.stripAll && !ctx.arg.keepSections.count(name))
+      return false;
+    return fieldCount() > 0;
   }
   void writeBody() override;
   void addInfo(const llvm::wasm::WasmProducerInfo &info);
@@ -410,7 +417,9 @@ public:
   TargetFeaturesSection()
       : SyntheticSection(llvm::wasm::WASM_SEC_CUSTOM, "target_features") {}
   bool isNeeded() const override {
-    return !config->stripAll && features.size() > 0;
+    if (ctx.arg.stripAll && !ctx.arg.keepSections.count(name))
+      return false;
+    return features.size() > 0;
   }
   void writeBody() override;
 
@@ -427,6 +436,35 @@ public:
 
 protected:
   OutputSection *sec;
+};
+
+class BuildIdSection : public SyntheticSection {
+public:
+  BuildIdSection();
+  void writeBody() override;
+  bool isNeeded() const override {
+    return ctx.arg.buildId != BuildIdKind::None;
+  }
+  void writeBuildId(llvm::ArrayRef<uint8_t> buf);
+  void writeTo(uint8_t *buf) override {
+    LLVM_DEBUG(llvm::dbgs()
+               << "BuildId writeto buf " << buf << " offset " << offset
+               << " headersize " << header.size() << '\n');
+    // The actual build ID is derived from a hash of all of the output
+    // sections, so it can't be calculated until they are written. Here
+    // we write the section leaving zeros in place of the hash.
+    SyntheticSection::writeTo(buf);
+    // Calculate and store the location where the hash will be written.
+    hashPlaceholderPtr = buf + offset + header.size() +
+                         +sizeof(buildIdSectionName) /*name string*/ +
+                         1 /* hash size */;
+  }
+
+  const uint32_t hashSize;
+
+private:
+  static constexpr char buildIdSectionName[] = "build_id";
+  uint8_t *hashPlaceholderPtr = nullptr;
 };
 
 // Linker generated output sections
@@ -447,6 +485,7 @@ struct OutStruct {
   NameSection *nameSec;
   ProducersSection *producersSec;
   TargetFeaturesSection *targetFeaturesSec;
+  BuildIdSection *buildIdSec;
 };
 
 extern OutStruct out;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: azalia.c,v 1.287 2024/05/17 19:43:45 kettenis Exp $	*/
+/*	$OpenBSD: azalia.c,v 1.292 2026/04/04 09:01:13 jsg Exp $	*/
 /*	$NetBSD: azalia.c,v 1.20 2006/05/07 08:31:44 kent Exp $	*/
 
 /*-
@@ -465,6 +465,7 @@ azalia_configure_pci(azalia_t *az)
 	case PCI_PRODUCT_INTEL_600SERIES_LP_HDA:
 	case PCI_PRODUCT_INTEL_700SERIES_HDA:
 	case PCI_PRODUCT_INTEL_700SERIES_LP_HDA:
+	case PCI_PRODUCT_INTEL_800SERIES_HDA:
 	case PCI_PRODUCT_INTEL_C600_HDA:
 	case PCI_PRODUCT_INTEL_C610_HDA_1:
 	case PCI_PRODUCT_INTEL_C610_HDA_2:
@@ -478,6 +479,10 @@ azalia_configure_pci(azalia_t *az)
 	case PCI_PRODUCT_INTEL_EHL_HDA:
 	case PCI_PRODUCT_INTEL_ADL_N_HDA:
 	case PCI_PRODUCT_INTEL_MTL_HDA:
+	case PCI_PRODUCT_INTEL_LNL_HDA:
+	case PCI_PRODUCT_INTEL_ARL_U_HDA:
+	case PCI_PRODUCT_INTEL_PTL_HDA:
+	case PCI_PRODUCT_INTEL_PTL_H_HDA:
 		reg = azalia_pci_read(az->pc, az->tag,
 		    INTEL_PCIE_NOSNOOP_REG);
 		reg &= INTEL_PCIE_NOSNOOP_MASK;
@@ -497,12 +502,17 @@ const struct pci_matchid azalia_pci_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_500SERIES_LP_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_600SERIES_LP_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_700SERIES_LP_HDA },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_APOLLOLAKE_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_GLK_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_JSL_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_EHL_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ADL_N_HDA },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_MTL_HDA },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_HDA },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_HDA },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_HDA },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_HDA },
 };
 
 int
@@ -598,16 +608,29 @@ azalia_pci_activate(struct device *self, int act)
 	azalia_t *sc = (azalia_t*)self;
 	int rv = 0; 
 
+	if (sc->detached)
+		return (0);
+
 	switch (act) {
-	case DVACT_SUSPEND:
-		azalia_suspend(sc);
+	case DVACT_QUIESCE:
+		rv = config_activate_children(self, act);
+		/* stop interrupts and clear status registers */
+		AZ_WRITE_4(sc, INTCTL, 0);
+		AZ_WRITE_2(sc, STATESTS, HDA_STATESTS_SDIWAKE);
+		AZ_WRITE_1(sc, RIRBSTS, HDA_RIRBSTS_RINTFL | HDA_RIRBSTS_RIRBOIS);
+		(void) AZ_READ_4(sc, INTSTS);
 		break;
-	case DVACT_POWERDOWN:
-		azalia_shutdown(sc);
+	case DVACT_SUSPEND:
+		rv = config_activate_children(self, act);
+		azalia_suspend(sc);
 		break;
 	case DVACT_RESUME:
 		azalia_resume(sc);
 		rv = config_activate_children(self, act);
+		break;
+	case DVACT_POWERDOWN:
+		rv = config_activate_children(self, act);
+		azalia_shutdown(sc);
 		break;
 	default:
 		rv = config_activate_children(self, act);
@@ -1387,6 +1410,12 @@ azalia_suspend(azalia_t *az)
 
 	if (az->detached)
 		return 0;
+
+	/* stop interrupts and clear status registers */
+	AZ_WRITE_4(az, INTCTL, 0);
+	AZ_WRITE_2(az, STATESTS, HDA_STATESTS_SDIWAKE);
+	AZ_WRITE_1(az, RIRBSTS, HDA_RIRBSTS_RINTFL | HDA_RIRBSTS_RIRBOIS);
+	(void) AZ_READ_4(az, INTSTS);
 
 	/* disable unsolicited responses */
 	AZ_WRITE_4(az, GCTL, AZ_READ_4(az, GCTL) & ~HDA_GCTL_UNSOL);

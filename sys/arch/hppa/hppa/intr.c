@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.51 2021/03/11 11:16:56 jsg Exp $	*/
+/*	$OpenBSD: intr.c,v 1.54 2026/03/08 17:07:31 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2002-2004 Michael Shalayeff
@@ -39,22 +39,6 @@
 #include <machine/autoconf.h>
 #include <machine/frame.h>
 #include <machine/reg.h>
-
-struct hppa_iv {
-	char pri;
-	char irq;
-	char flags;
-#define	HPPA_IV_CALL	0x01
-#define	HPPA_IV_SOFT	0x02
-	char pad;
-	int pad2;
-	int (*handler)(void *);
-	void *arg;
-	u_int bit;
-	struct hppa_iv *share;
-	struct hppa_iv *next;
-	struct evcount *cnt;
-} __packed;
 
 struct hppa_iv intr_store[8*2*CPU_NINTS] __attribute__ ((aligned(32))),
     *intr_more = intr_store, *intr_list;
@@ -253,7 +237,7 @@ cpu_intr(void *v)
 	mtctl(0, CR_EIEM);
 
 	s = ci->ci_cpl;
-	if (ci->ci_in_intr++)
+	if (ci->ci_idepth++)
 		frame->tf_flags |= TFF_INTR;
 
 	/* Process higher priority interrupts first. */
@@ -268,11 +252,11 @@ cpu_intr(void *v)
 			ci->ci_ipending &= ~(1L << bit);
 
 			if (iv->flags & HPPA_IV_CALL)
-				continue;
+				continue;	/* handled in locore */
 
-			uvmexp.intrs++;
+			atomic_inc_int(&uvmexp.intrs);
 			if (iv->flags & HPPA_IV_SOFT)
-				uvmexp.softs++;
+				atomic_inc_int(&uvmexp.softs);
 
 			ci->ci_cpl = iv->pri;
 			mtctl(frame->tf_eiem, CR_EIEM);
@@ -306,7 +290,7 @@ cpu_intr(void *v)
 			mtctl(0, CR_EIEM);
 		}
 	}
-	ci->ci_in_intr--;
+	ci->ci_idepth--;
 	ci->ci_cpl = s;
 
 	mtctl(frame->tf_eiem, CR_EIEM);

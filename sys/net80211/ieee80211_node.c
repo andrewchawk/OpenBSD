@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_node.c,v 1.198 2023/10/22 12:01:36 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_node.c,v 1.216 2026/05/24 16:29:51 kirill Exp $	*/
 /*	$NetBSD: ieee80211_node.c,v 1.14 2004/05/09 09:18:47 dyoung Exp $	*/
 
 /*-
@@ -75,12 +75,15 @@ void ieee80211_setup_node(struct ieee80211com *, struct ieee80211_node *,
 struct ieee80211_node *ieee80211_alloc_node_helper(struct ieee80211com *);
 void ieee80211_node_free_unref_cb(struct ieee80211_node *);
 void ieee80211_node_tx_flushed(struct ieee80211com *, struct ieee80211_node *);
-void ieee80211_node_switch_bss(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_addba_request(struct ieee80211_node *, int);
 void ieee80211_node_addba_request_ac_be_to(void *);
 void ieee80211_node_addba_request_ac_bk_to(void *);
 void ieee80211_node_addba_request_ac_vi_to(void *);
 void ieee80211_node_addba_request_ac_vo_to(void *);
+void ieee80211_node_addba_request_tid4(void *);
+void ieee80211_node_addba_request_tid5(void *);
+void ieee80211_node_addba_request_tid6(void *);
+void ieee80211_node_addba_request_tid7(void *);
 void ieee80211_needs_auth(struct ieee80211com *, struct ieee80211_node *);
 #ifndef IEEE80211_STA_ONLY
 void ieee80211_node_join_ht(struct ieee80211com *, struct ieee80211_node *);
@@ -88,6 +91,7 @@ void ieee80211_node_join_rsn(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_join_11g(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_leave_ht(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_leave_vht(struct ieee80211com *, struct ieee80211_node *);
+void ieee80211_node_leave_he(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_leave_rsn(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_leave_11g(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_leave_pwrsave(struct ieee80211com *,
@@ -142,6 +146,11 @@ ieee80211_print_ess(struct ieee80211_ess *ess)
 			printf(",wpa2");
 		if (ess->rsnprotos & IEEE80211_PROTO_WPA)
 			printf(",wpa1");
+
+		if (ess->rsnakms & IEEE80211_AKM_PSK)
+			printf(",psk");
+		if (ess->rsnakms & IEEE80211_AKM_SHA256_PSK)
+			printf(",sha256-psk");
 
 		if (ess->rsnakms & IEEE80211_AKM_8021X ||
 		    ess->rsnakms & IEEE80211_AKM_SHA256_8021X)
@@ -264,7 +273,7 @@ ieee80211_ess_setnwkeys(struct ieee80211_ess *ess,
 
 /* Keep in sync with ieee80211_ioctl.c:ieee80211_ioctl_setwpaparms() */
 static int
-ieee80211_ess_setwpaparms(struct ieee80211_ess *ess,
+ieee80211_ess_setwpaparms(struct ieee80211com *ic, struct ieee80211_ess *ess,
     const struct ieee80211_wpaparams *wpa)
 {
 	if (!wpa->i_enabled) {
@@ -295,8 +304,13 @@ ieee80211_ess_setwpaparms(struct ieee80211_ess *ess,
 		ess->rsnakms |= IEEE80211_AKM_8021X;
 	if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_8021X)
 		ess->rsnakms |= IEEE80211_AKM_SHA256_8021X;
-	if (ess->rsnakms == 0)	/* set to default (PSK) */
-		ess->rsnakms = IEEE80211_AKM_PSK;
+	if (wpa->i_akms & IEEE80211_WPA_AKM_SAE)
+		ess->rsnakms |= IEEE80211_AKM_SAE;
+	if (ess->rsnakms == 0)	{ /* set to default (PSK) */
+		ess->rsnakms |= IEEE80211_AKM_PSK;
+		if (ic->ic_caps & IEEE80211_C_MFP)
+			ess->rsnakms |= IEEE80211_AKM_SHA256_PSK;
+	}
 
 	if (wpa->i_groupcipher == IEEE80211_WPA_CIPHER_WEP40)
 		ess->rsngroupcipher = IEEE80211_CIPHER_WEP40;
@@ -394,10 +408,11 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
 	if (join->i_flags & IEEE80211_JOIN_WPA) {
 		if (join->i_wpaparams.i_enabled) {
 			if (!(ic->ic_caps & IEEE80211_C_RSN)) {
-				free(ess, M_DEVBUF, sizeof(*ess));
+				if (new)
+					free(ess, M_DEVBUF, sizeof(*ess));
 				return ENODEV;
 			}
-			ieee80211_ess_setwpaparms(ess,
+			ieee80211_ess_setwpaparms(ic, ess,
 			    &join->i_wpaparams);
 			if (join->i_flags & IEEE80211_JOIN_WPAPSK) {
 				ess->flags |= IEEE80211_F_PSK;
@@ -412,7 +427,8 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
 	} else if (join->i_flags & IEEE80211_JOIN_NWKEY) {
 		if (join->i_nwkey.i_wepon) {
 			if (!(ic->ic_caps & IEEE80211_C_WEP)) {
-				free(ess, M_DEVBUF, sizeof(*ess));
+				if (new)
+					free(ess, M_DEVBUF, sizeof(*ess));
 				return ENODEV;
 			}
 			ieee80211_ess_setnwkeys(ess, &join->i_nwkey);
@@ -925,15 +941,44 @@ ieee80211_create_ibss(struct ieee80211com* ic, struct ieee80211_channel *chan)
 		printf("%s: creating ibss\n", ifp->if_xname);
 	ic->ic_flags |= IEEE80211_F_SIBSS;
 	ni->ni_chan = chan;
-	if ((ic->ic_flags & IEEE80211_F_VHTON) && IEEE80211_IS_CHAN_5GHZ(chan))
+	if ((ic->ic_flags & IEEE80211_F_HEON) && IEEE80211_CHAN_HE(chan))
+		mode = IEEE80211_MODE_11AX;
+	else if ((ic->ic_flags & IEEE80211_F_VHTON) &&
+	    IEEE80211_IS_CHAN_5GHZ(chan) && IEEE80211_IS_CHAN_AC(chan))
 		mode = IEEE80211_MODE_11AC;
 	else if (ic->ic_flags & IEEE80211_F_HTON)
 		mode = IEEE80211_MODE_11N;
-	else
-		mode = ieee80211_chan2mode(ic, ni->ni_chan);
+	else {
+		/* Was a specific 11a/b/g phy mode set by ifconfig? */
+		switch (IFM_MODE(ic->ic_media.ifm_cur->ifm_media)) {
+		case IFM_IEEE80211_11A:
+			mode = IEEE80211_MODE_11A;
+			break;
+		case IFM_IEEE80211_11G:
+			mode = IEEE80211_MODE_11G;
+			break;
+		case IFM_IEEE80211_11B:
+			mode = IEEE80211_MODE_11B;
+			break;
+		default: /* If we get here, our phy mode is MODE_AUTO. */
+			if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
+				mode = IEEE80211_MODE_11A;
+			else if ((ni->ni_chan->ic_flags &
+			    (IEEE80211_CHAN_OFDM | IEEE80211_CHAN_DYN)) != 0)
+				mode = IEEE80211_MODE_11G;
+			else
+				mode = IEEE80211_MODE_11B;
+			break;
+		}
+	}
 	ieee80211_setmode(ic, mode);
 	/* Pick an appropriate mode for supported legacy rates. */
-	if (ic->ic_curmode == IEEE80211_MODE_11AC) {
+	if (ic->ic_curmode == IEEE80211_MODE_11AX) {
+		if (IEEE80211_IS_CHAN_5GHZ(chan))
+			mode = IEEE80211_MODE_11A;
+		else
+			mode = IEEE80211_MODE_11G;
+	} else if (ic->ic_curmode == IEEE80211_MODE_11AC) {
 		mode = IEEE80211_MODE_11A;
 	} else if (ic->ic_curmode == IEEE80211_MODE_11N) {
 		if (IEEE80211_IS_CHAN_5GHZ(chan))
@@ -1092,6 +1137,8 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
 	if ((ic->ic_flags & IEEE80211_F_DESBSSID) &&
 	    !IEEE80211_ADDR_EQ(ic->ic_des_bssid, ni->ni_bssid))
 		fail |= IEEE80211_NODE_ASSOCFAIL_BSSID;
+	if (ni->ni_flags & IEEE80211_NODE_CSA)
+		fail |= IEEE80211_NODE_ASSOCFAIL_CSA;
 
 	if (ic->ic_flags & IEEE80211_F_RSNON) {
 		/*
@@ -1301,7 +1348,7 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs)
 	uint32_t assoc_fail = 0;
 
 	/* Reinitialize media mode and channels if needed. */
-	mode = ieee80211_chan2mode(ic, selbs->ni_chan);
+	mode = ieee80211_node_abg_mode(ic, selbs);
 	if (mode != ic->ic_curmode)
 		ieee80211_setmode(ic, mode);
 
@@ -1314,8 +1361,6 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs)
 	(*ic->ic_node_copy)(ic, ic->ic_bss, selbs);
 	ni = ic->ic_bss;
 	ni->ni_assoc_fail |= assoc_fail;
-
-	ic->ic_curmode = ieee80211_chan2mode(ic, ni->ni_chan);
 
 	/* Make sure we send valid rates in an association request. */
 	if (ic->ic_opmode == IEEE80211_M_STA)
@@ -1559,7 +1604,7 @@ ieee80211_end_scan(struct ifnet *ifp)
 				ieee80211_setmode(ic, IEEE80211_MODE_11N);
 			else
 				ieee80211_setmode(ic,
-				    ieee80211_chan2mode(ic, ni->ni_chan));
+				    ieee80211_node_abg_mode(ic, ni));
 			return;
 		}
 	
@@ -1769,6 +1814,14 @@ ieee80211_node_set_timeouts(struct ieee80211_node *ni)
 	    ieee80211_node_addba_request_ac_vi_to, ni);
 	timeout_set(&ni->ni_addba_req_to[EDCA_AC_VO],
 	    ieee80211_node_addba_request_ac_vo_to, ni);
+	timeout_set(&ni->ni_addba_req_to[4],
+	    ieee80211_node_addba_request_tid4, ni);
+	timeout_set(&ni->ni_addba_req_to[5],
+	    ieee80211_node_addba_request_tid5, ni);
+	timeout_set(&ni->ni_addba_req_to[6],
+	    ieee80211_node_addba_request_tid6, ni);
+	timeout_set(&ni->ni_addba_req_to[7],
+	    ieee80211_node_addba_request_tid7, ni);
 	for (i = 0; i < nitems(ni->ni_addba_req_intval); i++)
 		ni->ni_addba_req_intval[i] = 1;
 }
@@ -2065,10 +2118,10 @@ ieee80211_ba_del(struct ieee80211_node *ni)
 	for (tid = 0; tid < nitems(ni->ni_tx_ba); tid++)
 		ieee80211_node_tx_ba_clear(ni, tid);
 
-	timeout_del(&ni->ni_addba_req_to[EDCA_AC_BE]);
-	timeout_del(&ni->ni_addba_req_to[EDCA_AC_BK]);
-	timeout_del(&ni->ni_addba_req_to[EDCA_AC_VI]);
-	timeout_del(&ni->ni_addba_req_to[EDCA_AC_VO]);
+	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
+		if (timeout_initialized(&ni->ni_addba_req_to[tid]))
+			timeout_del(&ni->ni_addba_req_to[tid]);
+	}
 }
 
 void
@@ -2104,8 +2157,11 @@ ieee80211_release_node(struct ieee80211com *ic, struct ieee80211_node *ni)
 	int s;
 	void (*ni_unref_cb)(struct ieee80211com *, struct ieee80211_node *);
 
-	DPRINTF(("%s refcnt %u\n", ether_sprintf(ni->ni_macaddr),
-	    ni->ni_refcnt));
+#ifdef IEEE80211_DEBUG
+	if (ieee80211_debug > 1)
+		DPRINTF(("%s refcnt %u\n", ether_sprintf(ni->ni_macaddr),
+		    ni->ni_refcnt));
+#endif
 	s = splnet();
 	if (ieee80211_node_decref(ni) == 0) {
 		if (ni->ni_unref_cb) {
@@ -2423,7 +2479,7 @@ ieee80211_40mhz_valid_secondary_below(uint8_t primary_chan)
 		1, 2, 3, 4, 5, 6, 7, 8, 9,
 		36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157
 	};
-	int8_t secondary_chan;
+	uint8_t secondary_chan;
 	int i;
 
 	if ((primary_chan >= 5 && primary_chan <= 13) ||
@@ -2444,7 +2500,7 @@ ieee80211_40mhz_valid_secondary_below(uint8_t primary_chan)
  * Only accept 40 MHz channel configurations that conform to
  * regulatory operating classes as defined by the 802.11ac spec.
  * Passing other configurations down to firmware can result in
- * regulatory assertions being trigged, such as fatal firmware
+ * regulatory assertions being triggered, such as fatal firmware
  * error 14FD in iwm(4).
  *
  * See 802.11ac 2013, page 380, Tables E-1 to E-5.
@@ -2482,7 +2538,7 @@ ieee80211_setup_htop(struct ieee80211_node *ni, const uint8_t *data,
 	if (!ieee80211_40mhz_center_freq_valid(data[0], data[1]))
 		ni->ni_htop0 &= ~IEEE80211_HTOP0_SCO_MASK;
 	ni->ni_htop1 = (data[2] | (data[3] << 8));
-	ni->ni_htop2 = (data[3] | (data[4] << 8));
+	ni->ni_htop2 = (data[4] | (data[5] << 8));
 
 	/*
 	 * According to 802.11-2012 Table 8-130 the Basic MCS set is
@@ -2511,8 +2567,7 @@ ieee80211_setup_vhtcaps(struct ieee80211_node *ni, const uint8_t *data,
 	ni->ni_vht_rx_max_lgi_mbit_s = ((data[6] | (data[7] << 8)) &
 	    IEEE80211_VHT_MAX_LGI_MBIT_S_MASK);
 	ni->ni_vht_txmcs = (data[8] | (data[9] << 8));
-	ni->ni_vht_tx_max_lgi_mbit_s = ((data[10] | (data[11] << 8)) &
-	    IEEE80211_VHT_MAX_LGI_MBIT_S_MASK);
+	ni->ni_vht_tx_max_lgi_mbit_s = (data[10] | (data[11] << 8));
 
 	ni->ni_flags |= IEEE80211_NODE_VHTCAP;
 }
@@ -2521,7 +2576,7 @@ ieee80211_setup_vhtcaps(struct ieee80211_node *ni, const uint8_t *data,
  * Only accept 80 MHz channel configurations that conform to
  * regulatory operating classes as defined by the 802.11ac spec.
  * Passing other configurations down to firmware can result in
- * regulatory assertions being trigged, such as fatal firmware
+ * regulatory assertions being triggered, such as fatal firmware
  * error 14FD in iwm(4).
  *
  * See 802.11ac 2013, page 380, Tables E-1 to E-5.
@@ -2549,8 +2604,10 @@ int
 ieee80211_setup_vhtop(struct ieee80211_node *ni, const uint8_t *data,
     uint8_t len, int isprobe)
 {
-	uint8_t sco;
-	int have_40mhz;
+	struct ieee80211com *ic = ni->ni_ic;
+	uint8_t sco, ccfs0, ccfs1, ccfs2, supp_chwidth, ext_nss_bw_supp;
+	uint8_t local_chwidth, local_ext_nss_bw_supp;
+	int have_40mhz, local_supports_160, width, ccf1;
 
 	if (len != 5)
 		return 0;
@@ -2567,14 +2624,88 @@ ieee80211_setup_vhtop(struct ieee80211_node *ni, const uint8_t *data,
 	    sco == IEEE80211_HTOP0_SCO_SCB);
 
 	if (have_40mhz && ieee80211_80mhz_center_freq_valid(data[1])) {
-		ni->ni_vht_chan_width = data[0];
-		ni->ni_vht_chan_center_freq_idx0 = data[1];
-
-		/* Only used in non-consecutive 80-80 160MHz configs. */
+		width = data[0];
+		ccfs0 = data[1];
 		if (data[2] && ieee80211_80mhz_center_freq_valid(data[2]))
-			ni->ni_vht_chan_center_freq_idx1 = data[2];
+			ccfs1 = data[2];
 		else
+			ccfs1 = 0;
+		ccfs2 = (ni->ni_htop1 & IEEE80211_HTOP1_CCFS2_MASK) >>
+		    IEEE80211_HTOP1_CCFS2_SHIFT;
+		if (!ieee80211_80mhz_center_freq_valid(ccfs2))
+			ccfs2 = 0;
+
+		supp_chwidth = (ni->ni_vhtcaps & IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
+		    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
+		ext_nss_bw_supp =
+		    (ni->ni_vhtcaps & IEEE80211_VHTCAP_EXT_NSS_BW_MASK) >>
+		    IEEE80211_VHTCAP_EXT_NSS_BW_SHIFT;
+		local_chwidth = (ic->ic_vhtcaps &
+		    IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
+		    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
+		local_ext_nss_bw_supp = (ic->ic_vhtcaps &
+		    IEEE80211_VHTCAP_EXT_NSS_BW_MASK) >>
+		    IEEE80211_VHTCAP_EXT_NSS_BW_SHIFT;
+		local_supports_160 = IEEE80211_CHAN_160MHZ_ALLOWED(ni->ni_chan) &&
+		    (local_chwidth == IEEE80211_VHTCAP_CHAN_WIDTH_160 ||
+		    local_chwidth == IEEE80211_VHTCAP_CHAN_WIDTH_160_8080 ||
+		    (local_ext_nss_bw_supp != 0 &&
+		    (ic->ic_vht_tx_max_lgi_mbit_s &
+		    IEEE80211_VHT_EXT_NSS_BW_CAPABLE) != 0));
+
+		/* See 802.11-2024 Table 9-314 */
+		switch ((supp_chwidth << 4) | ext_nss_bw_supp) {
+		case 0x01:
+		case 0x02:
+		case 0x03:
+			ccf1 = ccfs2;
+			break;
+		case 0x10:
+			ccf1 = ccfs1;
+			break;
+		case 0x11:
+		case 0x12:
+			if (ccfs1 != 0)
+				ccf1 = ccfs1;
+			else
+				ccf1 = ccfs2;
+			break;
+		case 0x13:
+		case 0x20:
+		case 0x23:
+			ccf1 = ccfs1;
+			break;
+		default:
+			ccf1 = 0;
+			break;
+		}
+
+		ni->ni_vht_chan_center_freq_idx0 = ccfs0;
+		ni->ni_vht_chan_center_freq_idx1 = ccfs1;
+
+		if (width == IEEE80211_VHTOP0_CHAN_WIDTH_80 && ccf1 != 0) {
+			int diff;
+
+			diff = abs(ccf1 - ccfs0);
+			if (diff == 8) {
+				if (local_supports_160) {
+					ni->ni_vht_chan_center_freq_idx0 = ccf1;
+					width = IEEE80211_VHTOP0_CHAN_WIDTH_160;
+				}
+				ni->ni_vht_chan_center_freq_idx1 = 0;
+			}
+		} else if (width == IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+			if (!local_supports_160) {
+				if (ni->ni_primary_chan < ccfs0)
+					ni->ni_vht_chan_center_freq_idx0 = ccfs0 - 4;
+				else if (ni->ni_primary_chan > ccfs0)
+					ni->ni_vht_chan_center_freq_idx0 = ccfs0 + 4;
+				width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
+			}
 			ni->ni_vht_chan_center_freq_idx1 = 0;
+		}
+
+		ni->ni_vht_chan_width = width;
 	} else {
 		ni->ni_vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
 		ni->ni_vht_chan_center_freq_idx0 = 0;
@@ -2582,6 +2713,81 @@ ieee80211_setup_vhtop(struct ieee80211_node *ni, const uint8_t *data,
 	}
 
 	ni->ni_vht_basic_mcs = (data[3] | data[4] << 8);
+	return 1;
+}
+
+/*
+ * Install received HE caps information in the node's state block.
+ */
+void
+ieee80211_setup_hecaps(struct ieee80211_node *ni, const uint8_t *data,
+    uint8_t len)
+{
+	uint8_t phycap0;
+	const uint8_t *mcs;
+	int mcslen;
+
+	if (len < IEEE80211_HE_CAPS_FIXED_LEN + IEEE80211_HE_MCS_NSS_80_LEN)
+		return;
+
+	/*
+	 * HE Tx/Rx MCS NSS support fields are variable-length and depend
+	 * on the channel width bits in the HE PHY capabilities.
+	 */
+	phycap0 = data[IEEE80211_HE_MAC_CAPS_LEN];
+	mcslen = IEEE80211_HE_MCS_NSS_SIZE(phycap0);
+	if (len < IEEE80211_HE_CAPS_FIXED_LEN + mcslen)
+		return;
+
+	memcpy(ni->ni_he_mac_cap, data, IEEE80211_HE_MAC_CAPS_LEN);
+	memcpy(ni->ni_he_phy_cap, data + IEEE80211_HE_MAC_CAPS_LEN,
+	    IEEE80211_HE_PHY_CAPS_LEN);
+
+	mcs = data + IEEE80211_HE_CAPS_FIXED_LEN;
+	ni->ni_he_rxmcs_80 = (mcs[0] | (mcs[1] << 8));
+	ni->ni_he_txmcs_80 = (mcs[2] | (mcs[3] << 8));
+	mcs += 4;
+
+	if (phycap0 & IEEE80211_HE_PHYCAP0_CHAN_WIDTH_160_IN_5G) {
+		ni->ni_he_rxmcs_160 = (mcs[0] | (mcs[1] << 8));
+		ni->ni_he_txmcs_160 = (mcs[2] | (mcs[3] << 8));
+		mcs += 4;
+	} else {
+		ni->ni_he_rxmcs_160 = 0;
+		ni->ni_he_txmcs_160 = 0;
+	}
+
+	if (phycap0 &
+	    IEEE80211_HE_PHYCAP0_CHAN_WIDTH_8080_IN_5G) {
+		ni->ni_he_rxmcs_80p80 = (mcs[0] | (mcs[1] << 8));
+		ni->ni_he_txmcs_80p80 = (mcs[2] | (mcs[3] << 8));
+	} else {
+		ni->ni_he_rxmcs_80p80 = 0;
+		ni->ni_he_txmcs_80p80 = 0;
+	}
+
+	ni->ni_flags |= IEEE80211_NODE_HECAP;
+}
+
+/*
+ * Install received HE operation information in the node's state block.
+ */
+int
+ieee80211_setup_heop(struct ieee80211_node *ni, const uint8_t *data,
+    uint8_t len, int isprobe)
+{
+	if (len < IEEE80211_HEOP_FIXED_LEN)
+		return 0;
+
+	memcpy(ni->ni_he_oper_params, data, IEEE80211_HEOP_PARAMS_LEN);
+
+	/*
+	 * The Basic HE-MCS and NSS set is only expected in Beacons and
+	 * Probe Responses. In other frames the field may be reserved.
+	 */
+	if (isprobe)
+		ni->ni_he_basic_mcs = (data[4] | (data[5] << 8));
+
 	return 1;
 }
 
@@ -2603,6 +2809,52 @@ ieee80211_clear_vhtcaps(struct ieee80211_node *ni)
 
 }
 #endif
+
+#ifndef IEEE80211_STA_ONLY
+/* 
+ * Handle nodes switching from 11ax into legacy modes.
+ */
+void
+ieee80211_clear_hecaps(struct ieee80211_node *ni)
+{
+	memset(ni->ni_he_mac_cap, 0, sizeof(ni->ni_he_mac_cap));
+	memset(ni->ni_he_phy_cap, 0, sizeof(ni->ni_he_phy_cap));
+	ni->ni_he_rxmcs_80 = 0;
+	ni->ni_he_txmcs_80 = 0;
+	ni->ni_he_rxmcs_160 = 0;
+	ni->ni_he_txmcs_160 = 0;
+	ni->ni_he_rxmcs_80p80 = 0;
+	ni->ni_he_txmcs_80p80 = 0;
+	memset(ni->ni_he_oper_params, 0, sizeof(ni->ni_he_oper_params));
+	ni->ni_he_basic_mcs = 0;
+	ni->ni_he_ss = 0;
+
+	ni->ni_flags &= ~(IEEE80211_NODE_HE | IEEE80211_NODE_HECAP);
+
+}
+#endif
+
+int
+ieee80211_node_is_11g(struct ieee80211_node *ni)
+{
+	struct ieee80211_rateset *rs = &ni->ni_rates;
+	const struct ieee80211_rateset *rs_ofdm = &ieee80211_std_rateset_11a;
+	int i, j;
+
+	if (!IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))
+		return 0;
+
+	/* 2GHz station which supports 11a OFDM rates implies 11g. */
+	for (i = 0; i < rs->rs_nrates; i++) {
+		for (j = 0; j < rs_ofdm->rs_nrates; j++) {
+			if ((rs->rs_rates[i] & IEEE80211_RATE_VAL) ==
+			    (rs_ofdm->rs_rates[j] & IEEE80211_RATE_VAL))
+			    	return 1;
+		}
+	}
+
+	return 0;
+}
 
 /*
  * Install received rate set information in the node's state block.
@@ -2631,8 +2883,48 @@ ieee80211_setup_rates(struct ieee80211com *ic, struct ieee80211_node *ni,
 		}
 		memcpy(rs->rs_rates + rs->rs_nrates, xrates+2, nxrates);
 		rs->rs_nrates += nxrates;
+
 	}
+
+	/* 11g support implies ERP support */
+	if (ieee80211_node_is_11g(ni))
+		ni->ni_flags |= IEEE80211_NODE_ERP;
+
 	return ieee80211_fix_rate(ic, ni, flags);
+}
+
+/* 
+ * Return the 11a/b/g mode mutually supported for the given node.
+ * ni->ni_chan must be set before calling this, and ieee80211_setup_rates()
+ * should be called beforehand to properly differentiate 11b and 11g.
+ */
+enum ieee80211_phymode
+ieee80211_node_abg_mode(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	/* Handle the case where our own phy mode was fixed by ifconfig. */
+	switch (IFM_MODE(ic->ic_media.ifm_cur->ifm_media)) {
+	case IFM_IEEE80211_11A:
+		return IEEE80211_MODE_11A; /* Peer uses 11a. */
+	case IFM_IEEE80211_11B:
+		return IEEE80211_MODE_11B; /* Peer uses 11b. */
+	case IFM_IEEE80211_11G:
+		/* Peer could be using either 11g or 11b, check below. */
+		break;
+	default:
+		break;
+	}
+
+	/* Our own phy mode is either 11G or AUTO. */
+
+	if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
+		return IEEE80211_MODE_11A;
+
+	if ((ni->ni_flags & IEEE80211_NODE_ERP) &&
+	    (ni->ni_chan->ic_flags &
+	    (IEEE80211_CHAN_OFDM | IEEE80211_CHAN_DYN)) != 0)
+		return IEEE80211_MODE_11G;
+
+	return IEEE80211_MODE_11B;
 }
 
 void
@@ -2682,32 +2974,35 @@ ieee80211_node_addba_request_ac_vo_to(void *arg)
 	ieee80211_node_addba_request(ni, EDCA_AC_VO);
 }
 
-#ifndef IEEE80211_STA_ONLY
-/*
- * Check if the specified node supports ERP.
- */
-int
-ieee80211_iserp_sta(const struct ieee80211_node *ni)
+void
+ieee80211_node_addba_request_tid4(void *arg)
 {
-	static const u_int8_t rates[] = { 2, 4, 11, 22, 12, 24, 48 };
-	const struct ieee80211_rateset *rs = &ni->ni_rates;
-	int i, j;
-
-	/*
-	 * A STA supports ERP operation if it includes all the Clause 19
-	 * mandatory rates in its supported rate set.
-	 */
-	for (i = 0; i < nitems(rates); i++) {
-		for (j = 0; j < rs->rs_nrates; j++) {
-			if ((rs->rs_rates[j] & IEEE80211_RATE_VAL) == rates[i])
-				break;
-		}
-		if (j == rs->rs_nrates)
-			return 0;
-	}
-	return 1;
+	struct ieee80211_node *ni = arg;
+	ieee80211_node_addba_request(ni, 4);
 }
 
+void
+ieee80211_node_addba_request_tid5(void *arg)
+{
+	struct ieee80211_node *ni = arg;
+	ieee80211_node_addba_request(ni, 5);
+}
+
+void
+ieee80211_node_addba_request_tid6(void *arg)
+{
+	struct ieee80211_node *ni = arg;
+	ieee80211_node_addba_request(ni, 6);
+}
+
+void
+ieee80211_node_addba_request_tid7(void *arg)
+{
+	struct ieee80211_node *ni = arg;
+	ieee80211_node_addba_request(ni, 7);
+}
+
+#ifndef IEEE80211_STA_ONLY
 /*
  * This function is called to notify the 802.1X PACP machine that a new
  * 802.1X port is enabled and must be authenticated. For 802.11, a port
@@ -2759,6 +3054,8 @@ ieee80211_node_join_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)
 	ni->ni_key_count = 0;
 	ni->ni_port_valid = 0;
 	ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+	ni->ni_flags &= ~IEEE80211_NODE_RXMGMTPROT;
+	ni->ni_flags &= ~IEEE80211_NODE_TXMGMTPROT;
 	ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
 	ni->ni_replaycnt = -1;	/* XXX */
 	ni->ni_rsn_retries = 0;
@@ -2802,7 +3099,7 @@ ieee80211_count_nonerpsta(void *arg, struct ieee80211_node *ni)
 	if (ni->ni_associd == 0 || ni->ni_state == IEEE80211_STA_COLLECT)
 		return;
 
-	if (!ieee80211_iserp_sta(ni))
+	if ((ni->ni_flags & IEEE80211_NODE_ERP) == 0)
 		(*nonerpsta)++;
 }
 
@@ -2855,7 +3152,7 @@ ieee80211_node_join_11g(struct ieee80211com *ic, struct ieee80211_node *ni)
 		    ether_sprintf(ni->ni_macaddr), longslotsta));
 	}
 
-	if (!ieee80211_iserp_sta(ni)) {
+	if ((ni->ni_flags & IEEE80211_NODE_ERP) == 0) {
 		/*
 		 * Joining STA is non-ERP.
 		 */
@@ -2872,8 +3169,7 @@ ieee80211_node_join_11g(struct ieee80211com *ic, struct ieee80211_node *ni)
 
 		if (!(ni->ni_capinfo & IEEE80211_CAPINFO_SHORT_PREAMBLE))
 			ic->ic_flags &= ~IEEE80211_F_SHPREAMBLE;
-	} else
-		ni->ni_flags |= IEEE80211_NODE_ERP;
+	}
 }
 
 void
@@ -2903,7 +3199,8 @@ ieee80211_node_join(struct ieee80211com *ic, struct ieee80211_node *ni,
 		ni->ni_associd = aid | 0xc000;
 		IEEE80211_AID_SET(ni->ni_associd, ic->ic_aid_bitmap);
 		if (ic->ic_curmode == IEEE80211_MODE_11G ||
-		    (ic->ic_curmode == IEEE80211_MODE_11N &&
+		    ((ic->ic_curmode == IEEE80211_MODE_11N ||
+		      ic->ic_curmode == IEEE80211_MODE_11AX) &&
 		    IEEE80211_IS_CHAN_2GHZ(ic->ic_bss->ni_chan)))
 			ieee80211_node_join_11g(ic, ni);
 	}
@@ -2975,6 +3272,15 @@ ieee80211_node_leave_vht(struct ieee80211com *ic, struct ieee80211_node *ni)
 }
 
 /*
+ * Handle an HE STA leaving an HE network.
+ */
+void
+ieee80211_node_leave_he(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	ieee80211_clear_hecaps(ni);
+}
+
+/*
  * Handle a station leaving an RSN network.
  */
 void
@@ -2998,6 +3304,9 @@ ieee80211_node_leave_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)
 
 	ni->ni_rsn_retries = 0;
 	ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+	ni->ni_flags &= ~IEEE80211_NODE_RXMGMTPROT;
+	ni->ni_flags &= ~IEEE80211_NODE_TXMGMTPROT;
+	ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
 	ni->ni_port_valid = 0;
 	(*ic->ic_delete_key)(ic, ni, &ni->ni_pairwise_key);
 }
@@ -3107,7 +3416,8 @@ ieee80211_node_leave(struct ieee80211com *ic, struct ieee80211_node *ni)
 		ieee80211_node_leave_rsn(ic, ni);
 
 	if (ic->ic_curmode == IEEE80211_MODE_11G ||
-	    (ic->ic_curmode == IEEE80211_MODE_11N &&
+	    ((ic->ic_curmode == IEEE80211_MODE_11N ||
+	      ic->ic_curmode == IEEE80211_MODE_11AX) &&
 	    IEEE80211_IS_CHAN_2GHZ(ic->ic_bss->ni_chan)))
 		ieee80211_node_leave_11g(ic, ni);
 
@@ -3115,6 +3425,8 @@ ieee80211_node_leave(struct ieee80211com *ic, struct ieee80211_node *ni)
 		ieee80211_node_leave_ht(ic, ni);
 	if (ni->ni_flags & IEEE80211_NODE_VHT)
 		ieee80211_node_leave_vht(ic, ni);
+	if (ni->ni_flags & IEEE80211_NODE_HE)
+		ieee80211_node_leave_he(ic, ni);
 
 	if (ic->ic_node_leave != NULL)
 		(*ic->ic_node_leave)(ic, ni);

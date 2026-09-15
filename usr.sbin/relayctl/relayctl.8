@@ -1,4 +1,4 @@
-.\" $OpenBSD: relayctl.8,v 1.33 2017/11/29 15:24:50 benno Exp $
+.\" $OpenBSD: relayctl.8,v 1.35 2026/08/29 09:36:49 rsadowski Exp $
 .\"
 .\" Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
 .\" Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -15,7 +15,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 29 2017 $
+.Dd $Mdocdate: August 29 2026 $
 .Dt RELAYCTL 8
 .Os
 .Sh NAME
@@ -23,6 +23,7 @@
 .Nd control the relay daemon
 .Sh SYNOPSIS
 .Nm
+.Op Fl v
 .Op Fl s Ar socket
 .Ar command
 .Op Ar argument ...
@@ -42,14 +43,16 @@ instead of the default
 .Pa /var/run/relayd.sock
 to communicate with
 .Xr relayd 8 .
+.It Fl v
+Verbose output.
 .El
 .Pp
 The following commands are available:
 .Bl -tag -width Ds
-.It Cm host disable Op Ar name | id
+.It Cm host disable Ar name | id
 Disable a host.
 Treat it as though it were always down.
-.It Cm host enable Op Ar name | id
+.It Cm host enable Ar name | id
 Enable the host.
 Start checking its health again.
 .It Cm load Ar filename
@@ -64,21 +67,21 @@ Continuously report any changes in the host checking engine and the
 engine.
 .It Cm poll
 Schedule an immediate check of all hosts.
-.It Cm redirect disable Op Ar name | id
+.It Cm redirect disable Ar name | id
 Disable a redirection.
 If it has
 .Xr pf 4
 redirection rules installed, remove them.
 Mark the redirection's main table and \(en
 if applicable \(en disable the backup table as well.
-.It Cm redirect enable Op Ar name | id
+.It Cm redirect enable Ar name | id
 Enable a redirection.
 Mark the redirection's main table and \(en if applicable \(en enable
 the backup table as well.
 .It Cm reload
 Reload the configuration file.
 .It Cm show hosts
-Show detailed status of hosts and tables.
+Show detailed status of hosts.
 It will also print the last error for failed host checks;
 see the
 .Sx DIAGNOSTICS
@@ -102,14 +105,14 @@ routes.
 Dump the complete list of running relay sessions.
 .It Cm show summary
 Display a list of all relays, redirections, routers, tables, and hosts.
-.It Cm table disable Op Ar name | id
+.It Cm table disable Ar name | id
 Disable a table.
 Consider all hosts disabled.
 If it is a main table of a redirection which has a non-empty backup table,
 swap the contents of the
 .Xr pf 4
 table with those of the backup table.
-.It Cm table enable Op Ar name | id
+.It Cm table enable Ar name | id
 Enable a table.
 Start doing checks for all hosts that aren't individually disabled
 again.

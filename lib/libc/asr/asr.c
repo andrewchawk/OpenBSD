@@ -1,4 +1,4 @@
-/*	$OpenBSD: asr.c,v 1.68 2022/01/20 14:18:10 naddy Exp $	*/
+/*	$OpenBSD: asr.c,v 1.72 2026/07/21 09:49:56 florian Exp $	*/
 /*
  * Copyright (c) 2010-2012 Eric Faurot <eric@openbsd.org>
  *
@@ -48,7 +48,7 @@ static struct asr_ctx *asr_ctx_create(void);
 static void asr_ctx_ref(struct asr_ctx *);
 static void asr_ctx_free(struct asr_ctx *);
 static int asr_ctx_add_searchdomain(struct asr_ctx *, const char *);
-static int asr_ctx_from_file(struct asr_ctx *, const char *);
+static int asr_ctx_from_fd(struct asr_ctx *, int);
 static int asr_ctx_from_string(struct asr_ctx *, const char *);
 static int asr_ctx_parse(struct asr_ctx *, const char *);
 static int asr_parse_nameserver(struct sockaddr *, const char *);
@@ -429,6 +429,7 @@ asr_check_reload(struct asr *asr)
 	struct stat	 st;
 	struct timespec	 ts;
 	pid_t		 pid;
+	int		 fd;
 
 	pid = getpid();
 	if (pid != asr->a_pid) {
@@ -444,14 +445,19 @@ asr_check_reload(struct asr *asr)
 	asr->a_rtime = ts.tv_sec;
 
 	DPRINT("asr: checking for update of \"%s\"\n", _PATH_RESCONF);
-	if (stat(_PATH_RESCONF, &st) == -1 ||
-	    asr->a_mtime == st.st_mtime ||
-	    (ac = asr_ctx_create()) == NULL)
+	fd = __pledge_open(_PATH_RESCONF, O_RDONLY|O_CLOEXEC);
+	if (fd == -1)
 		return;
+	if (fstat(fd, &st) == -1 ||
+	    asr->a_mtime == st.st_mtime ||
+	    (ac = asr_ctx_create()) == NULL) {
+		close(fd);
+		return;
+	}
 	asr->a_mtime = st.st_mtime;
 
 	DPRINT("asr: reloading config file\n");
-	if (asr_ctx_from_file(ac, _PATH_RESCONF) == -1) {
+	if (asr_ctx_from_fd(ac, fd) == -1) {
 		asr_ctx_free(ac);
 		return;
 	}
@@ -732,17 +738,20 @@ asr_ctx_from_string(struct asr_ctx *ac, const char *str)
 
 /*
  * Setup the "ac" async context from the file at location "path".
+ * Takes control of fd, so must close() if it encounters error
  */
 static int
-asr_ctx_from_file(struct asr_ctx *ac, const char *path)
+asr_ctx_from_fd(struct asr_ctx *ac, int fd)
 {
 	FILE	*cf;
 	char	 buf[4096];
 	ssize_t	 r;
 
-	cf = fopen(path, "re");
-	if (cf == NULL)
+	cf = fdopen(fd, "r");
+	if (cf == NULL) {
+		close(fd);
 		return (-1);
+	}
 
 	r = fread(buf, 1, sizeof buf - 1, cf);
 	if (feof(cf) == 0) {
@@ -851,9 +860,13 @@ asr_parse_nameserver(struct sockaddr *sa, const char *s)
 char *
 _asr_strdname(const char *_dname, char *buf, size_t max)
 {
-	const unsigned char *dname = _dname;
-	char	*res;
-	size_t	 left, count;
+	const unsigned char	*dname = _dname;
+	unsigned char		 c;
+	char			*res;
+	size_t			 left, count;
+
+	if (max == 0)
+		return (buf);
 
 	if (_dname[0] == 0) {
 		strlcpy(buf, ".", max);
@@ -864,10 +877,29 @@ _asr_strdname(const char *_dname, char *buf, size_t max)
 	left = max - 1;
 	while (dname[0] && left) {
 		count = (dname[0] < (left - 1)) ? dname[0] : (left - 1);
-		memmove(buf, dname + 1, count);
-		dname += dname[0] + 1;
-		left -= count;
-		buf += count;
+		if (left < 4 * count) {
+			*res = '\0';
+			return res;
+		}
+		dname++;
+		while (count > 0) {
+			c = *dname++;
+			count--;
+			if ( c == '\\') {
+				*buf++ = '\\';
+				*buf++ = '\\';
+				left -= 2;
+			} else if (c > 0x20 && c < 0x7f) {
+				*buf++ = c;
+				left--;
+			} else {
+				*buf++ = '\\';
+				*buf++ = '0' + ((c / 100) % 10);
+				*buf++ = '0' + ((c / 10) % 10);
+				*buf++ = '0' + (c % 10);
+				left -= 4;
+			}
+		}
 		if (left) {
 			left -= 1;
 			*buf++ = '.';

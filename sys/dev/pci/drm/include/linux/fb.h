@@ -4,11 +4,6 @@
 #define _LINUX_FB_H
 
 #include <sys/types.h>
-#include <linux/slab.h>
-#include <linux/notifier.h>
-#include <linux/backlight.h>
-#include <linux/kgdb.h>
-#include <linux/fs.h>
 #include <linux/i2c.h> /* via uapi/linux/fb.h */
 
 struct fb_cmap;
@@ -18,6 +13,7 @@ struct fb_image;
 struct fb_info;
 
 struct apertures_struct;
+struct backlight_device;
 
 struct fb_var_screeninfo {
 	int pixclock;
@@ -29,6 +25,7 @@ struct fb_var_screeninfo {
 
 struct fb_ops {
 	int (*fb_set_par)(struct fb_info *);
+	int (*fb_blank)(int, struct fb_info *);
 };
 
 struct fb_fix_screeninfo {
@@ -46,6 +43,7 @@ struct fb_info {
 	void *par;
 	int fbcon_rotate_hint;
 	bool skip_vt_switch;
+	bool skip_panic;
 	int flags;
 };
 
@@ -70,6 +68,8 @@ struct fb_info {
 #define FB_ROTATE_CCW		3
 
 #define FB_GEN_DEFAULT_DEFERRED_IOMEM_OPS(a, b, c)
+#define FB_GEN_DEFAULT_DEFERRED_DMAMEM_OPS(a, b, c)
+#define FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(a, b, c)
 
 static inline struct fb_info *
 framebuffer_alloc(size_t size, void *dev)
@@ -95,6 +95,15 @@ fb_get_options(const char *name, char **opt)
 }
 
 static inline int
+fb_blank(struct fb_info *fbi, int b)
+{
+	int r = 0;
+	if (fbi->fbops && fbi->fbops->fb_blank)
+		r = fbi->fbops->fb_blank(b, fbi);
+	return r;
+}
+
+static inline int
 register_framebuffer(struct fb_info *fbi)
 {
 	if (fbi->fbops && fbi->fbops->fb_set_par)
@@ -104,6 +113,11 @@ register_framebuffer(struct fb_info *fbi)
 
 static inline void
 unregister_framebuffer(struct fb_info *fbi)
+{
+}
+
+static inline void
+fb_deferred_io_cleanup(struct fb_info *fbi)
 {
 }
 

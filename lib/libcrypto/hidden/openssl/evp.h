@@ -1,4 +1,4 @@
-/* $OpenBSD: evp.h,v 1.4 2024/04/10 15:00:38 beck Exp $ */
+/* $OpenBSD: evp.h,v 1.7 2026/09/14 23:36:58 kenjiro Exp $ */
 /*
  * Copyright (c) 2024 Bob Beck <beck@openbsd.org>
  *
@@ -160,7 +160,6 @@ LCRYPTO_USED(EVP_sha3_384);
 LCRYPTO_USED(EVP_sha3_512);
 LCRYPTO_USED(EVP_sm3);
 LCRYPTO_USED(EVP_ripemd160);
-LCRYPTO_USED(EVP_whirlpool);
 LCRYPTO_USED(EVP_enc_null);
 LCRYPTO_USED(EVP_des_ecb);
 LCRYPTO_USED(EVP_des_ede);
@@ -258,13 +257,8 @@ LCRYPTO_USED(EVP_sm4_cbc);
 LCRYPTO_USED(EVP_sm4_cfb128);
 LCRYPTO_USED(EVP_sm4_ofb);
 LCRYPTO_USED(EVP_sm4_ctr);
-LCRYPTO_USED(OPENSSL_add_all_algorithms_noconf);
-LCRYPTO_USED(OPENSSL_add_all_algorithms_conf);
-LCRYPTO_USED(OpenSSL_add_all_ciphers);
-LCRYPTO_USED(OpenSSL_add_all_digests);
 LCRYPTO_USED(EVP_get_cipherbyname);
 LCRYPTO_USED(EVP_get_digestbyname);
-LCRYPTO_USED(EVP_cleanup);
 LCRYPTO_USED(EVP_CIPHER_do_all);
 LCRYPTO_USED(EVP_CIPHER_do_all_sorted);
 LCRYPTO_USED(EVP_MD_do_all);
@@ -353,9 +347,6 @@ LCRYPTO_USED(EVP_PKEY_paramgen_init);
 LCRYPTO_USED(EVP_PKEY_paramgen);
 LCRYPTO_USED(EVP_PKEY_keygen_init);
 LCRYPTO_USED(EVP_PKEY_keygen);
-LCRYPTO_USED(EVP_PKEY_check);
-LCRYPTO_USED(EVP_PKEY_public_check);
-LCRYPTO_USED(EVP_PKEY_param_check);
 LCRYPTO_USED(EVP_PKEY_CTX_set_cb);
 LCRYPTO_USED(EVP_PKEY_CTX_get_cb);
 LCRYPTO_USED(EVP_PKEY_CTX_get_keygen_info);
@@ -374,6 +365,11 @@ LCRYPTO_USED(EVP_AEAD_CTX_cleanup);
 LCRYPTO_USED(EVP_AEAD_CTX_seal);
 LCRYPTO_USED(EVP_AEAD_CTX_open);
 LCRYPTO_USED(ERR_load_EVP_strings);
+LCRYPTO_UNUSED(OPENSSL_add_all_algorithms_noconf);
+LCRYPTO_UNUSED(OPENSSL_add_all_algorithms_conf);
+LCRYPTO_UNUSED(OpenSSL_add_all_ciphers);
+LCRYPTO_UNUSED(OpenSSL_add_all_digests);
+LCRYPTO_UNUSED(EVP_cleanup);
 LCRYPTO_UNUSED(EVP_MD_CTX_init);
 LCRYPTO_UNUSED(EVP_EncryptFinal);
 LCRYPTO_UNUSED(EVP_DecryptFinal);

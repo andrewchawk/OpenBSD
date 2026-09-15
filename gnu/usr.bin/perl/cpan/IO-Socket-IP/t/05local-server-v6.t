@@ -1,10 +1,9 @@
 #!/usr/bin/perl
 
-use v5;
-use strict;
+use v5.14;
 use warnings;
 
-use Test::More;
+use Test2::V0;
 
 use IO::Socket::IP;
 use Socket qw( inet_pton inet_ntop pack_sockaddr_in6 unpack_sockaddr_in6 IN6ADDR_LOOPBACK );
@@ -40,7 +39,7 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
    );
 
    ok( defined $testserver, "IO::Socket::IP->new constructs a $socktype socket" ) or
-      diag( "  error was $@" );
+      diag( "  error was $IO::Socket::errstr" );
 
    is( $testserver->sockdomain, $AF_INET6,         "\$testserver->sockdomain for $socktype" );
    is( $testserver->socktype,   Socket->$socktype, "\$testserver->socktype for $socktype" );
@@ -65,18 +64,18 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
       do { $testserver->connect( $socket->sockname ); $testserver };
 
    ok( defined $testclient, "accepted test $socktype client" );
-   isa_ok( $testclient, "IO::Socket::IP", "\$testclient for $socktype" );
+   isa_ok( $testclient, [ "IO::Socket::IP" ], "\$testclient for $socktype" );
 
    is( $testclient->sockdomain, $AF_INET6,         "\$testclient->sockdomain for $socktype" );
    is( $testclient->socktype,   Socket->$socktype, "\$testclient->socktype for $socktype" );
 
-   is_deeply( [ unpack_sockaddr_in6_addrport( $socket->sockname ) ],
-              [ unpack_sockaddr_in6_addrport( $testclient->peername ) ],
-              "\$socket->sockname for $socktype" );
+   is( [ unpack_sockaddr_in6_addrport( $socket->sockname ) ],
+       [ unpack_sockaddr_in6_addrport( $testclient->peername ) ],
+       "\$socket->sockname for $socktype" );
 
-   is_deeply( [ unpack_sockaddr_in6_addrport( $socket->peername ) ],
-              [ unpack_sockaddr_in6_addrport( $testclient->sockname ) ],
-              "\$socket->peername for $socktype" );
+   is( [ unpack_sockaddr_in6_addrport( $socket->peername ) ],
+       [ unpack_sockaddr_in6_addrport( $testclient->sockname ) ],
+       "\$socket->peername for $socktype" );
 
    my $peerport = ( Socket::unpack_sockaddr_in6 $socket->peername )[0];
    my $sockport = ( Socket::unpack_sockaddr_in6 $socket->sockname )[0];

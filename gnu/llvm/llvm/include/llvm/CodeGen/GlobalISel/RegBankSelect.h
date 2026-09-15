@@ -190,7 +190,7 @@ public:
     /// Frequency of the insertion point.
     /// \p P is used to access the various analysis that will help to
     /// get that information, like MachineBlockFrequencyInfo.  If \p P
-    /// does not contain enough enough to return the actual frequency,
+    /// does not contain enough to return the actual frequency,
     /// this returns 1.
     virtual uint64_t frequency(const Pass &P) const { return 1; }
 
@@ -440,7 +440,7 @@ protected:
   public:
     /// Create a MappingCost assuming that most of the instructions
     /// will occur in a basic block with \p LocalFreq frequency.
-    MappingCost(const BlockFrequency &LocalFreq);
+    MappingCost(BlockFrequency LocalFreq);
 
     /// Add \p Cost to the local cost.
     /// \return true if this cost is saturated, false otherwise.
@@ -509,9 +509,6 @@ protected:
 
   /// Optimization mode of the pass.
   Mode OptMode;
-
-  /// Current target configuration. Controls how the pass handles errors.
-  const TargetPassConfig *TPC;
 
   /// Assign the register bank of each operand of \p MI.
   /// \return True on success, false otherwise.
@@ -624,19 +621,15 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
   MachineFunctionProperties getRequiredProperties() const override {
-    return MachineFunctionProperties()
-        .set(MachineFunctionProperties::Property::IsSSA)
-        .set(MachineFunctionProperties::Property::Legalized);
+    return MachineFunctionProperties().setIsSSA().setLegalized();
   }
 
   MachineFunctionProperties getSetProperties() const override {
-    return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::RegBankSelected);
+    return MachineFunctionProperties().setRegBankSelected();
   }
 
   MachineFunctionProperties getClearedProperties() const override {
-    return MachineFunctionProperties()
-      .set(MachineFunctionProperties::Property::NoPHIs);
+    return MachineFunctionProperties().setNoPHIs();
   }
 
   /// Check that our input is fully legal: we require the function to have the

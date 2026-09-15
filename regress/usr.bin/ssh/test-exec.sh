@@ -1,4 +1,4 @@
-#	$OpenBSD: test-exec.sh,v 1.119 2024/06/20 08:18:34 dtucker Exp $
+#	$OpenBSD: test-exec.sh,v 1.139 2025/12/22 01:31:07 djm Exp $
 #	Placed in the Public Domain.
 
 #SUDO=sudo
@@ -53,13 +53,14 @@ SSHKEYSCAN=ssh-keyscan
 SFTP=sftp
 SFTPSERVER=/usr/libexec/sftp-server
 SSHD_SESSION=/usr/libexec/sshd-session
+SSHD_AUTH=/usr/libexec/sshd-auth
 SCP=scp
 
 # Interop testing
 PLINK=/usr/local/bin/plink
 PUTTYGEN=/usr/local/bin/puttygen
 CONCH=/usr/local/bin/conch
-DROPBEAR=/usr/local/bin/dropbear
+DROPBEAR=/usr/local/sbin/dropbear
 DBCLIENT=/usr/local/bin/dbclient
 DROPBEARKEY=/usr/local/bin/dropbearkey
 DROPBEARCONVERT=/usr/local/bin/dropbearconvert
@@ -76,6 +77,9 @@ if [ "x$TEST_SSH_SSH" != "x" ]; then
 fi
 if [ "x$TEST_SSH_SSHD_SESSION" != "x" ]; then
 	SSHD_SESSION="${TEST_SSH_SSHD_SESSION}"
+fi
+if [ "x$TEST_SSH_SSHD_AUTH" != "x" ]; then
+	SSHD_AUTH="${TEST_SSH_SSHD_AUTH}"
 fi
 if [ "x$TEST_SSH_SSHD" != "x" ]; then
 	SSHD="${TEST_SSH_SSHD}"
@@ -136,6 +140,11 @@ fi
 case "$SSHD" in
 /*) ;;
 *) SSHD=`which $SSHD` ;;
+esac
+
+case "$SSH" in
+/*) ;;
+*) SSH=`which $SSH` ;;
 esac
 
 case "$SSHAGENT" in
@@ -200,6 +209,7 @@ fi
 # to preserve our debug logging.  In the rare instance where -q is desirable
 # -qq is equivalent and is not removed.
 SSHLOGWRAP=$OBJ/ssh-log-wrapper.sh
+rm -f ${SSHLOGWRAP}
 cat >$SSHLOGWRAP <<EOD
 #!/bin/sh
 timestamp="\`$OBJ/timestamp\`"
@@ -218,6 +228,7 @@ REAL_SSHD="$SSHD"
 SSH="$SSHLOGWRAP"
 
 SSHDLOGWRAP=$OBJ/sshd-log-wrapper.sh
+rm -f ${SSHDLOGWRAP}
 cat >$SSHDLOGWRAP <<EOD
 #!/bin/sh
 timestamp="\`$OBJ/timestamp\`"
@@ -247,14 +258,14 @@ ssh_logfile ()
 # [kbytes] to ensure the file is at least that large.
 DATANAME=data
 DATA=$OBJ/${DATANAME}
-cat ${SSH} >${DATA}
+cat ${REAL_SSH} >${DATA}
 COPY=$OBJ/copy
 rm -f ${COPY}
 
 increase_datafile_size()
 {
 	while [ `du -k ${DATA} | cut -f1` -lt $1 ]; do
-		cat ${SSH} >>${DATA}
+		cat ${REAL_SSH} >>${DATA}
 	done
 }
 
@@ -326,8 +337,10 @@ save_debug_log ()
 
 	for logfile in $TEST_SSH_LOGDIR $TEST_REGRESS_LOGFILE \
 	    $TEST_SSH_LOGFILE $TEST_SSHD_LOGFILE; do
-		if [ ! -z "$SUDO" ] && [ -f "$logfile" ]; then
+		if [ ! -z "$SUDO" ]; then
+			touch $logfile
 			$SUDO chown -R $USER $logfile
+			$SUDO chmod ug+rw $logfile
 		fi
 	done
 	echo $@ >>$TEST_REGRESS_LOGFILE
@@ -337,19 +350,6 @@ save_debug_log ()
 	(cat $TEST_REGRESS_LOGFILE; echo) >>$OBJ/failed-regress.log
 	(cat $TEST_SSH_LOGFILE; echo) >>$OBJ/failed-ssh.log
 	(cat $TEST_SSHD_LOGFILE; echo) >>$OBJ/failed-sshd.log
-
-	# Save all logfiles in a tarball.
-	(cd $OBJ &&
-	  logfiles=""
-	  for i in $TEST_REGRESS_LOGFILE $TEST_SSH_LOGFILE $TEST_SSHD_LOGFILE \
-	    $TEST_SSH_LOGDIR; do
-		if [ -e "`basename $i`" ]; then
-			logfiles="$logfiles `basename $i`"
-		else
-			logfiles="$logfiles $i"
-		fi
-	  done
-	  tar cf "$tarname" $logfiles)
 }
 
 trace ()
@@ -426,6 +426,7 @@ cat << EOF > $OBJ/sshd_config
 	AcceptEnv		_XXX_TEST
 	Subsystem	sftp	$SFTPSERVER
 	SshdSessionPath		$SSHD_SESSION
+	SshdAuthPath		$SSHD_AUTH
 	PerSourcePenalties	no
 EOF
 
@@ -519,9 +520,9 @@ export EXTRA_AGENT_ARGS
 
 maybe_filter_sk() {
 	if test -z "$SSH_SK_PROVIDER" ; then
-		grep -v ^sk
+		grep -v ^sk | grep -v ^webauthn
 	else
-		cat
+		grep -v ^webauthn
 	fi
 }
 
@@ -646,7 +647,8 @@ esac
 
 if test "$REGRESS_INTEROP_DROPBEAR" = "yes" ; then
 	trace Create dropbear keys and add to authorized_keys
-	mkdir -p $OBJ/.dropbear
+	mkdir -p $OBJ/.dropbear $OBJ/.ssh
+	awk '{print "somehost "$2" "$3}' $OBJ/known_hosts >$OBJ/.ssh/known_hosts
 	kt="ed25519"
 	for i in dss rsa ecdsa; do
 		if $SSH -Q key-plain | grep "$i" >/dev/null; then
@@ -672,7 +674,7 @@ fi
 # create a proxy version of the client config
 (
 	cat $OBJ/ssh_config
-	echo proxycommand ${SUDO} env SSH_SK_HELPER=\"$SSH_SK_HELPER\" ${OBJ}/sshd-log-wrapper.sh -i -f $OBJ/sshd_proxy
+	echo proxycommand ${SUDO} env SSH_SK_HELPER=\"$SSH_SK_HELPER\" ${TEST_SSH_SSHD_ENV} ${OBJ}/sshd-log-wrapper.sh -i -f $OBJ/sshd_proxy
 ) > $OBJ/ssh_proxy
 
 # check proxy config
@@ -689,8 +691,9 @@ start_sshd ()
 	PIDFILE=$OBJ/pidfile
 	# start sshd
 	logfile="${TEST_SSH_LOGDIR}/sshd.`$OBJ/timestamp`.$$.log"
-	$SUDO ${SSHD} -f $OBJ/sshd_config "$@" -t || fatal "sshd_config broken"
-	$SUDO env SSH_SK_HELPER="$SSH_SK_HELPER" \
+	$SUDO env SSH_SK_HELPER="$SSH_SK_HELPER" ${TEST_SSH_SSHD_ENV} \
+	    ${SSHD} -f $OBJ/sshd_config "$@" -t || fatal "sshd_config broken"
+	$SUDO env SSH_SK_HELPER="$SSH_SK_HELPER" ${TEST_SSH_SSHD_ENV} \
 	    ${SSHD} -f $OBJ/sshd_config "$@" -E$logfile
 	echo "trace: Started sshd as daemon, logfile $logfile" >>$TEST_REGRESS_LOGFILE
 
@@ -700,9 +703,16 @@ start_sshd ()
 		i=`expr $i + 1`
 		sleep $i
 	done
+	rm -f ${TEST_SSHD_LOGFILE}
 	ln -f -s ${logfile} $TEST_SSHD_LOGFILE
 
 	test -f $PIDFILE || fatal "no sshd running on port $PORT"
+}
+
+enable_all_kexes_in_sshd ()
+{
+	kexs=`$SSH -Q KexAlgorithms | (tr '\n' ,; echo) | sed 's/,$//'`
+	echo KexAlgorithms $kexs >>$OBJ/sshd_config
 }
 
 # Find a PKCS#11 library.
@@ -724,7 +734,7 @@ p11_setup() {
 	p11_find_lib \
 		/usr/local/lib/softhsm/libsofthsm2.so
 	test -z "$TEST_SSH_PKCS11" && return 1
-	verbose "using token library $TEST_SSH_PKCS11"
+	trace "using token library $TEST_SSH_PKCS11"
 	TEST_SSH_PIN=1234
 	TEST_SSH_SOPIN=12345678
 	if [ "x$TEST_SSH_SSHPKCS11HELPER" != "x" ]; then
@@ -776,13 +786,31 @@ EOF
 	    --import $ECP8 >/dev/null || fatal "softhsm import EC fail"
 	chmod 600 $EC
 	ssh-keygen -y -f $EC > ${EC}.pub
-	# Prepare askpass script to load PIN.
+	# Ed25519 key
+	ED25519=${SSH_SOFTHSM_DIR}/ED25519
+	ED25519P8=${SSH_SOFTHSM_DIR}/ED25519P8
+	$OPENSSL_BIN genpkey -algorithm ed25519 > $ED25519 || \
+	    fatal "genpkey Ed25519 fail"
+	$OPENSSL_BIN pkcs8 -nocrypt -in $ED25519 > $ED25519P8 || \
+		fatal "pkcs8 Ed25519 fail"
+	softhsm2-util --slot "$slot" --label 03 --id 03 --pin "$TEST_SSH_PIN" \
+	    --import $ED25519P8 >/dev/null || \
+		fatal "softhsm import ed25519 fail"
+	chmod 600 $ED25519
+	ssh-keygen -y -f $ED25519 > ${ED25519}.pub
+	# Prepare some askpass scripts to load PINs.
 	PIN_SH=$SSH_SOFTHSM_DIR/pin.sh
 	cat > $PIN_SH << EOF
 #!/bin/sh
 echo "${TEST_SSH_PIN}"
 EOF
 	chmod 0700 "$PIN_SH"
+	WRONGPIN_SH=$SSH_SOFTHSM_DIR/wrongpin.sh
+	cat > $WRONGPIN_SH << EOF
+#!/bin/sh
+echo "0000"
+EOF
+	chmod 0700 "$WRONGPIN_SH"
 	PKCS11_OK=yes
 	return 0
 }
@@ -790,6 +818,31 @@ EOF
 # Peforms ssh-add with the right token PIN.
 p11_ssh_add() {
 	env SSH_ASKPASS="$PIN_SH" SSH_ASKPASS_REQUIRE=force ${SSHADD} "$@"
+}
+
+start_ssh_agent() {
+	EXTRA_AGENT_ARGS="$1"
+	if [ "$PKCS11_OK" = "yes" ]; then
+		EXTRA_AGENT_ARGS="${EXTRA_AGENT_ARGS} -P${TEST_SSH_PKCS11}"
+	fi
+	SSH_AUTH_SOCK="$OBJ/agent.sock"
+	export SSH_AUTH_SOCK
+	rm -f $SSH_AUTH_SOCK $OBJ/agent.log
+	trace "start agent"
+	${SSHAGENT} ${EXTRA_AGENT_ARGS} -d -a $SSH_AUTH_SOCK \
+	    > $OBJ/agent.log 2>&1 &
+	AGENT_PID=$!
+	trap "kill $AGENT_PID" EXIT
+	for x in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ; do
+		# Give it a chance to start
+		${SSHADD} -l > /dev/null 2>&1
+		r=$?
+		test $r -eq 1 && break
+		sleep 1
+	done
+	if [ $r -ne 1 ]; then
+		fatal "ssh-add -l did not fail with exit code 1 (got $r)"
+	fi
 }
 
 # source test body

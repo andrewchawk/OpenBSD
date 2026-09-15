@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-pubkey.c,v 1.120 2024/05/17 00:30:23 djm Exp $ */
+/* $OpenBSD: auth2-pubkey.c,v 1.127 2026/07/30 03:37:39 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2010 Damien Miller.  All rights reserved.
@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <paths.h>
 #include <pwd.h>
+#include <glob.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -138,6 +139,11 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 		verbose_f("unsupported public key algorithm: %s", pkalg);
 		goto done;
 	}
+	if (match_pattern_list(pkalg, options.pubkey_accepted_algos, 0) != 1) {
+		logit_f("signature algorithm %s not in "
+		    "PubkeyAcceptedAlgorithms", pkalg);
+		goto done;
+	}
 	if ((r = sshkey_from_blob(pkblob, blen, &key)) != 0) {
 		error_fr(r, "parse key");
 		goto done;
@@ -146,18 +152,14 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 		error_f("cannot decode key: %s", pkalg);
 		goto done;
 	}
-	if (key->type != pktype) {
-		error_f("type mismatch for decoded key "
-		    "(received %d, expected %d)", key->type, pktype);
+	if (key->type != pktype || (sshkey_type_plain(pktype) == KEY_ECDSA &&
+	    sshkey_ecdsa_nid_from_name(pkalg) != key->ecdsa_nid)) {
+		error_f("key type mismatch for decoded key "
+		    "(received %s, expected %s)", sshkey_ssh_name(key), pkalg);
 		goto done;
 	}
 	if (auth2_key_already_used(authctxt, key)) {
 		logit("refusing previously-used %s key", sshkey_type(key));
-		goto done;
-	}
-	if (match_pattern_list(pkalg, options.pubkey_accepted_algos, 0) != 1) {
-		logit_f("signature algorithm %s not in "
-		    "PubkeyAcceptedAlgorithms", pkalg);
 		goto done;
 	}
 	if ((r = sshkey_check_cert_sigtype(key,
@@ -316,20 +318,51 @@ match_principals_file(struct passwd *pw, char *file,
     struct sshkey_cert *cert, struct sshauthopt **authoptsp)
 {
 	FILE *f;
-	int success;
+	int r, success = 0;
+	size_t i;
+	glob_t gl;
+	struct sshauthopt *opts = NULL;
 
 	if (authoptsp != NULL)
 		*authoptsp = NULL;
 
 	temporarily_use_uid(pw);
-	debug("trying authorized principals file %s", file);
-	if ((f = auth_openprincipals(file, pw, options.strict_modes)) == NULL) {
-		restore_uid();
-		return 0;
-	}
-	success = auth_process_principals(f, file, cert, authoptsp);
-	fclose(f);
+	r = glob(file, 0, NULL, &gl);
 	restore_uid();
+	if (r != 0) {
+		if (r != GLOB_NOMATCH) {
+			logit_f("glob \"%s\" failed", file);
+		}
+		return 0;
+	} else if (gl.gl_pathc > INT_MAX) {
+		fatal_f("too many glob results for \"%s\"", file);
+	} else if (gl.gl_pathc > 1) {
+		debug2_f("glob \"%s\" returned %zu matches", file,
+		    gl.gl_pathc);
+	}
+	for (i = 0; !success && i < gl.gl_pathc; i++) {
+		temporarily_use_uid(pw);
+		debug("trying authorized principals file %s", file);
+		if ((f = auth_openprincipals(gl.gl_pathv[i], pw,
+		    options.strict_modes)) == NULL) {
+			restore_uid();
+			continue;
+		}
+		success = auth_process_principals(f, gl.gl_pathv[i],
+		    cert, &opts);
+		fclose(f);
+		restore_uid();
+		if (!success) {
+			sshauthopt_free(opts);
+			opts = NULL;
+		}
+	}
+	globfree(&gl);
+	if (success && authoptsp != NULL) {
+		*authoptsp = opts;
+		opts = NULL;
+	}
+	sshauthopt_free(opts);
 	return success;
 }
 
@@ -525,7 +558,7 @@ user_cert_trusted_ca(struct passwd *pw, struct sshkey *key,
 	}
 	if (use_authorized_principals && principals_opts == NULL)
 		fatal_f("internal error: missing principals_opts");
-	if (sshkey_cert_check_authority_now(key, 0, 1, 0,
+	if (sshkey_cert_check_authority_now(key, 0, 0,
 	    use_authorized_principals ? NULL : pw->pw_name, &reason) != 0)
 		goto fail_reason;
 
@@ -551,8 +584,14 @@ user_cert_trusted_ca(struct passwd *pw, struct sshkey *key,
 		if ((final_opts = sshauthopt_merge(principals_opts,
 		    cert_opts, &reason)) == NULL) {
  fail_reason:
-			error("%s", reason);
-			auth_debug_add("%s", reason);
+			error("Refusing certificate ID \"%s\" serial=%llu "
+			    "signed by %s CA %s: %s", key->cert->key_id,
+			    (unsigned long long)key->cert->serial,
+			    sshkey_type(key->cert->signature_key), ca_fp,
+			    reason);
+			auth_debug_add("Refused Certificate ID \"%s\" "
+			    "serial=%llu: %s", key->cert->key_id,
+			    (unsigned long long)key->cert->serial, reason);
 			goto out;
 		}
 	}
@@ -750,8 +789,8 @@ int
 user_key_allowed(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
     int auth_attempt, struct sshauthopt **authoptsp)
 {
-	u_int success = 0, i;
-	char *file, *conn_id;
+	u_int success = 0, i, j;
+	char *file = NULL, *conn_id;
 	struct sshauthopt *opts = NULL;
 	const char *rdomain, *remote_ip, *remote_host;
 
@@ -773,17 +812,40 @@ user_key_allowed(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
 	    remote_ip, ssh_remote_port(ssh));
 
 	for (i = 0; !success && i < options.num_authkeys_files; i++) {
+		int r;
+		glob_t gl;
+
 		if (strcasecmp(options.authorized_keys_files[i], "none") == 0)
 			continue;
 		file = expand_authorized_keys(
 		    options.authorized_keys_files[i], pw);
-		success = user_key_allowed2(pw, key, file,
-		    remote_ip, remote_host, &opts);
-		free(file);
-		if (!success) {
-			sshauthopt_free(opts);
-			opts = NULL;
+		temporarily_use_uid(pw);
+		r = glob(file, 0, NULL, &gl);
+		restore_uid();
+		if (r != 0) {
+			if (r != GLOB_NOMATCH) {
+				logit_f("glob \"%s\" failed", file);
+			}
+			free(file);
+			file = NULL;
+			continue;
+		} else if (gl.gl_pathc > INT_MAX) {
+			fatal_f("too many glob results for \"%s\"", file);
+		} else if (gl.gl_pathc > 1) {
+			debug2_f("glob \"%s\" returned %zu matches", file,
+			    gl.gl_pathc);
 		}
+		for (j = 0; !success && j < gl.gl_pathc; j++) {
+			success = user_key_allowed2(pw, key, gl.gl_pathv[j],
+			    remote_ip, remote_host, &opts);
+			if (!success) {
+				sshauthopt_free(opts);
+				opts = NULL;
+			}
+		}
+		free(file);
+		file = NULL;
+		globfree(&gl);
 	}
 	if (success)
 		goto out;

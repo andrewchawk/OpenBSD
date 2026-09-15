@@ -1,4 +1,4 @@
-/*	$OpenBSD: demand.c,v 1.11 2015/01/16 06:40:19 deraadt Exp $	*/
+/*	$OpenBSD: demand.c,v 1.14 2026/09/03 11:52:26 claudio Exp $	*/
 
 /*
  * demand.c - Support routines for demand-dialling.
@@ -80,7 +80,7 @@ static int active_packet(unsigned char *, int);
  * demand_conf - configure the interface for doing dial-on-demand.
  */
 void
-demand_conf()
+demand_conf(void)
 {
     int i;
     struct protent *protp;
@@ -119,7 +119,7 @@ demand_conf()
  * without an error.
  */
 void
-demand_drop()
+demand_drop(void)
 {
     struct packet *pkt, *nextpkt;
     int i;
@@ -146,7 +146,7 @@ demand_drop()
  * demand_unblock - set each enabled network protocol to pass packets.
  */
 void
-demand_unblock()
+demand_unblock(void)
 {
     int i;
     struct protent *protp;
@@ -200,9 +200,7 @@ static u_short fcstab[256] = {
  * Return value is 1 if we need to bring up the link, 0 otherwise.
  */
 int
-loop_chars(p, n)
-    unsigned char *p;
-    int n;
+loop_chars(unsigned char *p, int n)
 {
     int c, rv;
 
@@ -252,9 +250,7 @@ loop_chars(p, n)
  * bring up the link.
  */
 int
-loop_frame(frame, len)
-    unsigned char *frame;
-    int len;
+loop_frame(unsigned char *frame, int len)
 {
     struct packet *pkt;
 
@@ -285,8 +281,7 @@ loop_frame(frame, len)
  * loopback, now that the real serial link is up.
  */
 void
-demand_rexmit(proto)
-    int proto;
+demand_rexmit(int proto)
 {
     struct packet *pkt, *prev, *nextpkt;
 
@@ -316,19 +311,20 @@ demand_rexmit(proto)
  * that is, whether it is worth bringing up the link for.
  */
 static int
-active_packet(p, len)
-    unsigned char *p;
-    int len;
+active_packet(unsigned char *p, int len)
 {
     int proto, i;
     struct protent *protp;
+#ifdef PPP_FILTER
+    struct pcap_pkthdr fhdr = { .len = len, .caplen = len };
+#endif
 
     if (len < PPP_HDRLEN)
 	return 0;
     proto = PPP_PROTOCOL(p);
 #ifdef PPP_FILTER
     if (active_filter.bf_len != 0
-	&& bpf_filter(active_filter.bf_insns, frame, len, len) == 0)
+	&& pcap_offline_filter(&active_filter, &fhdr, frame) == 0)
 	return 0;
 #endif
     for (i = 0; (protp = protocols[i]) != NULL; ++i) {

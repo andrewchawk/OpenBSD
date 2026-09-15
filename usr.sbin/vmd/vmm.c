@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmm.c,v 1.121 2024/07/10 09:27:33 dv Exp $	*/
+/*	$OpenBSD: vmm.c,v 1.141 2026/09/08 19:46:18 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -20,14 +20,8 @@
 #include <sys/ioctl.h>
 #include <sys/queue.h>
 #include <sys/wait.h>
-#include <sys/uio.h>
 #include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/mman.h>
 
-#include <dev/ic/i8253reg.h>
-#include <dev/isa/isareg.h>
-#include <dev/pci/pcireg.h>
 #include <dev/vmm/vmm.h>
 
 #include <net/if.h>
@@ -37,14 +31,10 @@
 #include <fcntl.h>
 #include <imsg.h>
 #include <limits.h>
-#include <poll.h>
-#include <pthread.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <util.h>
 
 #include "vmd.h"
 #include "atomicio.h"
@@ -59,6 +49,7 @@ int	terminate_vm(struct vm_terminate_params *);
 int	get_info_vm(struct privsep *, struct imsg *, int);
 int	opentap(char *);
 
+int	dev_null = -1;
 extern struct vmd *env;
 
 static struct privsep_proc procs[] = {
@@ -78,10 +69,20 @@ vmm_run(struct privsep *ps, struct privsep_proc *p, void *arg)
 		fatal("failed to initialize configuration");
 
 	/*
+	 * Early-open /dev/null so we can dup2(2) std{in,out,err}
+	 * after forking to create child processes.
+	 */
+	if (!env->vmd_debug) {
+		dev_null = open("/dev/null", O_RDWR|O_CLOEXEC, 0);
+		if (dev_null == -1)
+			fatal("/dev/null");
+	}
+
+	/*
 	 * We aren't root, so we can't chroot(2). Use unveil(2) instead.
 	 */
-	if (unveil(env->argv0, "x") == -1)
-		fatal("unveil %s", env->argv0);
+	if (unveil(env->vmd_execpath, "x") == -1)
+		fatal("unveil %s", env->vmd_execpath);
 	if (unveil(NULL, NULL) == -1)
 		fatal("unveil lock");
 
@@ -105,18 +106,23 @@ int
 vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct privsep		*ps = p->p_ps;
-	int			 res = 0, cmd = 0, verbose;
+	int			 res = 0, cmd = IMSG_NONE, verbose;
 	struct vmd_vm		*vm = NULL;
 	struct vm_terminate_params vtp;
 	struct vmop_id		 vid;
 	struct vmop_result	 vmr;
-	struct vmop_create_params vmc;
 	struct vmop_addr_result  var;
-	uint32_t		 id = 0, peerid = imsg->hdr.peerid;
-	pid_t			 pid = 0;
+	uint32_t		 id = 0, vm_id, type;
+	pid_t			 pid, vm_pid = 0;
 	unsigned int		 mode, flags;
 
-	switch (imsg->hdr.type) {
+	pid = imsg_get_pid(imsg);
+	type = imsg_get_type(imsg);
+
+	/* Parent uses peer id to communicate vm id. */
+	vm_id = imsg_get_id(imsg);
+
+	switch (type) {
 	case IMSG_VMDOP_START_VM_REQUEST:
 		res = config_getvm(ps, imsg);
 		if (res == -1) {
@@ -146,15 +152,14 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		}
 		break;
 	case IMSG_VMDOP_START_VM_END:
-		res = vmm_start_vm(imsg, &id, &pid);
+		res = vmm_start_vm(imsg, &id, &vm_pid);
 		/* Check if the ID can be mapped correctly */
 		if (res == 0 && (id = vm_id2vmid(id, NULL)) == 0)
 			res = ENOENT;
 		cmd = IMSG_VMDOP_START_VM_RESPONSE;
 		break;
 	case IMSG_VMDOP_TERMINATE_VM_REQUEST:
-		IMSG_SIZE_CHECK(imsg, &vid);
-		memcpy(&vid, imsg->data, sizeof(vid));
+		vmop_id_read(imsg, &vid);
 		id = vid.vid_id;
 		flags = vid.vid_flags;
 
@@ -215,115 +220,68 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		config_getconfig(env, imsg);
 		break;
 	case IMSG_CTL_RESET:
-		IMSG_SIZE_CHECK(imsg, &mode);
-		memcpy(&mode, imsg->data, sizeof(mode));
-
+		mode = imsg_uint_read(imsg);
 		if (mode & CONFIG_VMS) {
 			/* Terminate and remove all VMs */
 			vmm_shutdown();
 			mode &= ~CONFIG_VMS;
 		}
-
-		config_getreset(env, imsg);
+		config_purge(env, mode);
 		break;
 	case IMSG_CTL_VERBOSE:
-		IMSG_SIZE_CHECK(imsg, &verbose);
-		memcpy(&verbose, imsg->data, sizeof(verbose));
+		verbose = imsg_int_read(imsg);
 		log_setverbose(verbose);
 		env->vmd_verbose = verbose;
 		/* Forward message to each VM process */
 		TAILQ_FOREACH(vm, env->vmd_vms, vm_entry) {
-			imsg_compose_event(&vm->vm_iev,
-			    imsg->hdr.type, imsg->hdr.peerid, imsg->hdr.pid,
-			    -1, &verbose, sizeof(verbose));
+			imsg_compose_event(&vm->vm_iev, type, -1, pid, -1,
+			    &verbose, sizeof(verbose));
 		}
 		break;
 	case IMSG_VMDOP_PAUSE_VM:
-		IMSG_SIZE_CHECK(imsg, &vid);
-		memcpy(&vid, imsg->data, sizeof(vid));
+		vmop_id_read(imsg, &vid);
 		id = vid.vid_id;
 		if ((vm = vm_getbyvmid(id)) == NULL) {
 			res = ENOENT;
 			cmd = IMSG_VMDOP_PAUSE_VM_RESPONSE;
 			break;
 		}
-		imsg_compose_event(&vm->vm_iev,
-		    imsg->hdr.type, imsg->hdr.peerid, imsg->hdr.pid,
+		imsg_compose_event(&vm->vm_iev, type, -1, pid,
 		    imsg_get_fd(imsg), &vid, sizeof(vid));
 		break;
 	case IMSG_VMDOP_UNPAUSE_VM:
-		IMSG_SIZE_CHECK(imsg, &vid);
-		memcpy(&vid, imsg->data, sizeof(vid));
+		vmop_id_read(imsg, &vid);
 		id = vid.vid_id;
 		if ((vm = vm_getbyvmid(id)) == NULL) {
 			res = ENOENT;
 			cmd = IMSG_VMDOP_UNPAUSE_VM_RESPONSE;
 			break;
 		}
-		imsg_compose_event(&vm->vm_iev,
-		    imsg->hdr.type, imsg->hdr.peerid, imsg->hdr.pid,
+		imsg_compose_event(&vm->vm_iev, type, -1, pid,
 		    imsg_get_fd(imsg), &vid, sizeof(vid));
-		break;
-	case IMSG_VMDOP_SEND_VM_REQUEST:
-		IMSG_SIZE_CHECK(imsg, &vid);
-		memcpy(&vid, imsg->data, sizeof(vid));
-		id = vid.vid_id;
-		if ((vm = vm_getbyvmid(id)) == NULL) {
-			res = ENOENT;
-			close(imsg_get_fd(imsg));	/* XXX */
-			cmd = IMSG_VMDOP_START_VM_RESPONSE;
-			break;
-		}
-		imsg_compose_event(&vm->vm_iev,
-		    imsg->hdr.type, imsg->hdr.peerid, imsg->hdr.pid,
-		    imsg_get_fd(imsg), &vid, sizeof(vid));
-		break;
-	case IMSG_VMDOP_RECEIVE_VM_REQUEST:
-		IMSG_SIZE_CHECK(imsg, &vmc);
-		memcpy(&vmc, imsg->data, sizeof(vmc));
-		if (vm_register(ps, &vmc, &vm,
-		    imsg->hdr.peerid, vmc.vmc_owner.uid) != 0) {
-			res = errno;
-			cmd = IMSG_VMDOP_START_VM_RESPONSE;
-			break;
-		}
-		vm->vm_tty = imsg_get_fd(imsg);
-		vm->vm_state |= VM_STATE_RECEIVED;
-		vm->vm_state |= VM_STATE_PAUSED;
-		break;
-	case IMSG_VMDOP_RECEIVE_VM_END:
-		if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
-			res = ENOENT;
-			close(imsg_get_fd(imsg));	/* XXX */
-			cmd = IMSG_VMDOP_START_VM_RESPONSE;
-			break;
-		}
-		vm->vm_receive_fd = imsg_get_fd(imsg);
-		res = vmm_start_vm(imsg, &id, &pid);
-		/* Check if the ID can be mapped correctly */
-		if ((id = vm_id2vmid(id, NULL)) == 0)
-			res = ENOENT;
-		cmd = IMSG_VMDOP_START_VM_RESPONSE;
 		break;
 	case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
-		IMSG_SIZE_CHECK(imsg, &var);
-		memcpy(&var, imsg->data, sizeof(var));
+		vmop_addr_result_read(imsg, &var);
 		if ((vm = vm_getbyvmid(var.var_vmid)) == NULL) {
 			res = ENOENT;
 			break;
 		}
 		/* Forward hardware address details to the guest vm */
-		imsg_compose_event(&vm->vm_iev,
-		    imsg->hdr.type, imsg->hdr.peerid, imsg->hdr.pid,
+		imsg_compose_event(&vm->vm_iev, type, -1, pid,
 		    imsg_get_fd(imsg), &var, sizeof(var));
 		break;
 	case IMSG_VMDOP_RECEIVE_VMM_FD:
-		if (env->vmd_fd > -1)
+		if (env->vmd_vmm_fd != -1)
 			fatalx("already received vmm fd");
-		env->vmd_fd = imsg_get_fd(imsg);
+		env->vmd_vmm_fd = imsg_get_fd(imsg);
 
 		/* Get and terminate all running VMs */
 		get_info_vm(ps, NULL, 1);
+		break;
+	case IMSG_VMDOP_RECEIVE_PSP_FD:
+		if (env->vmd_psp_fd != -1)
+			fatalx("already received psp fd");
+		env->vmd_psp_fd = imsg_get_fd(imsg);
 		break;
 	default:
 		return (-1);
@@ -335,14 +293,14 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_VMDOP_START_VM_RESPONSE:
 		if (res != 0) {
 			/* Remove local reference if it exists */
-			if ((vm = vm_getbyvmid(imsg->hdr.peerid)) != NULL) {
+			if ((vm = vm_getbyvmid(vm_id)) != NULL) {
 				log_debug("%s: removing vm, START_VM_RESPONSE",
 				    __func__);
 				vm_remove(vm, __func__);
 			}
 		}
 		if (id == 0)
-			id = imsg->hdr.peerid;
+			id = vm_id;
 		/* FALLTHROUGH */
 	case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 	case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
@@ -350,14 +308,14 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		memset(&vmr, 0, sizeof(vmr));
 		vmr.vmr_result = res;
 		vmr.vmr_id = id;
-		vmr.vmr_pid = pid;
-		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd,
-		    peerid, -1, &vmr, sizeof(vmr)) == -1)
+		vmr.vmr_pid = vm_pid;
+		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &vmr,
+		    sizeof(vmr)) == -1)
 			return (-1);
 		break;
 	default:
-		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd,
-		    peerid, -1, &res, sizeof(res)) == -1)
+		if (proc_compose_imsg(ps, PROC_PARENT, cmd, vm_id, -1, &res,
+		    sizeof(res)) == -1)
 			return (-1);
 		break;
 	}
@@ -370,7 +328,6 @@ vmm_sighdlr(int sig, short event, void *arg)
 {
 	struct privsep *ps = arg;
 	int status, ret = 0;
-	uint32_t vmid;
 	pid_t pid;
 	struct vmop_result vmr;
 	struct vmd_vm *vm;
@@ -403,22 +360,21 @@ vmm_sighdlr(int sig, short event, void *arg)
 				    (vm->vm_state & VM_STATE_SHUTDOWN))
 					ret = 0;
 
-				vmid = vm->vm_params.vmc_params.vcp_id;
-				vtp.vtp_vm_id = vmid;
+				/* XXX check this */
+				vtp.vtp_vm_id = vm->vm_vmmid;
 
 				if (terminate_vm(&vtp) == 0)
 					log_debug("%s: terminated vm %s"
 					    " (id %d)", __func__,
-					    vm->vm_params.vmc_params.vcp_name,
+					    vm->vm_params.vmc_name,
 					    vm->vm_vmid);
 
 				memset(&vmr, 0, sizeof(vmr));
 				vmr.vmr_result = ret;
-				vmr.vmr_id = vm_id2vmid(vmid, vm);
+				vmr.vmr_id = vm_id2vmid(vm->vm_vmmid, vm);
 				if (proc_compose_imsg(ps, PROC_PARENT,
-				    -1, IMSG_VMDOP_TERMINATE_VM_EVENT,
-				    vm->vm_peerid, -1,
-				    &vmr, sizeof(vmr)) == -1)
+				    IMSG_VMDOP_TERMINATE_VM_EVENT,
+				    vm->vm_peerid, -1, &vmr, sizeof(vmr)) == -1)
 					log_warnx("could not signal "
 					    "termination of VM %u to "
 					    "parent", vm->vm_vmid);
@@ -475,7 +431,11 @@ vmm_pipe(struct vmd_vm *vm, int fd, void (*cb)(int, short, void *))
 		return (-1);
 	}
 
-	imsg_init(&iev->ibuf, fd);
+	if (imsgbuf_init(&iev->ibuf, fd) == -1) {
+		log_warn("failed to init imsgbuf");
+		return (-1);
+	}
+	imsgbuf_allow_fdpass(&iev->ibuf);
 	iev->handler = cb;
 	iev->data = vm;
 	imsg_event_add(iev);
@@ -492,16 +452,16 @@ void
 vmm_dispatch_vm(int fd, short event, void *arg)
 {
 	struct vmd_vm		*vm = arg;
-	struct vmop_result	 vmr;
 	struct imsgev		*iev = &vm->vm_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n;
+	int			 n;
 	unsigned int		 i;
+	uint32_t		 type;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* This pipe is dead, so remove the event handler */
 			event_del(&iev->ev);
@@ -510,34 +470,30 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write fd %d", __func__, ibuf->fd);
-		if (n == 0) {
-			/* This pipe is dead, so remove the event handler */
-			event_del(&iev->ev);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* This pipe is dead, remove the handler */
+				event_del(&iev->ev);
+				return;
+			}
+			fatal("%s: imsgbuf_write fd %d", __func__, ibuf->fd);
 		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
 		if (n == 0)
 			break;
 
-		DPRINTF("%s: got imsg %d from %s",
-		    __func__, imsg.hdr.type,
-		    vm->vm_params.vmc_params.vcp_name);
-
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+		switch (type) {
 		case IMSG_VMDOP_VM_SHUTDOWN:
 			vm->vm_state |= VM_STATE_SHUTDOWN;
 			break;
 		case IMSG_VMDOP_VM_REBOOT:
 			vm->vm_state &= ~VM_STATE_SHUTDOWN;
 			break;
-		case IMSG_VMDOP_SEND_VM_RESPONSE:
-			IMSG_SIZE_CHECK(&imsg, &vmr);
 		case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 		case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
 			for (i = 0; i < nitems(procs); i++) {
@@ -550,9 +506,8 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 			break;
 
 		default:
-			fatalx("%s: got invalid imsg %d from %s",
-			    __func__, imsg.hdr.type,
-			    vm->vm_params.vmc_params.vcp_name);
+			fatalx("%s: got invalid imsg %d from %s", __func__,
+			    type, vm->vm_params.vmc_name);
 		}
 		imsg_free(&imsg);
 	}
@@ -575,7 +530,7 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 int
 terminate_vm(struct vm_terminate_params *vtp)
 {
-	if (ioctl(env->vmd_fd, VMM_IOC_TERM, vtp) == -1)
+	if (ioctl(env->vmd_vmm_fd, VMM_IOC_TERM, vtp) == -1)
 		return (errno);
 
 	return (0);
@@ -643,25 +598,23 @@ opentap(char *ifname)
 int
 vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 {
-	struct vm_create_params	*vcp;
-	struct vmd_vm		*vm;
-	char			*nargv[8], num[32], vmm_fd[32];
-	int			 fd, ret = EINVAL;
+	struct vmd_vm		*vm, vm_copy;
+	char			*nargv[10], num[32], vmm_fd[32], psp_fd[32];
+	int			 ret = EINVAL;
 	int			 fds[2];
 	pid_t			 vm_pid;
 	size_t			 i, j, sz;
+	uint32_t		 peer_id;
 
-	if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
+	peer_id = imsg_get_id(imsg);
+	if ((vm = vm_getbyvmid(peer_id)) == NULL) {
 		log_warnx("%s: can't find vm", __func__);
 		return (ENOENT);
 	}
-	vcp = &vm->vm_params.vmc_params;
 
-	if (!(vm->vm_state & VM_STATE_RECEIVED)) {
-		if ((vm->vm_tty = imsg_get_fd(imsg)) == -1) {
-			log_warnx("%s: can't get tty", __func__);
-			goto err;
-		}
+	if ((vm->vm_tty = imsg_get_fd(imsg)) == -1) {
+		log_warnx("%s: can't get tty", __func__);
+		goto err;
 	}
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, PF_UNSPEC, fds)
@@ -682,10 +635,21 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		close_fd(fds[1]);
 
 		/* Send the details over the pipe to the child. */
-		sz = atomicio(vwrite, fds[0], vm, sizeof(*vm));
-		if (sz != sizeof(*vm)) {
+		memcpy(&vm_copy, vm, sizeof(vm_copy));
+		vm_copy.vm_kernel_path = NULL;
+		bzero(&vm_copy.vm_entry, sizeof(vm_copy.vm_entry));
+		bzero(&vm_copy.vm_iev, sizeof(vm_copy.vm_iev));
+		for (i = 0; i < nitems(vm_copy.vm_ifs); i++) {
+			vm_copy.vm_ifs[i].vif_name = NULL;
+			vm_copy.vm_ifs[i].vif_switch = NULL;
+			vm_copy.vm_ifs[i].vif_group = NULL;
+			bzero(&vm_copy.vm_ifs[i].vif_entry,
+			    sizeof(vm_copy.vm_ifs[i].vif_entry));
+		}
+		sz = atomicio(vwrite, fds[0], &vm_copy, sizeof(vm_copy));
+		if (sz != sizeof(vm_copy)) {
 			log_warnx("%s: failed to send config for vm '%s'",
-			    __func__, vcp->vcp_name);
+			    __func__, vm->vm_params.vmc_name);
 			ret = EIO;
 			/* Defer error handling until after fd closing. */
 		}
@@ -717,26 +681,27 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		    sizeof(env->vmd_cfg.cfg_localprefix));
 		if (sz != sizeof(env->vmd_cfg.cfg_localprefix)) {
 			log_warnx("%s: failed to send local prefix for vm '%s'",
-			    __func__, vcp->vcp_name);
+			    __func__, vm->vm_params.vmc_name);
 			ret = EIO;
 			goto err;
 		}
 
 		/* Read back the kernel-generated vm id from the child */
-		sz = atomicio(read, fds[0], &vcp->vcp_id, sizeof(vcp->vcp_id));
-		if (sz != sizeof(vcp->vcp_id)) {
+		sz = atomicio(read, fds[0], &vm->vm_vmmid,
+		    sizeof(vm->vm_vmmid));
+		if (sz != sizeof(vm->vm_vmmid)) {
 			log_debug("%s: failed to receive vm id from vm %s",
-			    __func__, vcp->vcp_name);
+			    __func__, vm->vm_params.vmc_name);
 			/* vmd could not allocate memory for the vm. */
 			ret = ENOMEM;
 			goto err;
 		}
 
 		/* Check for an invalid id. This indicates child failure. */
-		if (vcp->vcp_id == 0)
+		if (vm->vm_vmmid == 0)
 			goto err;
 
-		*id = vcp->vcp_id;
+		*id = vm->vm_vmmid;
 		*pid = vm->vm_pid;
 
 		/* Wire up our pipe into the event handling. */
@@ -751,43 +716,48 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		close_fd(PROC_PARENT_SOCK_FILENO);
 
 		/* Detach from terminal. */
-		if (!env->vmd_debug && (fd =
-			open("/dev/null", O_RDWR, 0)) != -1) {
-			dup2(fd, STDIN_FILENO);
-			dup2(fd, STDOUT_FILENO);
-			dup2(fd, STDERR_FILENO);
-			if (fd > 2)
-				close(fd);
+		if (!env->vmd_debug) {
+			dup2(dev_null, STDIN_FILENO);
+			dup2(dev_null, STDOUT_FILENO);
+			dup2(dev_null, STDERR_FILENO);
+			if (dev_null > 2)
+				close(dev_null);
 		}
+
+		if (env->vmd_psp_fd > 0)
+			fcntl(env->vmd_psp_fd, F_SETFD, 0); /* psp device fd */
 
 		/*
 		 * Prepare our new argv for execvp(2) with the fd of our open
 		 * pipe to the parent/vmm process as an argument.
 		 */
-		memset(&nargv, 0, sizeof(nargv));
 		memset(num, 0, sizeof(num));
 		snprintf(num, sizeof(num), "%d", fds[1]);
 		memset(vmm_fd, 0, sizeof(vmm_fd));
-		snprintf(vmm_fd, sizeof(vmm_fd), "%d", env->vmd_fd);
+		snprintf(vmm_fd, sizeof(vmm_fd), "%d", env->vmd_vmm_fd);
+		memset(psp_fd, 0, sizeof(psp_fd));
+		snprintf(psp_fd, sizeof(psp_fd), "%d", env->vmd_psp_fd);
 
-		nargv[0] = env->argv0;
-		nargv[1] = "-V";
-		nargv[2] = num;
-		nargv[3] = "-n";
-		nargv[4] = "-i";
-		nargv[5] = vmm_fd;
-		nargv[6] = NULL;
-
-		if (env->vmd_verbose == 1) {
-			nargv[6] = VMD_VERBOSE_1;
-			nargv[7] = NULL;
-		} else if (env->vmd_verbose > 1) {
-			nargv[6] = VMD_VERBOSE_2;
-			nargv[7] = NULL;
-		}
+		i = 0;
+		nargv[i++] = env->vmd_execpath;
+		nargv[i++] = "-V";
+		nargv[i++] = num;
+		nargv[i++] = "-i";
+		nargv[i++] = vmm_fd;
+		nargv[i++] = "-j";
+		nargv[i++] = psp_fd;
+		if (env->vmd_debug)
+			nargv[i++] = "-d";
+		if (env->vmd_verbose == 1)
+			nargv[i++] = "-v";
+		else if (env->vmd_verbose > 1)
+			nargv[i++] = "-vv";
+		nargv[i++] = NULL;
+		if (i > sizeof(nargv) / sizeof(nargv[0]))
+			fatalx("%s: nargv overflow", __func__);
 
 		/* Control resumes in vmd main(). */
-		execvp(nargv[0], nargv);
+		execv(nargv[0], nargv);
 
 		ret = errno;
 		log_warn("execvp %s", nargv[0]);
@@ -827,6 +797,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 	struct vm_info_result *info;
 	struct vm_terminate_params vtp;
 	struct vmop_info_result vir;
+	uint32_t peer_id;
 
 	/*
 	 * We issue the VMM_IOC_INFO ioctl twice, once with an input
@@ -846,7 +817,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 	memset(&vir, 0, sizeof(vir));
 
 	/* First ioctl to see how many bytes needed (vip.vip_size) */
-	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) == -1)
+	if (ioctl(env->vmd_vmm_fd, VMM_IOC_INFO, &vip) == -1)
 		return (errno);
 
 	if (vip.vip_info_ct != 0)
@@ -858,7 +829,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 
 	/* Second ioctl to get the actual list */
 	vip.vip_info = info;
-	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) == -1) {
+	if (ioctl(env->vmd_vmm_fd, VMM_IOC_INFO, &vip) == -1) {
 		ret = errno;
 		free(info);
 		return (ret);
@@ -875,10 +846,21 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 			    info[i].vir_name, info[i].vir_id);
 			continue;
 		}
-		memcpy(&vir.vir_info, &info[i], sizeof(vir.vir_info));
-		vir.vir_info.vir_id = vm_id2vmid(info[i].vir_id, NULL);
-		if (proc_compose_imsg(ps, PROC_PARENT, -1,
-		    IMSG_VMDOP_GET_INFO_VM_DATA, imsg->hdr.peerid, -1,
+
+		/* XXX */
+		vir.vir_memory_size = info[i].vir_memory_size;
+		vir.vir_used_size = info[i].vir_used_size;
+		vir.vir_ncpus = info[i].vir_ncpus;
+		memcpy(vir.vir_vcpu_state, info[i].vir_vcpu_state,
+		    sizeof(vir.vir_vcpu_state));
+		vir.vir_creator_pid = info[i].vir_creator_pid;
+		vir.vir_id = vm_id2vmid(info[i].vir_id, NULL);
+		memcpy(vir.vir_name, info[i].vir_name, sizeof(vir.vir_name));
+
+		peer_id = imsg_get_id(imsg);
+
+		if (proc_compose_imsg(ps, PROC_PARENT,
+		    IMSG_VMDOP_GET_INFO_VM_DATA, peer_id, -1,
 		    &vir, sizeof(vir)) == -1) {
 			ret = EIO;
 			break;

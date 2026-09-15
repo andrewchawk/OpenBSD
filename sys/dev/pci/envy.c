@@ -1,4 +1,4 @@
-/*	$OpenBSD: envy.c,v 1.88 2024/05/24 06:02:53 jsg Exp $	*/
+/*	$OpenBSD: envy.c,v 1.90 2025/11/02 14:37:20 ratchov Exp $	*/
 /*
  * Copyright (c) 2007 Alexandre Ratchov <alex@caoua.org>
  *
@@ -110,6 +110,7 @@ int envy_halt_input(void *);
 int envy_query_devinfo(void *, struct mixer_devinfo *);
 int envy_get_port(void *, struct mixer_ctrl *);
 int envy_set_port(void *, struct mixer_ctrl *);
+size_t envy_display_name(void *, char *, size_t);
 #if NMIDI > 0
 int envy_midi_open(void *, int, void (*)(void *, int),
     void (*)(void *), void *);
@@ -191,6 +192,7 @@ const struct audio_hw_if envy_hw_if = {
 	.freem = envy_freem,
 	.trigger_output = envy_trigger_output,
 	.trigger_input = envy_trigger_input,
+	.display_name = envy_display_name,
 };
 
 #if NMIDI > 0
@@ -1811,6 +1813,8 @@ envy_allocm(void *self, int dir, size_t size, int type, int flags)
 	int err, wait;
 	struct envy_buf *buf;
 	bus_addr_t dma_addr;
+	bus_dma_segment_t seg;
+	int rseg;
 
 	buf = (dir == AUMODE_RECORD) ? &sc->ibuf : &sc->obuf;
 	if (buf->addr != NULL) {
@@ -1823,12 +1827,17 @@ envy_allocm(void *self, int dir, size_t size, int type, int flags)
 #define ENVY_ALIGN	4
 #define ENVY_MAXADDR	((1 << 28) - 1)
 
-	buf->addr = (caddr_t)uvm_km_kmemalloc_pla(kernel_map,
-	    uvm.kernel_object, buf->size, 0, UVM_KMF_NOWAIT, 0,
-	    (paddr_t)ENVY_MAXADDR, 0, 0, 1);
-	if (buf->addr == NULL) {
-		DPRINTF("%s: unable to alloc dma segment\n", DEVNAME(sc));
+	err = bus_dmamem_alloc_range(sc->pci_dmat, buf->size, 0, 0, &seg, 1,
+	    &rseg, BUS_DMA_NOWAIT, (bus_addr_t)0, (bus_addr_t)ENVY_MAXADDR);
+	if (err) {
+		DPRINTF("%s: dmamem_alloc_range failed %d", DEVNAME(sc), err);
 		goto err_ret;
+	}
+	err = bus_dmamem_map(sc->pci_dmat, &seg, rseg, buf->size, &buf->addr,
+	    BUS_DMA_NOWAIT);
+	if (err) {
+		DPRINTF("%s: dmamem_map failed %d\n", DEVNAME(sc), err);
+		goto err_unmap;
 	}
 	err = bus_dmamap_create(sc->pci_dmat, buf->size, 1, buf->size, 0,
 	    wait, &buf->map);
@@ -1855,7 +1864,7 @@ envy_allocm(void *self, int dir, size_t size, int type, int flags)
  err_destroy:
 	bus_dmamap_destroy(sc->pci_dmat, buf->map);
  err_unmap:
-	uvm_km_free(kernel_map, (vaddr_t)buf->addr, buf->size);
+	bus_dmamem_free(sc->pci_dmat, &seg, rseg);
  err_ret:
 	return NULL;
 }
@@ -1879,7 +1888,7 @@ envy_freem(void *self, void *addr, int type)
 	}
 	bus_dmamap_unload(sc->pci_dmat, buf->map);
 	bus_dmamap_destroy(sc->pci_dmat, buf->map);
-	uvm_km_free(kernel_map, (vaddr_t)&buf->addr, buf->size);
+	bus_dmamem_free(sc->pci_dmat, buf->map->dm_segs, 1);
 	buf->addr = NULL;
 	DPRINTF("%s: freed buffer (mode=%d)\n", DEVNAME(sc), dir);
 }
@@ -2426,6 +2435,14 @@ envy_set_port(void *self, struct mixer_ctrl *ctl)
 	if (idx < ndev)
 		return sc->card->dac->set(sc, ctl, idx);
 	return ENXIO;
+}
+
+size_t
+envy_display_name(void *self, char *buf, size_t size)
+{
+	struct envy_softc *sc = (struct envy_softc *)self;
+
+	return strlcpy(buf, sc->card->name, size);
 }
 
 #if NMIDI > 0

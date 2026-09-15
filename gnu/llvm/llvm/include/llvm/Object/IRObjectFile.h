@@ -17,6 +17,7 @@
 #include "llvm/Object/IRSymtab.h"
 #include "llvm/Object/ModuleSymbolTable.h"
 #include "llvm/Object/SymbolicFile.h"
+#include "llvm/Support/Compiler.h"
 
 namespace llvm {
 class Module;
@@ -24,7 +25,7 @@ class Module;
 namespace object {
 class ObjectFile;
 
-class IRObjectFile : public SymbolicFile {
+class LLVM_ABI IRObjectFile : public SymbolicFile {
   std::vector<std::unique_ptr<Module>> Mods;
   ModuleSymbolTable SymTab;
   IRObjectFile(MemoryBufferRef Object,
@@ -37,7 +38,9 @@ public:
   Expected<uint32_t> getSymbolFlags(DataRefImpl Symb) const override;
   basic_symbol_iterator symbol_begin() const override;
   basic_symbol_iterator symbol_end() const override;
-
+  bool is64Bit() const override {
+    return Triple(getTargetTriple()).isArch64Bit();
+  }
   StringRef getTargetTriple() const;
 
   static bool classof(const Binary *v) {
@@ -78,8 +81,7 @@ struct IRSymtabFile {
 };
 
 /// Reads a bitcode file, creating its irsymtab if necessary.
-Expected<IRSymtabFile> readIRSymtab(MemoryBufferRef MBRef);
-
+LLVM_ABI Expected<IRSymtabFile> readIRSymtab(MemoryBufferRef MBRef);
 }
 
 } // namespace llvm

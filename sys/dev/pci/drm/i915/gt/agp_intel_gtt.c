@@ -16,8 +16,6 @@
 
 #include "../i915_drv.h"
 
-#include <drm/drm_legacy.h> /* for agp */
-
 /* MCH IFP BARs */
 #define I915_IFPADDR	0x60
 #define I965_IFPADDR	0x70
@@ -47,7 +45,7 @@ inteldrm_gmch_match(struct pci_attach_args *pa)
 }
 
 void
-i915_alloc_ifp(struct inteldrm_softc *dev_priv, struct pci_attach_args *bpa)
+i915_alloc_ifp(struct drm_i915_private *dev_priv, struct pci_attach_args *bpa)
 {
 	bus_addr_t	addr;
 	u_int32_t	reg;
@@ -80,7 +78,7 @@ nope:
 }
 
 void
-i965_alloc_ifp(struct inteldrm_softc *dev_priv, struct pci_attach_args *bpa)
+i965_alloc_ifp(struct drm_i915_private *dev_priv, struct pci_attach_args *bpa)
 {
 	bus_addr_t	addr;
 	u_int32_t	lo, hi;
@@ -119,7 +117,7 @@ nope:
 void
 intel_gtt_chipset_setup(struct drm_device *dev)
 {
-	struct inteldrm_softc *dev_priv = dev->dev_private;
+	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct pci_attach_args bpa;
 
 	if (GRAPHICS_VER(dev_priv) >= 6)
@@ -158,7 +156,7 @@ intel_gtt_chipset_setup(struct drm_device *dev)
 int
 intel_gmch_enable_gtt(void)
 {
-	struct inteldrm_softc *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
 
 	intel_gtt_chipset_setup(&dev_priv->drm);
 	return 1;
@@ -175,7 +173,7 @@ void
 intel_gmch_gtt_get(u64 *gtt_total,
     phys_addr_t *mappable_base, resource_size_t *mappable_end)
 {
-	struct inteldrm_softc *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
 	struct agp_info *ai = &dev_priv->drm.agp->info;
 	
 	*gtt_total = ai->ai_aperture_size;
@@ -186,7 +184,7 @@ intel_gmch_gtt_get(u64 *gtt_total,
 void
 intel_gmch_gtt_flush(void)
 {
-	struct inteldrm_softc *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
 
 	/*
 	 * Write to this flush page flushes the chipset write cache.
@@ -223,7 +221,7 @@ void
 intel_gmch_gtt_insert_sg_entries(struct sg_table *pages, unsigned int pg_start,
     unsigned int flags)
 {
-	struct inteldrm_softc *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
 	struct agp_softc *sc = dev_priv->drm.agp->agpdev;
 	bus_addr_t addr = sc->sc_apaddr + pg_start * PAGE_SIZE;
 	struct sg_page_iter sg_iter;
@@ -241,7 +239,7 @@ void
 intel_gmch_gtt_insert_page(dma_addr_t addr, unsigned int pg,
     unsigned int flags)
 {
-	struct inteldrm_softc *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
 	struct agp_softc *sc = dev_priv->drm.agp->agpdev;
 	bus_addr_t apaddr = sc->sc_apaddr + (pg * PAGE_SIZE);
 	sc->sc_methods->bind_page(sc->sc_chipc, apaddr, addr, flags);
@@ -251,7 +249,7 @@ intel_gmch_gtt_insert_page(dma_addr_t addr, unsigned int pg,
 void
 intel_gmch_gtt_clear_range(unsigned int first_entry, unsigned int num_entries)
 {
-	struct inteldrm_softc *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
 	struct agp_softc *sc = dev_priv->drm.agp->agpdev;
 	bus_addr_t addr = sc->sc_apaddr + first_entry * PAGE_SIZE;
 	int i;
@@ -261,4 +259,22 @@ intel_gmch_gtt_clear_range(unsigned int first_entry, unsigned int num_entries)
 		addr += PAGE_SIZE;
 	}
 	membar_producer_wc();
+}
+
+dma_addr_t
+intel_gmch_gtt_read_entry(unsigned int pg, bool *is_present, bool *is_local)
+{
+	struct drm_i915_private *dev_priv = (void *)inteldrm_cd.cd_devs[0];
+	struct agp_softc *sc = dev_priv->drm.agp->agpdev;
+	bus_addr_t apaddr = sc->sc_apaddr + (pg * PAGE_SIZE);
+
+	*is_present = apaddr & 1;
+	*is_local = false;
+
+	if (INTEL_INFO(dev_priv)->dma_mask_size == 36)
+		apaddr = ((apaddr & 0xf0) << 28) | (apaddr & 0xfffff000);
+	else
+		apaddr = apaddr & 0xfffff000;
+
+	return apaddr;
 }

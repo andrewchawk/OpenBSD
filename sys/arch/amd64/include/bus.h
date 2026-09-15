@@ -1,4 +1,4 @@
-/*	$OpenBSD: bus.h,v 1.35 2020/10/28 09:58:57 jsg Exp $	*/
+/*	$OpenBSD: bus.h,v 1.38 2026/04/19 09:59:22 kettenis Exp $	*/
 /*	$NetBSD: bus.h,v 1.6 1996/11/10 03:19:25 thorpej Exp $	*/
 
 /*-
@@ -498,12 +498,12 @@ bus_space_barrier(bus_space_tag_t space, bus_space_handle_t
  */
 
 /* space is i/o space */
-extern const struct x86_bus_space_ops x86_bus_space_io_ops;
-#define	X86_BUS_SPACE_IO	(&x86_bus_space_io_ops)
+extern const struct x86_bus_space_ops *x86_bus_space_io_ops;
+#define	X86_BUS_SPACE_IO	(x86_bus_space_io_ops)
 
 /* space is mem space */
-extern const struct x86_bus_space_ops x86_bus_space_mem_ops;
-#define X86_BUS_SPACE_MEM	(&x86_bus_space_mem_ops)
+extern const struct x86_bus_space_ops *x86_bus_space_mem_ops;
+#define X86_BUS_SPACE_MEM	(x86_bus_space_mem_ops)
 
 /*
  * bus_dma
@@ -552,6 +552,9 @@ typedef struct bus_dmamap		*bus_dmamap_t;
 struct bus_dma_segment {
 	bus_addr_t	ds_addr;	/* DMA address */
 	bus_size_t	ds_len;		/* length of transfer */
+	vaddr_t		_ds_va;		/* mapped loaded data */
+	vaddr_t		_ds_bounce_va;	/* mapped bounced data */
+
 	/*
 	 * Ugh. need this so can pass alignment down from bus_dmamem_alloc
 	 * to scatter gather maps. only the first one is used so the rest is
@@ -655,6 +658,11 @@ struct bus_dmamap {
 
 	void		*_dm_cookie;	/* cookie for bus-specific functions */
 
+	struct vm_page **_dm_pages;	/* replacement pages */
+	vaddr_t		_dm_pgva;	/* those above -- mapped */
+	int		_dm_npages;	/* number of pages allocated */
+	int		_dm_nused;	/* number of pages replaced */
+
 	/*
 	 * PUBLIC MEMBERS: these are used by machine-independent code.
 	 */
@@ -662,6 +670,8 @@ struct bus_dmamap {
 	int		dm_nsegs;	/* # valid segments in mapping */
 	bus_dma_segment_t dm_segs[1];	/* segments; variable length */
 };
+
+void	bus_dma_init(void);
 
 int	_bus_dmamap_create(bus_dma_tag_t, bus_size_t, int, bus_size_t,
 	    bus_size_t, int, bus_dmamap_t *);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mainbus.c,v 1.10 2024/05/13 01:15:50 jsg Exp $ */
+/*	$OpenBSD: mainbus.c,v 1.16 2026/06/22 21:12:12 kettenis Exp $ */
 
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
@@ -26,9 +26,6 @@
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/fdt.h>
 
-#include <machine/riscv64var.h>
-#include <riscv64/dev/mainbus.h>
-
 int mainbus_match(struct device *, void *, void *);
 void mainbus_attach(struct device *, struct device *, void *);
 
@@ -53,8 +50,7 @@ struct mainbus_softc {
 };
 
 const struct cfattach mainbus_ca = {
-	sizeof(struct mainbus_softc), mainbus_match, mainbus_attach, NULL,
-	config_activate_children
+	sizeof(struct mainbus_softc), mainbus_match, mainbus_attach
 };
 
 struct cfdriver mainbus_cd = {
@@ -64,6 +60,7 @@ struct cfdriver mainbus_cd = {
 struct machine_bus_dma_tag mainbus_dma_tag = {
 	NULL,
 	BUS_DMA_COHERENT,
+	0, (paddr_t)-1,
 	_dmamap_create,
 	_dmamap_destroy,
 	_dmamap_load,
@@ -74,6 +71,7 @@ struct machine_bus_dma_tag mainbus_dma_tag = {
 	_dmamap_unload,
 	_dmamap_sync,
 	_dmamem_alloc,
+	_dmamem_alloc_range,
 	_dmamem_free,
 	_dmamem_map,
 	_dmamem_unmap,
@@ -104,6 +102,9 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dmat = &mainbus_dma_tag;
 	sc->sc_acells = OF_getpropint(OF_peer(0), "#address-cells", 1);
 	sc->sc_scells = OF_getpropint(OF_peer(0), "#size-cells", 1);
+
+	if (OF_getpropbool(sc->sc_node, "dma-noncoherent"))
+		sc->sc_dmat->_flags &= ~BUS_DMA_COHERENT;
 
 	len = OF_getprop(sc->sc_node, "model", prop, sizeof(prop));
 	if (len > 0) {
@@ -245,12 +246,12 @@ mainbus_attach_node(struct device *self, int node, cfmatch_t submatch)
 		OF_getpropintarray(node, "interrupts", fa.fa_intr, len);
 	}
 
-	if (OF_getproplen(node, "dma-noncoherent") >= 0) {
+	if (OF_getpropbool(node, "dma-noncoherent")) {
 		fa.fa_dmat = malloc(sizeof(*sc->sc_dmat),
 		    M_DEVBUF, M_WAITOK | M_ZERO);
 		memcpy(fa.fa_dmat, sc->sc_dmat, sizeof(*sc->sc_dmat));
 		fa.fa_dmat->_flags &= ~BUS_DMA_COHERENT;
-	} else if (OF_getproplen(node, "dma-coherent") >= 0) {
+	} else if (OF_getpropbool(node, "dma-coherent")) {
 		fa.fa_dmat = malloc(sizeof(*sc->sc_dmat),
 		    M_DEVBUF, M_WAITOK | M_ZERO);
 		memcpy(fa.fa_dmat, sc->sc_dmat, sizeof(*sc->sc_dmat));

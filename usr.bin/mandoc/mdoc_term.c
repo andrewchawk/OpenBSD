@@ -1,6 +1,7 @@
-/* $OpenBSD: mdoc_term.c,v 1.282 2023/11/13 19:13:00 schwarze Exp $ */
+/* $OpenBSD: mdoc_term.c,v 1.287 2026/01/07 08:22:24 schwarze Exp $ */
 /*
- * Copyright (c) 2010, 2012-2020, 2022 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010, 2012-2020, 2022, 2025, 2026
+ *               Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2008, 2009, 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
  * Copyright (c) 2013 Franco Fichtner <franco@lastsummer.de>
  *
@@ -300,7 +301,7 @@ print_mdoc_node(DECL_ARGS)
 {
 	const struct mdoc_term_act *act;
 	struct termpair	 npair;
-	size_t		 offset, rmargin;
+	size_t		 offset, rmargin;  /* In basic units. */
 	int		 chld;
 
 	/*
@@ -439,37 +440,43 @@ print_mdoc_node(DECL_ARGS)
 static void
 print_mdoc_foot(struct termp *p, const struct roff_meta *meta)
 {
-	size_t sz;
+	char	*title;
+	size_t	 datelen, titlen;  /* In basic units. */
+
+	assert(meta->title != NULL);
+	datelen = term_strlen(p, meta->date);
+	if (meta->msec == NULL)
+		title = mandoc_strdup(meta->title);
+	else
+		mandoc_asprintf(&title, "%s(%s)", meta->title, meta->msec);
+	titlen = term_strlen(p, title);
 
 	term_fontrepl(p, TERMFONT_NONE);
-
-	/*
-	 * Output the footer in new-groff style, that is, three columns
-	 * with the middle being the manual date and flanking columns
-	 * being the operating system:
-	 *
-	 * SYSTEM                  DATE                    SYSTEM
-	 */
-
 	term_vspace(p);
 
+	/* Bottom left corner: operating system. */
+
 	p->tcol->offset = 0;
-	sz = term_strlen(p, meta->date);
-	p->tcol->rmargin = p->maxrmargin > sz ?
-	    (p->maxrmargin + term_len(p, 1) - sz) / 2 : 0;
+	p->maxrmargin = p->defrmargin;
+	p->tcol->rmargin = p->maxrmargin > datelen ?
+	    (p->maxrmargin + term_len(p, 1) - datelen) / 2 : 0;
 	p->trailspace = 1;
 	p->flags |= TERMP_NOSPACE | TERMP_NOBREAK;
 
 	term_word(p, meta->os);
 	term_flushln(p);
 
+	/* At the bottom in the middle: manual date. */
+
 	p->tcol->offset = p->tcol->rmargin;
-	sz = term_strlen(p, meta->os);
-	p->tcol->rmargin = p->maxrmargin > sz ? p->maxrmargin - sz : 0;
+	p->tcol->rmargin = p->maxrmargin > titlen ?
+	    p->maxrmargin - titlen : 0;
 	p->flags |= TERMP_NOSPACE;
 
 	term_word(p, meta->date);
 	term_flushln(p);
+
+	/* Bottom right corner: manual title and section. */
 
 	p->tcol->offset = p->tcol->rmargin;
 	p->tcol->rmargin = p->maxrmargin;
@@ -477,32 +484,19 @@ print_mdoc_foot(struct termp *p, const struct roff_meta *meta)
 	p->flags &= ~TERMP_NOBREAK;
 	p->flags |= TERMP_NOSPACE;
 
-	term_word(p, meta->os);
+	term_word(p, title);
 	term_flushln(p);
 
 	p->tcol->offset = 0;
-	p->tcol->rmargin = p->maxrmargin;
 	p->flags = 0;
+	free(title);
 }
 
 static void
 print_mdoc_head(struct termp *p, const struct roff_meta *meta)
 {
 	char			*volume, *title;
-	size_t			 vollen, titlen;
-
-	/*
-	 * The header is strange.  It has three components, which are
-	 * really two with the first duplicated.  It goes like this:
-	 *
-	 * IDENTIFIER              TITLE                   IDENTIFIER
-	 *
-	 * The IDENTIFIER is NAME(SECTION), which is the command-name
-	 * (if given, or "unknown" if not) followed by the manual page
-	 * section.  These are given in `Dt'.  The TITLE is a free-form
-	 * string depending on the manual volume.  If not specified, it
-	 * switches on the manual section.
-	 */
+	size_t			 vollen, titlen;  /* In basic units. */
 
 	assert(meta->vol);
 	if (NULL == meta->arch)
@@ -511,6 +505,8 @@ print_mdoc_head(struct termp *p, const struct roff_meta *meta)
 		mandoc_asprintf(&volume, "%s (%s)",
 		    meta->vol, meta->arch);
 	vollen = term_strlen(p, volume);
+
+	/* Top left corner: manual title and section. */
 
 	if (NULL == meta->msec)
 		title = mandoc_strdup(meta->title);
@@ -522,12 +518,15 @@ print_mdoc_head(struct termp *p, const struct roff_meta *meta)
 	p->flags |= TERMP_NOBREAK | TERMP_NOSPACE;
 	p->trailspace = 1;
 	p->tcol->offset = 0;
-	p->tcol->rmargin = 2 * (titlen+1) + vollen < p->maxrmargin ?
+	p->tcol->rmargin =
+	    titlen * 2 + term_len(p, 2) + vollen < p->maxrmargin ?
 	    (p->maxrmargin - vollen + term_len(p, 1)) / 2 :
-	    vollen < p->maxrmargin ?  p->maxrmargin - vollen : 0;
+	    vollen < p->maxrmargin ? p->maxrmargin - vollen : 0;
 
 	term_word(p, title);
 	term_flushln(p);
+
+	/* At the top in the middle: manual volume. */
 
 	p->flags |= TERMP_NOSPACE;
 	p->tcol->offset = p->tcol->rmargin;
@@ -536,6 +535,8 @@ print_mdoc_head(struct termp *p, const struct roff_meta *meta)
 
 	term_word(p, volume);
 	term_flushln(p);
+
+	/* Top right corner: title and section, again. */
 
 	p->flags &= ~TERMP_NOBREAK;
 	p->trailspace = 0;
@@ -554,6 +555,11 @@ print_mdoc_head(struct termp *p, const struct roff_meta *meta)
 	free(volume);
 }
 
+/*
+ * Interpret the string v as a scaled width or, if the syntax is invalid,
+ * measure how much width it takes up when printed.  In both cases,
+ * return the width in basic units.
+ */
 static int
 a2width(const struct termp *p, const char *v)
 {
@@ -562,10 +568,10 @@ a2width(const struct termp *p, const char *v)
 
 	end = a2roffsu(v, &su, SCALE_MAX);
 	if (end == NULL || *end != '\0') {
-		su.unit = SCALE_EN;
-		su.scale = term_strlen(p, v) / term_strlen(p, "0");
+		su.unit = SCALE_BU;
+		su.scale = term_strlen(p, v);
 	}
-	return term_hen(p, &su);
+	return term_hspan(p, &su);
 }
 
 /*
@@ -621,8 +627,11 @@ termp_it_pre(DECL_ARGS)
 	struct roffsu		su;
 	char			buf[24];
 	const struct roff_node *bl, *nn;
-	size_t			ncols, dcol;
-	int			i, offset, width;
+	size_t			ncols;	/* Number of columns in .Bl -column. */
+	size_t			dcol;	/* Column spacing in basic units. */
+	int			i;	/* Zero-based column index. */
+	int			offset;	/* Start of column in basic units. */
+	int			width;	/* Column width in basic units. */
 	enum mdoc_list		type;
 
 	if (n->type == ROFFT_BLOCK) {
@@ -699,10 +708,9 @@ termp_it_pre(DECL_ARGS)
 		for (i = 0, nn = n->prev;
 		    nn->prev && i < (int)ncols;
 		    nn = nn->prev, i++) {
-			su.unit = SCALE_EN;
-			su.scale = term_strlen(p, bl->norm->Bl.cols[i]) /
-			    term_strlen(p, "0");
-			offset += term_hen(p, &su) + dcol;
+			su.unit = SCALE_BU;
+			su.scale = term_strlen(p, bl->norm->Bl.cols[i]);
+			offset += term_hspan(p, &su) + dcol;
 		}
 
 		/*
@@ -718,10 +726,9 @@ termp_it_pre(DECL_ARGS)
 		 * Use the declared column widths, extended as explained
 		 * in the preceding paragraph.
 		 */
-		su.unit = SCALE_EN;
-		su.scale = term_strlen(p, bl->norm->Bl.cols[i]) /
-		    term_strlen(p, "0");
-		width = term_hen(p, &su) + dcol;
+		su.unit = SCALE_BU;
+		su.scale = term_strlen(p, bl->norm->Bl.cols[i]);
+		width = term_hspan(p, &su) + dcol;
 		break;
 	default:
 		if (NULL == bl->norm->Bl.width)
@@ -1272,6 +1279,7 @@ termp_sh_pre(DECL_ARGS)
 			term_vspace(p);
 		break;
 	case ROFFT_HEAD:
+		p->fontibi = 1;
 		return termp_bold_pre(p, pair, meta, n);
 	case ROFFT_BODY:
 		p->tcol->offset = term_len(p, p->defindent);
@@ -1292,6 +1300,7 @@ termp_sh_post(DECL_ARGS)
 {
 	switch (n->type) {
 	case ROFFT_HEAD:
+		p->fontibi = 0;
 		term_newln(p);
 		break;
 	case ROFFT_BODY:
@@ -1419,7 +1428,7 @@ termp_fa_pre(DECL_ARGS)
 static int
 termp_bd_pre(DECL_ARGS)
 {
-	int			 offset;
+	int			 offset;  /* In basic units. */
 
 	if (n->type == ROFFT_BLOCK) {
 		print_bvspace(p, n, n);
@@ -1507,7 +1516,8 @@ termp_ss_pre(DECL_ARGS)
 			term_vspace(p);
 		break;
 	case ROFFT_HEAD:
-		p->tcol->offset = term_len(p, (p->defindent+1)/2);
+		p->tcol->offset = term_len(p, p->defindent) / 2 + 1;
+		p->fontibi = 1;
 		return termp_bold_pre(p, pair, meta, n);
 	case ROFFT_BODY:
 		p->tcol->offset = term_len(p, p->defindent);
@@ -1524,8 +1534,16 @@ termp_ss_pre(DECL_ARGS)
 static void
 termp_ss_post(DECL_ARGS)
 {
-	if (n->type == ROFFT_HEAD || n->type == ROFFT_BODY)
+	switch (n->type) {
+	case ROFFT_HEAD:
+		p->fontibi = 0;
+		/* FALLTHROUGH */
+	case ROFFT_BODY:
 		term_newln(p);
+		break;
+	default:
+		break;
+	}
 }
 
 static int
@@ -1886,9 +1904,7 @@ termp_lk_pre(DECL_ARGS)
 	}
 
 	/* Link target. */
-	term_fontpush(p, TERMFONT_BOLD);
 	term_word(p, link->string);
-	term_fontpop(p);
 
 	/* Trailing punctuation. */
 	while (punct != NULL) {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.115 2024/05/29 12:21:33 kettenis Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.118 2026/04/03 22:01:46 sf Exp $	*/
 /* $NetBSD: cpu.c,v 1.1.2.7 2000/06/26 02:04:05 sommerfeld Exp $ */
 
 /*-
@@ -142,7 +142,10 @@ struct cpu_functions mp_cpu_funcs =
  * CPU, on uniprocessors).  The CPU info list is initialized to
  * point at it.
  */
-struct cpu_info_full cpu_info_full_primary = { .cif_cpu = { .ci_self = &cpu_info_primary } };
+struct cpu_info_full cpu_info_full_primary = { .cif_cpu = {
+	.ci_self = &cpu_info_primary,
+	.ci_flags = CPUF_PRIMARY,
+} };
 
 struct cpu_info *cpu_info_list = &cpu_info_primary;
 
@@ -231,6 +234,7 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 	struct cpu_info *ci;
 
 #ifdef MULTIPROCESSOR
+	struct cpu_info *ci_last;
 	int cpunum = sc->sc_dev.dv_unit;
 	vaddr_t kstack;
 	struct pcb *pcb;
@@ -362,8 +366,10 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 		identifycpu(ci);
 		clockqueue_init(&ci->ci_queue);
 		sched_init_cpu(ci);
-		ci->ci_next = cpu_info_list->ci_next;
-		cpu_info_list->ci_next = ci;
+		ci_last = cpu_info_list;
+		while (ci_last->ci_next != NULL)
+			ci_last = ci_last->ci_next;
+		ci_last->ci_next = ci;
 		ncpus++;
 #endif
 		break;
@@ -927,3 +933,4 @@ wbinvd_on_all_cpus(void)
 #endif
 
 int cpu_suspended;
+int cpu_wakeups;

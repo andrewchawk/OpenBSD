@@ -1,33 +1,18 @@
 #define PERL_NO_GET_CONTEXT
-/* Workaround for mingw 32-bit compiler by mingw-w64.sf.net - has to come before any #include.
- * It also defines USE_NO_MINGW_SETJMP_TWO_ARGS for the mingw.org 32-bit compilers ... but
- * that's ok as that compiler makes no use of that symbol anyway */
-#if defined(WIN32) && defined(__MINGW32__) && !defined(__MINGW64__)
-#  define USE_NO_MINGW_SETJMP_TWO_ARGS 1
-#endif
+/* Tell XSUB.h not to redefine common functions. Its setjmp() override has a
+ * circular definition in Perls < 5.40. */
+#define NO_XSLOCKS
+
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
-/* Workaround for XSUB.h bug under WIN32 */
-#ifdef WIN32
-#  undef setjmp
-#  if defined(USE_NO_MINGW_SETJMP_TWO_ARGS) || (!defined(__BORLANDC__) && !defined(__MINGW64__))
-#    define setjmp(x) _setjmp(x)
-#  endif
-#  if defined(__MINGW64__)
-#    include <intrin.h>
-#    define setjmp(x) _setjmpex((x), mingw_getsp())
-#  endif
-#endif
+
 #define NEED_PL_signals
 #define NEED_sv_2pv_flags
 #include "ppport.h"
 #include "threads.h"
 #ifndef sv_dup_inc
 #  define sv_dup_inc(s,t) SvREFCNT_inc(sv_dup(s,t))
-#endif
-#ifndef SvREFCNT_dec_NN
-#  define SvREFCNT_dec_NN(x)  SvREFCNT_dec(x)
 #endif
 #ifndef PERL_UNUSED_RESULT
 #  if defined(__GNUC__) && defined(HASATTRIBUTE_WARN_UNUSED_RESULT)
@@ -205,9 +190,6 @@ S_ithread_set(pTHX_ ithread *thread)
 {
     dMY_CXT;
     MY_CXT.context = thread;
-#ifdef PERL_SET_NON_tTHX_CONTEXT
-    PERL_SET_NON_tTHX_CONTEXT(thread->interp);
-#endif
 }
 
 STATIC ithread *
@@ -373,10 +355,19 @@ S_exit_warning(pTHX)
 {
     int veto_cleanup, warn;
     dMY_POOL;
+    IV running_threads;
+    IV joinable_threads;
+    IV detached_threads;
 
     MUTEX_LOCK(&MY_POOL.create_destruct_mutex);
-    veto_cleanup = (MY_POOL.total_threads > 0);
-    warn         = (MY_POOL.running_threads || MY_POOL.joinable_threads);
+
+    running_threads  = MY_POOL.running_threads;
+    joinable_threads = MY_POOL.joinable_threads;
+    detached_threads = MY_POOL.detached_threads;
+
+    veto_cleanup     = (MY_POOL.total_threads > 0);
+    warn             = (running_threads || joinable_threads);
+
     MUTEX_UNLOCK(&MY_POOL.create_destruct_mutex);
 
     if (warn) {
@@ -385,9 +376,9 @@ S_exit_warning(pTHX)
                             IVdf " running and unjoined\n\t%"
                             IVdf " finished and unjoined\n\t%"
                             IVdf " running and detached\n",
-                            MY_POOL.running_threads,
-                            MY_POOL.joinable_threads,
-                            MY_POOL.detached_threads);
+                            running_threads,
+                            joinable_threads,
+                            detached_threads);
         }
     }
 
@@ -547,11 +538,11 @@ S_jmpenv_run(pTHX_ int action, ithread *thread,
     return jmp_rc;
 }
 
-
 /* Starts executing the thread.
  * Passed as the C level function to run in the new thread.
  */
 #ifdef WIN32
+PERL_STACK_REALIGN
 STATIC THREAD_RET_TYPE
 S_ithread_run(LPVOID arg)
 #else
@@ -602,7 +593,9 @@ S_ithread_run(void * arg)
     S_set_sigmask(&thread->initial_sigmask);
 #endif
 
+#if PERL_VERSION_GE(5, 27, 9)
     thread_locale_init();
+#endif
 
     PL_perl_destruct_level = 2;
 
@@ -612,16 +605,26 @@ S_ithread_run(void * arg)
         int ii;
         int jmp_rc;
 
-        dSP;
+#ifdef PERL_RC_STACK
+        assert(rpp_stack_is_rc());
+#endif
+
         ENTER;
         SAVETMPS;
 
         /* Put args on the stack */
-        PUSHMARK(SP);
+        PUSHMARK(PL_stack_sp);
         for (ii=0; ii < len; ii++) {
-            XPUSHs(av_shift(params));
+            SV *sv = av_shift(params);
+#ifdef PERL_RC_STACK
+            rpp_xpush_1(sv);
+#else
+            /* temporary workaround until rpp_* are in ppport.h */
+            dSP;
+            XPUSHs(sv);
+            PUTBACK;
+#endif
         }
-        PUTBACK;
 
         jmp_rc = S_jmpenv_run(aTHX_ 0, thread, &len, &exit_app, &exit_code);
 
@@ -634,12 +637,17 @@ S_ithread_run(void * arg)
 #endif
 
         /* Remove args from stack and put back in params array */
-        SPAGAIN;
         for (ii=len-1; ii >= 0; ii--) {
-            SV *sv = POPs;
+            SV *sv = *PL_stack_sp;
             if (jmp_rc == 0 && (thread->gimme & G_WANT) != G_VOID) {
                 av_store(params, ii, SvREFCNT_inc(sv));
             }
+#ifdef PERL_RC_STACK
+            rpp_popfree_1();
+#else
+            /* temporary workaround until rpp_* are in ppport.h */
+            PL_stack_sp--;
+#endif
         }
 
         FREETMPS;
@@ -689,7 +697,9 @@ S_ithread_run(void * arg)
     MUTEX_UNLOCK(&thread->mutex);
     MUTEX_UNLOCK(&MY_POOL.create_destruct_mutex);
 
+#if PERL_VERSION_GE(5, 27, 9)
     thread_locale_term();
+#endif
 
     /* Exit application if required */
     if (exit_app) {
@@ -796,7 +806,8 @@ S_ithread_create(
           int fd = PerlIO_fileno(Perl_error_log);
           if (fd >= 0) {
             /* If there's no error_log, we cannot scream about it missing. */
-            PERL_UNUSED_RESULT(PerlLIO_write(fd, PL_no_mem, strlen(PL_no_mem)));
+            static const char oomp[] = "Out of memory in perl:threads:ithread_create\n";
+            PERL_UNUSED_RESULT(PerlLIO_write(fd, oomp, sizeof oomp - 1));
           }
         }
         my_exit(1);
@@ -1589,11 +1600,15 @@ ithread_object(...)
         }
         classname = (char *)SvPV_nolen(ST(0));
 
+        if (items < 2) {
+            XSRETURN_UNDEF;
+        }
+
         /* Turn $tid from PVLV to SV if needed (bug #73330) */
         arg = ST(1);
         SvGETMAGIC(arg);
 
-        if ((items < 2) || ! SvOK(arg)) {
+        if (! SvOK(arg)) {
             XSRETURN_UNDEF;
         }
 

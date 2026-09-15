@@ -1,4 +1,4 @@
-/* $OpenBSD: wsemul_vt100var.h,v 1.13 2023/03/06 17:14:44 miod Exp $ */
+/* $OpenBSD: wsemul_vt100var.h,v 1.16 2026/08/31 07:18:07 dgl Exp $ */
 /* $NetBSD: wsemul_vt100var.h,v 1.5 2000/04/28 21:56:17 mycroft Exp $ */
 
 /*
@@ -28,6 +28,8 @@
  */
 
 #define	VT100_EMUL_NARGS	10	/* max # of args to a command */
+
+#define	VT100_EMUL_ARG_CLAMP	100000	/* max value of arg to a command */
 
 struct wsemul_vt100_emuldata {
 	const struct wsdisplay_emulops *emulops;
@@ -72,7 +74,7 @@ struct wsemul_vt100_emuldata {
 	int sschartab; /* single shift */
 
 	int nargs;
-	u_int args[VT100_EMUL_NARGS]; /* numeric command args (CSI/DCS) */
+	int args[VT100_EMUL_NARGS]; /* numeric command args (CSI/DCS) */
 
 	char modif1;	/* {>?} in VT100_EMUL_STATE_CSI */
 	char modif2;	/* {!"$&} in VT100_EMUL_STATE_CSI */
@@ -153,10 +155,13 @@ int	wsemul_vt100_scrolldown(struct wsemul_vt100_emuldata *, int);
 int	wsemul_vt100_ed(struct wsemul_vt100_emuldata *, int);
 int	wsemul_vt100_el(struct wsemul_vt100_emuldata *, int);
 int	wsemul_vt100_handle_csi(struct wsemul_vt100_emuldata *,
-	    struct wsemul_inputstate *);
+	    struct wsemul_inputstate *, int);
 void	wsemul_vt100_handle_dcs(struct wsemul_vt100_emuldata *);
 
 int	wsemul_vt100_translate(void *cookie, kbd_t, keysym_t, const u_char **);
 
 void	vt100_initchartables(struct wsemul_vt100_emuldata *);
 int	vt100_setnrc(struct wsemul_vt100_emuldata *, int);
+
+int	wsemul_vt100_output_normal(struct wsemul_vt100_emuldata *,
+	    struct wsemul_inputstate *, int, int);

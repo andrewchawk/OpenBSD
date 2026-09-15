@@ -1,4 +1,4 @@
-/*	$OpenBSD: msgtest.c,v 1.7 2021/12/13 16:56:50 deraadt Exp $	*/
+/*	$OpenBSD: msgtest.c,v 1.10 2026/07/13 16:22:43 bluhm Exp $	*/
 /*	$NetBSD: msgtest.c,v 1.6 2001/02/19 22:44:41 cgd Exp $	*/
 
 /*-
@@ -48,7 +48,6 @@
 #include <time.h>
 #include <unistd.h>
 
-int	main(int, char *[]);
 void	print_msqid_ds(struct msqid_ds *, mode_t);
 void	sigsys_handler(int);
 void	sigchld_handler(int);
@@ -81,7 +80,7 @@ char keyname[] = "/tmp/msgtestXXXXXXXX";
 int verbose;
 
 int
-main(int argc, char **argv)
+main(int argc, char *argv[])
 {
 	struct sigaction sa;
 	struct msqid_ds m_ds;
@@ -182,11 +181,12 @@ main(int argc, char **argv)
 	 * Send the first message to the receiver and wait for the ACK.
 	 */
 	m.mtype = MTYPE_1;
-	strlcpy(m.mtext, m1_str, sizeof m.mtext);
-	if (msgsnd(sender_msqid, &m, sizeof(m), 0) == -1)
+	strlcpy(m.mtext, m1_str, sizeof(m.mtext));
+	if (msgsnd(sender_msqid, &m, sizeof(m.mtext), 0) == -1)
 		err(1, "sender: msgsnd 1");
 
-	if (msgrcv(sender_msqid, &m, sizeof(m), MTYPE_1_ACK, 0) != sizeof(m))
+	if (msgrcv(sender_msqid, &m, sizeof(m.mtext), MTYPE_1_ACK, 0) !=
+	    sizeof(m.mtext))
 		err(1, "sender: msgrcv 1 ack");
 
 	if (verbose)
@@ -196,11 +196,12 @@ main(int argc, char **argv)
 	 * Send the second message to the receiver and wait for the ACK.
 	 */
 	m.mtype = MTYPE_2;
-	strlcpy(m.mtext, m2_str, sizeof m.mtext);
-	if (msgsnd(sender_msqid, &m, sizeof(m), 0) == -1)
+	strlcpy(m.mtext, m2_str, sizeof(m.mtext));
+	if (msgsnd(sender_msqid, &m, sizeof(m.mtext), 0) == -1)
 		err(1, "sender: msgsnd 2");
 
-	if (msgrcv(sender_msqid, &m, sizeof(m), MTYPE_2_ACK, 0) != sizeof(m))
+	if (msgrcv(sender_msqid, &m, sizeof(m.mtext), MTYPE_2_ACK, 0) !=
+	    sizeof(m.mtext))
 		err(1, "sender: msgrcv 2 ack");
 
 	/*
@@ -216,16 +217,14 @@ main(int argc, char **argv)
 }
 
 void
-sigsys_handler(signo)
-	int signo;
+sigsys_handler(int signo)
 {
 
 	errx(1, "System V Message Queue support is not present in the kernel");
 }
 
 void
-sigchld_handler(signo)
-	int signo;
+sigchld_handler(int signo)
 {
 	struct msqid_ds m_ds;
 	int cstatus;
@@ -259,7 +258,7 @@ sigchld_handler(signo)
 }
 
 void
-cleanup()
+cleanup(void)
 {
 
 	/*
@@ -274,9 +273,7 @@ cleanup()
 }
 
 void
-print_msqid_ds(mp, mode)
-	struct msqid_ds *mp;
-	mode_t mode;
+print_msqid_ds(struct msqid_ds *mp, mode_t mode)
 {
 	uid_t uid = geteuid();
 	gid_t gid = getegid();
@@ -309,7 +306,7 @@ print_msqid_ds(mp, mode)
 }
 
 void
-receiver()
+receiver(void)
 {
 	struct thismsg m;
 	int msqid;
@@ -321,7 +318,7 @@ receiver()
 	 * Receive the first message, print it, and send an ACK.
 	 */
 
-	if (msgrcv(msqid, &m, sizeof(m), MTYPE_1, 0) != sizeof(m))
+	if (msgrcv(msqid, &m, sizeof(m.mtext), MTYPE_1, 0) != sizeof(m.mtext))
 		err(1, "receiver: msgrcv 1");
 
 	if (verbose)
@@ -331,14 +328,14 @@ receiver()
 
 	m.mtype = MTYPE_1_ACK;
 
-	if (msgsnd(msqid, &m, sizeof(m), 0) == -1)
+	if (msgsnd(msqid, &m, sizeof(m.mtext), 0) == -1)
 		err(1, "receiver: msgsnd ack 1");
 
 	/*
 	 * Receive the second message, print it, and send an ACK.
 	 */
 
-	if (msgrcv(msqid, &m, sizeof(m), MTYPE_2, 0) != sizeof(m))
+	if (msgrcv(msqid, &m, sizeof(m.mtext), MTYPE_2, 0) != sizeof(m.mtext))
 		err(1, "receiver: msgrcv 2");
 
 	if (verbose)
@@ -348,7 +345,7 @@ receiver()
 
 	m.mtype = MTYPE_2_ACK;
 
-	if (msgsnd(msqid, &m, sizeof(m), 0) == -1)
+	if (msgsnd(msqid, &m, sizeof(m.mtext), 0) == -1)
 		err(1, "receiver: msgsnd ack 2");
 
 	exit(0);

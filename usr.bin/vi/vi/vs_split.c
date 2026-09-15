@@ -1,4 +1,4 @@
-/*	$OpenBSD: vs_split.c,v 1.16 2016/05/27 09:18:12 martijn Exp $	*/
+/*	$OpenBSD: vs_split.c,v 1.19 2026/04/22 15:54:08 renaud Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -42,6 +42,12 @@ vs_split(SCR *sp, SCR *new, int ccl)
 	int issmallscreen, splitup;
 
 	gp = sp->gp;
+
+	/* Source screen must have a visual map to split. */
+	if (VIP(sp) == NULL || _HMAP(sp) == NULL) {
+		msgq(sp, M_ERR, "Not in visual mode: cannot split screen");
+		return (1);
+	}
 
 	/* Check to see if it's possible. */
 	/* XXX: The IS_ONELINE fix will change this, too. */
@@ -234,7 +240,7 @@ vs_discard(SCR *sp, SCR **spp)
 		*spp = sp;
 	if (sp == NULL)
 		return (0);
-		
+
 	/*
 	 * Make no effort to clean up the discarded screen's information.  If
 	 * it's not exiting, we'll do the work when the user redisplays it.
@@ -458,11 +464,8 @@ vs_swap(SCR *sp, SCR **nspp, char *name)
 int
 vs_resize(SCR *sp, long count, adj_t adj)
 {
-	GS *gp;
 	SCR *g, *s;
 	size_t g_off, s_off;
-
-	gp = sp->gp;
 
 	/*
 	 * Figure out which screens will grow, which will shrink, and

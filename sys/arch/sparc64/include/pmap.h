@@ -1,3 +1,4 @@
+/*	$OpenBSD: pmap.h,v 1.41 2025/09/18 14:54:33 kettenis Exp $	*/
 /*	$NetBSD: pmap.h,v 1.16 2001/04/22 23:19:30 thorpej Exp $	*/
 
 /*-
@@ -40,6 +41,8 @@
 #endif
 #include <sys/mutex.h>
 #endif
+
+#define __HAVE_PMAP_PURGE
 
 /*
  * This scheme uses 2-level page tables.
@@ -172,8 +175,6 @@ int	pmap_copyinsn(pmap_t, vaddr_t, uint32_t *);
 #define PMAP_CHECK_COPYIN	CPU_ISSUN4V
 
 #define PMAP_GROWKERNEL         /* turn on pmap_growkernel interface */
-
-#define	__HAVE_PMAP_COLLECT
 
 /* SPARC specific? */
 int	pmap_dumpsize(void);

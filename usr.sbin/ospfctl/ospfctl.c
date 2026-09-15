@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfctl.c,v 1.68 2020/05/20 11:11:24 denis Exp $ */
+/*	$OpenBSD: ospfctl.c,v 1.76 2026/08/30 12:33:15 jsg Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -106,7 +106,8 @@ main(int argc, char *argv[])
 
 	if ((ibuf = malloc(sizeof(struct imsgbuf))) == NULL)
 		err(1, NULL);
-	imsg_init(ibuf, ctl_sock);
+	if (imsgbuf_init(ibuf, ctl_sock) == -1)
+		err(1, NULL);
 	done = 0;
 
 	/* process user request */
@@ -213,23 +214,22 @@ main(int argc, char *argv[])
 		break;
 	}
 
-	while (ibuf->w.queued)
-		if (msgbuf_write(&ibuf->w) <= 0 && errno != EAGAIN)
-			err(1, "write error");
+	if (imsgbuf_flush(ibuf) == -1)
+		err(1, "write error");
 
 	/* no output for certain commands such as log verbose */
 	if (!done) {
 		output->head(res);
 
 		while (!done) {
-			if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-				errx(1, "imsg_read error");
+			if ((n = imsgbuf_read(ibuf)) == -1)
+				err(1, "read error");
 			if (n == 0)
 				errx(1, "pipe closed");
 
 			while (!done) {
-				if ((n = imsg_get(ibuf, &imsg)) == -1)
-					errx(1, "imsg_get error");
+				if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+					errx(1, "imsgbuf_get error");
 				if (n == 0)
 					break;
 
@@ -258,10 +258,8 @@ show(struct imsg *imsg, struct parse_result *res)
 	struct kroute		*k;
 	struct kif		*kif;
 	static struct in_addr	 area_id;
-	struct area		*area;
 	static u_int8_t		 lasttype;
 	static char		 ifname[IF_NAMESIZE];
-	struct iface		*iface;
 	struct lsa		*lsa;
 	struct lsa_hdr		*lsa_hdr;
 
@@ -322,13 +320,13 @@ show(struct imsg *imsg, struct parse_result *res)
 		lasttype = lsa_hdr->type;
 		break;
 	case IMSG_CTL_AREA:
-		area = imsg->data;
-		area_id = area->id;
+		if (imsg_get_data(imsg, &area_id, sizeof(area_id)) == -1)
+			errx(1, "IMSG_CTL_AREA: imsg_get_data() failed");
 		lasttype = 0;
 		break;
 	case IMSG_CTL_IFACE:
-		iface = imsg->data;
-		strlcpy(ifname, iface->name, sizeof(ifname));
+		if (imsg_get_data(imsg, ifname, sizeof(ifname)) == -1)
+			errx(1, "IMSG_CTL_IFACE: imsg_get_data() failed");
 		lasttype = 0;
 		break;
 	case IMSG_CTL_END:

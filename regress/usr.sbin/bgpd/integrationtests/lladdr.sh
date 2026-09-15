@@ -1,5 +1,5 @@
 #!/bin/ksh
-#	$OpenBSD: lladdr.sh,v 1.2 2023/10/16 12:49:15 claudio Exp $
+#	$OpenBSD: lladdr.sh,v 1.4 2025/04/29 18:35:51 claudio Exp $
 
 set -e
 
@@ -22,7 +22,6 @@ GIF2IP6=fe80::beef:2
 error_notify() {
 	set -x
 	echo cleanup
-	pfctl -q -t bgpd_integ_test -T kill
 	pkill -T ${RDOMAIN1} bgpd || true
 	pkill -T ${RDOMAIN2} bgpd || true
 	sleep 1
@@ -93,13 +92,13 @@ sleep 2
 
 route -T11 exec bgpctl show rib | tee lladdr.rdomain1.out
 route -T11 exec bgpctl show fib | grep -v 'link#' | tee -a lladdr.rdomain1.out
-route -T11 get 2001:db8:2::/48 | grep -v "if address" | tee -a lladdr.rdomain1.out
-route -T11 get 2001:db8:12::/48 | grep -v "if address" | tee -a lladdr.rdomain1.out
+route -T11 -n get 2001:db8:2::/48 | grep -v "if address" | tee -a lladdr.rdomain1.out
+route -T11 -n get 2001:db8:12::/48 | grep -v "if address" | tee -a lladdr.rdomain1.out
 
 route -T12 exec bgpctl show rib | tee lladdr.rdomain2.out
 route -T12 exec bgpctl show fib | grep -v 'link#' | tee -a lladdr.rdomain2.out
-route -T12 get 2001:db8:1::/48 | grep -v "if address" | tee -a lladdr.rdomain2.out
-route -T12 get 2001:db8:11::/48 | grep -v "if address" | tee -a lladdr.rdomain2.out
+route -T12 -n get 2001:db8:1::/48 | grep -v "if address" | tee -a lladdr.rdomain2.out
+route -T12 -n get 2001:db8:11::/48 | grep -v "if address" | tee -a lladdr.rdomain2.out
 
 sleep .2
 diff -u ${BGPDCONFIGDIR}/lladdr.rdomain1.ok lladdr.rdomain1.out

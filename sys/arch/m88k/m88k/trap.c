@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.135 2024/03/03 11:14:34 miod Exp $	*/
+/*	$OpenBSD: trap.c,v 1.141 2026/03/08 17:07:31 deraadt Exp $	*/
 /*
  * Copyright (c) 2004, Miodrag Vallat.
  * Copyright (c) 1998 Steve Murphree, Jr.
@@ -92,7 +92,7 @@ const char *trap_type[] = {
 	"Data Access Exception",
 	"Misaligned Access",
 	"Unimplemented Opcode",
-	"Privilege Violation"
+	"Privilege Violation",
 	"Bounds Check Violation",
 	"Illegal Integer Divide",
 	"Integer Overflow",
@@ -170,9 +170,9 @@ interrupt(struct trapframe *frame)
 {
 	struct cpu_info *ci = curcpu();
 
-	ci->ci_intrdepth++;
+	ci->ci_idepth++;
 	md_interrupt_func(frame);
-	ci->ci_intrdepth--;
+	ci->ci_idepth--;
 }
 
 #ifdef M88110
@@ -206,7 +206,7 @@ ast(struct trapframe *frame)
 
 	p->p_md.md_astpending = 0;
 
-	uvmexp.softs++;
+	atomic_inc_int(&uvmexp.softs);
 	mi_ast(p, ci->ci_want_resched);
 	userret(p);
 }
@@ -231,7 +231,7 @@ m88100_trap(u_int type, struct trapframe *frame)
 #endif
 	int sig = 0;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if ((p = curproc) == NULL)
 		p = &proc0;
 
@@ -631,7 +631,7 @@ m88110_trap(u_int type, struct trapframe *frame)
 #endif
 	int sig = 0;
 
-	uvmexp.traps++;
+	atomic_inc_int(&uvmexp.traps);
 	if ((p = curproc) == NULL)
 		p = &proc0;
 
@@ -680,7 +680,7 @@ m88110_trap(u_int type, struct trapframe *frame)
 			if (copyinsn(p, (u_int32_t *)frame->tf_exip,
 			    (u_int32_t *)&instr) == 0 &&
 			    instr == 0xf400cc01) {
-				uprintf("mc88110 errata #16, exip 0x%lx enip 0x%lx",
+				printf("mc88110 errata #16, exip 0x%lx enip 0x%lx",
 				    (frame->tf_exip + 4) | 1, frame->tf_enip);
 				sig = SIGILL;
 			}
@@ -1167,7 +1167,7 @@ m88100_syscall(register_t code, struct trapframe *tf)
 	register_t *args;
 	register_t rval[2] __aligned(8);
 
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 
 	p->p_md.md_tf = tf;
 
@@ -1253,7 +1253,7 @@ m88110_syscall(register_t code, struct trapframe *tf)
 	register_t rval[2] __aligned(8);
 	register_t *args;
 
-	uvmexp.syscalls++;
+	atomic_inc_int(&uvmexp.syscalls);
 
 	p->p_md.md_tf = tf;
 
@@ -1333,8 +1333,7 @@ m88110_syscall(register_t code, struct trapframe *tf)
  * and do normal return-to-user-mode stuff.
  */
 void
-child_return(arg)
-	void *arg;
+child_return(void *arg)
 {
 	struct proc *p = arg;
 	struct trapframe *tf;
@@ -1594,7 +1593,7 @@ splassert_check(int wantipl, const char *func)
 int
 double_reg_fixup(struct trapframe *frame, int fault)
 {
-	u_int32_t pc, instr, value;
+	uint32_t pc, instr, value;
 	int regno, store;
 	vaddr_t addr;
 
@@ -1683,12 +1682,14 @@ double_reg_fixup(struct trapframe *frame, int fault)
 		/*
 		 * Two word loads. r0 should be left unaltered, but the
 		 * value should still be fetched even if it is discarded.
+		 * We can use copyin32 here as the address is guaranteed
+		 * to be properly aligned on a 32-bit boundary.
 		 */
-		if (copyin((void *)addr, &value, sizeof(u_int32_t)) != 0)
+		if (copyin32((const uint32_t *)addr, &value) != 0)
 			return SIGSEGV;
 		if (regno != 0)
 			frame->tf_r[regno] = value;
-		if (copyin((void *)(addr + 4), &value, sizeof(u_int32_t)) != 0)
+		if (copyin32((const uint32_t *)(addr + 4), &value) != 0)
 			return SIGSEGV;
 		if (regno != 31)
 			frame->tf_r[regno + 1] = value;

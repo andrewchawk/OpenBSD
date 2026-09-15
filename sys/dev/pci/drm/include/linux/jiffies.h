@@ -9,6 +9,8 @@
 #include <sys/limits.h>
 #include <sys/kernel.h>
 
+#include <linux/cache.h>
+
 extern volatile unsigned long jiffies;
 #define jiffies_64 jiffies /* XXX */
 #undef HZ
@@ -30,12 +32,13 @@ jiffies_to_usecs(const unsigned long x)
 	return (((uint64_t)(x)) * 1000000 / hz);
 }
 
-static inline unsigned int
+static inline uint64_t
 jiffies_to_nsecs(const unsigned long x)
 {
 	return (((uint64_t)(x)) * 1000000000 / hz);
 }
 
+#define secs_to_jiffies(x)	(((uint64_t)(x)) * hz)
 #define msecs_to_jiffies(x)	(((uint64_t)(x)) * hz / 1000)
 #define usecs_to_jiffies(x)	(((uint64_t)(x)) * hz / 1000000)
 #define nsecs_to_jiffies(x)	(((uint64_t)(x)) * hz / 1000000000)

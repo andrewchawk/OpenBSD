@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_spppsubr.c,v 1.194 2024/06/22 10:22:29 jsg Exp $	*/
+/*	$OpenBSD: if_spppsubr.c,v 1.202 2026/06/14 05:39:23 mvs Exp $	*/
 /*
  * Synchronous PPP link level subroutines.
  *
@@ -37,7 +37,6 @@
 #include <sys/param.h>
 
 #include <sys/systm.h>
-#include <sys/kernel.h>
 #include <sys/sockio.h>
 #include <sys/socket.h>
 #include <sys/syslog.h>
@@ -49,7 +48,6 @@
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/netisr.h>
 #include <net/if_types.h>
 #include <net/route.h>
 
@@ -64,6 +62,8 @@
 #endif
 
 #include <net/if_sppp.h>
+
+extern unsigned int	rtmap_limit;
 
 # define UNTIMEOUT(fun, arg, handle)	\
 	timeout_del(&(handle))
@@ -227,6 +227,7 @@ static struct timeout keepalive_ch;
 	struct ifnet *ifp = &sp->pp_if;				\
 	int debug = ifp->if_flags & IFF_DEBUG
 
+void sppp_autodial(void *);
 int sppp_output(struct ifnet *ifp, struct mbuf *m,
 		       struct sockaddr *dst, struct rtentry *rt);
 
@@ -411,8 +412,32 @@ static const struct cp *cps[IDX_COUNT] = {
 
 /* Workaround */
 void
-spppattach(struct ifnet *ifp)
+spppattach(int count)
 {
+}
+
+int
+sppp_proto_up(struct ifnet *ifp, uint16_t proto)
+{
+	struct sppp *sp = (struct sppp *)ifp;
+	int af = AF_UNSPEC;
+
+	switch (ntohs(proto)) {
+	case PPP_IP:
+		if (sp->state[IDX_IPCP] == STATE_OPENED)
+			af = AF_INET;
+		break;
+#ifdef INET6
+	case PPP_IPV6:
+		if (sp->state[IDX_IPV6CP] == STATE_OPENED)
+			af = AF_INET6;
+		break;
+#endif
+	default:
+		break;
+	}
+
+	return (af);
 }
 
 /*
@@ -509,7 +534,7 @@ sppp_input(struct ifnet *ifp, struct mbuf *m)
 			if (sp->state[IDX_IPCP] == STATE_OPENED) {
 				sp->pp_last_activity = tv.tv_sec;
 				if (ifp->if_flags & IFF_UP) {
-					ipv4_input(ifp, m);
+					ipv4_input(ifp, m, NULL);
 					return;
 				}
 			}
@@ -524,7 +549,7 @@ sppp_input(struct ifnet *ifp, struct mbuf *m)
 			if (sp->state[IDX_IPV6CP] == STATE_OPENED) {
 				sp->pp_last_activity = tv.tv_sec;
 				if (ifp->if_flags & IFF_UP) {
-					ipv6_input(ifp, m);
+					ipv6_input(ifp, m, NULL);
 					return;
 				}
 			}
@@ -546,6 +571,20 @@ sppp_input(struct ifnet *ifp, struct mbuf *m)
 	goto drop;
 }
 
+void
+sppp_autodial(void *arg)
+{
+	struct sppp *sp = arg;
+	struct ifnet *ifp = &sp->pp_if;
+
+	NET_LOCK();
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_AUTO)) == IFF_AUTO) {
+		ifp->if_flags |= IFF_RUNNING;
+		lcp.Open(sp);
+	}
+	NET_UNLOCK();
+}
+
 /*
  * Enqueue transmit packet.
  */
@@ -557,6 +596,7 @@ sppp_output(struct ifnet *ifp, struct mbuf *m,
 	struct timeval tv;
 	int s, rv = 0;
 	u_int16_t protocol;
+	int if_flags;
 
 #ifdef DIAGNOSTIC
 	if (ifp->if_rdomain != rtable_l2(m->m_pkthdr.ph_rtableid)) {
@@ -572,22 +612,20 @@ sppp_output(struct ifnet *ifp, struct mbuf *m,
 	getmicrouptime(&tv);
 	sp->pp_last_activity = tv.tv_sec;
 
-	if ((ifp->if_flags & IFF_UP) == 0 ||
-	    (ifp->if_flags & (IFF_RUNNING | IFF_AUTO)) == 0) {
+	if_flags = ifp->if_flags;
+	if ((if_flags & IFF_UP) == 0 ||
+	    (if_flags & (IFF_RUNNING | IFF_AUTO)) == 0) {
 		m_freem (m);
 		splx (s);
 		return (ENETDOWN);
 	}
 
-	if ((ifp->if_flags & (IFF_RUNNING | IFF_AUTO)) == IFF_AUTO) {
+	if ((if_flags & (IFF_RUNNING | IFF_AUTO)) == IFF_AUTO) {
 		/*
 		 * Interface is not yet running, but auto-dial.  Need
 		 * to start LCP for it.
 		 */
-		ifp->if_flags |= IFF_RUNNING;
-		splx(s);
-		lcp.Open(sp);
-		s = splnet();
+		task_add(systq, &sp->pp_autodial);
 	}
 
 	if (dst->sa_family == AF_INET) {
@@ -631,8 +669,9 @@ sppp_output(struct ifnet *ifp, struct mbuf *m,
 		 * ENETDOWN, as opposed to ENOBUFS.
 		 */
 		protocol = htons(PPP_IP);
-		if (sp->state[IDX_IPCP] != STATE_OPENED)
+		if (sp->state[IDX_IPCP] != STATE_OPENED) {
 			rv = ENETDOWN;
+		}
 		break;
 #ifdef INET6
 	case AF_INET6:   /* Internet Protocol v6 */
@@ -656,6 +695,8 @@ sppp_output(struct ifnet *ifp, struct mbuf *m,
 		splx(s);
 		return (EAFNOSUPPORT);
 	}
+
+	m->m_pkthdr.ph_family = dst->sa_family; /* for bpf */
 
 	M_PREPEND(m, 2, M_DONTWAIT);
 	if (m == NULL) {
@@ -722,6 +763,8 @@ sppp_attach(struct ifnet *ifp)
 	sp->pp_up = lcp.Up;
 	sp->pp_down = lcp.Down;
 
+	task_set(&sp->pp_autodial, sppp_autodial, sp);
+
 	for (i = 0; i < IDX_COUNT; i++)
 		timeout_set(&sp->ch[i], (cps[i])->TO, (void *)sp);
 	timeout_set(&sp->pap_my_to_ch, sppp_pap_my_TO, (void *)sp);
@@ -738,6 +781,8 @@ sppp_detach(struct ifnet *ifp)
 {
 	struct sppp **q, *p, *sp = (struct sppp*) ifp;
 	int i;
+
+	taskq_del_barrier(systq, &sp->pp_autodial);
 
 	sppp_ipcp_destroy(sp);
 	sppp_ipv6cp_destroy(sp);
@@ -3768,8 +3813,8 @@ sppp_pap_input(struct sppp *sp, struct mbuf *m)
 			sppp_print_string((char*)passwd, passwd_len);
 			addlog(">\n");
 		}
-		if (name_len > AUTHMAXLEN ||
-		    passwd_len > AUTHMAXLEN ||
+		if (name_len != strlen(sp->hisauth.name) ||
+		    passwd_len != strlen(sp->hisauth.secret) ||
 		    bcmp(name, sp->hisauth.name, name_len) != 0 ||
 		    bcmp(passwd, sp->hisauth.secret, passwd_len) != 0) {
 			/* action scn, tld */
@@ -4216,7 +4261,7 @@ sppp_update_gw(struct ifnet *ifp)
 	u_int tid;
 
 	/* update routing table */
-	for (tid = 0; tid <= RT_TABLEID_MAX; tid++) {
+	for (tid = 0; tid <= rtmap_limit; tid++) {
 		rtable_walk(tid, AF_INET, NULL, sppp_update_gw_walker, ifp);
 	}
 }

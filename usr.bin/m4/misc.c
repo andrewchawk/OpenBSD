@@ -1,4 +1,4 @@
-/*	$OpenBSD: misc.c,v 1.47 2017/06/15 13:48:42 bcallah Exp $	*/
+/*	$OpenBSD: misc.c,v 1.50 2026/02/25 05:37:25 op Exp $	*/
 /*	$NetBSD: misc.c,v 1.6 1995/09/28 05:37:41 tls Exp $	*/
 
 /*
@@ -66,7 +66,7 @@ unsigned char *endpbb;			/* end of push-back buffer     */
  * find the index of second str in the first str.
  */
 ptrdiff_t
-indx(const char *s1, const char *s2)
+doindex(const char *s1, const char *s2)
 {
 	char *t;
 
@@ -157,7 +157,7 @@ pbunsigned(unsigned long n)
 }
 
 void
-initspaces()
+initspaces(void)
 {
 	int i;
 
@@ -173,7 +173,7 @@ initspaces()
 }
 
 void
-enlarge_strspace()
+enlarge_strspace(void)
 {
 	char *newstrspace;
 	int i;
@@ -194,7 +194,7 @@ enlarge_strspace()
 }
 
 void
-enlarge_bufspace()
+enlarge_bufspace(void)
 {
 	unsigned char *newbuf;
 	int i;
@@ -238,7 +238,7 @@ getdiv(int n)
 }
 
 void
-onintr(int signo)
+onintr(int signo UNUSED)
 {
 #define intrmessage	"m4: interrupted.\n"
 	write(STDERR_FILENO, intrmessage, sizeof(intrmessage)-1);
@@ -249,7 +249,7 @@ onintr(int signo)
  * killdiv - get rid of the diversion files
  */
 void
-killdiv()
+killdiv(void)
 {
 	int n;
 
@@ -411,7 +411,7 @@ set_input(struct input_file *f, FILE *real, const char *name)
 }
 
 void
-do_emit_synchline()
+do_emit_synchline(void)
 {
 	fprintf(active, "#line %lu \"%s\"\n",
 	    infile[ilevel].lineno, infile[ilevel].name);
@@ -451,7 +451,7 @@ doprintfilename(struct input_file *f)
  * and later dump everything that was added since then to a file.
  */
 size_t
-buffer_mark()
+buffer_mark(void)
 {
 	return bp - buf;
 }

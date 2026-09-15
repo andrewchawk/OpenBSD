@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_syscalls.c,v 1.366 2024/07/10 09:12:11 krw Exp $	*/
+/*	$OpenBSD: vfs_syscalls.c,v 1.388 2026/08/15 22:07:04 gnezdo Exp $	*/
 /*	$NetBSD: vfs_syscalls.c,v 1.71 1996/04/23 10:29:02 mycroft Exp $	*/
 
 /*
@@ -61,15 +61,13 @@
 
 #include <sys/syscallargs.h>
 
-extern int suid_clear;
-
 static int change_dir(struct nameidata *, struct proc *);
 
 void checkdirs(struct vnode *);
 
 int copyout_statfs(struct statfs *, void *, struct proc *);
 
-int doopenat(struct proc *, int, const char *, int, mode_t, register_t *);
+int doopenat(struct proc *, int, const char *, int, mode_t, int, register_t *);
 int domknodat(struct proc *, int, const char *, mode_t, dev_t);
 int dolinkat(struct proc *, int, const char *, int, const char *, int);
 int dosymlinkat(struct proc *, const char *, int, const char *);
@@ -184,6 +182,7 @@ sys_mount(struct proc *p, void *v, register_t *retval)
 	}
 	if (vp->v_type != VDIR) {
 		vput(vp);
+		error = ENOTDIR;
 		goto fail;
 	}
 	error = copyinstr(SCARG(uap, type), fstypename, MFSNAMELEN, NULL);
@@ -418,7 +417,7 @@ dounmount(struct mount *mp, int flags, struct proc *p)
 	 */
 	while ((mp = TAILQ_NEXT(mp, mnt_list)) != NULL) {
 		SLIST_FOREACH(nmp, &mplist, mnt_dounmount) {
-			if (mp->mnt_vnodecovered == NULLVP ||
+			if (mp->mnt_vnodecovered == NULL ||
 			    mp->mnt_vnodecovered->v_mount != nmp)
 				continue;
 
@@ -503,7 +502,7 @@ dounmount_leaf(struct mount *mp, int flags, struct proc *p)
 	}
 
 	TAILQ_REMOVE(&mountlist, mp, mnt_list);
-	if ((coveredvp = mp->mnt_vnodecovered) != NULLVP) {
+	if ((coveredvp = mp->mnt_vnodecovered) != NULL) {
 		coveredvp->v_mountedhere = NULL;
 		vrele(coveredvp);
 	}
@@ -553,13 +552,14 @@ sys_quotactl(struct proc *p, void *v, register_t *retval)
 		syscallarg(const char *) path;
 		syscallarg(int) cmd;
 		syscallarg(int) uid;
-		syscallarg(char *) arg;
+		syscallarg(void *) arg;
 	} */ *uap = v;
 	struct mount *mp;
 	int error;
 	struct nameidata nd;
 
 	NDINIT(&nd, LOOKUP, FOLLOW, UIO_USERSPACE, SCARG(uap, path), p);
+	nd.ni_unveil = UNVEIL_READ | UNVEIL_WRITE;
 	if ((error = namei(&nd)) != 0)
 		return (error);
 	mp = nd.ni_vp->v_mount;
@@ -894,8 +894,10 @@ sys___realpath(struct proc *p, void *v, register_t *retval)
 		bp = &cwdbuf[cwdlen - 1];
 		*bp = '\0';
 
+		KERNEL_LOCK();
 		error = vfs_getcwd_common(p->p_fd->fd_cdir, NULL, &bp, cwdbuf,
 		    cwdlen/2, GETCWD_CHECK_ACCESS, p);
+		KERNEL_UNLOCK();
 
 		if (error) {
 			free(cwdbuf, M_TEMP, cwdlen);
@@ -919,12 +921,16 @@ sys___realpath(struct proc *p, void *v, register_t *retval)
 
 	nd.ni_pledge = PLEDGE_RPATH;
 	nd.ni_unveil = UNVEIL_READ;
-	if ((error = namei(&nd)) != 0)
+	KERNEL_LOCK();
+	if ((error = namei(&nd)) != 0) {
+		KERNEL_UNLOCK();
 		goto end;
+	}
 
 	/* release reference from namei */
 	if (nd.ni_vp)
 		vrele(nd.ni_vp);
+	KERNEL_UNLOCK();
 
 	error = copyoutstr(nd.ni_cnd.cn_rpbuf, SCARG(uap, resolved),
 	    MAXPATHLEN, NULL);
@@ -966,6 +972,14 @@ sys_unveil(struct proc *p, void *v, register_t *retval)
 	    sizeof(permissions), NULL);
 	if (error)
 		return (error);
+
+	/*
+	 * System calls in other threads may sleep between unveil
+	 * datastructure inspections -- this is the simplest way to
+	 * provide consistency 
+	 */
+	single_thread_set(p, SINGLE_UNWIND);
+
 	pathname = pool_get(&namei_pool, PR_WAITOK);
 	error = copyinstr(SCARG(uap, path), pathname, MAXPATHLEN, &pathlen);
 	if (error)
@@ -1031,6 +1045,7 @@ sys_unveil(struct proc *p, void *v, register_t *retval)
 end:
 	pool_put(&namei_pool, pathname);
 
+	single_thread_clear(p);
 	return (error);
 }
 
@@ -1048,7 +1063,30 @@ sys_open(struct proc *p, void *v, register_t *retval)
 	} */ *uap = v;
 
 	return (doopenat(p, AT_FDCWD, SCARG(uap, path), SCARG(uap, flags),
-	    SCARG(uap, mode), retval));
+	    SCARG(uap, mode), 0, retval));
+}
+
+/*
+ * Check permissions, allocate an open file structure,
+ * and call the device open routine if any.
+ */
+int
+sys___pledge_open(struct proc *p, void *v, register_t *retval)
+{
+	struct sys___pledge_open_args /* {
+		syscallarg(const char *) path;
+		syscallarg(int) flags;
+		syscallarg(mode_t) mode;
+	} */ *uap = v;
+	int rw = SCARG(uap, flags) & O_ACCMODE;
+
+	/* libc only calls with O_RDONLY, O_RDWR, O_CLOEXEC, O_CLOFORK */
+	if ((SCARG(uap, flags) & ~(O_ACCMODE|O_CLOEXEC|O_CLOFORK)) ||
+	    !(rw == O_RDONLY || rw == O_RDWR))
+		return (EINVAL);
+
+	return (doopenat(p, AT_FDCWD, SCARG(uap, path), SCARG(uap, flags),
+	    SCARG(uap, mode), UNVEIL_PLEDGEOPEN, retval));
 }
 
 int
@@ -1062,23 +1100,23 @@ sys_openat(struct proc *p, void *v, register_t *retval)
 	} */ *uap = v;
 
 	return (doopenat(p, SCARG(uap, fd), SCARG(uap, path),
-	    SCARG(uap, flags), SCARG(uap, mode), retval));
+	    SCARG(uap, flags), SCARG(uap, mode), 0, retval));
 }
 
 int
 doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
-    register_t *retval)
+    int pledgeopen, register_t *retval)
 {
 	struct filedesc *fdp = p->p_fd;
 	struct file *fp;
 	struct vnode *vp;
 	struct vattr vattr;
-	int flags, cloexec, cmode;
+	int flags, fdflags, cmode;
 	int type, indx, error, localtrunc = 0;
 	struct flock lf;
 	struct nameidata nd;
 	uint64_t ni_pledge = 0;
-	u_char ni_unveil = 0;
+	u_char ni_unveil = pledgeopen;
 
 	if (oflags & (O_EXLOCK | O_SHLOCK)) {
 		error = pledge_flock(p);
@@ -1086,7 +1124,8 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 			return (error);
 	}
 
-	cloexec = (oflags & O_CLOEXEC) ? UF_EXCLOSE : 0;
+	fdflags = ((oflags & O_CLOEXEC) ? UF_EXCLOSE : 0)
+	    | ((oflags & O_CLOFORK) ? UF_FORKCLOSE : 0);
 
 	fdplock(fdp);
 	if ((error = falloc(p, &fp, &indx)) != 0) {
@@ -1120,26 +1159,25 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 		localtrunc = 1;
 		flags &= ~O_TRUNC;	/* Must do truncate ourselves */
 	}
+	KERNEL_LOCK();
 	if ((error = vn_open(&nd, flags, cmode)) != 0) {
 		fdplock(fdp);
 		if (error == ENODEV &&
 		    p->p_dupfd >= 0 &&			/* XXX from fdopen */
 		    (error =
 			dupfdopen(p, indx, flags)) == 0) {
-			fdpunlock(fdp);
-			closef(fp, p);
 			*retval = indx;
-			return (error);
+			goto error;
 		}
 		if (error == ERESTART)
 			error = EINTR;
 		fdremove(fdp, indx);
-		fdpunlock(fdp);
-		closef(fp, p);
-		return (error);
+		goto error;
 	}
 	p->p_dupfd = 0;
 	vp = nd.ni_vp;
+	if (pledgeopen && vp->v_type != VCHR)
+		fdflags |= UF_PLEDGEOPEN;
 	fp->f_flag = flags & FMASK;
 	fp->f_type = DTYPE_VNODE;
 	fp->f_ops = &vnops;
@@ -1161,9 +1199,7 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 			fdplock(fdp);
 			/* closef will vn_close the file for us. */
 			fdremove(fdp, indx);
-			fdpunlock(fdp);
-			closef(fp, p);
-			return (error);
+			goto error;
 		}
 		vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 		atomic_setbits_int(&fp->f_iflags, FIF_HASLOCK);
@@ -1176,7 +1212,7 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 		else if (vp->v_type == VDIR)
 			error = EISDIR;
 		else if ((error = vn_writechk(vp)) == 0) {
-			VATTR_NULL(&vattr);
+			vattr_null(&vattr);
 			vattr.va_size = 0;
 			error = VOP_SETATTR(vp, &vattr, fp->f_cred, p);
 		}
@@ -1185,103 +1221,21 @@ doopenat(struct proc *p, int fd, const char *path, int oflags, mode_t mode,
 			fdplock(fdp);
 			/* closef will close the file for us. */
 			fdremove(fdp, indx);
-			fdpunlock(fdp);
-			closef(fp, p);
-			return (error);
+			goto error;
 		}
 	}
 	VOP_UNLOCK(vp);
+	KERNEL_UNLOCK();
 	*retval = indx;
 	fdplock(fdp);
-	fdinsert(fdp, indx, cloexec, fp);
+	fdinsert(fdp, indx, fdflags, fp);
 	fdpunlock(fdp);
 	FRELE(fp, p);
 	return (error);
-}
-
-/*
- * Open a new created file (in /tmp) suitable for mmaping.
- */
-int
-sys___tmpfd(struct proc *p, void *v, register_t *retval)
-{
-	struct sys___tmpfd_args /* {
-		syscallarg(int) flags;
-	} */ *uap = v;
-	struct filedesc *fdp = p->p_fd;
-	struct file *fp;
-	struct vnode *vp;
-	int oflags = SCARG(uap, flags);
-	int flags, cloexec, cmode;
-	int indx, error;
-	unsigned int i;
-	struct nameidata nd;
-	char path[64];
-	static const char *letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
-
-	/* most flags are hardwired */
-	oflags = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | (oflags & O_CLOEXEC);
-
-	cloexec = (oflags & O_CLOEXEC) ? UF_EXCLOSE : 0;
-
-	fdplock(fdp);
-	if ((error = falloc(p, &fp, &indx)) != 0) {
-		fdpunlock(fdp);
-		return (error);
-	}
+error:
+	KERNEL_UNLOCK();
 	fdpunlock(fdp);
-
-	flags = FFLAGS(oflags);
-
-	arc4random_buf(path, sizeof(path));
-	memcpy(path, "/tmp/", 5);
-	for (i = 5; i < sizeof(path) - 1; i++)
-		path[i] = letters[(unsigned char)path[i] & 63];
-	path[sizeof(path)-1] = 0;
-
-	cmode = 0600;
-	NDINITAT(&nd, 0, KERNELPATH, UIO_SYSSPACE, AT_FDCWD, path, p);
-	if ((error = vn_open(&nd, flags, cmode)) != 0) {
-		if (error == ERESTART)
-			error = EINTR;
-		fdplock(fdp);
-		fdremove(fdp, indx);
-		fdpunlock(fdp);
-		closef(fp, p);
-		return (error);
-	}
-	vp = nd.ni_vp;
-	fp->f_flag = flags & FMASK;
-	fp->f_type = DTYPE_VNODE;
-	fp->f_ops = &vnops;
-	fp->f_data = vp;
-	VOP_UNLOCK(vp);
-	*retval = indx;
-	fdplock(fdp);
-	fdinsert(fdp, indx, cloexec, fp);
-	fdpunlock(fdp);
-	FRELE(fp, p);
-
-	/* unlink it */
-	/* XXX
-	 * there is a wee race here, although it is mostly inconsequential.
-	 * perhaps someday we can create a file like object without a name...
-	 */
-	NDINITAT(&nd, DELETE, KERNELPATH | LOCKPARENT | LOCKLEAF, UIO_SYSSPACE,
-	    AT_FDCWD, path, p);
-	if ((error = namei(&nd)) != 0) {
-		printf("can't unlink temp file! %d\n", error);
-		error = 0;
-	} else {
-		vp = nd.ni_vp;
-		uvm_vnp_uncache(vp);
-		error = VOP_REMOVE(nd.ni_dvp, nd.ni_vp, &nd.ni_cnd);
-		if (error) {
-			printf("error removing vop: %d\n", error);
-			error = 0;
-		}
-	}
-
+	closef(fp, p);
 	return (error);
 }
 
@@ -1340,7 +1294,7 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 	struct vnode *vp = NULL;
 	struct mount *mp;
 	struct ucred *cred = p->p_ucred;
-	int flags, cloexec;
+	int flags, fdflags;
 	int type, indx, error=0;
 	struct flock lf;
 	struct vattr va;
@@ -1358,7 +1312,8 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 	if ((flags & O_CREAT))
 		return (EINVAL);
 
-	cloexec = (flags & O_CLOEXEC) ? UF_EXCLOSE : 0;
+	fdflags = ((flags & O_CLOEXEC) ? UF_EXCLOSE : 0)
+	    | ((flags & O_CLOFORK) ? UF_FORKCLOSE : 0);
 
 	fdplock(fdp);
 	if ((error = falloc(p, &fp, &indx)) != 0) {
@@ -1405,7 +1360,7 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 			goto bad;
 	}
 	if (flags & O_TRUNC) {
-		VATTR_NULL(&va);
+		vattr_null(&va);
 		va.va_size = 0;
 		if ((error = VOP_SETATTR(vp, &va, cred, p)) != 0)
 			goto bad;
@@ -1444,7 +1399,7 @@ sys_fhopen(struct proc *p, void *v, register_t *retval)
 	VOP_UNLOCK(vp);
 	*retval = indx;
 	fdplock(fdp);
-	fdinsert(fdp, indx, cloexec, fp);
+	fdinsert(fdp, indx, fdflags, fp);
 	fdpunlock(fdp);
 	FRELE(fp, p);
 	return (0);
@@ -1587,7 +1542,7 @@ domknodat(struct proc *p, int fd, const char *path, mode_t mode, dev_t dev)
 	if (vp != NULL)
 		error = EEXIST;
 	else {
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_mode = (mode & ALLPERMS) &~ p->p_fd->fd_cmask;
 		if ((p->p_p->ps_flags & PS_PLEDGE))
 			vattr.va_mode &= ACCESSPERMS;
@@ -1801,7 +1756,7 @@ dosymlinkat(struct proc *p, const char *upath, int fd, const char *link)
 		error = EEXIST;
 		goto out;
 	}
-	VATTR_NULL(&vattr);
+	vattr_null(&vattr);
 	vattr.va_mode = ACCESSPERMS &~ p->p_fd->fd_cmask;
 	error = VOP_SYMLINK(nd.ni_dvp, &nd.ni_vp, &nd.ni_cnd, &vattr, path);
 out:
@@ -1971,7 +1926,7 @@ dofaccessat(struct proc *p, int fd, const char *path, int amode, int flag)
 	struct vnode *vp;
 	struct ucred *newcred, *oldcred;
 	struct nameidata nd;
-	int error;
+	int vflags = 0, error;
 
 	if (amode & ~(R_OK | W_OK | X_OK))
 		return (EINVAL);
@@ -1996,21 +1951,20 @@ dofaccessat(struct proc *p, int fd, const char *path, int amode, int flag)
 	NDINITAT(&nd, LOOKUP, FOLLOW | LOCKLEAF, UIO_USERSPACE, fd, path, p);
 	nd.ni_pledge = PLEDGE_RPATH;
 	nd.ni_unveil = UNVEIL_READ;
+	if (amode & R_OK)
+		vflags |= VREAD;
+	if (amode & W_OK) {
+		vflags |= VWRITE;
+		nd.ni_unveil |= UNVEIL_WRITE;
+	}
+	if (amode & X_OK)
+		vflags |= VEXEC;
 	if ((error = namei(&nd)) != 0)
 		goto out;
 	vp = nd.ni_vp;
 
 	/* Flags == 0 means only check for existence. */
 	if (amode) {
-		int vflags = 0;
-
-		if (amode & R_OK)
-			vflags |= VREAD;
-		if (amode & W_OK)
-			vflags |= VWRITE;
-		if (amode & X_OK)
-			vflags |= VEXEC;
-
 		error = VOP_ACCESS(vp, vflags, p->p_ucred, p);
 		if (!error && (vflags & VWRITE))
 			error = vn_writechk(vp);
@@ -2067,10 +2021,14 @@ dofstatat(struct proc *p, int fd, const char *path, struct stat *buf, int flag)
 	NDINITAT(&nd, LOOKUP, follow | LOCKLEAF, UIO_USERSPACE, fd, path, p);
 	nd.ni_pledge = PLEDGE_RPATH;
 	nd.ni_unveil = UNVEIL_READ;
-	if ((error = namei(&nd)) != 0)
+	KERNEL_LOCK();
+	if ((error = namei(&nd)) != 0) {
+		KERNEL_UNLOCK();
 		return (error);
+	}
 	error = vn_stat(nd.ni_vp, &sb, p);
 	vput(nd.ni_vp);
+	KERNEL_UNLOCK();
 	if (error)
 		return (error);
 	/* Don't let non-root see generation numbers (for NFS security) */
@@ -2277,6 +2235,10 @@ sys_fchflags(struct proc *p, void *v, register_t *retval)
 
 	if ((error = getvnode(p, SCARG(uap, fd), &fp)) != 0)
 		return (error);
+	if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN) {
+		FRELE(fp, p);
+		return (EPERM);
+	}
 	vp = fp->f_data;
 	vref(vp);
 	FRELE(fp, p);
@@ -2290,7 +2252,7 @@ dovchflags(struct proc *p, struct vnode *vp, u_int flags)
 	int error;
 
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	if (vp->v_mount && vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
 	else if (flags == VNOVAL)
 		error = EINVAL;
@@ -2304,7 +2266,7 @@ dovchflags(struct proc *p, struct vnode *vp, u_int flags)
 				goto out;
 			}
 		}
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_flags = flags;
 		error = VOP_SETATTR(vp, &vattr, p->p_ucred, p);
 	}
@@ -2364,10 +2326,10 @@ dofchmodat(struct proc *p, int fd, const char *path, mode_t mode, int flag)
 		return (error);
 	vp = nd.ni_vp;
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	if (vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
 	else {
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_mode = mode & ALLPERMS;
 		error = VOP_SETATTR(vp, &vattr, p->p_ucred, p);
 	}
@@ -2400,10 +2362,12 @@ sys_fchmod(struct proc *p, void *v, register_t *retval)
 		return (error);
 	vp = fp->f_data;
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	if (vp->v_mount && vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
+	else if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN)
+		error = EPERM;
 	else {
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_mode = mode & ALLPERMS;
 		error = VOP_SETATTR(vp, &vattr, p->p_ucred, p);
 	}
@@ -2464,14 +2428,12 @@ dofchownat(struct proc *p, int fd, const char *path, uid_t uid, gid_t gid,
 		return (error);
 	vp = nd.ni_vp;
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	if (vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
 	else {
 		if ((error = pledge_chown(p, uid, gid)))
 			goto out;
-		if ((uid != -1 || gid != -1) &&
-		    !vnoperm(vp) &&
-		    (suser(p) || suid_clear)) {
+		if ((uid != -1 || gid != -1) && !vnoperm(vp)) {
 			error = VOP_GETATTR(vp, &vattr, p->p_ucred, p);
 			if (error)
 				goto out;
@@ -2480,7 +2442,7 @@ dofchownat(struct proc *p, int fd, const char *path, uid_t uid, gid_t gid,
 				mode = VNOVAL;
 		} else
 			mode = VNOVAL;
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_uid = uid;
 		vattr.va_gid = gid;
 		vattr.va_mode = mode;
@@ -2517,14 +2479,12 @@ sys_lchown(struct proc *p, void *v, register_t *retval)
 		return (error);
 	vp = nd.ni_vp;
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	if (vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
 	else {
 		if ((error = pledge_chown(p, uid, gid)))
 			goto out;
-		if ((uid != -1 || gid != -1) &&
-		    !vnoperm(vp) &&
-		    (suser(p) || suid_clear)) {
+		if ((uid != -1 || gid != -1) && !vnoperm(vp)) {
 			error = VOP_GETATTR(vp, &vattr, p->p_ucred, p);
 			if (error)
 				goto out;
@@ -2533,7 +2493,7 @@ sys_lchown(struct proc *p, void *v, register_t *retval)
 				mode = VNOVAL;
 		} else
 			mode = VNOVAL;
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_uid = uid;
 		vattr.va_gid = gid;
 		vattr.va_mode = mode;
@@ -2569,12 +2529,12 @@ sys_fchown(struct proc *p, void *v, register_t *retval)
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
+	else if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN)
+		error = EPERM;
 	else {
 		if ((error = pledge_chown(p, uid, gid)))
 			goto out;
-		if ((uid != -1 || gid != -1) &&
-		    !vnoperm(vp) &&
-		    (suser(p) || suid_clear)) {
+		if ((uid != -1 || gid != -1) && !vnoperm(vp)) {
 			error = VOP_GETATTR(vp, &vattr, p->p_ucred, p);
 			if (error)
 				goto out;
@@ -2583,7 +2543,7 @@ sys_fchown(struct proc *p, void *v, register_t *retval)
 				mode = VNOVAL;
 		} else
 			mode = VNOVAL;
-		VATTR_NULL(&vattr);
+		vattr_null(&vattr);
 		vattr.va_uid = uid;
 		vattr.va_gid = gid;
 		vattr.va_mode = mode;
@@ -2706,7 +2666,7 @@ dovutimens(struct proc *p, struct vnode *vp, struct timespec ts[2])
 	}
 #endif
 
-	VATTR_NULL(&vattr);
+	vattr_null(&vattr);
 
 	/*  make sure ctime is updated even if neither mtime nor atime is */
 	vattr.va_vaflags = VA_UTIMES_CHANGE;
@@ -2728,7 +2688,7 @@ dovutimens(struct proc *p, struct vnode *vp, struct timespec ts[2])
 		vattr.va_mtime = ts[1];
 
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
-	if (vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
 		error = EROFS;
 	else
 		error = VOP_SETATTR(vp, &vattr, p->p_ucred, p);
@@ -2846,7 +2806,7 @@ dotruncate(struct proc *p, struct vnode *vp, off_t len)
 			return EFBIG;
 		}
 	}
-	VATTR_NULL(&vattr);
+	vattr_null(&vattr);
 	vattr.va_size = len;
 	return VOP_SETATTR(vp, &vattr, p->p_ucred, p);
 }
@@ -2896,6 +2856,9 @@ sys_ftruncate(struct proc *p, void *v, register_t *retval)
 		return (error);
 	if ((fp->f_flag & FWRITE) == 0) {
 		error = EINVAL;
+		goto bad;
+	} else if (p->p_fd->fd_ofileflags[SCARG(uap, fd)] & UF_PLEDGEOPEN) {
+		error = EPERM;
 		goto bad;
 	}
 	vp = fp->f_data;
@@ -3094,7 +3057,7 @@ domkdirat(struct proc *p, int fd, const char *path, mode_t mode)
 		vrele(vp);
 		return (EEXIST);
 	}
-	VATTR_NULL(&vattr);
+	vattr_null(&vattr);
 	vattr.va_type = VDIR;
 	vattr.va_mode = (mode & ACCESSPERMS) &~ p->p_fd->fd_cmask;
 	error = VOP_MKDIR(nd.ni_dvp, &nd.ni_vp, &nd.ni_cnd, &vattr);

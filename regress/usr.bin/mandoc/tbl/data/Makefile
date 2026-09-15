@@ -1,8 +1,8 @@
-# $OpenBSD: Makefile,v 1.6 2022/04/26 14:46:30 schwarze Exp $
+# $OpenBSD: Makefile,v 1.8 2026/09/08 21:17:06 schwarze Exp $
 
 REGRESS_TARGETS	 = blankline block_empty block_unclosed block_width
-REGRESS_TARGETS	+= block_wrap empty escz escz_end insert
-LINT_TARGETS	 = block_unclosed empty insert
+REGRESS_TARGETS	+= block_wrap empty escz escz_end insert unclosed
+LINT_TARGETS	 = block_unclosed empty insert unclosed
 
 # groff-1.23.0 defects:
 # - When a table ends in the middle of a block,
@@ -12,5 +12,11 @@ LINT_TARGETS	 = block_unclosed empty insert
 #   aligning it to the next column.
 
 SKIP_GROFF	 = block_unclosed escz_end
+
+# groff-1.23.0 regression:
+# - When a table does not contain any cells, it causes no output,
+#   not even a line break.
+
+SKIP_GROFF	+= empty
 
 .include <bsd.regress.mk>

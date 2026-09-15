@@ -1,4 +1,4 @@
-/*	$OpenBSD: aic79xx.c,v 1.67 2022/01/09 05:42:38 jsg Exp $	*/
+/*	$OpenBSD: aic79xx.c,v 1.70 2025/07/14 23:49:08 jsg Exp $	*/
 
 /*
  * Copyright (c) 2004 Milos Urbanek, Kenneth R. Westerback & Marco Peereboom
@@ -1624,7 +1624,7 @@ ahd_handle_scsiint(struct ahd_softc *ahd, u_int intstat)
 		 * 'Selection in Progress' status bit, the busy
 		 * LED does.  SELINGO is only cleared by a successful
 		 * selection, so we must manually clear it to insure
-		 * the LED turns off just incase no future successful
+		 * the LED turns off just in case no future successful
 		 * selections occur (e.g. no devices on the bus).
 		 */
 		ahd_outb(ahd, CLRSINT0, CLRSELINGO);
@@ -2060,7 +2060,7 @@ ahd_handle_pkt_busfree(struct ahd_softc *ahd, u_int busfreetime)
 		 * SCB that encountered the failure.  Clean
 		 * up the queue, clear SELDO and LQOBUSFREE,
 		 * and allow the sequencer to restart the select
-		 * out at its lesure.
+		 * out at its leisure.
 		 */
 		ahd_set_modes(ahd, AHD_MODE_SCSI, AHD_MODE_SCSI);
 		scbid = ahd_inw(ahd, CURRSCB);
@@ -10246,7 +10246,7 @@ ahd_outw(struct ahd_softc *ahd, u_int port, u_int value)
 {
 	/*
 	 * Write low byte first to accommodate registers
-	 * such as PRGMCNT where the order maters.
+	 * such as PRGMCNT where the order matters.
 	 */
 	ahd_outb(ahd, port, value & 0xFF);
 	ahd_outb(ahd, port+1, (value >> 8) & 0xFF);

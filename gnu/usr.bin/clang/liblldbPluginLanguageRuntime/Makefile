@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.4 2021/04/28 12:55:41 patrick Exp $
+# $OpenBSD: Makefile,v 1.6 2026/05/29 11:18:31 robert Exp $
 
 LIB=	lldbPluginLanguageRuntime
 NOPIC=
@@ -7,8 +7,9 @@ NOPROFILE=
 .include <bsd.own.mk>
 
 # CPlusPlus
-SRCS+= CPPLanguageRuntime.cpp \
-	ItaniumABILanguageRuntime.cpp
+SRCS+=	CPPLanguageRuntime.cpp \
+	ItaniumABILanguageRuntime.cpp \
+	VerboseTrapFrameRecognizer.cpp
 
 # ObjC
 SRCS+=	ObjCLanguageRuntime.cpp \
@@ -21,17 +22,10 @@ SRCS+=	ObjCLanguageRuntime.cpp \
 	AppleObjCClassDescriptorV2.cpp \
 	AppleObjCTypeEncodingParser.cpp
 
-# RenderScript
-SRCS+=	RenderScriptRuntime.cpp \
-	RenderScriptExpressionOpts.cpp \
-	RenderScriptx86ABIFixups.cpp \
-	RenderScriptScriptGroup.cpp
-
 .PATH:	${.CURDIR}/../../../llvm/lldb/source/Plugins/LanguageRuntime/CPlusPlus
 .PATH:	${.CURDIR}/../../../llvm/lldb/source/Plugins/LanguageRuntime/CPlusPlus/ItaniumABI
 .PATH:	${.CURDIR}/../../../llvm/lldb/source/Plugins/LanguageRuntime/ObjC
 .PATH:	${.CURDIR}/../../../llvm/lldb/source/Plugins/LanguageRuntime/ObjC/AppleObjCRuntime
-.PATH:	${.CURDIR}/../../../llvm/lldb/source/Plugins/LanguageRuntime/RenderScript/RenderScriptRuntime
 
 install:
 	@# Nothing here so far ...

@@ -1,4 +1,4 @@
-/* $OpenBSD: dwiic_pci.c,v 1.27 2024/05/24 06:02:53 jsg Exp $ */
+/* $OpenBSD: dwiic_pci.c,v 1.36 2026/08/14 03:36:11 jsg Exp $ */
 /*
  * Synopsys DesignWare I2C controller
  * PCI attachment
@@ -24,19 +24,9 @@
 #include <dev/pci/pcidevs.h>
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
+#include <dev/pci/lpssreg.h>
 
 #include <dev/ic/dwiicvar.h>
-
-/* 13.3: I2C Additional Registers Summary */
-#define LPSS_RESETS		0x204
-#define  LPSS_RESETS_I2C	(1 << 0) | (1 << 1)
-#define  LPSS_RESETS_IDMA	(1 << 2)
-#define LPSS_ACTIVELTR		0x210
-#define LPSS_IDLELTR		0x214
-#define LPSS_CAPS		0x2fc
-#define  LPSS_CAPS_NO_IDMA	(1 << 8)
-#define  LPSS_CAPS_TYPE_SHIFT	4
-#define  LPSS_CAPS_TYPE_MASK	(0xf << LPSS_CAPS_TYPE_SHIFT)
 
 int		dwiic_pci_match(struct device *, void *, void *);
 void		dwiic_pci_attach(struct device *, struct device *, void *);
@@ -135,6 +125,12 @@ const struct pci_matchid dwiic_pci_ids[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_700SERIES_I2C_3 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_700SERIES_I2C_4 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_700SERIES_I2C_5 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_I2C_0 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_I2C_1 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_I2C_2 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_I2C_3 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_I2C_4 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_800SERIES_I2C_5 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_APOLLOLAKE_I2C_1 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_APOLLOLAKE_I2C_2 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_APOLLOLAKE_I2C_3 },
@@ -179,6 +175,36 @@ const struct pci_matchid dwiic_pci_ids[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_MTL_I2C_3 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_MTL_I2C_4 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_MTL_I2C_5 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_I2C_0 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_I2C_1 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_I2C_2 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_I2C_3 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_I2C_4 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_LNL_I2C_5 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_I2C_0 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_I2C_1 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_I2C_2 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_I2C_3 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_I2C_4 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_ARL_U_I2C_5 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_I2C_0 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_I2C_1 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_I2C_2 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_I2C_3 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_I2C_4 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_I2C_5 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_I2C_0 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_I2C_1 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_I2C_2 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_I2C_3 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_I2C_4 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PTL_H_I2C_5 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WCL_I2C_0 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WCL_I2C_1 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WCL_I2C_2 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WCL_I2C_3 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WCL_I2C_4 },
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WCL_I2C_5 },
 };
 
 int
@@ -220,7 +246,7 @@ dwiic_pci_attach(struct device *parent, struct device *self, void *aux)
 
 	/* un-reset - page 958 */
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, LPSS_RESETS,
-	    (LPSS_RESETS_I2C | LPSS_RESETS_IDMA));
+	    (LPSS_RESETS_FUNC | LPSS_RESETS_IDMA));
 
 #if NACPI > 0
 	/* fetch timing parameters from ACPI, if possible */
@@ -293,15 +319,14 @@ dwiic_pci_activate(struct device *self, int act)
 	struct dwiic_softc *sc = (struct dwiic_softc *)self;
 
 	switch (act) {
-	case DVACT_WAKEUP:
+	case DVACT_RESUME:
+		DELAY(10000);	/* 10 msec */
 		bus_space_write_4(sc->sc_iot, sc->sc_ioh, LPSS_RESETS,
-		    (LPSS_RESETS_I2C | LPSS_RESETS_IDMA));
+		    (LPSS_RESETS_FUNC | LPSS_RESETS_IDMA));
+		DELAY(10000);	/* 10 msec */
 		break;
 	}
-
-	dwiic_activate(self, act);
-
-	return 0;
+	return dwiic_activate(self, act);
 }
 
 void

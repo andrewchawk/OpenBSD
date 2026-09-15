@@ -1,4 +1,4 @@
-/* $OpenBSD: evp.h,v 1.135 2024/07/09 16:15:37 tb Exp $ */
+/* $OpenBSD: evp.h,v 1.138 2025/07/02 06:36:52 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -595,9 +595,6 @@ const EVP_MD *EVP_sm3(void);
 #ifndef OPENSSL_NO_RIPEMD
 const EVP_MD *EVP_ripemd160(void);
 #endif
-#ifndef OPENSSL_NO_WHIRLPOOL
-const EVP_MD *EVP_whirlpool(void);
-#endif
 const EVP_CIPHER *EVP_enc_null(void);		/* does nothing :-) */
 #ifndef OPENSSL_NO_DES
 const EVP_CIPHER *EVP_des_ecb(void);
@@ -781,28 +778,24 @@ void *EVP_PKEY_get0(const EVP_PKEY *pkey);
 const unsigned char *EVP_PKEY_get0_hmac(const EVP_PKEY *pkey, size_t *len);
 
 #ifndef OPENSSL_NO_RSA
-struct rsa_st;
-struct rsa_st *EVP_PKEY_get0_RSA(EVP_PKEY *pkey);
-struct rsa_st *EVP_PKEY_get1_RSA(EVP_PKEY *pkey);
-int EVP_PKEY_set1_RSA(EVP_PKEY *pkey, struct rsa_st *key);
+RSA *EVP_PKEY_get0_RSA(const EVP_PKEY *pkey);
+RSA *EVP_PKEY_get1_RSA(const EVP_PKEY *pkey);
+int EVP_PKEY_set1_RSA(EVP_PKEY *pkey, RSA *key);
 #endif
 #ifndef OPENSSL_NO_DSA
-struct dsa_st;
-struct dsa_st *EVP_PKEY_get0_DSA(EVP_PKEY *pkey);
-struct dsa_st *EVP_PKEY_get1_DSA(EVP_PKEY *pkey);
-int EVP_PKEY_set1_DSA(EVP_PKEY *pkey, struct dsa_st *key);
+DSA *EVP_PKEY_get0_DSA(const EVP_PKEY *pkey);
+DSA *EVP_PKEY_get1_DSA(const EVP_PKEY *pkey);
+int EVP_PKEY_set1_DSA(EVP_PKEY *pkey, DSA *key);
 #endif
 #ifndef OPENSSL_NO_DH
-struct dh_st;
-struct dh_st *EVP_PKEY_get0_DH(EVP_PKEY *pkey);
-struct dh_st *EVP_PKEY_get1_DH(EVP_PKEY *pkey);
-int EVP_PKEY_set1_DH(EVP_PKEY *pkey, struct dh_st *key);
+DH *EVP_PKEY_get0_DH(const EVP_PKEY *pkey);
+DH *EVP_PKEY_get1_DH(const EVP_PKEY *pkey);
+int EVP_PKEY_set1_DH(EVP_PKEY *pkey, DH *key);
 #endif
 #ifndef OPENSSL_NO_EC
-struct ec_key_st;
-struct ec_key_st *EVP_PKEY_get0_EC_KEY(EVP_PKEY *pkey);
-struct ec_key_st *EVP_PKEY_get1_EC_KEY(EVP_PKEY *pkey);
-int EVP_PKEY_set1_EC_KEY(EVP_PKEY *pkey, struct ec_key_st *key);
+EC_KEY *EVP_PKEY_get0_EC_KEY(const EVP_PKEY *pkey);
+EC_KEY *EVP_PKEY_get1_EC_KEY(const EVP_PKEY *pkey);
+int EVP_PKEY_set1_EC_KEY(EVP_PKEY *pkey, EC_KEY *key);
 #endif
 
 EVP_PKEY *EVP_PKEY_new(void);
@@ -985,9 +978,6 @@ int EVP_PKEY_paramgen_init(EVP_PKEY_CTX *ctx);
 int EVP_PKEY_paramgen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey);
 int EVP_PKEY_keygen_init(EVP_PKEY_CTX *ctx);
 int EVP_PKEY_keygen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey);
-int EVP_PKEY_check(EVP_PKEY_CTX *ctx);
-int EVP_PKEY_public_check(EVP_PKEY_CTX *ctx);
-int EVP_PKEY_param_check(EVP_PKEY_CTX *ctx);
 
 void EVP_PKEY_CTX_set_cb(EVP_PKEY_CTX *ctx, EVP_PKEY_gen_cb *cb);
 EVP_PKEY_gen_cb *EVP_PKEY_CTX_get_cb(EVP_PKEY_CTX *ctx);

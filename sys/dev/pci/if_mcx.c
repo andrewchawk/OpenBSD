@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_mcx.c,v 1.115 2024/05/24 06:02:53 jsg Exp $ */
+/*	$OpenBSD: if_mcx.c,v 1.123 2026/07/03 03:28:23 jmatthew Exp $ */
 
 /*
  * Copyright (c) 2017 David Gwynne <dlg@openbsd.org>
@@ -90,8 +90,6 @@ enum mcx_cmdq_slot {
 #define MCX_LOG_RQ_SIZE			10
 #define MCX_LOG_SQ_SIZE			11
 
-#define MCX_MAX_QUEUES			16
-
 /* completion event moderation - about 10khz, or 90% of the cq */
 #define MCX_CQ_MOD_PERIOD		50
 #define MCX_CQ_MOD_COUNTER		\
@@ -121,8 +119,8 @@ CTASSERT(ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN == MCX_SQ_INLINE_SIZE);
 #define MCX_WQ_DOORBELL_BASE		MCX_PAGE_SIZE/2
 #define MCX_WQ_DOORBELL_STRIDE		64
 /* make sure the doorbells fit */
-CTASSERT(MCX_MAX_QUEUES * MCX_CQ_DOORBELL_STRIDE < MCX_WQ_DOORBELL_BASE);
-CTASSERT(MCX_MAX_QUEUES * MCX_WQ_DOORBELL_STRIDE <
+CTASSERT(IF_MAX_VECTORS * MCX_CQ_DOORBELL_STRIDE < MCX_WQ_DOORBELL_BASE);
+CTASSERT(IF_MAX_VECTORS * MCX_WQ_DOORBELL_STRIDE <
     MCX_DOORBELL_AREA_SIZE - MCX_WQ_DOORBELL_BASE);
 
 #define MCX_WQ_DOORBELL_MASK		0xffff
@@ -918,7 +916,6 @@ struct mcx_cap_device {
 					0x08000000
 #define MCX_CAP_DEVICE_DC_CONNECT_CP	0x00040000
 #define MCX_CAP_DEVICE_DC_CNAK_DRACE	0x00020000
-#define MCX_CAP_DEVICE_DRAIN_SIGERR	0x00010000
 #define MCX_CAP_DEVICE_DRAIN_SIGERR	0x00010000
 #define MCX_CAP_DEVICE_CMDIF_CHECKSUM	0x0000c000
 #define MCX_CAP_DEVICE_SIGERR_QCE	0x00002000
@@ -2318,6 +2315,9 @@ struct mcx_rx {
 struct mcx_tx {
 	struct mcx_softc	*tx_softc;
 	struct ifqueue		*tx_ifq;
+#if NBPFILTER > 0
+	caddr_t			*tx_bpfp;
+#endif
 
 	int			 tx_uar;
 	int			 tx_sqn;
@@ -2340,6 +2340,9 @@ struct mcx_queues {
 	struct mcx_tx		 q_tx;
 	struct mcx_cq		 q_cq;
 	struct mcx_eq		 q_eq;
+#if NBPFILTER > 0
+	caddr_t			 q_bpf;
+#endif
 #if NKSTAT > 0
 	struct kstat		*q_kstat;
 #endif
@@ -2477,6 +2480,7 @@ struct mcx_softc {
 
 	struct mcx_dmamem	 sc_doorbell_mem;
 
+	int			 sc_max_eqs;
 	struct mcx_eq		 sc_admin_eq;
 	struct mcx_eq		 sc_queue_eq;
 
@@ -2927,27 +2931,29 @@ mcx_attach(struct device *parent, struct device *self, void *aux)
 		goto teardown;
 	}
 
-	printf(", %s, address %s\n", intrstr,
-	    ether_sprintf(sc->sc_ac.ac_enaddr));
-
 	msix--; /* admin ops took one */
-	sc->sc_intrmap = intrmap_create(&sc->sc_dev, msix, MCX_MAX_QUEUES,
-	    INTRMAP_POWEROF2);
+	sc->sc_intrmap = intrmap_create(&sc->sc_dev, msix,
+	    MIN(sc->sc_max_eqs, IF_MAX_VECTORS), INTRMAP_POWEROF2);
 	if (sc->sc_intrmap == NULL) {
-		printf("%s: unable to create interrupt map\n", DEVNAME(sc));
+		printf(": unable to create interrupt map\n");
 		goto teardown;
 	}
 	sc->sc_queues = mallocarray(intrmap_count(sc->sc_intrmap),
 	    sizeof(*sc->sc_queues), M_DEVBUF, M_WAITOK|M_ZERO);
 	if (sc->sc_queues == NULL) {
-		printf("%s: unable to create queues\n", DEVNAME(sc));
+		printf(": unable to create queues\n");
 		goto intrunmap;
 	}
+
+	printf(", %s, %d queue%s, address %s\n", intrstr,
+	    intrmap_count(sc->sc_intrmap),
+	    intrmap_count(sc->sc_intrmap) > 1 ? "s" : "",
+	    ether_sprintf(sc->sc_ac.ac_enaddr));
 
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX;
-	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_xflags = IFXF_MPSAFE | IFXF_MBUF_64BIT;
 	ifp->if_ioctl = mcx_ioctl;
 	ifp->if_qstart = mcx_start;
 	ifp->if_watchdog = mcx_watchdog;
@@ -3020,6 +3026,14 @@ mcx_attach(struct device *parent, struct device *self, void *aux)
 			    DEVNAME(sc), i);
 			goto intrdisestablish;
 		}
+
+#if NBPFILTER > 0
+		bpfxattach(&q->q_bpf, q->q_name,
+		    ifp, DLT_EN10MB, ETHER_HDR_LEN);
+
+		ifiq->ifiq_bpfp = &q->q_bpf;
+		tx->tx_bpfp = &q->q_bpf;
+#endif
 	}
 
 	timeout_set(&sc->sc_calibrate, mcx_calibrate, sc);
@@ -4030,6 +4044,8 @@ mcx_hca_max_caps(struct mcx_softc *sc)
 
 	sc->sc_mhz = bemtoh32(&hca->device_frequency_mhz);
 	sc->sc_khz = bemtoh32(&hca->device_frequency_khz);
+
+	sc->sc_max_eqs = 1 << (hca->log_max_eq & MCX_CAP_DEVICE_LOG_MAX_EQ);
 
 free:
 	mcx_dmamem_free(sc, &mxm);
@@ -7288,7 +7304,7 @@ mcx_up(struct mcx_softc *sc)
 	struct mcx_flow_match match_crit;
 	struct mcx_rss_rule *rss;
 	uint32_t dest;
-	int rqns[MCX_MAX_QUEUES];
+	int rqns[IF_MAX_VECTORS];
 
 	if (mcx_create_tis(sc, &sc->sc_tis) != 0)
 		goto down;
@@ -7807,6 +7823,9 @@ mcx_start(struct ifqueue *ifq)
 	uint32_t csum;
 	size_t bf_base;
 	int i, seg, nseg;
+#if NBPFILTER > 0
+	caddr_t if_bpf;
+#endif
 
 	bf_base = (tx->tx_uar * MCX_PAGE_SIZE) + MCX_UAR_BF;
 
@@ -7879,10 +7898,19 @@ mcx_start(struct ifqueue *ifq)
 		bf = (uint64_t *)sqe;
 
 #if NBPFILTER > 0
-		if (ifp->if_bpf)
-			bpf_mtap_hdr(ifp->if_bpf,
+		if_bpf = *tx->tx_bpfp;
+		if (if_bpf) {
+			bpf_mtap_hdr(if_bpf,
 			    (caddr_t)sqe->sqe_inline_headers,
 			    MCX_SQ_INLINE_SIZE, m, BPF_DIRECTION_OUT);
+		}
+
+		if_bpf = ifp->if_bpf;
+		if (if_bpf) {
+			bpf_mtap_hdr(if_bpf,
+			    (caddr_t)sqe->sqe_inline_headers,
+			    MCX_SQ_INLINE_SIZE, m, BPF_DIRECTION_OUT);
+		}
 #endif
 		map = ms->ms_map;
 		bus_dmamap_sync(sc->sc_dmat, map, 0, map->dm_mapsize,
@@ -8277,7 +8305,7 @@ mcx_dmamem_alloc(struct mcx_softc *sc, struct mcx_dmamem *mxm,
 		return (1);
 	if (bus_dmamem_alloc(sc->sc_dmat, mxm->mxm_size,
 	    align, 0, &mxm->mxm_seg, 1, &mxm->mxm_nsegs,
-	    BUS_DMA_WAITOK | BUS_DMA_ZERO) != 0)
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_64BIT) != 0)
 		goto destroy;
 	if (bus_dmamem_map(sc->sc_dmat, &mxm->mxm_seg, mxm->mxm_nsegs,
 	    mxm->mxm_size, &mxm->mxm_kva, BUS_DMA_WAITOK) != 0)
@@ -8325,7 +8353,8 @@ mcx_hwmem_alloc(struct mcx_softc *sc, struct mcx_hwmem *mhm, unsigned int pages)
 	seglen = sizeof(*segs) * pages;
 
 	if (bus_dmamem_alloc(sc->sc_dmat, len, MCX_PAGE_SIZE, 0,
-	    segs, pages, &mhm->mhm_seg_count, BUS_DMA_NOWAIT) != 0)
+	    segs, pages, &mhm->mhm_seg_count,
+            BUS_DMA_NOWAIT|BUS_DMA_64BIT) != 0)
 		goto free_segs;
 
 	if (mhm->mhm_seg_count < pages) {
@@ -8348,7 +8377,7 @@ mcx_hwmem_alloc(struct mcx_softc *sc, struct mcx_hwmem *mhm, unsigned int pages)
 		mhm->mhm_segs = segs;
 
 	if (bus_dmamap_create(sc->sc_dmat, len, pages, MCX_PAGE_SIZE,
-	    MCX_PAGE_SIZE, BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW /*|BUS_DMA_64BIT*/,
+	    MCX_PAGE_SIZE, BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW|BUS_DMA_64BIT,
 	    &mhm->mhm_map) != 0)
 		goto free_dmamem;
 
@@ -8800,6 +8829,7 @@ mcx_kstat_attach_queues(struct mcx_softc *sc)
 		ks->ks_data = kvs;
 		ks->ks_datalen = nitems(mcx_queue_kstat_tpl) * sizeof(*kvs);
 		ks->ks_read = mcx_kstat_queue_read;
+		kstat_set_wlock(ks, &sc->sc_cmdq_kstat_lk);
 
 		sc->sc_queues[q].q_kstat = ks;
 		kstat_install(ks);

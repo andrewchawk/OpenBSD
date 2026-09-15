@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.3 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.5 2026/05/29 11:18:30 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -7,16 +7,24 @@ LLVM_SRCS=	${.CURDIR}/../../../../../llvm/llvm
 HDRS=	RISCVGenAsmMatcher.inc \
 	RISCVGenAsmWriter.inc \
 	RISCVGenCompressInstEmitter.inc \
+	RISCVGenMacroFusion.inc \
 	RISCVGenDAGISel.inc \
 	RISCVGenDisassemblerTables.inc \
-	RISCVGenGlobalISel.inc \
 	RISCVGenInstrInfo.inc \
 	RISCVGenMCCodeEmitter.inc \
 	RISCVGenMCPseudoLowering.inc \
 	RISCVGenRegisterBank.inc \
 	RISCVGenRegisterInfo.inc \
 	RISCVGenSearchableTables.inc \
-	RISCVGenSubtargetInfo.inc
+	RISCVGenSubtargetInfo.inc \
+	RISCVGenExegesis.inc \
+	RISCVGenSDNodeInfo.inc
+
+# GISel
+HDRS+=	RISCVGenGlobalISel.inc \
+	RISCVGenO0PreLegalizeGICombiner.inc \
+	RISCVGenPreLegalizeGICombiner.inc \
+	RISCVGenPostLegalizeGICombiner.inc
 
 all: ${HDRS}
 
@@ -33,6 +41,7 @@ RISCVGenRegisterInfo.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 
 RISCVGenDisassemblerTables.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-disassembler \
+		--specialize-decoders-per-bitwidth \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
 		-o ${.TARGET} ${.ALLSRC}
 
@@ -66,6 +75,11 @@ RISCVGenCompressInstEmitter.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
 		-o ${.TARGET} ${.ALLSRC}
 
+RISCVGenMacroFusion.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-macro-fusion-pred \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
 RISCVGenSubtargetInfo.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-subtarget \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
@@ -91,11 +105,6 @@ RISCVGenRegisterBank.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
 		-o ${.TARGET} ${.ALLSRC}
 
-RISCVGenGlobalISel.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
-	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-global-isel \
-		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
-		-o ${.TARGET} ${.ALLSRC}
-
 RISCVGenCompressInstEmitter.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen --gen-compress-inst-emitter \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
@@ -106,5 +115,40 @@ RISCVGenGICombiner.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
 		-combiners="RISCVPreLegalizerCombinerHelper" \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
 		-o ${.TARGET} ${.ALLSRC}
+
+RISCVGenExegesis.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-exegesis \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
+RISCVGenSDNodeInfo.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCV.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-sd-node-info \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
+# GISel
+RISCVGenGlobalISel.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCVGISel.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-global-isel \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
+RISCVGenO0PreLegalizeGICombiner.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCVGISel.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-global-isel-combiner \
+		-combiners="RISCVO0PreLegalizerCombiner" \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
+RISCVGenPreLegalizeGICombiner.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCVGISel.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-global-isel-combiner \
+		-combiners="RISCVPreLegalizerCombiner" \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
+RISCVGenPostLegalizeGICombiner.inc: ${LLVM_SRCS}/lib/Target/RISCV/RISCVGISel.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-global-isel-combiner \
+		-combiners="RISCVPostLegalizerCombiner" \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/RISCV \
+		-o ${.TARGET} ${.ALLSRC}
+
 
 .include <bsd.obj.mk>

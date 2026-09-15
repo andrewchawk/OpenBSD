@@ -1,10 +1,9 @@
 #!/usr/bin/perl
 
-use v5;
-use strict;
+use v5.14;
 use warnings;
 
-use Test::More;
+use Test2::V0;
 
 use IO::Socket::IP;
 use Socket qw( inet_pton inet_ntop pack_sockaddr_in6 unpack_sockaddr_in6 IN6ADDR_LOOPBACK );
@@ -54,7 +53,7 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
    );
 
    ok( defined $socket, "IO::Socket::IP->new constructs a $socktype socket" ) or
-      diag( "  error was $@" );
+      diag( "  error was $IO::Socket::errstr" );
 
    is( $socket->sockdomain, $AF_INET6,         "\$socket->sockdomain for $socktype" );
    is( $socket->socktype,   Socket->$socktype, "\$socket->socktype for $socktype" );
@@ -67,13 +66,13 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
 
    ok( $socket->connected, "\$socket is connected for $socktype" );
 
-   is_deeply( [ unpack_sockaddr_in6_addrport( $socket->sockname ) ],
-              [ unpack_sockaddr_in6_addrport( $testclient->peername ) ],
-              "\$socket->sockname for $socktype" );
+   is( [ unpack_sockaddr_in6_addrport( $socket->sockname ) ],
+       [ unpack_sockaddr_in6_addrport( $testclient->peername ) ],
+       "\$socket->sockname for $socktype" );
 
-   is_deeply( [ unpack_sockaddr_in6_addrport( $socket->peername ) ],
-              [ unpack_sockaddr_in6_addrport( $testclient->sockname ) ],
-              "\$socket->peername for $socktype" );
+   is( [ unpack_sockaddr_in6_addrport( $socket->peername ) ],
+       [ unpack_sockaddr_in6_addrport( $testclient->sockname ) ],
+       "\$socket->peername for $socktype" );
 
    is( $socket->peerhost, $IN6ADDR_LOOPBACK_HOST, "\$socket->peerhost for $socktype" );
    is( $socket->peerport, $testport,              "\$socket->peerport for $socktype" );

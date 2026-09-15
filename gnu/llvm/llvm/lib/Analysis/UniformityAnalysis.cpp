@@ -1,4 +1,4 @@
-//===- ConvergenceUtils.cpp -----------------------------------------------===//
+//===- UniformityAnalysis.cpp ---------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,7 +10,6 @@
 #include "llvm/ADT/GenericUniformityImpl.h"
 #include "llvm/Analysis/CycleAnalysis.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
-#include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -26,23 +25,28 @@ bool llvm::GenericUniformityAnalysisImpl<SSAContext>::hasDivergentDefs(
 
 template <>
 bool llvm::GenericUniformityAnalysisImpl<SSAContext>::markDefsDivergent(
-    const Instruction &Instr, bool AllDefsDivergent) {
-  return markDivergent(&Instr);
+    const Instruction &Instr) {
+  return markDivergent(cast<Value>(&Instr));
 }
 
 template <> void llvm::GenericUniformityAnalysisImpl<SSAContext>::initialize() {
   for (auto &I : instructions(F)) {
-    if (TTI->isSourceOfDivergence(&I)) {
-      assert(!I.isTerminator());
-      markDivergent(I);
-    } else if (TTI->isAlwaysUniform(&I)) {
+    InstructionUniformity IU = TTI->getInstructionUniformity(&I);
+    switch (IU) {
+    case InstructionUniformity::AlwaysUniform:
       addUniformOverride(I);
+      continue;
+    case InstructionUniformity::NeverUniform:
+      markDivergent(I);
+      continue;
+    case InstructionUniformity::Default:
+      break;
     }
   }
   for (auto &Arg : F.args()) {
-    if (TTI->isSourceOfDivergence(&Arg)) {
+    if (TTI->getInstructionUniformity(&Arg) ==
+        InstructionUniformity::NeverUniform)
       markDivergent(&Arg);
-    }
   }
 }
 
@@ -50,13 +54,8 @@ template <>
 void llvm::GenericUniformityAnalysisImpl<SSAContext>::pushUsers(
     const Value *V) {
   for (const auto *User : V->users()) {
-    const auto *UserInstr = dyn_cast<const Instruction>(User);
-    if (!UserInstr)
-      continue;
-    if (isAlwaysUniform(*UserInstr))
-      continue;
-    if (markDivergent(*UserInstr)) {
-      Worklist.push_back(UserInstr);
+    if (const auto *UserInstr = dyn_cast<const Instruction>(User)) {
+      markDivergent(*UserInstr);
     }
   }
 }
@@ -73,13 +72,38 @@ void llvm::GenericUniformityAnalysisImpl<SSAContext>::pushUsers(
 template <>
 bool llvm::GenericUniformityAnalysisImpl<SSAContext>::usesValueFromCycle(
     const Instruction &I, const Cycle &DefCycle) const {
-  if (isAlwaysUniform(I))
-    return false;
+  assert(!isAlwaysUniform(I));
   for (const Use &U : I.operands()) {
     if (auto *I = dyn_cast<Instruction>(&U)) {
       if (DefCycle.contains(I->getParent()))
         return true;
     }
+  }
+  return false;
+}
+
+template <>
+void llvm::GenericUniformityAnalysisImpl<
+    SSAContext>::propagateTemporalDivergence(const Instruction &I,
+                                             const Cycle &DefCycle) {
+  for (auto *User : I.users()) {
+    auto *UserInstr = cast<Instruction>(User);
+    if (DefCycle.contains(UserInstr->getParent()))
+      continue;
+    markDivergent(*UserInstr);
+    recordTemporalDivergence(&I, UserInstr, &DefCycle);
+  }
+}
+
+template <>
+bool llvm::GenericUniformityAnalysisImpl<SSAContext>::isDivergentUse(
+    const Use &U) const {
+  const auto *V = U.get();
+  if (isDivergent(V))
+    return true;
+  if (const auto *DefInstr = dyn_cast<Instruction>(V)) {
+    const auto *UseInstr = cast<Instruction>(U.getUser());
+    return isTemporalDivergent(*UseInstr->getParent(), *DefInstr);
   }
   return false;
 }
@@ -99,7 +123,12 @@ llvm::UniformityInfo UniformityInfoAnalysis::run(Function &F,
   auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
   auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
   auto &CI = FAM.getResult<CycleAnalysis>(F);
-  return UniformityInfo{F, DT, CI, &TTI};
+  UniformityInfo UI{DT, CI, &TTI};
+  // Skip computation if we can assume everything is uniform.
+  if (TTI.hasBranchDivergence(&F))
+    UI.compute();
+
+  return UI;
 }
 
 AnalysisKey UniformityInfoAnalysis::Key;
@@ -121,21 +150,20 @@ PreservedAnalyses UniformityInfoPrinterPass::run(Function &F,
 
 char UniformityInfoWrapperPass::ID = 0;
 
-UniformityInfoWrapperPass::UniformityInfoWrapperPass() : FunctionPass(ID) {
-  initializeUniformityInfoWrapperPassPass(*PassRegistry::getPassRegistry());
-}
+UniformityInfoWrapperPass::UniformityInfoWrapperPass() : FunctionPass(ID) {}
 
-INITIALIZE_PASS_BEGIN(UniformityInfoWrapperPass, "uniforminfo",
-                      "Uniform Info Analysis", true, true)
+INITIALIZE_PASS_BEGIN(UniformityInfoWrapperPass, "uniformity",
+                      "Uniformity Analysis", false, true)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(CycleInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
-INITIALIZE_PASS_END(UniformityInfoWrapperPass, "uniforminfo",
-                    "Uniform Info Analysis", true, true)
+INITIALIZE_PASS_END(UniformityInfoWrapperPass, "uniformity",
+                    "Uniformity Analysis", false, true)
 
 void UniformityInfoWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
   AU.addRequired<DominatorTreeWrapperPass>();
-  AU.addRequired<CycleInfoWrapperPass>();
+  AU.addRequiredTransitive<CycleInfoWrapperPass>();
   AU.addRequired<TargetTransformInfoWrapperPass>();
 }
 
@@ -146,13 +174,18 @@ bool UniformityInfoWrapperPass::runOnFunction(Function &F) {
       getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
 
   m_function = &F;
-  m_uniformityInfo =
-      UniformityInfo{F, domTree, cycleInfo, &targetTransformInfo};
+  m_uniformityInfo = UniformityInfo{domTree, cycleInfo, &targetTransformInfo};
+
+  // Skip computation if we can assume everything is uniform.
+  if (targetTransformInfo.hasBranchDivergence(m_function))
+    m_uniformityInfo.compute();
+
   return false;
 }
 
 void UniformityInfoWrapperPass::print(raw_ostream &OS, const Module *) const {
   OS << "UniformityInfo for function '" << m_function->getName() << "':\n";
+  m_uniformityInfo.print(OS);
 }
 
 void UniformityInfoWrapperPass::releaseMemory() {

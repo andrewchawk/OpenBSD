@@ -1,4 +1,4 @@
-/* $OpenBSD: cpu.h,v 1.50 2024/07/24 21:24:18 kettenis Exp $ */
+/* $OpenBSD: cpu.h,v 1.57 2026/09/06 20:02:12 kettenis Exp $ */
 /*
  * Copyright (c) 2016 Dale Rahn <drahn@dalerahn.com>
  *
@@ -37,7 +37,8 @@
 #define	CPU_ID_AA64SMFR0       10
 #define	CPU_ID_AA64ZFR0	       11
 #define	CPU_LIDACTION          12
-#define	CPU_MAXID	       13	/* number of valid machdep ids */
+#define	CPU_LED_BLINK	       13	/* int: blink leds? */
+#define	CPU_MAXID	       14	/* number of valid machdep ids */
 
 #define	CTL_MACHDEP_NAMES { \
 	{ 0, 0 }, \
@@ -53,6 +54,7 @@
 	{ "id_aa64smfr0", CTLTYPE_QUAD }, \
 	{ "id_aa64zfr0", CTLTYPE_QUAD }, \
 	{ "lidaction", CTLTYPE_INT }, \
+	{ "led_blink", CTLTYPE_INT }, \
 }
 
 #ifdef _KERNEL
@@ -69,6 +71,7 @@ extern uint64_t cpu_id_aa64mmfr1;
 extern uint64_t cpu_id_aa64mmfr2;
 extern uint64_t cpu_id_aa64pfr0;
 extern uint64_t cpu_id_aa64pfr1;
+extern uint64_t cpu_id_aa64zfr0;
 
 void cpu_identify_cleanup(void);
 
@@ -111,6 +114,7 @@ void cpu_identify_cleanup(void);
 #include <sys/sched.h>
 #include <sys/srp.h>
 #include <uvm/uvm_percpu.h>
+#include <sys/xcall.h>
 
 struct cpu_info {
 	struct device		*ci_dev; /* Device corresponding to this CPU */
@@ -125,6 +129,7 @@ struct cpu_info {
 	struct cpu_info		*ci_self;
 
 #define __HAVE_CPU_TOPOLOGY
+	u_int32_t		ci_cputype;
 	u_int32_t		ci_smt_id;
 	u_int32_t		ci_core_id;
 	u_int32_t		ci_pkg_id;
@@ -161,11 +166,14 @@ struct cpu_info {
 	volatile int		ci_opp_max;
 	uint32_t		ci_cpu_supply;
 
+	uint64_t		ci_capacity;
+
 	u_long			ci_prev_sleep;
 	u_long			ci_last_itime;
 
 #ifdef MULTIPROCESSOR
 	struct srp_hazard	ci_srp_hazards[SRP_HAZARD_NUM];
+	struct xcall_cpu	ci_xcall;
 #define __HAVE_UVM_PERCPU
 	struct uvm_pmr_cache	ci_uvm;
 	volatile int		ci_flags;
@@ -194,6 +202,8 @@ struct cpu_info {
 #define CPUF_PRESENT		(1<<4)
 #define CPUF_GO			(1<<5)
 #define CPUF_RUNNING		(1<<6)
+#define CPUF_PARK		(1<<7)
+#define CPUF_PARKED		(1<<8)
 
 static inline struct cpu_info *
 curcpu(void)
@@ -338,6 +348,7 @@ intr_restore(u_long daif)
 	restore_daif(daif);
 }
 
+void	cpu_classify(void);
 void	cpu_halt(void);
 int	cpu_suspend_primary(void);
 void	cpu_resume_secondary(struct cpu_info *);
@@ -349,6 +360,14 @@ void	cpu_wfi(void);
 
 void	delay (unsigned);
 #define	DELAY(x)	delay(x)
+
+struct blink_led {
+	void (*bl_func)(void *, int);
+	void *bl_arg;
+	SLIST_ENTRY(blink_led) bl_next;
+};
+
+void blink_led_register(struct blink_led *);
 
 #endif /* _KERNEL */
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: efiboot.c,v 1.42 2024/04/25 18:31:49 kn Exp $	*/
+/*	$OpenBSD: efiboot.c,v 1.44 2025/09/16 05:07:33 yasuoka Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -40,6 +40,8 @@
 
 #define	KERN_LOADSPACE_SIZE	(64 * 1024 * 1024)
 
+#define EFI_OS_INDICATIONS_BOOT_TO_FW_UI	1ULL
+
 EFI_SYSTEM_TABLE	*ST;
 EFI_BOOT_SERVICES	*BS;
 EFI_RUNTIME_SERVICES	*RS;
@@ -58,6 +60,7 @@ int	 efi_device_path_depth(EFI_DEVICE_PATH *dp, int);
 int	 efi_device_path_ncmp(EFI_DEVICE_PATH *, EFI_DEVICE_PATH *, int);
 static void	 efi_heap_init(void);
 static int	 efi_memprobe_internal(void);
+static int	 efi_update_bios_memmap(void);
 static void	 efi_video_init(void);
 static void	 efi_video_reset(void);
 static EFI_STATUS
@@ -281,6 +284,7 @@ efi_device_path_ncmp(EFI_DEVICE_PATH *dpa, EFI_DEVICE_PATH *dpb, int deptn)
  ***********************************************************************/
 bios_memmap_t		 bios_memmap[128];
 bios_efiinfo_t		 bios_efiinfo;
+int			 bios_memmap_modified = 0;
 
 static void
 efi_heap_init(void)
@@ -333,13 +337,7 @@ efi_memprobe_internal(void)
 	EFI_STATUS		 status;
 	UINTN			 mapkey, mmsiz, siz;
 	UINT32			 mmver;
-	EFI_MEMORY_DESCRIPTOR	*mm0, *mm;
-	int			 i, n;
-	bios_memmap_t		*bm, bm0;
-	int			 error = 0;
-
-	cnvmem = extmem = 0;
-	bios_memmap[0].type = BIOS_MAP_END;
+	EFI_MEMORY_DESCRIPTOR	*mm;
 
 	if (bios_efiinfo.mmap_start != 0)
 		free((void *)bios_efiinfo.mmap_start, bios_efiinfo.mmap_size);
@@ -348,14 +346,37 @@ efi_memprobe_internal(void)
 	status = BS->GetMemoryMap(&siz, NULL, &mapkey, &mmsiz, &mmver);
 	if (status != EFI_BUFFER_TOO_SMALL)
 		panic("cannot get the size of memory map");
-	mm0 = alloc(siz);
-	status = BS->GetMemoryMap(&siz, mm0, &mapkey, &mmsiz, &mmver);
+	mm = alloc(siz);
+	status = BS->GetMemoryMap(&siz, mm, &mapkey, &mmsiz, &mmver);
 	if (status != EFI_SUCCESS)
 		panic("cannot get the memory map");
-	n = siz / mmsiz;
+
 	mmap_key = mapkey;
 
-	for (i = 0, mm = mm0; i < n; i++, mm = NextMemoryDescriptor(mm, mmsiz)){
+	bios_efiinfo.mmap_desc_ver = mmver;
+	bios_efiinfo.mmap_desc_size = mmsiz;
+	bios_efiinfo.mmap_size = siz;
+	bios_efiinfo.mmap_start = (uintptr_t)mm;
+
+	if (bios_memmap_modified)
+		return (0);
+
+	return (efi_update_bios_memmap());
+}
+
+static int
+efi_update_bios_memmap(void)
+{
+	int			 i, n, error = 0;
+	bios_memmap_t		*bm, bm0;
+	EFI_MEMORY_DESCRIPTOR	*mm;
+
+	cnvmem = extmem = 0;
+	bios_memmap[0].type = BIOS_MAP_END;
+	n = bios_efiinfo.mmap_size / bios_efiinfo.mmap_desc_size;
+	for (i = 0, mm = (EFI_MEMORY_DESCRIPTOR *)bios_efiinfo.mmap_start;
+	    i < n;
+	    i++, mm = NextMemoryDescriptor(mm, bios_efiinfo.mmap_desc_size)) {
 		bm0.type = BIOS_MAP_END;
 		bm0.addr = mm->PhysicalStart;
 		bm0.size = mm->NumberOfPages * EFI_PAGE_SIZE;
@@ -413,12 +434,7 @@ efi_memprobe_internal(void)
 			extmem += bm->size / 1024;
 	}
 
-	bios_efiinfo.mmap_desc_ver = mmver;
-	bios_efiinfo.mmap_desc_size = mmsiz;
-	bios_efiinfo.mmap_size = siz;
-	bios_efiinfo.mmap_start = (uintptr_t)mm0;
-
-	return error;
+	return (error);
 }
 
 /***********************************************************************
@@ -1243,3 +1259,41 @@ Xidle_efi(void)
 	return 0;
 }
 #endif /* IDLE_POWEROFF */
+
+int
+Xfwsetup_efi(void)
+{
+	UINT64 osind;
+	UINTN osind_size = sizeof(osind);
+	UINT32 osind_attrs = 0x1 | 0x2 | 0x4;
+	EFI_GUID global = EFI_GLOBAL_VARIABLE;
+	EFI_STATUS status;
+
+	status = RS->GetVariable(L"OsIndicationsSupported", &global, NULL,
+	    &osind_size, &osind);
+	if (status == EFI_NOT_FOUND) {
+		printf("not supported on this machine.\n");
+		return -1;
+	} else if (status != EFI_SUCCESS) {
+		printf("%s: %d\n", __func__, status);
+		return -1;
+	}
+
+	if ((osind & EFI_OS_INDICATIONS_BOOT_TO_FW_UI) == 0) {
+		printf("not supported on this machine.\n");
+		return -1;
+	}
+
+	osind = EFI_OS_INDICATIONS_BOOT_TO_FW_UI;
+	status = RS->SetVariable(L"OsIndications", &global, osind_attrs,
+	    sizeof(osind), &osind);
+	if (status != EFI_SUCCESS) {
+		printf("%s: %d\n", __func__, status);
+		return -1;
+	}
+
+	RS->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
+	for (;;)
+		continue;
+	return 0;
+}

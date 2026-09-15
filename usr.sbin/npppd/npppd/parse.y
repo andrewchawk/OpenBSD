@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.30 2024/07/17 08:26:19 yasuoka Exp $ */
+/*	$OpenBSD: parse.y,v 1.33 2026/04/03 00:09:24 yasuoka Exp $ */
 
 /*
  * Copyright (c) 2002, 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -639,7 +639,7 @@ addressport	: address optport {
 		;
 
 in4_addr	: STRING {
-			if (inet_aton($1, &($$)) != 1) {
+			if (inet_pton(AF_INET, $1, &($$)) != 1) {
 				yyerror("could not parse the address %s", $1);
 				free($1);
 				YYERROR;
@@ -875,14 +875,14 @@ ipcpopt		: POOL_ADDRESS STRING ipcppooltype {
 			if ($3 != 1) {
 				if (in_addr_range_list_add(
 				    &curr_ipcpconf->dynamic_pool, $2) != 0) {
-					yyerror("out of memory");
+					yyerror("%s", strerror(errno));
 					free($2);
 					YYERROR;
 				}
 			}
 			if (in_addr_range_list_add(
 			    &curr_ipcpconf->static_pool, $2) != 0) {
-				yyerror("out of memory");
+				yyerror("%s", strerror(errno));
 				free($2);
 				YYERROR;
 			}
@@ -1668,7 +1668,7 @@ radconf_fini(struct radconf *radconf)
 	TAILQ_FOREACH_SAFE(server, &radconf->servers, entry, server0) {
 		if (server->secret != NULL)
 			free(server->secret);
-		server->secret = NULL;
+		free(server);
 	}
 }
 

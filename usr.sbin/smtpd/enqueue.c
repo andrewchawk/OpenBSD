@@ -1,4 +1,4 @@
-/*	$OpenBSD: enqueue.c,v 1.122 2024/01/20 09:01:03 claudio Exp $	*/
+/*	$OpenBSD: enqueue.c,v 1.128 2026/08/03 06:58:55 claudio Exp $	*/
 
 /*
  * Copyright (c) 2005 Henning Brauer <henning@bulabula.org>
@@ -24,6 +24,7 @@
 #include <pwd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sysexits.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -272,6 +273,25 @@ enqueue(int argc, char *argv[], FILE *ofp)
 		argv++;
 		argc--;
 	}
+
+	/*
+	 * Values taken from argv are interpolated into SMTP command lines
+	 * (MAIL FROM, RCPT TO and their DSN options).  An embedded CR or LF
+	 * would split the intended command boundary and inject additional
+	 * SMTP commands, so reject any such field before starting the
+	 * dialogue.
+	 */
+	if (msg.from != NULL && strpbrk(msg.from, "\r\n") != NULL)
+		errx(EX_USAGE, "sender address contains a line break");
+	for (i = 0; i < msg.rcpt_cnt; i++)
+		if (strpbrk(msg.rcpts[i], "\r\n") != NULL)
+			errx(EX_USAGE, "recipient address contains a line break");
+	if (msg.dsn_notify != NULL && strpbrk(msg.dsn_notify, "\r\n") != NULL)
+		errx(EX_USAGE, "DSN NOTIFY value contains a line break");
+	if (msg.dsn_ret != NULL && strpbrk(msg.dsn_ret, "\r\n") != NULL)
+		errx(EX_USAGE, "DSN RET value contains a line break");
+	if (msg.dsn_envid != NULL && strpbrk(msg.dsn_envid, "\r\n") != NULL)
+		errx(EX_USAGE, "DSN ENVID value contains a line break");
 
 	if ((fp = tmpfile()) == NULL)
 		err(EX_UNAVAILABLE, "tmpfile");
@@ -784,18 +804,17 @@ open_connection(void)
 
 	imsg_compose(ibuf, IMSG_CTL_SMTP_SESSION, IMSG_VERSION, 0, -1, NULL, 0);
 
-	while (ibuf->w.queued)
-		if (msgbuf_write(&ibuf->w) <= 0 && errno != EAGAIN)
-			err(1, "write error");
+	if (imsgbuf_flush(ibuf) == -1)
+		err(1, "write error");
 
 	while (1) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			errx(1, "imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			err(1, "read error");
 		if (n == 0)
 			errx(1, "pipe closed");
 
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			errx(1, "imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			errx(1, "imsgbuf_get error");
 		if (n == 0)
 			continue;
 

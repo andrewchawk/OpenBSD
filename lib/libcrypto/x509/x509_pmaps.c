@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_pmaps.c,v 1.5 2024/07/13 15:08:58 tb Exp $ */
+/* $OpenBSD: x509_pmaps.c,v 1.7 2025/05/10 05:54:39 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project.
  */
@@ -61,8 +61,10 @@
 
 #include <openssl/asn1t.h>
 #include <openssl/conf.h>
-#include <openssl/err.h>
 #include <openssl/x509v3.h>
+
+#include "err_local.h"
+#include "x509_local.h"
 
 static void *v2i_POLICY_MAPPINGS(const X509V3_EXT_METHOD *method,
     X509V3_CTX *ctx, STACK_OF(CONF_VALUE) *nval);

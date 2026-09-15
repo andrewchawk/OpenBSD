@@ -1,4 +1,4 @@
-/* $OpenBSD: apicvec.s,v 1.36 2022/12/08 01:25:44 guenther Exp $ */
+/* $OpenBSD: apicvec.s,v 1.40 2026/01/14 20:43:56 deraadt Exp $ */
 /* $NetBSD: apicvec.s,v 1.1.2.2 2000/02/21 21:54:01 sommerfeld Exp $ */
 
 /*-
@@ -68,8 +68,13 @@ IDTVEC(intripi_invltlb)
 	movl	%cr3, %eax
 	movl	%eax, %cr3
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decl	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%eax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl	%eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popl	%ds
 	popl	%eax
@@ -87,8 +92,13 @@ IDTVEC(intripi_invlpg)
 	movl	tlb_shoot_addr1, %eax
 	invlpg	(%eax)
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decl	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%eax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl	%eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popl	%ds
 	popl	%eax
@@ -111,8 +121,13 @@ IDTVEC(intripi_invlrange)
 	cmpl	%edx, %eax
 	jb	1b
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decl	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%eax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl	%eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popl	%ds
 	popl	%edx
@@ -137,8 +152,13 @@ IDTVEC(intripi_reloadcr3)
 	movl	PM_PDIRPA(%eax), %eax
 	movl	%eax, %cr3
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decl	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%eax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl	%eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popl	%fs
 	popl	%ds
@@ -175,7 +195,7 @@ KIDTVEC(intrsoftclock)
 	ioapic_asm_ack()
 	sti
 	incl	CPUVAR(IDEPTH)
-	pushl	$I386_SOFTINTR_SOFTCLOCK
+	pushl	$SOFTINTR_CLOCK
 	call	softintr_dispatch
 	addl	$4,%esp
 	decl	CPUVAR(IDEPTH)
@@ -190,7 +210,7 @@ KIDTVEC(intrsoftnet)
 	ioapic_asm_ack()
 	sti
 	incl	CPUVAR(IDEPTH)
-	pushl	$I386_SOFTINTR_SOFTNET
+	pushl	$SOFTINTR_NET
 	call	softintr_dispatch
 	addl	$4,%esp
 	decl	CPUVAR(IDEPTH)
@@ -206,7 +226,7 @@ KIDTVEC(intrsofttty)
 	ioapic_asm_ack()
 	sti
 	incl	CPUVAR(IDEPTH)
-	pushl	$I386_SOFTINTR_SOFTTTY
+	pushl	$SOFTINTR_TTY
 	call	softintr_dispatch
 	addl	$4,%esp
 	decl	CPUVAR(IDEPTH)

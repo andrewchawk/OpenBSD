@@ -1,4 +1,4 @@
-/*	$OpenBSD: nd6_rtr.c,v 1.171 2024/07/14 18:53:39 bluhm Exp $	*/
+/*	$OpenBSD: nd6_rtr.c,v 1.176 2025/07/08 00:47:41 jsg Exp $	*/
 /*	$KAME: nd6_rtr.c,v 1.97 2001/02/07 11:09:13 itojun Exp $	*/
 
 /*
@@ -32,26 +32,16 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/timeout.h>
-#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/sockio.h>
-#include <sys/time.h>
-#include <sys/kernel.h>
 #include <sys/errno.h>
-#include <sys/ioctl.h>
-#include <sys/syslog.h>
-#include <sys/queue.h>
 
 #include <net/if.h>
-#include <net/if_dl.h>
 #include <net/if_var.h>
 #include <net/route.h>
 #include <net/rtable.h>
 
 #include <netinet/in.h>
-#include <netinet6/in6_var.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
 #include <netinet6/nd6.h>
@@ -75,21 +65,13 @@ nd6_rtr_cache(struct mbuf *m, int off, int icmp6len, int icmp6_type)
 	int lladdrlen = 0;
 	int i_am_router = (atomic_load_int(&ip6_forwarding) != 0);
 	struct nd_opts ndopts;
-	char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
 
 	KASSERT(icmp6_type == ND_ROUTER_SOLICIT || icmp6_type ==
 	    ND_ROUTER_ADVERT);
 
 	/* Sanity checks */
-	if (ip6->ip6_hlim != 255) {
-		nd6log((LOG_ERR,
-		    "%s: invalid hlim (%d) from %s to %s on %u\n",
-		    __func__, ip6->ip6_hlim,
-		    inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src)),
-		    inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst)),
-		    m->m_pkthdr.ph_ifidx));
+	if (ip6->ip6_hlim != 255)
 		goto bad;
-	}
 
 	switch (icmp6_type) {
 	case ND_ROUTER_SOLICIT:
@@ -100,8 +82,7 @@ nd6_rtr_cache(struct mbuf *m, int off, int icmp6len, int icmp6_type)
 		if (IN6_IS_ADDR_UNSPECIFIED(&saddr6))
 			goto freeit;
 
-		IP6_EXTHDR_GET(nd_rs, struct nd_router_solicit *, m, off,
-		    icmp6len);
+		nd_rs = ip6_exthdr_get(&m, off, icmp6len);
 		if (nd_rs == NULL) {
 			icmp6stat_inc(icp6s_tooshort);
 			return;
@@ -109,22 +90,15 @@ nd6_rtr_cache(struct mbuf *m, int off, int icmp6len, int icmp6_type)
 
 		icmp6len -= sizeof(*nd_rs);
 		if (nd6_options(nd_rs + 1, icmp6len, &ndopts) < 0) {
-			nd6log((LOG_INFO,
-			    "%s: invalid ND option, ignored\n", __func__));
 			/* nd6_options have incremented stats */
 			goto freeit;
 		}
 		break;
 	case ND_ROUTER_ADVERT:
-		if (!IN6_IS_ADDR_LINKLOCAL(&saddr6)) {
-			nd6log((LOG_ERR,
-			    "%s: src %s is not link-local\n", __func__,
-			    inet_ntop(AF_INET6, &saddr6, src, sizeof(src))));
+		if (!IN6_IS_ADDR_LINKLOCAL(&saddr6))
 			goto bad;
-		}
 
-		IP6_EXTHDR_GET(nd_ra, struct nd_router_advert *, m, off,
-		    icmp6len);
+		nd_ra = ip6_exthdr_get(&m, off, icmp6len);
 		if (nd_ra == NULL) {
 			icmp6stat_inc(icp6s_tooshort);
 			return;
@@ -132,8 +106,6 @@ nd6_rtr_cache(struct mbuf *m, int off, int icmp6len, int icmp6_type)
 
 		icmp6len -= sizeof(*nd_ra);
 		if (nd6_options(nd_ra + 1, icmp6len, &ndopts) < 0) {
-			nd6log((LOG_INFO,
-			    "%s: invalid ND option, ignored\n", __func__));
 			/* nd6_options have incremented stats */
 			goto freeit;
 		}
@@ -150,10 +122,6 @@ nd6_rtr_cache(struct mbuf *m, int off, int icmp6len, int icmp6_type)
 		goto freeit;
 
 	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
-		nd6log((LOG_INFO,
-		    "%s: lladdrlen mismatch for %s (if %d, RA/RS packet %d)\n",
-		     __func__, inet_ntop(AF_INET6, &saddr6, src, sizeof(src)),
-		    ifp->if_addrlen, lladdrlen - 2));
 		if_put(ifp);
 		goto bad;
 	}
@@ -204,8 +172,10 @@ rt6_flush(struct in6_addr *gateway, struct ifnet *ifp)
 			info.rti_info[RTAX_GATEWAY] = rt->rt_gateway;
 			info.rti_info[RTAX_NETMASK] = rt_plen2mask(rt,
 			    &sa_mask);
+			KERNEL_LOCK();
 			error = rtrequest_delete(&info, RTP_ANY, ifp, NULL,
 			    ifp->if_rdomain);
+			KERNEL_UNLOCK();
 			if (error == 0)
 				error = EAGAIN;
 		}

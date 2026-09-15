@@ -90,6 +90,11 @@ struct mesh_area {
 	/** rbtree of all current queries (mesh_state.node)*/
 	rbtree_type all;
 
+	/** number of queries for unbound's auth_zones, upstream query */
+	size_t num_query_authzone_up;
+	/** number of queries for unbound's auth_zones, downstream answers */
+	size_t num_query_authzone_down;
+
 	/** count of the total number of mesh_reply entries */
 	size_t num_reply_addrs;
 	/** count of the number of mesh_states that have mesh_replies 
@@ -126,12 +131,22 @@ struct mesh_area {
 	size_t ans_secure;
 	/** (extended stats) bogus replies */
 	size_t ans_bogus;
+	/** (extended stats) number of validation operations */
+	size_t val_ops;
 	/** (extended stats) rcodes in replies */
 	size_t ans_rcode[UB_STATS_RCODE_NUM];
 	/** (extended stats) rcode nodata in replies */
 	size_t ans_nodata;
 	/** (extended stats) type of applied RPZ action */
 	size_t rpz_action[UB_STATS_RPZ_ACTION_NUM];
+	/** stats, number of queries removed due to discard-timeout */
+	size_t num_queries_discard_timeout;
+	/** stats, number of queries removed due to replyaddr limit */
+	size_t num_queries_replyaddr_limit;
+	/** stats, number of queries removed due to wait-limit */
+	size_t num_queries_wait_limit;
+	/** stats, number of dns error reports generated */
+	size_t num_dns_error_reports;
 
 	/** backup of query if other operations recurse and need the
 	 * network buffers */
@@ -176,6 +191,12 @@ struct mesh_state {
 	struct module_qstate s;
 	/** the list of replies to clients for the results */
 	struct mesh_reply* reply_list;
+	/** if it has a first reply time */
+	int has_first_reply_time;
+	/** wall-clock time the first client reply was attached;
+	 *  used by mesh_make_new_space() so duplicate retransmits
+	 *  cannot reset jostle aging. */
+	struct timeval first_reply_time;
 	/** the list of callbacks for the results */
 	struct mesh_cb* cb_list;
 	/** set of superstates (that want this state's result) 
@@ -386,6 +407,8 @@ void mesh_detach_subs(struct module_qstate* qstate);
  * @param qstate: the state to find mesh state, and that wants to receive
  * 	the results from the new subquery.
  * @param qinfo: what to query for (copied).
+ * @param cinfo: if non-NULL client specific info that may affect IP-based
+ * 	actions that apply to the query result. It is copied.
  * @param qflags: what flags to use (RD / CD flag or not).
  * @param prime: if it is a (stub) priming query.
  * @param valrec: if it is a validation recursion query (lookup of key, DS).
@@ -394,7 +417,8 @@ void mesh_detach_subs(struct module_qstate* qstate);
  * @return: false on error, true if success (and init may be needed).
  */
 int mesh_attach_sub(struct module_qstate* qstate, struct query_info* qinfo,
-	uint16_t qflags, int prime, int valrec, struct module_qstate** newq);
+	struct respip_client_info* cinfo, uint16_t qflags, int prime,
+	int valrec, struct module_qstate** newq);
 
 /**
  * Add detached query.
@@ -413,6 +437,8 @@ int mesh_attach_sub(struct module_qstate* qstate, struct query_info* qinfo,
  * @param qstate: the state to find mesh state, and that wants to receive
  * 	the results from the new subquery.
  * @param qinfo: what to query for (copied).
+ * @param cinfo: if non-NULL client specific info that may affect IP-based
+ * 	actions that apply to the query result. It is copied.
  * @param qflags: what flags to use (RD / CD flag or not).
  * @param prime: if it is a (stub) priming query.
  * @param valrec: if it is a validation recursion query (lookup of key, DS).
@@ -422,8 +448,8 @@ int mesh_attach_sub(struct module_qstate* qstate, struct query_info* qinfo,
  * @return: false on error, true if success (and init may be needed).
  */
 int mesh_add_sub(struct module_qstate* qstate, struct query_info* qinfo,
-        uint16_t qflags, int prime, int valrec, struct module_qstate** newq,
-	struct mesh_state** sub);
+	struct respip_client_info* cinfo, uint16_t qflags, int prime,
+	int valrec, struct module_qstate** newq, struct mesh_state** sub);
 
 /**
  * Query state is done, send messages to reply entries.
@@ -657,9 +683,11 @@ void mesh_list_remove(struct mesh_state* m, struct mesh_state** fp,
  * @param mesh: to update the counters.
  * @param m: the mesh state.
  * @param cp: the comm_point to remove from the list.
+ * @param doq_stream: if not NULL, it specifies the doq_stream to match
+ *	for the delete.
  */
 void mesh_state_remove_reply(struct mesh_area* mesh, struct mesh_state* m,
-	struct comm_point* cp);
+	struct comm_point* cp, struct doq_stream* doq_stream);
 
 /** Callback for when the serve expired client timer has run out.  Tries to
  * find an expired answer in the cache and reply that to the client.
@@ -673,11 +701,12 @@ void mesh_serve_expired_callback(void* arg);
  * the same behavior as when replying from cache.
  * @param qstate: the module qstate.
  * @param lookup_qinfo: the query info to look for in the cache.
+ * @param is_expired: set if the cached answer is expired.
  * @return dns_msg if a cached answer was found, otherwise NULL.
  */
 struct dns_msg*
 mesh_serve_expired_lookup(struct module_qstate* qstate,
-	struct query_info* lookup_qinfo);
+	struct query_info* lookup_qinfo, int* is_expired);
 
 /**
  * See if the mesh has space for more queries. You can allocate queries
@@ -695,5 +724,22 @@ int mesh_jostle_exceeded(struct mesh_area* mesh);
  * @param mstate: mesh state for query that has serve_expired_data.
  */
 void mesh_respond_serve_expired(struct mesh_state* mstate);
+
+/**
+ * Remove callback from mesh. Removes the callback from the state.
+ * The state itself is left to run. Searches for the pointer values.
+ *
+ * @param mesh: the mesh.
+ * @param qinfo: query from client.
+ * @param qflags: flags from client query.
+ * @param cb: callback function.
+ * @param cb_arg: callback user arg.
+ */
+void mesh_remove_callback(struct mesh_area* mesh, struct query_info* qinfo,
+	uint16_t qflags, mesh_cb_func_type cb, void* cb_arg);
+
+/** Copy the client info to the query region. */
+struct respip_client_info* mesh_copy_client_info(struct regional* region,
+	struct respip_client_info* cinfo);
 
 #endif /* SERVICES_MESH_H */

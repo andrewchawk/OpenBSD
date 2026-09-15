@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex.h,v 1.11 2016/05/27 09:18:12 martijn Exp $	*/
+/*	$OpenBSD: ex.h,v 1.12 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -217,7 +217,7 @@ typedef enum {
 /* Ex address error types. */
 enum badaddr { A_COMBO, A_EMPTY, A_EOF, A_NOTSET, A_ZERO };
 
-/* Ex common tag error messages. */                                         
+/* Ex common tag error messages. */
 typedef enum {
 	TAG_BADLNO,		/* Tag line doesn't exist. */
 	TAG_EMPTY,		/* Tags stack is empty. */

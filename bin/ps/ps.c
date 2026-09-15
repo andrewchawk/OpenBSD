@@ -1,4 +1,4 @@
-/*	$OpenBSD: ps.c,v 1.81 2024/05/18 13:08:09 sobrado Exp $	*/
+/*	$OpenBSD: ps.c,v 1.84 2025/07/02 13:24:48 deraadt Exp $	*/
 /*	$NetBSD: ps.c,v 1.15 1995/05/18 20:33:25 mycroft Exp $	*/
 
 /*-
@@ -46,7 +46,6 @@
 #include <fcntl.h>
 #include <kvm.h>
 #include <locale.h>
-#include <nlist.h>
 #include <paths.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -61,18 +60,18 @@ extern char *__progname;
 
 struct varent *vhead;
 
-int	eval;			/* exit value */
 int	sumrusage;		/* -S */
 int	termwidth;		/* width of screen (0 == infinity) */
 int	totwidth;		/* calculated width of requested variables */
+int pagesize;
 
-int	needcomm, needenv, neednlist, commandonly;
+int	needcomm, needenv, commandonly;
 
 enum sort { DEFAULT, SORTMEM, SORTCPU } sortby = DEFAULT;
 
 static char	*kludge_oldps_options(char *);
 static int	 pscomp(const void *, const void *);
-static void	 scanvars(void);
+static void	 scanvars(struct kinfo_proc *kp, size_t nentries);
 static void	 forest_sort(struct pinfo *, int);
 static void	 usage(void);
 
@@ -100,7 +99,7 @@ main(int argc, char *argv[])
 	uid_t uid;
 	int all, ch, flag, i, fmt, lineno, nentries;
 	int prtheader, showthreads, wflag, kflag, what, Uflag, xflg;
-	int forest;
+	int forest, rval = 0;
 	char *nlistf, *memf, *swapf, *cols, errbuf[_POSIX2_LINE_MAX];
 
 	setlocale(LC_CTYPE, "");
@@ -116,6 +115,7 @@ main(int argc, char *argv[])
 		termwidth = ws.ws_col - 1;
 	if (termwidth == 0)
 		termwidth = 79;
+	pagesize = getpagesize();
 
 	if (argc > 1)
 		argv[1] = kludge_oldps_options(argv[1]);
@@ -156,7 +156,7 @@ main(int argc, char *argv[])
 			prtheader = ws.ws_row > 5 ? ws.ws_row : 22;
 			break;
 		case 'j':
-			parsefmt(jfmt);
+			rval |= parsefmt(jfmt);
 			fmt = 1;
 			jfmt[0] = '\0';
 			break;
@@ -167,7 +167,7 @@ main(int argc, char *argv[])
 			showkey();
 			exit(0);
 		case 'l':
-			parsefmt(lfmt);
+			rval |= parsefmt(lfmt);
 			fmt = 1;
 			lfmt[0] = '\0';
 			break;
@@ -181,14 +181,14 @@ main(int argc, char *argv[])
 			nlistf = optarg;
 			break;
 		case 'O':
-			parsefmt(o1);
-			parsefmt(optarg);
-			parsefmt(o2);
+			rval |= parsefmt(o1);
+			rval |= parsefmt(optarg);
+			rval |= parsefmt(o2);
 			o1[0] = o2[0] = '\0';
 			fmt = 1;
 			break;
 		case 'o':
-			parsefmt(optarg);
+			rval |= parsefmt(optarg);
 			fmt = 1;
 			break;
 		case 'p':
@@ -245,13 +245,13 @@ main(int argc, char *argv[])
 			break;
 		}
 		case 'u':
-			parsefmt(ufmt);
+			rval |= parsefmt(ufmt);
 			sortby = SORTCPU;
 			fmt = 1;
 			ufmt[0] = '\0';
 			break;
 		case 'v':
-			parsefmt(vfmt);
+			rval |= parsefmt(vfmt);
 			sortby = SORTMEM;
 			fmt = 1;
 			vfmt[0] = '\0';
@@ -314,9 +314,9 @@ main(int argc, char *argv[])
 
 	if (!fmt) {
 		if (showthreads)
-			parsefmt(tfmt);
+			rval |= parsefmt(tfmt);
 		else
-			parsefmt(dfmt);
+			rval |= parsefmt(dfmt);
 	}
 
 	/* XXX - should be cleaner */
@@ -325,14 +325,7 @@ main(int argc, char *argv[])
 		Uflag = 1;
 	}
 
-	/*
-	 * scan requested variables, noting what structures are needed,
-	 * and adjusting header widths as appropriate.
-	 */
-	scanvars();
-
-	if (neednlist && !nlistread)
-		(void) donlist();
+	rval |= getkernvars();
 
 	/*
 	 * get proc list
@@ -362,6 +355,12 @@ main(int argc, char *argv[])
 	kp = kvm_getprocs(kd, what, flag, sizeof(*kp), &nentries);
 	if (kp == NULL)
 		errx(1, "%s", kvm_geterr(kd));
+
+	/*
+	 * scan requested variables, noting what structures are needed,
+	 * and adjusting header widths as appropriate.
+	 */
+	scanvars(kp, nentries);
 
 	/*
 	 * print header
@@ -400,26 +399,41 @@ main(int argc, char *argv[])
 			lineno = 0;
 		}
 	}
-	exit(eval);
+	exit(rval);
 }
 
 static void
-scanvars(void)
+scanvars(struct kinfo_proc *kp, size_t nentries)
 {
 	struct varent *vent;
 	VAR *v;
 	int i;
+	int vszbump = 0, rssbump = 0;
 
+#define pgtok(a)    (((unsigned long long)(a)*pagesize)/1024)
+	for (i = 0; i < nentries; i++) {
+		struct kinfo_proc *ki = &kp[i];
+		if (vszbump == 0 && pgtok(ki->p_vm_dsize + ki->p_vm_ssize + ki->p_vm_tsize) >= 100000)
+			vszbump = 1;
+		if (vszbump == 1 && pgtok(ki->p_vm_dsize + ki->p_vm_ssize + ki->p_vm_tsize) >= 1000000)
+			vszbump = 2;
+		if (rssbump == 0 && pgtok(ki->p_vm_rssize) >= 100000)
+			rssbump = 1;
+		if (rssbump == 1 && pgtok(ki->p_vm_rssize) >= 1000000)
+			rssbump = 2;
+	}
 	for (vent = vhead; vent; vent = vent->next) {
 		v = vent->var;
+		if (strcmp(v->name, "vsz") == 0)
+			v->width += vszbump;
+		if (strcmp(v->name, "rss") == 0)
+			v->width += rssbump;
 		i = strlen(v->header);
 		if (v->width < i)
 			v->width = i;
 		totwidth += v->width + 1;	/* +1 for space */
 		if (v->flag & COMM)
 			needcomm = 1;
-		if (v->flag & NLIST)
-			neednlist = 1;
 	}
 	totwidth--;
 }

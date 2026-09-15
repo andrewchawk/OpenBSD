@@ -1,4 +1,4 @@
-/*	$OpenBSD: locore.S,v 1.148 2024/08/02 22:24:51 guenther Exp $	*/
+/*	$OpenBSD: locore.S,v 1.151 2025/08/02 07:33:28 sf Exp $	*/
 /*	$NetBSD: locore.S,v 1.13 2004/03/25 18:33:17 drochner Exp $	*/
 
 /*
@@ -148,18 +148,9 @@
 
 #if NLAPIC > 0 
 	.align	NBPG, 0xcc
-	.globl	local_apic, lapic_id, lapic_tpr
+	.globl	local_apic
 local_apic:
-	.space	LAPIC_ID
-lapic_id:
-	.long	0x00000000
-	.space	LAPIC_TPRI-(LAPIC_ID+4)
-lapic_tpr:
-	.space	LAPIC_PPRI-LAPIC_TPRI
-lapic_ppr:
-	.space	LAPIC_ISR-LAPIC_PPRI 
-lapic_isr:
-	.space	NBPG-LAPIC_ISR
+	.space	NBPG
 #endif
 
 /*****************************************************************************/
@@ -882,8 +873,30 @@ KTEXT_PAGE_START
 0:	pause
 	lfence
 	jmp	0b
-	.space	(.Liretq_swapgs - XUsyscall_meltdown) - \
-		(. - Xsyscall_meltdown), 0xcc
+.LKiretq_swapgs:
+	/*
+	 * The desired directive here would be:
+	 *	.space	(.Liretq_swapgs - XUsyscall_meltdown) - \
+	 *		(.LKiretq_swapgs - Xsyscall_meltdown), 0xcc
+	 *
+	 * While llvm-18 and earlier handled that, llvm/clang-19 miscalculates
+	 * it and thinks that's a negative number; it's not: the correct value
+	 * at this time is "2".  Indeed, it calculates the value correctly if
+	 * you append this bit to the end of locore.S:
+	 *	.section .rodata
+	 *	right_value:
+	 *	.quad	(.Liretq_swapgs - XUsyscall_meltdown) - \
+	 *		(.LKiretq_swapgs - Xsyscall_meltdown)
+	 * You can build locore.o manually, use objdump on it, and see what
+	 * value was stored at 'right_value'!  So compiler updates go.
+	 * Fortunately(?), this has broken before so the kernel Makefile
+	 * checks the compiled locore.o to verify that the iretq instructions
+	 * line up (that being the most critical part of what matters).  If
+	 * the intr_user_exit sequence changes such that the correct value is
+	 * _not_ "2" and builds fail, then append that chunk above and get the
+	 * correct new value to use here.  :(
+	 */
+	.space	2, 0xcc
 	CODEPATCH_END(CPTAG_MELTDOWN_NOP)
 	swapgs
 

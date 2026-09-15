@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_delete.c,v 1.8 2014/11/12 04:28:41 bentley Exp $	*/
+/*	$OpenBSD: v_delete.c,v 1.9 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -80,7 +80,7 @@ v_delete(SCR *sp, VICMD *vp)
 	 *
 	 * This currently matches the check made in v_yank(), I'm hoping that
 	 * they should be consistent...
-	 */  
+	 */
 	if (!F_ISSET(vp, VM_LMODE)) {
 		F_CLR(vp, VM_RCM_MASK);
 		F_SET(vp, VM_RCM_SET);

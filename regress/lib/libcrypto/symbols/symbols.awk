@@ -1,4 +1,4 @@
-# $OpenBSD: symbols.awk,v 1.12 2024/07/10 13:11:22 tb Exp $
+# $OpenBSD: symbols.awk,v 1.15 2025/08/22 15:52:34 tb Exp $
 
 # Copyright (c) 2018,2020 Theo Buehler <tb@openbsd.org>
 #
@@ -20,20 +20,13 @@ BEGIN {
 	printf("#include \"include_headers.c\"\n\n")
 }
 
-# These are machdep.
-/^OPENSSL_cpuid_setup$/						||
-/^OPENSSL_cpu_caps$/ {
-	printf("/* skipped %s */\n", $0)
-	next
-}
-
 {
 	symbols[$0] = $0
 
 	# Undefine aliases, so we don't accidentally leave them in Symbols.list.
 	printf("#ifdef %s\n#undef %s\n#endif\n", $0, $0)
 
-	printf("static typeof(%s) *_libre_%s;\n", $0, $0);
+	printf("extern typeof(%s) *_libre_%s;\n", $0, $0);
 }
 
 END {
@@ -58,8 +51,12 @@ END {
 
 	printf("\t\};\n\n")
 
-	printf("\tfor (i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++)\n")
+	printf("\tfor (i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {\n")
 	printf("\t\tfprintf(stderr, \"%%s: %%p\\n\", symbols[i].name, symbols[i].addr);\n")
+	printf("#if defined(USE_LIBRESSL_NAMESPACE)\n")
+	printf("\t\tfprintf(stderr, \"_libre_%%s: %%p\\n\", symbols[i].name, symbols[i].libre_addr);\n")
+	printf("#endif\n")
+	printf("\t}\n")
 	printf("\n\tprintf(\"OK\\n\");\n")
 	printf("\n\treturn 0;\n}\n")
 }

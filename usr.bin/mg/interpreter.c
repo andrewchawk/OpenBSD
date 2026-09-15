@@ -1,4 +1,4 @@
-/*      $OpenBSD: interpreter.c,v 1.35 2023/04/17 10:11:30 op Exp $	*/
+/*      $OpenBSD: interpreter.c,v 1.38 2026/07/19 13:14:55 op Exp $	*/
 /*
  * This file is in the public domain.
  *
@@ -395,11 +395,12 @@ parsexp(char *begp, const char *par1, const char *par2, int blkid, int expctr,
 {
 	struct expentry *e1 = NULL;
 	PF		 funcp;
-	char		*cmdp, *fendp, *valp, *fname, *funb = NULL;;
+	char		*cmdp, *fendp, *valp, *fname, *funb = NULL;
 	int		 numparams, ret;
 
 	cmdp = begp;
-	fendp = strchr(cmdp, ' ');
+	if ((fendp = strchr(cmdp, ' ')) == NULL)
+		return (dobeep_msgs("Unknown command:", cmdp));
 	*fendp = '\0';
 
 	/*
@@ -592,15 +593,20 @@ founddef(char *defstr, int blkid, int expctr, int hasval, int elen)
 
 	if (!SLIST_EMPTY(&varhead)) {
 		SLIST_FOREACH_SAFE(v1, &varhead, entry, vt) {
-			if (strcmp(vnamep, v1->v_name) == 0)
+			if (strcmp(vnamep, v1->v_name) == 0) {
 				SLIST_REMOVE(&varhead, v1, varentry, entry);
+				free(v1->v_name);
+				free(v1);
+			}
 		}
 	}
 	if ((v1 = malloc(sizeof(struct varentry))) == NULL)
 		return (ABORT);
-	SLIST_INSERT_HEAD(&varhead, v1, entry);
-	if ((v1->v_name = strndup(vnamep, BUFSIZE)) == NULL)
+	if ((v1->v_name = strndup(vnamep, BUFSIZE)) == NULL) {
+		free(v1);
 		return(dobeep_msg("strndup error"));
+	}
+	SLIST_INSERT_HEAD(&varhead, v1, entry);
 	vnamep = v1->v_name;
 	v1->v_count = 0;
 	v1->v_vals = NULL;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ppp.c,v 1.118 2024/02/28 16:08:34 denis Exp $	*/
+/*	$OpenBSD: if_ppp.c,v 1.124 2026/09/10 18:31:39 claudio Exp $	*/
 /*	$NetBSD: if_ppp.c,v 1.39 1997/05/17 21:11:59 christos Exp $	*/
 
 /*
@@ -114,7 +114,6 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/time.h>
 #include <sys/malloc.h>
@@ -123,7 +122,6 @@
 #include <net/if_var.h>
 #include <net/if_types.h>
 #include <net/netisr.h>
-#include <net/route.h>
 #include <net/bpf.h>
 
 #include <netinet/in.h>
@@ -194,7 +192,7 @@ struct if_clone ppp_cloner =
  * Called from boot code to establish ppp interfaces.
  */
 void
-pppattach(void)
+pppattach(int count)
 {
 	LIST_INIT(&ppp_softc_list);
 	if_clone_attach(&ppp_cloner);
@@ -527,7 +525,7 @@ pppioctl(struct ppp_softc *sc, u_long cmd, caddr_t data, int flag,
 	case PPPIOCSPASS:
 	case PPPIOCSACTIVE:
 		nbp = (struct bpf_program *) data;
-		if ((unsigned) nbp->bf_len > BPF_MAXINSNS)
+		if (nbp->bf_len > BPF_MAXINSNS)
 			return EINVAL;
 		newcodelen = nbp->bf_len * sizeof(struct bpf_insn);
 		if (nbp->bf_len != 0) {
@@ -748,8 +746,7 @@ pppoutput(struct ifnet *ifp, struct mbuf *m0, struct sockaddr *dst,
 		 */
 		*mtod(m0, u_char *) = 1;	/* indicates outbound */
 		if (sc->sc_pass_filt.bf_insns != 0 &&
-		    bpf_filter(sc->sc_pass_filt.bf_insns, (u_char *)m0,
-		    len, 0) == 0) {
+		    bpf_mfilter(&sc->sc_pass_filt, m0, len) == 0) {
 			error = 0; /* drop this packet */
 			goto bad;
 		}
@@ -758,8 +755,7 @@ pppoutput(struct ifnet *ifp, struct mbuf *m0, struct sockaddr *dst,
 		 * Update the time we sent the most recent packet.
 		 */
 		if (sc->sc_active_filt.bf_insns == 0 ||
-		    bpf_filter(sc->sc_active_filt.bf_insns, (u_char *)m0,
-		    len, 0))
+		    bpf_mfilter(&sc->sc_active_filt, m0, len))
 			sc->sc_last_sent = getuptime();
 
 		*mtod(m0, u_char *) = address;
@@ -1368,15 +1364,13 @@ ppp_inproc(struct ppp_softc *sc, struct mbuf *m)
 		adrs = *mtod(m, u_char *);	/* save address field */
 		*mtod(m, u_char *) = 0;		/* indicate inbound */
 		if (sc->sc_pass_filt.bf_insns != 0 &&
-		    bpf_filter(sc->sc_pass_filt.bf_insns, (u_char *) m,
-		     ilen, 0) == 0) {
+		    bpf_mfilter(&sc->sc_pass_filt, m, ilen) == 0) {
 			/* drop this packet */
 			m_freem(m);
 			return;
 		}
 		if (sc->sc_active_filt.bf_insns == 0 ||
-		    bpf_filter(sc->sc_active_filt.bf_insns, (u_char *)m,
-		     ilen, 0))
+		    bpf_mfilter(&sc->sc_active_filt, m, ilen))
 			sc->sc_last_recv = getuptime();
 
 		*mtod(m, u_char *) = adrs;
@@ -1410,7 +1404,7 @@ ppp_inproc(struct ppp_softc *sc, struct mbuf *m)
 		m->m_data += PPP_HDRLEN;
 		m->m_len -= PPP_HDRLEN;
 
-		ipv4_input(ifp, m);
+		ipv4_input(ifp, m, NULL);
 		rv = 1;
 		break;
 #ifdef INET6
@@ -1428,7 +1422,7 @@ ppp_inproc(struct ppp_softc *sc, struct mbuf *m)
 		m->m_data += PPP_HDRLEN;
 		m->m_len -= PPP_HDRLEN;
 
-		ipv6_input(ifp, m);
+		ipv6_input(ifp, m, NULL);
 		rv = 1;
 		break;
 #endif

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_vops.c,v 1.36 2024/05/13 11:17:40 semarie Exp $	*/
+/*	$OpenBSD: vfs_vops.c,v 1.39 2026/06/10 00:04:38 beck Exp $	*/
 /*
  * Copyright (c) 2010 Thordur I. Bjornsson <thib@openbsd.org> 
  *
@@ -444,6 +444,9 @@ VOP_READDIR(struct vnode *vp, struct uio *uio, struct ucred *cred,
 
 	ASSERT_VP_ISLOCKED(vp);
 
+	if (vp->v_type != VDIR)
+		return (ENOTDIR);
+
 	if (vp->v_op->vop_readdir == NULL)
 		return (EOPNOTSUPP);
 
@@ -555,6 +558,7 @@ VOP_BMAP(struct vnode *vp, daddr_t bn, struct vnode **vpp,
 	return ((vp->v_op->vop_bmap)(&a));
 }
 
+#if defined(DEBUG) || defined(DIAGNOSTIC) || defined(VFSLCKDEBUG)
 int
 VOP_PRINT(struct vnode *vp)
 {
@@ -566,6 +570,7 @@ VOP_PRINT(struct vnode *vp)
 
 	return ((vp->v_op->vop_print)(&a));
 }
+#endif
 
 int
 VOP_PATHCONF(struct vnode *vp, int name, register_t *retval)
@@ -624,9 +629,6 @@ VOP_STRATEGY(struct vnode *vp, struct buf *bp)
 	struct vop_strategy_args a;
 	a.a_vp = vp;
 	a.a_bp = bp;
-
-	if ((ISSET(bp->b_flags, B_BC)) && (!ISSET(bp->b_flags, B_DMA)))
-		panic("Non dma reachable buffer passed to VOP_STRATEGY");
 
 	if (vp->v_op->vop_strategy == NULL)
 		return (EOPNOTSUPP);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.6 2022/09/08 10:22:06 kn Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.10 2026/05/02 14:09:17 jsing Exp $	*/
 
 /*
  * Copyright (c) 2009 Miodrag Vallat.
@@ -21,7 +21,9 @@
 #include <sys/reboot.h>
 #include <sys/hibernate.h>
 #include <sys/systm.h>
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
+
+#include <machine/bus.h>
 
 #if defined(NFSCLIENT)
 #include <net/if.h>
@@ -50,9 +52,13 @@ cpu_configure(void)
 	splhigh();
 
 	softintr_init();
+	bus_dma_init();
+
 	config_rootfound("mainbus", NULL);
 
 	unmap_startup();
+
+	cpu_identify_cleanup();
 
 	cold = 0;
 	spl0();
@@ -101,7 +107,7 @@ const struct nam2blk nam2blk[] = {
 	{ "wd",		 0 },
 	{ "sd",		 4 },
 	{ "cd",		 6 },
-	{ "vnd",	14 },
 	{ "rd",		 8 },
+	{ "vnd",	14 },
 	{ NULL,		-1 }
 };

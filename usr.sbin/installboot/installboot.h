@@ -1,4 +1,4 @@
-/*	$OpenBSD: installboot.h,v 1.16 2022/11/08 12:08:53 kn Exp $	*/
+/*	$OpenBSD: installboot.h,v 1.18 2025/11/19 15:05:04 deraadt Exp $	*/
 /*
  * Copyright (c) 2012, 2013 Joel Sing <jsing@openbsd.org>
  *
@@ -19,6 +19,7 @@
 
 #include <stdlib.h>
 
+extern int config;
 extern int nowrite;
 extern int stages;
 extern int verbose;
@@ -26,6 +27,8 @@ extern int verbose;
 extern char *root;
 extern char *stage1;
 extern char *stage2;
+
+extern size_t dl16sz;
 
 #ifdef BOOTSTRAP
 void	bootstrap(int, char *, char *);
@@ -49,4 +52,9 @@ void	sr_installboot(int, char *);
 void	sr_install_bootblk(int, int, int);
 void	sr_install_bootldr(int, char *);
 void	sr_status(struct bio_status *);
+#endif
+
+#ifdef EFIBOOTMGR
+struct gpt_partition;
+void	efi_bootmgr_setup(int, struct gpt_partition *, const char *);
 #endif

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmctl.h,v 1.39 2024/07/09 15:51:11 mlarkin Exp $	*/
+/*	$OpenBSD: vmctl.h,v 1.45 2026/04/16 21:34:47 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -36,8 +36,6 @@ enum actions {
 	CMD_WAITFOR,
 	CMD_PAUSE,
 	CMD_UNPAUSE,
-	CMD_SEND,
-	CMD_RECEIVE,
 };
 
 struct ctl_command;
@@ -54,7 +52,7 @@ struct parse_result {
 	int			 nnets;
 	size_t			 ndisks;
 	char			**disks;
-	int			*disktypes;
+	enum vm_disk_fmt	*disktypes;
 	int			 verbose;
 	char			*instance;
 	unsigned int		 flags;
@@ -79,20 +77,27 @@ int	 parse_ifs(struct parse_result *, char *, int);
 int	 parse_network(struct parse_result *, char *);
 void	 parse_size(struct parse_result *, char *, const char *);
 int	 parse_disktype(const char *, const char **);
-int	 parse_disk(struct parse_result *, char *, int);
+int	 parse_disk(struct parse_result *, char *, enum vm_disk_fmt);
 int	 parse_vmid(struct parse_result *, char *, int);
 int	 parse_instance(struct parse_result *, char *);
 void	 parse_free(struct parse_result *);
 int	 parse(int, char *[]);
 __dead void
 	 ctl_openconsole(const char *);
+__dead void
+	 fatal(const char *, ...);
+__dead void
+	 fatalx(const char *, ...);
+void	 log_debug(const char *, ...);
+void	 log_warn(const char *, ...);
+void	 log_warnx(const char *, ...);
 
 /* vmctl.c */
 int	 open_imagefile(int, const char *, int,
 	    struct virtio_backing *, off_t *);
 int	 create_imagefile(int, const char *, const char *, uint64_t, const char **);
 int	 vm_start(uint32_t, const char *, size_t, int, char **, int,
-	    char **, int *, char *, char *, char *, unsigned int);
+	    char **, enum vm_disk_fmt *, char *, char *, char *, unsigned int);
 int	 vm_start_complete(struct imsg *, int *, int);
 void	 terminate_vm(uint32_t, const char *, unsigned int);
 int	 terminate_vm_complete(struct imsg *, int *, unsigned int);
@@ -101,8 +106,6 @@ void	 pause_vm(uint32_t, const char *);
 int	 pause_vm_complete(struct imsg *, int *);
 void	 unpause_vm(uint32_t, const char *);
 int	 unpause_vm_complete(struct imsg *, int *);
-void	 send_vm(uint32_t, const char *);
-void	 vm_receive(uint32_t, const char *);
 int	 check_info_id(const char *, uint32_t);
 void	 get_info_vm(uint32_t, const char *, enum actions, unsigned int);
 int	 add_info(struct imsg *, int *);
@@ -112,5 +115,9 @@ int	 print_vm_info(struct vmop_info_result *, size_t);
 void	 terminate_all(struct vmop_info_result *, size_t, unsigned int);
 __dead void
 	 vm_console(struct vmop_info_result *, size_t);
+
+int	 imsg_int_read(struct imsg *);
+void	 vmop_result_read(struct imsg *, struct vmop_result *);
+void	 vmop_info_result_read(struct imsg *, struct vmop_info_result *);
 
 #endif /* VMCTL_PARSER_H */

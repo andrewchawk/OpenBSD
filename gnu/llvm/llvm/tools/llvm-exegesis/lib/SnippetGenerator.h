@@ -25,7 +25,6 @@
 #include "llvm/MC/MCInst.h"
 #include "llvm/Support/Error.h"
 #include <cstdlib>
-#include <memory>
 #include <vector>
 
 namespace llvm {
@@ -106,6 +105,9 @@ void setRandomAliasing(const AliasingConfigurations &AliasingConfigurations,
 Error randomizeUnsetVariables(const LLVMState &State,
                               const BitVector &ForbiddenRegs,
                               InstructionTemplate &IT);
+
+// Sanity check generated instruction.
+Error validateGeneratedInstruction(const LLVMState &State, const MCInst &Inst);
 
 } // namespace exegesis
 } // namespace llvm

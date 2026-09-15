@@ -1,4 +1,4 @@
-/*	$OpenBSD: route.c,v 1.436 2024/03/31 15:53:12 bluhm Exp $	*/
+/*	$OpenBSD: route.c,v 1.451 2026/04/22 15:17:43 claudio Exp $	*/
 /*	$NetBSD: route.c,v 1.14 1996/02/13 22:00:46 christos Exp $	*/
 
 /*
@@ -105,11 +105,8 @@
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/timeout.h>
 #include <sys/domain.h>
-#include <sys/ioctl.h>
-#include <sys/kernel.h>
 #include <sys/queue.h>
 #include <sys/pool.h>
 #include <sys/atomic.h>
@@ -215,7 +212,7 @@ route_cache(struct route *ro, const struct in_addr *dst,
 	    ro->ro_tableid == rtableid &&
 	    ro->ro_dstsa.sa_family == AF_INET &&
 	    ro->ro_dstsin.sin_addr.s_addr == dst->s_addr) {
-		if (src == NULL || !ipmultipath ||
+		if (src == NULL || !atomic_load_int(&ipmultipath) ||
 		    !ISSET(ro->ro_rt->rt_flags, RTF_MPATH) ||
 		    (ro->ro_srcin.s_addr != INADDR_ANY &&
 		    ro->ro_srcin.s_addr == src->s_addr)) {
@@ -272,7 +269,7 @@ route6_cache(struct route *ro, const struct in6_addr *dst,
 	    ro->ro_tableid == rtableid &&
 	    ro->ro_dstsa.sa_family == AF_INET6 &&
 	    IN6_ARE_ADDR_EQUAL(&ro->ro_dstsin6.sin6_addr, dst)) {
-		if (src == NULL || !ip6_multipath ||
+		if (src == NULL || !atomic_load_int(&ip6_multipath) ||
 		    !ISSET(ro->ro_rt->rt_flags, RTF_MPATH) ||
 		    (!IN6_IS_ADDR_UNSPECIFIED(&ro->ro_srcin6) &&
 		    IN6_ARE_ADDR_EQUAL(&ro->ro_srcin6, src))) {
@@ -324,7 +321,8 @@ rtisvalid(struct rtentry *rt)
 		return (0);
 
 	if (ISSET(rt->rt_flags, RTF_GATEWAY)) {
-		KASSERT(rt->rt_gwroute != NULL);
+		if (rt->rt_gwroute == NULL)
+			return (0);
 		KASSERT(!ISSET(rt->rt_gwroute->rt_flags, RTF_GATEWAY));
 		if (!ISSET(rt->rt_gwroute->rt_flags, RTF_UP))
 			return (0);
@@ -425,7 +423,7 @@ rt_hash(struct rtentry *rt, const struct sockaddr *dst, uint32_t *src)
 	    {
 		const struct sockaddr_in *sin;
 
-		if (!ipmultipath)
+		if (!atomic_load_int(&ipmultipath))
 			return (-1);
 
 		sin = satosin_const(dst);
@@ -439,7 +437,7 @@ rt_hash(struct rtentry *rt, const struct sockaddr *dst, uint32_t *src)
 	    {
 		const struct sockaddr_in6 *sin6;
 
-		if (!ip6_multipath)
+		if (!atomic_load_int(&ip6_multipath))
 			return (-1);
 
 		sin6 = satosin6_const(dst);
@@ -557,17 +555,14 @@ rt_setgwroute(struct rtentry *rt, const struct sockaddr *gate, u_int rtableid)
 	 * If the MTU of next hop is 0, this will reset the MTU of the
 	 * route to run PMTUD again from scratch.
 	 */
-	if (!ISSET(rt->rt_locks, RTV_MTU) && (rt->rt_mtu > nhrt->rt_mtu))
-		rt->rt_mtu = nhrt->rt_mtu;
+	if (!ISSET(rt->rt_locks, RTV_MTU)) {
+		u_int mtu, nhmtu;
 
-	/*
-	 * To avoid reference counting problems when writing link-layer
-	 * addresses in an outgoing packet, we ensure that the lifetime
-	 * of a cached entry is greater than the bigger lifetime of the
-	 * gateway entries it is pointed by.
-	 */
-	nhrt->rt_flags |= RTF_CACHED;
-	nhrt->rt_cachecnt++;
+		mtu = atomic_load_int(&rt->rt_mtu);
+		nhmtu = atomic_load_int(&nhrt->rt_mtu);
+		if (mtu > nhmtu)
+			atomic_cas_uint(&rt->rt_mtu, mtu, nhmtu);
+	}
 
 	/* commit */
 	rt_putgwroute(rt, nhrt);
@@ -588,17 +583,30 @@ rt_putgwroute(struct rtentry *rt, struct rtentry *nhrt)
 	if (!ISSET(rt->rt_flags, RTF_GATEWAY))
 		return;
 
-	/* this is protected as per [X] in route.h */
+	/*
+	 * To avoid reference counting problems when writing link-layer
+	 * addresses in an outgoing packet, we ensure that the lifetime
+	 * of a cached entry is greater than the bigger lifetime of the
+	 * gateway entries it is pointed by.
+	 */
+	if (nhrt != NULL) {
+		mtx_enter(&nhrt->rt_mtx);
+		SET(nhrt->rt_flags, RTF_CACHED);
+		nhrt->rt_cachecnt++;
+		mtx_leave(&nhrt->rt_mtx);
+	}
+
 	onhrt = rt->rt_gwroute;
 	rt->rt_gwroute = nhrt;
 
 	if (onhrt != NULL) {
+		mtx_enter(&onhrt->rt_mtx);
 		KASSERT(onhrt->rt_cachecnt > 0);
 		KASSERT(ISSET(onhrt->rt_flags, RTF_CACHED));
-
-		--onhrt->rt_cachecnt;
+		onhrt->rt_cachecnt--;
 		if (onhrt->rt_cachecnt == 0)
 			CLR(onhrt->rt_flags, RTF_CACHED);
+		mtx_leave(&onhrt->rt_mtx);
 
 		rtfree(onhrt);
 	}
@@ -797,7 +805,9 @@ rtdeletemsg(struct rtentry *rt, struct ifnet *ifp, u_int tableid)
 	info.rti_flags = rt->rt_flags;
 	info.rti_info[RTAX_IFP] = sdltosa(ifp->if_sadl);
 	info.rti_info[RTAX_IFA] = rt->rt_ifa->ifa_addr;
+	KERNEL_LOCK();
 	error = rtrequest_delete(&info, rt->rt_priority, ifp, &rt, tableid);
+	KERNEL_UNLOCK();
 	rtm_miss(RTM_DELETE, &info, info.rti_flags, rt->rt_priority,
 	    rt->rt_ifidx, error, tableid);
 	if (error == 0)
@@ -897,7 +907,7 @@ rtrequest_delete(struct rt_addrinfo *info, u_int8_t prio, struct ifnet *ifp,
 		return (ESRCH);
 
 	/* Make sure that's the route the caller want to delete. */
-	if (ifp != NULL && ifp->if_index != rt->rt_ifidx) {
+	if (ifp->if_index != rt->rt_ifidx) {
 		rtfree(rt);
 		return (ESRCH);
 	}
@@ -969,7 +979,6 @@ rtrequest(int req, struct rt_addrinfo *info, u_int8_t prio,
 			return (EINVAL);
 		if ((rt->rt_flags & RTF_CLONING) == 0)
 			return (EINVAL);
-		KASSERT(rt->rt_ifa->ifa_ifp != NULL);
 		info->rti_ifa = rt->rt_ifa;
 		info->rti_flags = rt->rt_flags | (RTF_CLONED|RTF_HOST);
 		info->rti_flags &= ~(RTF_CLONING|RTF_CONNECTED|RTF_STATIC);
@@ -981,6 +990,7 @@ rtrequest(int req, struct rt_addrinfo *info, u_int8_t prio,
 	case RTM_ADD:
 		if (info->rti_ifa == NULL)
 			return (EINVAL);
+		KASSERT(info->rti_ifa->ifa_ifp != NULL);
 		ifa = info->rti_ifa;
 		ifp = ifa->ifa_ifp;
 		if (prio == 0)
@@ -997,6 +1007,7 @@ rtrequest(int req, struct rt_addrinfo *info, u_int8_t prio,
 			return (ENOBUFS);
 		}
 
+		mtx_init_flags(&rt->rt_mtx, IPL_SOFTNET, "rtentry", 0);
 		refcnt_init_trace(&rt->rt_refcnt, DT_REFCNT_IDX_RTENTRY);
 		rt->rt_flags = info->rti_flags | RTF_UP;
 		rt->rt_priority = prio;	/* init routing priority */
@@ -1128,7 +1139,7 @@ rt_setgate(struct rtentry *rt, const struct sockaddr *gate, u_int rtableid)
 	if (rt->rt_gateway == gate) {
 		/* nop */
 		return (0);
-	};
+	}
 
 	sa = malloc(glen, M_RTABLE, M_NOWAIT | M_ZERO);
 	if (sa == NULL)
@@ -1157,7 +1168,7 @@ struct rtentry *
 rt_getll(struct rtentry *rt)
 {
 	if (ISSET(rt->rt_flags, RTF_GATEWAY)) {
-		KASSERT(rt->rt_gwroute != NULL);
+	 	/* We may return NULL here. */
 		return (rt->rt_gwroute);
 	}
 
@@ -1327,7 +1338,9 @@ rt_ifa_del(struct ifaddr *ifa, int flags, struct sockaddr *dst,
 		prio = ifp->if_priority + RTP_CONNECTED;
 
 	rtable_clearsource(rdomain, ifa->ifa_addr);
+	KERNEL_LOCK();
 	error = rtrequest_delete(&info, prio, ifp, &rt, rdomain);
+	KERNEL_UNLOCK();
 	if (error == 0) {
 		rtm_send(rt, RTM_DELETE, 0, rdomain);
 		if (flags & RTF_LOCAL)
@@ -1714,7 +1727,8 @@ rt_mpls_set(struct rtentry *rt, const struct sockaddr *src, uint8_t op)
 	if (psa_mpls != NULL && psa_mpls->smpls_family != AF_MPLS)
 		return (EAFNOSUPPORT);
 
-	rt->rt_llinfo = malloc(sizeof(struct rt_mpls), M_TEMP, M_NOWAIT|M_ZERO);
+	rt->rt_llinfo = malloc(sizeof(struct rt_mpls), M_RTABLE,
+	    M_NOWAIT|M_ZERO);
 	if (rt->rt_llinfo == NULL)
 		return (ENOMEM);
 
@@ -1732,7 +1746,7 @@ void
 rt_mpls_clear(struct rtentry *rt)
 {
 	if (rt->rt_llinfo != NULL && rt->rt_flags & RTF_MPLS) {
-		free(rt->rt_llinfo, M_TEMP, sizeof(struct rt_mpls));
+		free(rt->rt_llinfo, M_RTABLE, sizeof(struct rt_mpls));
 		rt->rt_llinfo = NULL;
 	}
 	rt->rt_flags &= ~RTF_MPLS;
@@ -1990,13 +2004,12 @@ rt_plentosa(sa_family_t af, int plen, struct sockaddr_in6 *sa_mask)
 }
 
 struct sockaddr *
-rt_plen2mask(struct rtentry *rt, struct sockaddr_in6 *sa_mask)
+rt_plen2mask(const struct rtentry *rt, struct sockaddr_in6 *sa_mask)
 {
 	return (rt_plentosa(rt_key(rt)->sa_family, rt_plen(rt), sa_mask));
 }
 
 #ifdef DDB
-#include <machine/db_machdep.h>
 #include <ddb/db_output.h>
 
 void	db_print_sa(struct sockaddr *);

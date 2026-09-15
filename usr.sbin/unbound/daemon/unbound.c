@@ -174,7 +174,7 @@ static void
 checkrlimits(struct config_file* cfg)
 {
 #ifndef S_SPLINT_S
-#ifdef HAVE_GETRLIMIT
+#if defined(HAVE_GETRLIMIT) && !defined(unbound_testbound)
 	/* list has number of ports to listen to, ifs number addresses */
 	int list = ((cfg->do_udp?1:0) + (cfg->do_tcp?1 + 
 			(int)cfg->incoming_num_tcp:0));
@@ -463,6 +463,18 @@ detach(void)
 #endif /* HAVE_DAEMON */
 }
 
+/** setup the remote and ticket keys */
+static void
+setup_sslctx_remote(struct daemon* daemon, struct config_file* cfg)
+{
+#ifdef HAVE_SSL
+	if(!(daemon->rc = daemon_remote_create(cfg)))
+		fatal_exit("could not set up remote-control");
+#else /* HAVE_SSL */
+	(void)daemon;(void)cfg;
+#endif /* HAVE_SSL */
+}
+
 /** daemonize, drop user privileges and chroot if needed */
 static void
 perform_setup(struct daemon* daemon, struct config_file* cfg, int debug_mode,
@@ -473,7 +485,11 @@ perform_setup(struct daemon* daemon, struct config_file* cfg, int debug_mode,
 #endif
 #ifdef HAVE_GETPWNAM
 	struct passwd *pwd = NULL;
+#endif
 
+	if(!daemon_privileged(daemon))
+		fatal_exit("could not do privileged setup");
+#ifdef HAVE_GETPWNAM
 	if(cfg->username && cfg->username[0]) {
 		if((pwd = getpwnam(cfg->username)) == NULL)
 			fatal_exit("user '%s' does not exist.", cfg->username);
@@ -485,36 +501,8 @@ perform_setup(struct daemon* daemon, struct config_file* cfg, int debug_mode,
 #endif
 
 	/* read ssl keys while superuser and outside chroot */
-#ifdef HAVE_SSL
-	if(!(daemon->rc = daemon_remote_create(cfg)))
-		fatal_exit("could not set up remote-control");
-	if(cfg->ssl_service_key && cfg->ssl_service_key[0]) {
-		if(!(daemon->listen_sslctx = listen_sslctx_create(
-			cfg->ssl_service_key, cfg->ssl_service_pem, NULL)))
-			fatal_exit("could not set up listen SSL_CTX");
-		if(cfg->tls_ciphers && cfg->tls_ciphers[0]) {
-			if (!SSL_CTX_set_cipher_list(daemon->listen_sslctx, cfg->tls_ciphers)) {
-				fatal_exit("failed to set tls-cipher %s", cfg->tls_ciphers);
-			}
-		}
-#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
-		if(cfg->tls_ciphersuites && cfg->tls_ciphersuites[0]) {
-			if (!SSL_CTX_set_ciphersuites(daemon->listen_sslctx, cfg->tls_ciphersuites)) {
-				fatal_exit("failed to set tls-ciphersuites %s", cfg->tls_ciphersuites);
-			}
-		}
-#endif
-		if(cfg->tls_session_ticket_keys.first &&
-			cfg->tls_session_ticket_keys.first->str[0] != 0) {
-			if(!listen_sslctx_setup_ticket_keys(daemon->listen_sslctx, cfg->tls_session_ticket_keys.first)) {
-				fatal_exit("could not set session ticket SSL_CTX");
-			}
-		}
-	}
-	if(!(daemon->connect_sslctx = connect_sslctx_create(NULL, NULL,
-		cfg->tls_cert_bundle, cfg->tls_win_cert)))
-		fatal_exit("could not set up connect SSL_CTX");
-#endif
+	setup_sslctx_remote(daemon, cfg);
+	daemon_setup_sslctxs(daemon, cfg);
 
 	/* init syslog (as root) if needed, before daemonize, otherwise
 	 * a fork error could not be printed since daemonize closed stderr.*/
@@ -550,7 +538,7 @@ perform_setup(struct daemon* daemon, struct config_file* cfg, int debug_mode,
 		 * because that creates privilege escape problems, with the
 		 * pidfile writable by unprivileged users, but used by
 		 * privileged users. */
-		if(cfg->username && cfg->username[0])
+		if(!(cfg->username && cfg->username[0]))
 			checkoldpid(daemon->pidfile, pidinchroot);
 	}
 #endif
@@ -677,6 +665,9 @@ perform_setup(struct daemon* daemon, struct config_file* cfg, int debug_mode,
 	 * it would succeed on SIGHUP as well */
 	if(!cfg->use_syslog)
 		log_init(cfg->logfile, cfg->use_syslog, cfg->chrootdir);
+	daemon->cfgfile = strdup(*cfgfile);
+	if(!daemon->cfgfile)
+		fatal_exit("out of memory in daemon cfgfile strdup");
 }
 
 /**
@@ -711,6 +702,7 @@ run_daemon(const char* cfgfile, int cmdline_verbose, int debug_mode, int need_pi
 					"the commandline to see more errors, "
 					"or unbound-checkconf", cfgfile);
 			log_warn("Continuing with default config settings");
+			config_auto_slab_values(cfg);
 		}
 		apply_settings(daemon, cfg, cmdline_verbose, debug_mode);
 		if(!done_setup)

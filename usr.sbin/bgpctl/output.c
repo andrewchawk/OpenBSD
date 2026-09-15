@@ -1,4 +1,4 @@
-/*	$OpenBSD: output.c,v 1.51 2024/05/22 08:42:34 claudio Exp $ */
+/*	$OpenBSD: output.c,v 1.78 2026/06/24 06:02:48 claudio Exp $ */
 
 /*
  * Copyright (c) 2003 Henning Brauer <henning@openbsd.org>
@@ -19,6 +19,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 #include <endian.h>
 #include <err.h>
 #include <math.h>
@@ -27,7 +30,6 @@
 #include <string.h>
 
 #include "bgpd.h"
-#include "session.h"
 #include "rde.h"
 
 #include "bgpctl.h"
@@ -66,7 +68,7 @@ show_head(struct parse_result *res)
 			break;
 		printf("flags: "
 		    "* = Valid, > = Selected, I = via IBGP, A = Announced,\n"
-		    "       S = Stale, E = Error\n");
+		    "       S = Stale, E = Error, F = Filtered, L = Leaked\n");
 		printf("origin validation state: "
 		    "N = not-found, V = valid, ! = invalid\n");
 		printf("aspa validation state: "
@@ -93,7 +95,7 @@ show_head(struct parse_result *res)
 }
 
 static void
-show_summary(struct peer *p)
+show_summary(struct ctl_peer *p)
 {
 	char		*s;
 	const char	*a;
@@ -119,10 +121,10 @@ show_summary(struct peer *p)
 	    p->stats.msg_sent_open + p->stats.msg_sent_notification +
 	    p->stats.msg_sent_update + p->stats.msg_sent_keepalive +
 	    p->stats.msg_sent_rrefresh,
-	    p->wbuf.queued,
+	    p->stats.msg_queue_len,
 	    fmt_monotime(p->stats.last_updown));
 	if (p->state == STATE_ESTABLISHED) {
-		printf("%6u", p->stats.prefix_cnt);
+		printf("%6u", p->rde_stats.prefix_cnt);
 		if (p->conf.max_prefix != 0)
 			printf("/%u", p->conf.max_prefix);
 	} else if (p->conf.template)
@@ -182,9 +184,11 @@ show_neighbor_capa_restart(struct capabilities *capa)
 	int	comma;
 	uint8_t	i;
 
-	printf("    Graceful Restart");
+	printf("    Graceful Restart: ");
 	if (capa->grestart.timeout)
-		printf(": Timeout: %d, ", capa->grestart.timeout);
+		printf("timeout: %d, ", capa->grestart.timeout);
+	if (capa->grestart.grnotification)
+		printf("graceful notification, ");
 	for (i = AID_MIN, comma = 0; i < AID_MAX; i++)
 		if (capa->grestart.flags[i] & CAPA_GR_PRESENT) {
 			if (!comma &&
@@ -201,7 +205,7 @@ show_neighbor_capa_restart(struct capabilities *capa)
 }
 
 static void
-show_neighbor_msgstats(struct peer *p)
+show_neighbor_msgstats(struct ctl_peer *p)
 {
 	printf("  Message statistics:\n");
 	printf("  %-15s %-10s %-10s\n", "", "Sent", "Received");
@@ -222,30 +226,39 @@ show_neighbor_msgstats(struct peer *p)
 	    p->stats.msg_rcvd_open + p->stats.msg_rcvd_notification +
 	    p->stats.msg_rcvd_update + p->stats.msg_rcvd_keepalive +
 	    p->stats.msg_rcvd_rrefresh);
+
 	printf("  Update statistics:\n");
 	printf("  %-15s %-10s %-10s %-10s\n", "", "Sent", "Received",
 	    "Pending");
 	printf("  %-15s %10u %10u\n", "Prefixes",
-	    p->stats.prefix_out_cnt, p->stats.prefix_cnt);
+	    p->rde_stats.prefix_out_cnt, p->rde_stats.prefix_cnt);
 	printf("  %-15s %10llu %10llu %10u\n", "Updates",
-	    p->stats.prefix_sent_update, p->stats.prefix_rcvd_update,
-	    p->stats.pending_update);
+	    p->rde_stats.prefix_sent_update, p->rde_stats.prefix_rcvd_update,
+	    p->rde_stats.pending_update);
 	printf("  %-15s %10llu %10llu %10u\n", "Withdraws",
-	    p->stats.prefix_sent_withdraw, p->stats.prefix_rcvd_withdraw,
-	    p->stats.pending_withdraw);
+	    p->rde_stats.prefix_sent_withdraw,
+	    p->rde_stats.prefix_rcvd_withdraw,
+	    p->rde_stats.pending_withdraw);
 	printf("  %-15s %10llu %10llu\n", "End-of-Rib",
-	    p->stats.prefix_sent_eor, p->stats.prefix_rcvd_eor);
+	    p->rde_stats.prefix_sent_eor, p->rde_stats.prefix_rcvd_eor);
 	printf("  Route Refresh statistics:\n");
 	printf("  %-15s %10llu %10llu\n", "Request",
 	    p->stats.refresh_sent_req, p->stats.refresh_rcvd_req);
 	printf("  %-15s %10llu %10llu\n", "Begin-of-RR",
 	    p->stats.refresh_sent_borr, p->stats.refresh_rcvd_borr);
-	printf("  %-15s %10llu %10llu\n", "End-of-RR",
+	printf("  %-15s %10llu %10llu\n\n", "End-of-RR",
 	    p->stats.refresh_sent_eorr, p->stats.refresh_rcvd_eorr);
+
+	printf("  Queue statistics:\n");
+	printf("  %-15s %-10s %-10s\n", "", "Count", "Size");
+	printf("  %-15s %10llu %10llu\n", "ibuf queue",
+	    p->rde_stats.ibufq_msg_count, p->rde_stats.ibufq_payload_size);
+	printf("  %-15s %10llu %10s\n", "rib queue",
+	    p->rde_stats.rib_entry_count, "-");
 }
 
 static void
-show_neighbor_full(struct peer *p, struct parse_result *res)
+show_neighbor_full(struct ctl_peer *p, struct parse_result *res)
 {
 	const char	*errstr;
 	struct in_addr	 ina;
@@ -302,7 +315,7 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 		ina.s_addr = htonl(p->remote_bgpid);
 		printf("  BGP version 4, remote router-id %s",
 		    inet_ntoa(ina));
-		printf("%s\n", fmt_auth_method(p->auth.method));
+		printf("%s\n", fmt_auth_method(p->auth_method));
 	}
 	printf("  BGP state = %s", statenames[p->state]);
 	if (p->conf.down) {
@@ -312,7 +325,7 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 		printf(" with shutdown reason \"%s\"",
 		    log_reason(p->conf.reason));
 	}
-	if (p->stats.last_updown != 0)
+	if (monotime_valid(p->stats.last_updown))
 		printf(", %s for %s",
 		    p->state == STATE_ESTABLISHED ? "up" : "down",
 		    fmt_monotime(p->stats.last_updown));
@@ -332,7 +345,8 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 	}
 	if (hascapamp || hascapaap || p->capa.peer.grestart.restart ||
 	    p->capa.peer.refresh || p->capa.peer.enhanced_rr ||
-	    p->capa.peer.as4byte || p->capa.peer.policy) {
+	    p->capa.peer.as4byte || p->capa.peer.policy ||
+	    p->capa.peer.ext_msg) {
 		printf("  Neighbor capabilities:\n");
 		if (hascapamp)
 			show_neighbor_capa_mp(&p->capa.peer);
@@ -342,6 +356,8 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 			printf("    Route Refresh\n");
 		if (p->capa.peer.enhanced_rr)
 			printf("    Enhanced Route Refresh\n");
+		if (p->capa.peer.ext_msg)
+			printf("    Extended message\n");
 		if (p->capa.peer.grestart.restart)
 			show_neighbor_capa_restart(&p->capa.peer);
 		if (hascapaap)
@@ -362,7 +378,8 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 	}
 	if (hascapamp || hascapaap || p->capa.neg.grestart.restart ||
 	    p->capa.neg.refresh || p->capa.neg.enhanced_rr ||
-	    p->capa.neg.as4byte || p->capa.neg.policy) {
+	    p->capa.neg.as4byte || p->capa.neg.policy ||
+	    p->capa.neg.ext_msg) {
 		printf("  Negotiated capabilities:\n");
 		if (hascapamp)
 			show_neighbor_capa_mp(&p->capa.neg);
@@ -372,6 +389,8 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 			printf("    Route Refresh\n");
 		if (p->capa.neg.enhanced_rr)
 			printf("    Enhanced Route Refresh\n");
+		if (p->capa.neg.ext_msg)
+			printf("    Extended message\n");
 		if (p->capa.neg.grestart.restart)
 			show_neighbor_capa_restart(&p->capa.neg);
 		if (hascapaap)
@@ -413,7 +432,7 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 }
 
 static void
-show_neighbor(struct peer *p, struct parse_result *res)
+show_neighbor(struct ctl_peer *p, struct parse_result *res)
 {
 	char *s;
 
@@ -444,10 +463,11 @@ show_neighbor(struct peer *p, struct parse_result *res)
 		    p->stats.msg_sent_update, p->stats.msg_rcvd_update,
 		    p->stats.msg_sent_keepalive, p->stats.msg_rcvd_keepalive,
 		    p->stats.msg_sent_rrefresh, p->stats.msg_rcvd_rrefresh,
-		    p->stats.prefix_cnt, p->conf.max_prefix,
-		    p->stats.prefix_sent_update, p->stats.prefix_rcvd_update,
-		    p->stats.prefix_sent_withdraw,
-		    p->stats.prefix_rcvd_withdraw, s,
+		    p->rde_stats.prefix_cnt, p->conf.max_prefix,
+		    p->rde_stats.prefix_sent_update,
+		    p->rde_stats.prefix_rcvd_update,
+		    p->rde_stats.prefix_sent_withdraw,
+		    p->rde_stats.prefix_rcvd_withdraw, s,
 		    log_as(p->conf.remote_as), p->conf.descr);
 		free(s);
 		break;
@@ -461,10 +481,10 @@ show_timer(struct ctl_timer *t)
 {
 	printf("  %-20s ", timernames[t->type]);
 
-	if (t->val <= 0)
-		printf("%-20s\n", "due");
+	if (get_rel_monotime(t->val) >= 0)
+		printf("%s\n", "due");
 	else
-		printf("due in %-13s\n", fmt_timeframe(t->val));
+		printf("%s\n", fmt_monotime(t->val));
 }
 
 static void
@@ -1026,8 +1046,8 @@ show_rib_detail(struct ctl_show_rib *r, struct ibuf *asbuf, int flag0)
 	printf("avs %s, %s", fmt_avs(r->aspa_validation_state, 0),
 	    fmt_flags(r->flags, 0));
 
-	printf("%c    Last update: %s ago%c", EOL0(flag0),
-	    fmt_timeframe(r->age), EOL0(flag0));
+	printf("%c    Last update: %s%c", EOL0(flag0),
+	    fmt_monotime(r->lastchange), EOL0(flag0));
 }
 
 static void
@@ -1060,6 +1080,15 @@ show_rib_mem(struct rde_memstats *stats)
 	printf("%10lld prefix entries using %s of memory\n",
 	    stats->prefix_cnt, fmt_mem(stats->prefix_cnt *
 	    sizeof(struct prefix)));
+	printf("%10lld adjout_prefix entries using %s out of",
+	    stats->adjout_prefix_cnt,
+	    fmt_mem(stats->adjout_prefix_cnt * sizeof(struct adjout_prefix)));
+	printf(" %s memory\n", fmt_mem(stats->adjout_prefix_size));
+	printf("%10lld adjout attribute entries using %s of memory\n",
+	    stats->adjout_attr_cnt, fmt_mem(stats->adjout_attr_cnt *
+	    sizeof(struct adjout_attr)));
+	printf("\t   and holding %lld references\n",
+	    stats->adjout_attr_refs);
 	printf("%10lld BGP path attribute entries using %s of memory\n",
 	    stats->path_cnt, fmt_mem(stats->path_cnt *
 	    sizeof(struct rde_aspath)));
@@ -1080,19 +1109,63 @@ show_rib_mem(struct rde_memstats *stats)
 	    stats->attr_refs);
 	printf("%10lld BGP attributes using %s of memory\n",
 	    stats->attr_dcnt, fmt_mem(stats->attr_data));
+	printf("%10lld pending attribute entries using %s of memory\n",
+	    stats->pend_attr_cnt, fmt_mem(stats->pend_attr_cnt *
+	    sizeof(struct pend_attr)));
+	printf("%10lld pending prefix entries using %s of memory\n",
+	    stats->pend_prefix_cnt, fmt_mem(stats->pend_prefix_cnt *
+	    sizeof(struct pend_prefix)));
+	printf("%10lld extended bitmaps using %s of memory\n",
+	    stats->bitmap_cnt, fmt_mem(stats->bitmap_size));
+	printf("%10lld hash tables using %s of memory\n",
+	    stats->hash_cnt, fmt_mem(stats->hash_size));
+	printf("\t   and holding %lld references\n",
+	    stats->hash_refs);
+	printf("%10lld filters using %s of memory\n",
+	    stats->filter_cnt, fmt_mem(stats->filter_size));
+	printf("\t   and holding %lld references\n",
+	    stats->filter_refs);
+	printf("%10lld filter-sets using %s of memory\n",
+	    stats->filter_set_cnt, fmt_mem(stats->filter_set_size));
+	printf("\t   and holding %lld references\n",
+	    stats->filter_set_refs);
 	printf("%10lld as-set elements in %lld tables using "
 	    "%s of memory\n", stats->aset_nmemb, stats->aset_cnt,
 	    fmt_mem(stats->aset_size));
 	printf("%10lld prefix-set elements using %s of memory\n",
 	    stats->pset_cnt, fmt_mem(stats->pset_size));
+	printf("%10lld aspa-set elements using %s of memory\n",
+	    stats->aspa_cnt, fmt_mem(stats->aspa_size));
 	printf("RIB using %s of memory\n", fmt_mem(pts +
 	    stats->prefix_cnt * sizeof(struct prefix) +
+	    stats->adjout_prefix_cnt * sizeof(struct adjout_prefix) +
+	    stats->adjout_attr_cnt * sizeof(struct adjout_attr) +
+	    stats->pend_prefix_cnt * sizeof(struct pend_prefix) +
+	    stats->pend_attr_cnt * sizeof(struct pend_attr) +
 	    stats->rib_cnt * sizeof(struct rib_entry) +
 	    stats->path_cnt * sizeof(struct rde_aspath) +
 	    stats->aspath_size + stats->attr_cnt * sizeof(struct attr) +
-	    stats->attr_data));
-	printf("Sets using %s of memory\n", fmt_mem(stats->aset_size +
-	    stats->pset_size));
+	    stats->attr_data + stats->bitmap_size + stats->hash_size));
+	printf("Sets and filters using %s of memory\n",
+	    fmt_mem(stats->aset_size + stats->pset_size + stats->aspa_size +
+	    stats->filter_size + stats->filter_set_size));
+
+	printf("\nRDE queue statistics\n");
+	printf("%10lld messages queued holding %s of data\n",
+	    stats->rde_ibufq_msg_count, fmt_mem(stats->rde_ibufq_payload_size));
+	printf("%10lld rib entries queued\n", stats->rde_rib_entry_count);
+
+	printf("\nRDE timing statistics\n");
+	printf("%10lld usec spent in the event loop for %llu rounds\n",
+	    stats->rde_event_loop_usec, stats->rde_event_loop_count);
+	printf("%10lld usec spent on io\n", stats->rde_event_io_usec);
+	printf("%10lld usec spent on peers\n", stats->rde_event_peer_usec);
+	printf("%10lld usec spent on adj-out\n", stats->rde_event_adjout_usec);
+	printf("%10lld usec spent on rib dumps\n",
+	    stats->rde_event_ribdump_usec);
+	printf("%10lld usec spent on nexthops\n",
+	    stats->rde_event_nexthop_usec);
+	printf("%10lld usec spent on updates\n", stats->rde_event_update_usec);
 }
 
 static void
@@ -1107,7 +1180,7 @@ show_rib_set(struct ctl_show_set *set)
 		snprintf(buf, sizeof(buf), "%7zu %7zu %6s",
 		    set->v4_cnt, set->v6_cnt, "-");
 
-	printf("%-6s %-34s %s %11s\n", fmt_set_type(set), set->name,
+	printf("%-6s %-34s %s %12s\n", fmt_set_type(set), set->name,
 	    buf, fmt_monotime(set->lastchange));
 }
 
@@ -1128,8 +1201,9 @@ show_rtr(struct ctl_show_rtr *rtr)
 	if (rtr->local_addr.aid != AID_UNSPEC)
 		printf(" Local Address: %s\n", log_addr(&rtr->local_addr));
 	if (rtr->session_id != -1)
-		printf(" Version: %u Session ID: %d Serial #: %u\n",
-		    rtr->version, rtr->session_id, rtr->serial);
+		printf(" Version: %u min %u Session ID: %d Serial #: %u\n",
+		    rtr->version, rtr->min_version, rtr->session_id,
+		    rtr->serial);
 	printf(" Refresh: %u, Retry: %u, Expire: %u\n",
 	    rtr->refresh, rtr->retry, rtr->expire);
 

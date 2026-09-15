@@ -1,4 +1,4 @@
-/*	$OpenBSD: dev.h,v 1.46 2024/05/24 15:16:09 ratchov Exp $	*/
+/*	$OpenBSD: dev.h,v 1.60 2026/08/04 09:43:23 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -26,7 +26,7 @@
 /*
  * preallocated audio clients
  */
-#define DEV_NSLOT	8
+#define DEV_NSLOT	32
 
 /*
  * preallocated control clients
@@ -40,6 +40,7 @@
 struct slotops
 {
 	void (*onmove)(void *);			/* clock tick */
+	void (*onxrun)(void *);			/* xrun */
 	void (*onvol)(void *);			/* tell client vol changed */
 	void (*fill)(void *);			/* request to fill a play block */
 	void (*flush)(void *);			/* request to flush a rec block */
@@ -77,11 +78,10 @@ struct slot {
 		int prime;			/* initial cycles to skip */
 		int bpf;			/* byte per frame */
 		int nch;			/* number of rec chans */
-		struct cmap cmap;		/* channel mapper state */
+		struct cmap cmap_rec;		/* rec channel mapper state */
+		struct cmap cmap_mon;		/* mon channel mapper state */
 		struct resamp resamp;		/* buffer for resampling */
 		struct conv enc;		/* buffer for encoding */
-		int join;			/* channel join factor */
-		int expand;			/* channel expand factor */
 		void *resampbuf, *encbuf;	/* tmp buffers */
 	} sub;
 	int xrun;				/* underrun policy */
@@ -100,13 +100,9 @@ struct slot {
 #define SLOT_RUN	3			/* buffer attached to device */
 #define SLOT_STOP	4			/* draining */
 	int pstate;
+	int paused;				/* paused because of xrun */
 
-#define SLOT_NAMEMAX	8
-	char name[SLOT_NAMEMAX];		/* name matching [a-z]+ */
-	unsigned int unit;			/* instance of name */
-	unsigned int serial;			/* global unique number */
-	unsigned int vol;			/* current (midi) volume */
-	unsigned int id;			/* process id */
+	struct app *app;
 };
 
 /*
@@ -127,7 +123,10 @@ struct ctl {
 #define CTL_HW		0
 #define CTL_DEV_MASTER	1
 #define CTL_OPT_DEV	2
-#define CTL_SLOT_LEVEL	3
+#define CTL_APP_LEVEL	3
+#define CTL_OPT_MODE	4
+#define CTL_MIDI_PORT	5
+#define CTL_MIDI_THRU	6
 	unsigned int scope;
 	union {
 		struct {
@@ -142,21 +141,24 @@ struct ctl {
 			struct dev *dev;
 		} dev_master;
 		struct {
-			struct slot *slot;
-		} slot_level;
-		struct {
-			struct slot *slot;
 			struct opt *opt;
-		} slot_opt;
+			struct app *app;
+		} app_level;
 		struct {
 			struct opt *opt;
 			struct dev *dev;
 		} opt_dev;
+		struct {
+			struct opt *opt;
+			int idx;
+		} opt_mode;
+		struct {
+			struct midithru *midithru;
+			struct port *port;
+		} midi;
 	} u;
 
 	unsigned int addr;		/* slot side control address */
-#define CTL_NAMEMAX	12		/* max name length */
-#define CTL_DISPLAYMAX	24		/* max name length */
 	char func[CTL_NAMEMAX];		/* parameter function name */
 	char group[CTL_NAMEMAX];	/* group aka namespace */
 	char display[CTL_DISPLAYMAX];	/* free-format hint */
@@ -178,6 +180,7 @@ struct ctlslot {
 	struct ctlops *ops;
 	void *arg;
 	struct opt *opt;
+	struct midithru *midithru;
 	unsigned int self;		/* equal to (1 << index) */
 	unsigned int mode;
 };
@@ -223,11 +226,6 @@ struct dev {
 	char name[CTL_NAMEMAX];
 
 	/*
-	 * next to try if this fails
-	 */
-	struct dev *alt_next;
-
-	/*
 	 * audio device (while opened)
 	 */
 	struct dev_sio sio;
@@ -252,12 +250,8 @@ struct dev {
 	/*
 	 * desired parameters
 	 */
-	unsigned int reqmode;			/* mode */
 	struct aparams reqpar;			/* parameters */
 	int reqpchan, reqrchan;			/* play & rec chans */
-	unsigned int reqbufsz;			/* buffer size */
-	unsigned int reqround;			/* block size */
-	unsigned int reqrate;			/* sample rate */
 	unsigned int hold;			/* hold the device open ? */
 	unsigned int autovol;			/* auto adjust playvol ? */
 	unsigned int refcnt;			/* number of openers */
@@ -286,19 +280,17 @@ extern struct ctl *ctl_list;
 extern struct slot slot_array[DEV_NSLOT];
 extern struct ctlslot ctlslot_array[DEV_NCTLSLOT];
 extern struct mtc mtc_array[1];
+extern int dev_rate, dev_bufsz, dev_round;
 
-void slot_array_init(void);
-
-void dev_log(struct dev *);
+size_t chans_fmt(char *, size_t, int, int, int, int, int);
 int dev_open(struct dev *);
 void dev_close(struct dev *);
 void dev_abort(struct dev *);
-struct dev *dev_migrate(struct dev *);
-struct dev *dev_new(char *, struct aparams *, unsigned int, unsigned int,
-    unsigned int, unsigned int, unsigned int, unsigned int);
+void dev_migrate(struct dev *);
+struct dev *dev_new(char *, struct aparams *, unsigned int, unsigned int);
 struct dev *dev_bynum(int);
 void dev_del(struct dev *);
-void dev_adjpar(struct dev *, int, int, int);
+void dev_adjpar(struct dev *, int, int);
 int  dev_init(struct dev *);
 void dev_done(struct dev *);
 int dev_ref(struct dev *);
@@ -317,10 +309,7 @@ void dev_cycle(struct dev *);
  */
 void dev_master(struct dev *, unsigned int);
 void dev_midi_send(struct dev *, void *, int);
-void dev_midi_vol(struct dev *, struct slot *);
 void dev_midi_master(struct dev *);
-void dev_midi_slotdesc(struct dev *, struct slot *);
-void dev_midi_dump(struct dev *);
 
 void mtc_midi_qfr(struct mtc *, int);
 void mtc_midi_full(struct mtc *);
@@ -333,12 +322,10 @@ void mtc_setdev(struct mtc *, struct dev *);
 /*
  * sio_open(3) like interface for clients
  */
-void slot_log(struct slot *);
 struct slot *slot_new(struct opt *, unsigned int, char *,
     struct slotops *, void *, int);
 void slot_del(struct slot *);
 void slot_setvol(struct slot *, unsigned int);
-void slot_setopt(struct slot *, struct opt *);
 void slot_start(struct slot *);
 void slot_stop(struct slot *, int);
 void slot_read(struct slot *);
@@ -354,14 +341,16 @@ void slot_detach(struct slot *);
 struct ctl *ctl_new(int, void *, void *,
     int, char *, char *, char *, int, char *, char *, int, int, int);
 int ctl_del(int, void *, void *);
-void ctl_log(struct ctl *);
+size_t ctl_node_fmt(char *, size_t, struct ctl_node *);
+size_t ctl_scope_fmt(char *, size_t, struct ctl *);
+size_t ctl_fmt(char *, size_t, struct ctl *);
 int ctl_setval(struct ctl *c, int val);
 int ctl_match(struct ctl *, int, void *, void *);
 struct ctl *ctl_find(int, void *, void *);
 void ctl_update(struct ctl *);
 int ctl_onval(int, void *, void *, int);
 
-struct ctlslot *ctlslot_new(struct opt *, struct ctlops *, void *);
+struct ctlslot *ctlslot_new(struct opt *, struct midithru *, struct ctlops *, void *);
 void ctlslot_del(struct ctlslot *);
 int ctlslot_visible(struct ctlslot *, struct ctl *);
 struct ctl *ctlslot_lookup(struct ctlslot *, int);

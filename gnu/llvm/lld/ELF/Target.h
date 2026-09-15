@@ -12,28 +12,36 @@
 #include "Config.h"
 #include "InputSection.h"
 #include "lld/Common/ErrorHandler.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Object/ELF.h"
+#include "llvm/Object/ELFTypes.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/MathExtras.h"
 #include <array>
 
 namespace lld {
-std::string toString(elf::RelType type);
-
 namespace elf {
 class Defined;
+class DynamicReloc;
 class InputFile;
 class Symbol;
+template <class RelTy> struct Relocs;
+
+std::string toStr(Ctx &, RelType type);
 
 class TargetInfo {
 public:
+  TargetInfo(Ctx &ctx) : ctx(ctx) {}
   virtual uint32_t calcEFlags() const { return 0; }
   virtual RelExpr getRelExpr(RelType type, const Symbol &s,
                              const uint8_t *loc) const = 0;
   virtual RelType getDynRel(RelType type) const { return 0; }
+  virtual void prepareDynamicReloc(RelType type, const Symbol &sym,
+                                   InputSectionBase &sec) {}
+  virtual void finalizeDynamicReloc(DynamicReloc &rel) const {}
   virtual void writeGotPltHeader(uint8_t *buf) const {}
   virtual void writeGotHeader(uint8_t *buf) const {}
-  virtual void writeGotPlt(uint8_t *buf, const Symbol &s) const {};
+  virtual void writeGotPlt(uint8_t *buf, const Symbol &s) const {}
   virtual void writeIgotPlt(uint8_t *buf, const Symbol &s) const {}
   virtual int64_t getImplicitAddend(const uint8_t *buf, RelType type) const;
   virtual int getTlsGdRelaxSkip(RelType type) const { return 1; }
@@ -43,8 +51,13 @@ public:
   // they are called. This function writes that code.
   virtual void writePltHeader(uint8_t *buf) const {}
 
+  virtual uint64_t getPltEntryOffset(uint32_t pltIdx,
+                                     uint64_t headerSize) const {
+    return headerSize + uint64_t{pltIdx} * pltEntrySize;
+  }
   virtual void writePlt(uint8_t *buf, const Symbol &sym,
                         uint64_t pltEntryAddr) const {}
+  virtual void finalizePlt(uint8_t *buf) const {}
   virtual void writeIplt(uint8_t *buf, const Symbol &sym,
                          uint64_t pltEntryAddr) const {
     // All but PPC32 and PPC64 use the same format for .plt and .iplt entries.
@@ -84,18 +97,34 @@ public:
   virtual bool inBranchRange(RelType type, uint64_t src,
                              uint64_t dst) const;
 
+  // Function for scanning relocation. Typically overridden by targets that
+  // require special type or addend adjustment.
+  virtual void scanSection(InputSectionBase &);
+  // Called by scanSection as a default implementation for specific ELF
+  // relocation types.
+  template <class ELFT> void scanSection1(InputSectionBase &);
+  template <class ELFT, class RelTy>
+  void scanSectionImpl(InputSectionBase &, Relocs<RelTy>);
+
   virtual void relocate(uint8_t *loc, const Relocation &rel,
                         uint64_t val) const = 0;
   void relocateNoSym(uint8_t *loc, RelType type, uint64_t val) const {
     relocate(loc, Relocation{R_NONE, type, 0, 0, nullptr}, val);
   }
-  virtual void relocateAlloc(InputSectionBase &sec, uint8_t *buf) const;
+  virtual void relocateAlloc(InputSection &sec, uint8_t *buf) const;
+  void relocateEh(EhInputSection &sec, uint8_t *buf) const;
 
   // Do a linker relaxation pass and return true if we changed something.
   virtual bool relaxOnce(int pass) const { return false; }
+  virtual bool synthesizeAlign(uint64_t &dot, InputSection *sec) {
+    return false;
+  }
+  // Do finalize relaxation after collecting relaxation infos.
+  virtual void finalizeRelax(int passes) const {}
 
   virtual void applyJumpInstrMod(uint8_t *loc, JumpModType type,
                                  JumpModType val) const {}
+  virtual void applyBranchToBranchOpt() const {}
 
   virtual ~TargetInfo();
 
@@ -109,29 +138,32 @@ public:
     return false;
   }
 
+  Ctx &ctx;
   unsigned defaultCommonPageSize = 4096;
   unsigned defaultMaxPageSize = 4096;
 
   uint64_t getImageBase() const;
 
-  // True if _GLOBAL_OFFSET_TABLE_ is relative to .got.plt, false if .got.
+  // True if _GLOBAL_OFFSET_TABLE_ is relative to .got.plt, false if .got. If
+  // true, usesGotPlt must also be true.
   bool gotBaseSymInGotPlt = false;
 
   static constexpr RelType noneRel = 0;
-  RelType copyRel;
-  RelType gotRel;
-  RelType pltRel;
-  RelType relativeRel;
-  RelType iRelativeRel;
-  RelType symbolicRel;
-  RelType tlsDescRel;
-  RelType tlsGotRel;
-  RelType tlsModuleIndexRel;
-  RelType tlsOffsetRel;
-  unsigned gotEntrySize = config->wordsize;
-  unsigned pltEntrySize;
-  unsigned pltHeaderSize;
-  unsigned ipltEntrySize;
+  RelType copyRel = 0;
+  RelType gotRel = 0;
+  RelType pltRel = 0;
+  RelType relativeRel = 0;
+  RelType iRelativeRel = 0;
+  RelType symbolicRel = 0;
+  RelType iRelSymbolicRel = 0;
+  RelType tlsDescRel = 0;
+  RelType tlsGotRel = 0;
+  RelType tlsModuleIndexRel = 0;
+  RelType tlsOffsetRel = 0;
+  unsigned gotEntrySize = ctx.arg.wordsize;
+  unsigned pltEntrySize = 0;
+  unsigned pltHeaderSize = 0;
+  unsigned ipltEntrySize = 0;
 
   // At least on x86_64 positions 1 and 2 are used by the first plt entry
   // to support lazy loading.
@@ -140,11 +172,19 @@ public:
   // On PPC ELF V2 abi, the first entry in the .got is the .TOC.
   unsigned gotHeaderEntriesNum = 0;
 
+  bool usesGotPlt = true;
+
+  // On PPC ELF V2 abi, the dynamic section needs DT_PPC64_OPT (DT_LOPROC + 3)
+  // to be set to 0x2 if there can be multiple TOC's. Although we do not emit
+  // multiple TOC's, there can be a mix of TOC and NOTOC addressing which
+  // is functionally equivalent.
+  int ppc64DynamicSectionOpt = 0;
+
   bool needsThunks = false;
 
   // A 4-byte field corresponding to one or more trap instructions, used to pad
   // executable OutputSections.
-  std::array<uint8_t, 4> trapInstr;
+  std::array<uint8_t, 4> trapInstr = {};
 
   // Stores the NOP instructions of different sizes for the target and is used
   // to pad sections that are relaxed.
@@ -158,6 +198,8 @@ public:
   virtual RelExpr adjustTlsExpr(RelType type, RelExpr expr) const;
   virtual RelExpr adjustGotPcExpr(RelType type, int64_t addend,
                                   const uint8_t *loc) const;
+  virtual RelExpr adjustGotOffExpr(RelType type, const Symbol &sym,
+                                   int64_t addend, const uint8_t *loc) const;
 
 protected:
   // On FreeBSD x86_64 the first page cannot be mmaped.
@@ -167,19 +209,21 @@ protected:
   uint64_t defaultImageBase = 0x10000;
 };
 
-TargetInfo *getAArch64TargetInfo();
-TargetInfo *getAMDGPUTargetInfo();
-TargetInfo *getARMTargetInfo();
-TargetInfo *getAVRTargetInfo();
-TargetInfo *getHexagonTargetInfo();
-TargetInfo *getMSP430TargetInfo();
-TargetInfo *getPPC64TargetInfo();
-TargetInfo *getPPCTargetInfo();
-TargetInfo *getRISCVTargetInfo();
-TargetInfo *getSPARCV9TargetInfo();
-TargetInfo *getX86TargetInfo();
-TargetInfo *getX86_64TargetInfo();
-template <class ELFT> TargetInfo *getMipsTargetInfo();
+void setAArch64TargetInfo(Ctx &);
+void setAMDGPUTargetInfo(Ctx &);
+void setARMTargetInfo(Ctx &);
+void setAVRTargetInfo(Ctx &);
+void setHexagonTargetInfo(Ctx &);
+void setLoongArchTargetInfo(Ctx &);
+void setMSP430TargetInfo(Ctx &);
+void setMipsTargetInfo(Ctx &);
+void setPPC64TargetInfo(Ctx &);
+void setPPCTargetInfo(Ctx &);
+void setRISCVTargetInfo(Ctx &);
+void setSPARCV9TargetInfo(Ctx &);
+void setSystemZTargetInfo(Ctx &);
+void setX86TargetInfo(Ctx &);
+void setX86_64TargetInfo(Ctx &);
 
 struct ErrorPlace {
   InputSectionBase *isec;
@@ -188,15 +232,26 @@ struct ErrorPlace {
 };
 
 // Returns input section and corresponding source string for the given location.
-ErrorPlace getErrorPlace(const uint8_t *loc);
+ErrorPlace getErrorPlace(Ctx &ctx, const uint8_t *loc);
 
-static inline std::string getErrorLocation(const uint8_t *loc) {
-  return getErrorPlace(loc).loc;
+static inline std::string getErrorLoc(Ctx &ctx, const uint8_t *loc) {
+  return getErrorPlace(ctx, loc).loc;
 }
 
-void writePPC32GlinkSection(uint8_t *buf, size_t numEntries);
+void processArmCmseSymbols(Ctx &);
+
+template <class ELFT> uint32_t calcMipsEFlags(Ctx &);
+uint8_t getMipsFpAbiFlag(Ctx &, InputFile *file, uint8_t oldFlag,
+                         uint8_t newFlag);
+uint64_t getMipsPageAddr(uint64_t addr);
+bool isMipsN32Abi(Ctx &, const InputFile &f);
+bool isMicroMips(Ctx &);
+bool isMipsR6(Ctx &);
+
+void writePPC32GlinkSection(Ctx &, uint8_t *buf, size_t numEntries);
 
 unsigned getPPCDFormOp(unsigned secondaryOp);
+unsigned getPPCDSFormOp(unsigned secondaryOp);
 
 // In the PowerPC64 Elf V2 abi a function can have 2 entry points.  The first
 // is a global entry point (GEP) which typically is used to initialize the TOC
@@ -205,83 +260,98 @@ unsigned getPPCDFormOp(unsigned secondaryOp);
 // offset between GEP and LEP is encoded in a function's st_other flags.
 // This function will return the offset (in bytes) from the global entry-point
 // to the local entry-point.
-unsigned getPPC64GlobalEntryToLocalEntryOffset(uint8_t stOther);
+unsigned getPPC64GlobalEntryToLocalEntryOffset(Ctx &, uint8_t stOther);
 
 // Write a prefixed instruction, which is a 4-byte prefix followed by a 4-byte
 // instruction (regardless of endianness). Therefore, the prefix is always in
 // lower memory than the instruction.
-void writePrefixedInstruction(uint8_t *loc, uint64_t insn);
+void writePrefixedInst(Ctx &, uint8_t *loc, uint64_t insn);
 
-void addPPC64SaveRestore();
-uint64_t getPPC64TocBase();
+void addPPC64SaveRestore(Ctx &);
+uint64_t getPPC64TocBase(Ctx &ctx);
 uint64_t getAArch64Page(uint64_t expr);
+bool isAArch64BTILandingPad(Ctx &, Symbol &s, int64_t a);
+template <typename ELFT> void writeARMCmseImportLib(Ctx &);
+uint64_t getLoongArchPageDelta(uint64_t dest, uint64_t pc, RelType type);
 void riscvFinalizeRelax(int passes);
-void mergeRISCVAttributesSections();
+void mergeRISCVAttributesSections(Ctx &);
+void mergeHexagonAttributesSections(Ctx &);
+void addArmInputSectionMappingSymbols(Ctx &);
+void addArmSyntheticSectionMappingSymbol(Defined *);
+void sortArmMappingSymbols(Ctx &);
+void convertArmInstructionstoBE8(Ctx &, InputSection *sec, uint8_t *buf);
+void createTaggedSymbols(Ctx &);
+void initSymbolAnchors(Ctx &);
 
-LLVM_LIBRARY_VISIBILITY extern const TargetInfo *target;
-TargetInfo *getTarget();
+void setTarget(Ctx &);
 
 template <class ELFT> bool isMipsPIC(const Defined *sym);
 
-void reportRangeError(uint8_t *loc, const Relocation &rel, const Twine &v,
-                      int64_t min, uint64_t max);
-void reportRangeError(uint8_t *loc, int64_t v, int n, const Symbol &sym,
-                      const Twine &msg);
+const ELFSyncStream &operator<<(const ELFSyncStream &, RelType);
+
+void reportRangeError(Ctx &, uint8_t *loc, const Relocation &rel,
+                      const Twine &v, int64_t min, uint64_t max);
+void reportRangeError(Ctx &ctx, uint8_t *loc, int64_t v, int n,
+                      const Symbol &sym, const Twine &msg);
 
 // Make sure that V can be represented as an N bit signed integer.
-inline void checkInt(uint8_t *loc, int64_t v, int n, const Relocation &rel) {
+inline void checkInt(Ctx &ctx, uint8_t *loc, int64_t v, int n,
+                     const Relocation &rel) {
   if (v != llvm::SignExtend64(v, n))
-    reportRangeError(loc, rel, Twine(v), llvm::minIntN(n), llvm::maxIntN(n));
+    reportRangeError(ctx, loc, rel, Twine(v), llvm::minIntN(n),
+                     llvm::maxIntN(n));
 }
 
 // Make sure that V can be represented as an N bit unsigned integer.
-inline void checkUInt(uint8_t *loc, uint64_t v, int n, const Relocation &rel) {
+inline void checkUInt(Ctx &ctx, uint8_t *loc, uint64_t v, int n,
+                      const Relocation &rel) {
   if ((v >> n) != 0)
-    reportRangeError(loc, rel, Twine(v), 0, llvm::maxUIntN(n));
+    reportRangeError(ctx, loc, rel, Twine(v), 0, llvm::maxUIntN(n));
 }
 
 // Make sure that V can be represented as an N bit signed or unsigned integer.
-inline void checkIntUInt(uint8_t *loc, uint64_t v, int n,
+inline void checkIntUInt(Ctx &ctx, uint8_t *loc, uint64_t v, int n,
                          const Relocation &rel) {
   // For the error message we should cast V to a signed integer so that error
   // messages show a small negative value rather than an extremely large one
   if (v != (uint64_t)llvm::SignExtend64(v, n) && (v >> n) != 0)
-    reportRangeError(loc, rel, Twine((int64_t)v), llvm::minIntN(n),
+    reportRangeError(ctx, loc, rel, Twine((int64_t)v), llvm::minIntN(n),
                      llvm::maxUIntN(n));
 }
 
-inline void checkAlignment(uint8_t *loc, uint64_t v, int n,
+inline void checkAlignment(Ctx &ctx, uint8_t *loc, uint64_t v, int n,
                            const Relocation &rel) {
   if ((v & (n - 1)) != 0)
-    error(getErrorLocation(loc) + "improper alignment for relocation " +
-          lld::toString(rel.type) + ": 0x" + llvm::utohexstr(v) +
-          " is not aligned to " + Twine(n) + " bytes");
+    Err(ctx) << getErrorLoc(ctx, loc) << "improper alignment for relocation "
+             << rel.type << ": 0x" << llvm::utohexstr(v)
+             << " is not aligned to " << n << " bytes";
 }
 
 // Endianness-aware read/write.
-inline uint16_t read16(const void *p) {
-  return llvm::support::endian::read16(p, config->endianness);
+inline uint16_t read16(Ctx &ctx, const void *p) {
+  return llvm::support::endian::read16(p, ctx.arg.endianness);
 }
 
-inline uint32_t read32(const void *p) {
-  return llvm::support::endian::read32(p, config->endianness);
+inline uint32_t read32(Ctx &ctx, const void *p) {
+  return llvm::support::endian::read32(p, ctx.arg.endianness);
 }
 
-inline uint64_t read64(const void *p) {
-  return llvm::support::endian::read64(p, config->endianness);
+inline uint64_t read64(Ctx &ctx, const void *p) {
+  return llvm::support::endian::read64(p, ctx.arg.endianness);
 }
 
-inline void write16(void *p, uint16_t v) {
-  llvm::support::endian::write16(p, v, config->endianness);
+inline void write16(Ctx &ctx, void *p, uint16_t v) {
+  llvm::support::endian::write16(p, v, ctx.arg.endianness);
 }
 
-inline void write32(void *p, uint32_t v) {
-  llvm::support::endian::write32(p, v, config->endianness);
+inline void write32(Ctx &ctx, void *p, uint32_t v) {
+  llvm::support::endian::write32(p, v, ctx.arg.endianness);
 }
 
-inline void write64(void *p, uint64_t v) {
-  llvm::support::endian::write64(p, v, config->endianness);
+inline void write64(Ctx &ctx, void *p, uint64_t v) {
+  llvm::support::endian::write64(p, v, ctx.arg.endianness);
 }
+
 } // namespace elf
 } // namespace lld
 
@@ -289,21 +359,23 @@ inline void write64(void *p, uint64_t v) {
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #endif
 #define invokeELFT(f, ...)                                                     \
-  switch (config->ekind) {                                                     \
-  case ELF32LEKind:                                                            \
-    f<ELF32LE>(__VA_ARGS__);                                                   \
-    break;                                                                     \
-  case ELF32BEKind:                                                            \
-    f<ELF32BE>(__VA_ARGS__);                                                   \
-    break;                                                                     \
-  case ELF64LEKind:                                                            \
-    f<ELF64LE>(__VA_ARGS__);                                                   \
-    break;                                                                     \
-  case ELF64BEKind:                                                            \
-    f<ELF64BE>(__VA_ARGS__);                                                   \
-    break;                                                                     \
-  default:                                                                     \
-    llvm_unreachable("unknown config->ekind");                                 \
-  }
+  do {                                                                         \
+    switch (ctx.arg.ekind) {                                                   \
+    case lld::elf::ELF32LEKind:                                                \
+      f<llvm::object::ELF32LE>(__VA_ARGS__);                                   \
+      break;                                                                   \
+    case lld::elf::ELF32BEKind:                                                \
+      f<llvm::object::ELF32BE>(__VA_ARGS__);                                   \
+      break;                                                                   \
+    case lld::elf::ELF64LEKind:                                                \
+      f<llvm::object::ELF64LE>(__VA_ARGS__);                                   \
+      break;                                                                   \
+    case lld::elf::ELF64BEKind:                                                \
+      f<llvm::object::ELF64BE>(__VA_ARGS__);                                   \
+      break;                                                                   \
+    default:                                                                   \
+      llvm_unreachable("unknown ctx.arg.ekind");                               \
+    }                                                                          \
+  } while (0)
 
 #endif

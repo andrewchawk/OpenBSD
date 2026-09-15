@@ -1,4 +1,4 @@
-/* $OpenBSD: if_vether.c,v 1.36 2020/08/28 12:01:48 mvs Exp $ */
+/* $OpenBSD: if_vether.c,v 1.39 2025/09/16 23:11:39 jan Exp $ */
 
 /*
  * Copyright (c) 2009 Theo de Raadt
@@ -19,9 +19,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/mbuf.h>
-#include <sys/socket.h>
 #include <sys/sockio.h>
-#include <sys/ioctl.h>
 
 #include <net/if.h>
 #include <net/if_media.h>
@@ -29,6 +27,7 @@
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
 
+#include "vlan.h"
 #include "bpfilter.h"
 #if NBPFILTER > 0
 #include <net/bpf.h>
@@ -87,6 +86,12 @@ vether_clone_create(struct if_clone *ifc, int unit)
 
 	ifp->if_hardmtu = ETHER_MAX_HARDMTU_LEN;
 	ifp->if_capabilities = IFCAP_VLAN_MTU;
+#if NVLAN > 0
+	ifp->if_capabilities |= IFCAP_VLAN_HWTAGGING;
+#endif
+	ifp->if_capabilities |= IFCAP_CSUM_IPv4;
+	ifp->if_capabilities |= IFCAP_CSUM_TCPv4 | IFCAP_CSUM_UDPv4;
+	ifp->if_capabilities |= IFCAP_CSUM_TCPv6 | IFCAP_CSUM_UDPv6;
 	ifp->if_xflags = IFXF_CLONED | IFXF_MPSAFE;
 
 	ifmedia_init(&sc->sc_media, 0, vether_media_change,

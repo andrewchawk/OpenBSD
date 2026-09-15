@@ -1,4 +1,4 @@
-#	$OpenBSD: bsd.lib.mk,v 1.102 2022/01/09 16:39:06 robert Exp $
+#	$OpenBSD: bsd.lib.mk,v 1.106 2026/03/17 17:07:58 robert Exp $
 #	$NetBSD: bsd.lib.mk,v 1.67 1996/01/17 20:39:26 mycroft Exp $
 #	@(#)bsd.lib.mk	5.26 (Berkeley) 5/2/91
 
@@ -33,6 +33,7 @@ CFLAGS+=	${NOPIE_FLAGS}
 CXXFLAGS+=	${NOPIE_FLAGS}
 AFLAGS+=	${NOPIE_FLAGS}
 .endif
+PFLAGS+=-p
 
 .c.o:
 	@echo "${COMPILE.c} ${.IMPSRC} -o ${.TARGET}"
@@ -42,8 +43,8 @@ AFLAGS+=	${NOPIE_FLAGS}
 	@rm -f ${.TARGET}.o
 
 .c.po:
-	@echo "${COMPILE.c} -p ${.IMPSRC} -o ${.TARGET}"
-	@${COMPILE.c} ${DFLAGS} -p ${.IMPSRC} -o ${.TARGET}.o
+	@echo "${COMPILE.c} ${PFLAGS} ${.IMPSRC} -o ${.TARGET}"
+	@${COMPILE.c} ${DFLAGS} ${PFLAGS} ${.IMPSRC} -o ${.TARGET}.o
 	@-mv $@.d $*.d
 	@${LD} -X -r ${.TARGET}.o -o ${.TARGET}
 	@rm -f ${.TARGET}.o
@@ -70,8 +71,8 @@ AFLAGS+=	${NOPIE_FLAGS}
 	@rm -f ${.TARGET}.o
 
 .cc.po .cpp.po .C.po .cxx.po:
-	@echo "${COMPILE.cc} -p ${.IMPSRC} -o ${.TARGET}"
-	@${COMPILE.cc} ${DFLAGS} -p ${.IMPSRC} -o ${.TARGET}.o
+	@echo "${COMPILE.cc} ${PFLAGS} ${.IMPSRC} -o ${.TARGET}"
+	@${COMPILE.cc} ${DFLAGS} ${PFLAGS} ${.IMPSRC} -o ${.TARGET}.o
 	@-mv $@.d $*.d
 	@${LD} -X -r ${.TARGET}.o -o ${.TARGET}
 	@rm -f ${.TARGET}.o
@@ -92,8 +93,8 @@ AFLAGS+=	${NOPIE_FLAGS}
 	@rm -f ${.TARGET}.o
 
 .f.po:
-	@echo "${COMPILE.f} -p ${.IMPSRC} -o ${.TARGET}"
-	@${COMPILE.f} ${DFLAGS} -p ${.IMPSRC} -o ${.TARGET}.o
+	@echo "${COMPILE.f} ${PFLAGS} ${.IMPSRC} -o ${.TARGET}"
+	@${COMPILE.f} ${DFLAGS} ${PFLAGS} ${.IMPSRC} -o ${.TARGET}.o
 	@-mv $@.d $*.d
 	@${LD} -X -r ${.TARGET}.o -o ${.TARGET}
 	@rm -f ${.TARGET}.o
@@ -205,21 +206,19 @@ lib${LIB}_p.a: ${POBJS}
 SOBJS+=	${OBJS:.o=.so}
 BUILDAFTER += ${SOBJS}
 
-# exclude from readelf(1) output for syspatch building
-EXCLUDE_REGEX:=	"(cmll-586|(comparetf|libgcc|unwind-dw)2|		\
-		mul(t|d|s|x)(c|f)3|crt(begin|end)S|			\
-		(div|umod|mod)(d|t)i3|emutls|(add|div|sub)tf3|		\
-		(fixtf|float|extend|trunctf)(d|s)(ftf2|i|itf|f2)|	\
-		floatunsitf|udivmodti4|AMDGPURegAsmNames|clear_cache)"
-
 ${FULLSHLIBNAME}: ${SOBJS} ${DPADD}
 	@echo building shared ${LIB} library \(version ${SHLIB_MAJOR}.${SHLIB_MINOR}\)
 	@rm -f ${.TARGET}
 .if defined(SYSPATCH_PATH)
+	@>${.TARGET}.rsp
+	@for _f in `readelf -Ws ${SYSPATCH_PATH}${LIBDIR}/${.TARGET} | \
+	    awk '/ FILE/{sub(".*/", "", $$NF); gsub(/\.[^.]+$$/, ".so", $$NF); \
+	    print $$NF}' | awk '!x[$$0]++'`; do \
+		[[ ! -f $${_f} ]] || echo $${_f} >>${.TARGET}.rsp; \
+	done
 	${CC} -shared -Wl,-soname,${FULLSHLIBNAME} ${PICFLAG} -o ${.TARGET} \
-	    `readelf -Ws ${SYSPATCH_PATH}${LIBDIR}/${.TARGET} | \
-	    awk '/ FILE/{sub(".*/", "", $$NF); gsub(/\..*/, ".so", $$NF); print $$NF}' | \
-	    egrep -v ${EXCLUDE_REGEX:C/[[:blank:]]//g} | awk '!x[$$0]++'` ${LDADD}
+	    @${.TARGET}.rsp ${LDADD}
+	@rm -f ${.TARGET}.rsp
 .else
 	${CC} -shared -Wl,-soname,${FULLSHLIBNAME} ${PICFLAG} -o ${.TARGET} \
 	    `echo ${SOBJS} | tr ' ' '\n' | sort -R` ${LDADD}
@@ -255,7 +254,7 @@ ${DIST_LIB}: ${SELECTED_DOBJS}
 
 .if !target(clean)
 clean: _SUBDIRUSE
-	rm -f a.out [Ee]rrs mklog *.core y.tab.h \
+	rm -f a.out [Ee]rrs mklog *.core *.o.tmp y.tab.h \
 	    ${_LEXINTM} ${_YACCINTM} ${CLEANFILES}
 	rm -f lib${LIB}.a ${OBJS}
 	rm -f lib${LIB}_g.a ${GOBJS}

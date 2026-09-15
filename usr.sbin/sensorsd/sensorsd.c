@@ -1,4 +1,4 @@
-/*	$OpenBSD: sensorsd.c,v 1.69 2023/03/08 04:43:15 guenther Exp $ */
+/*	$OpenBSD: sensorsd.c,v 1.70 2026/04/12 13:29:46 deraadt Exp $ */
 
 /*
  * Copyright (c) 2003 Henning Brauer <henning@openbsd.org>
@@ -363,8 +363,11 @@ check_sdlim(struct sdlim_t *sdlim, time_t this_check)
 
 		mib[3] = limit->type;
 		mib[4] = limit->numt;
-		if (sysctl(mib, 5, &sensor, &len, NULL, 0) == -1)
-			err(1, "sysctl");
+		if (sysctl(mib, 5, &sensor, &len, NULL, 0) == -1) {
+			if (errno != ENOENT)
+				warn("sysctl");
+			continue;
+		}
 
 		if (!(limit->flags & SENSORSD_L_ISTATUS)) {
 			enum sensor_status	newastatus = sensor.status;
@@ -753,6 +756,7 @@ parse_config_sdlim(struct sdlim_t *sdlim, char *cf)
 		if (cgetstr(buf, "command", &ebuf) < 0)
 			ebuf = NULL;
 		if (ebuf != NULL) {
+			free(p->command);
 			p->command = ebuf;
 			ebuf = NULL;
 		}

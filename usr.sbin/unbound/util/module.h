@@ -143,7 +143,7 @@
  * also contain an rcode that is nonzero, but in this case additional
  * information (query, additional) can be passed along.
  *
- * The rcode and dns_msg are used to pass the result from the the rightmost
+ * The rcode and dns_msg are used to pass the result from the rightmost
  * module towards the leftmost modules and then towards the user.
  *
  * If you want to avoid recursion-cycles where queries need other queries
@@ -177,6 +177,7 @@ struct val_anchors;
 struct val_neg_cache;
 struct iter_forwards;
 struct iter_hints;
+struct views;
 struct respip_set;
 struct respip_client_info;
 struct respip_addr_info;
@@ -319,13 +320,15 @@ typedef int inplace_cb_query_response_func_type(struct module_qstate* qstate,
 /**
  * Function called when looking for (expired) cached answers during the serve
  * expired logic.
- * Called as func(qstate, lookup_qinfo)
+ * Called as func(qstate, lookup_qinfo, &is_expired)
  * Where:
  *	qstate: the query state.
  *	lookup_qinfo: the qinfo to lookup for.
+ *      is_expired: set if the cached answer is expired.
  */
 typedef struct dns_msg* serve_expired_lookup_func_type(
-	struct module_qstate* qstate, struct query_info* lookup_qinfo);
+	struct module_qstate* qstate, struct query_info* lookup_qinfo,
+	int* is_expired);
 
 /**
  * Module environment.
@@ -408,6 +411,8 @@ struct module_env {
 	 * @param qstate: the state to find mesh state, and that wants to 
 	 * 	receive the results from the new subquery.
 	 * @param qinfo: what to query for (copied).
+	 * @param cinfo: if non-NULL client specific info that may affect
+	 *	IP-based actions that apply to the query result.
 	 * @param qflags: what flags to use (RD, CD flag or not).
 	 * @param prime: if it is a (stub) priming query.
 	 * @param valrec: validation lookup recursion, does not need validation
@@ -416,8 +421,9 @@ struct module_env {
 	 * @return: false on error, true if success (and init may be needed).
 	 */ 
 	int (*attach_sub)(struct module_qstate* qstate, 
-		struct query_info* qinfo, uint16_t qflags, int prime, 
-		int valrec, struct module_qstate** newq);
+		struct query_info* qinfo, struct respip_client_info* cinfo,
+		uint16_t qflags, int prime, int valrec,
+		struct module_qstate** newq);
 
 	/**
 	 * Add detached query.
@@ -437,6 +443,8 @@ struct module_env {
 	 * @param qstate: the state to find mesh state, and that wants to receive
 	 * 	the results from the new subquery.
 	 * @param qinfo: what to query for (copied).
+	 * @param cinfo: if non-NULL client specific info that may affect
+	 *	IP-based actions that apply to the query result.
 	 * @param qflags: what flags to use (RD / CD flag or not).
 	 * @param prime: if it is a (stub) priming query.
 	 * @param valrec: if it is a validation recursion query (lookup of key, DS).
@@ -446,9 +454,9 @@ struct module_env {
 	 * @return: false on error, true if success (and init may be needed).
 	 */
 	int (*add_sub)(struct module_qstate* qstate, 
-		struct query_info* qinfo, uint16_t qflags, int prime, 
-		int valrec, struct module_qstate** newq,
-		struct mesh_state** sub);
+		struct query_info* qinfo, struct respip_client_info* cinfo,
+		uint16_t qflags, int prime, int valrec,
+		struct module_qstate** newq, struct mesh_state** sub);
 
 	/**
 	 * Kill newly attached sub. If attach_sub returns newq for 
@@ -522,6 +530,10 @@ struct module_env {
 	 * data structure. 
 	 */
 	struct iter_hints* hints;
+	/** views structure containing view tree */
+	struct views* views;
+	/** response-ip set with associated actions and tags. */
+	struct respip_set* respip_set;
 	/** module specific data. indexed by module id. */
 	void* modinfo[MAX_MODULE];
 
@@ -686,6 +698,10 @@ struct module_qstate {
 	time_t qstarttime;
 	/** whether a message from cachedb will be used for the reply */
 	int is_cachedb_answer;
+	/** if the response as error is from error_response_cache, and is
+	 * suitable for caching (briefly) the error response. Set by the
+	 * iterator when no_cache_store is enabled, and there is an error. */
+	int error_response_cache;
 
 	/**
 	 * Attributes of clients that share the qstate that may affect IP-based
@@ -696,6 +712,8 @@ struct module_qstate {
 	/** Extended result of response-ip action processing, mainly
 	 *  for logging purposes. */
 	struct respip_action_info* respip_action_info;
+	/** if the query has been modified by rpz processing. */
+	int rpz_applied;
 	/** if the query is rpz passthru, no further rpz processing for it */
 	int rpz_passthru;
 	/* Flag tcp required. */
@@ -703,6 +721,12 @@ struct module_qstate {
 
 	/** whether the reply should be dropped */
 	int is_drop;
+	/** the global quota that was reached, by one of the modules.
+	 * So that continued counting can go on from that point. */
+	int global_quota_reached;
+	/** the global quota that a query started with, it is a subquery,
+	 * so that calling mesh states can see the increase. */
+	int global_quota_started;
 };
 
 /** 
@@ -713,7 +737,28 @@ struct module_func_block {
 	const char* name;
 
 	/** 
-	 * init the module. Called once for the global state.
+	 * Set up the module for start. This is called only once at startup.
+	 * Privileged operations like opening device files may be done here.
+	 * The function ptr can be NULL, if it is not used.
+	 * @param env: module environment.
+	 * @param id: module id number.
+	 * return: 0 on error
+	 */
+	int (*startup)(struct module_env* env, int id);
+
+	/**
+	 * Close down the module for stop. This is called only once before
+	 * shutdown to free resources allocated during startup().
+	 * Closing privileged ports or files must be done here.
+	 * The function ptr can be NULL, if it is not used.
+	 * @param env: module environment.
+	 * @param id: module id number.
+	 */
+	void (*destartup)(struct module_env* env, int id);
+
+	/**
+	 * Initialise the module. Called when restarting or reloading the
+	 * daemon.
 	 * This is the place to apply settings from the config file.
 	 * @param env: module environment.
 	 * @param id: module id number.
@@ -722,7 +767,8 @@ struct module_func_block {
 	int (*init)(struct module_env* env, int id);
 
 	/**
-	 * de-init, delete, the module. Called once for the global state.
+	 * Deinitialise the module, undo stuff done during init().
+	 * Called before reloading the daemon.
 	 * @param env: module environment.
 	 * @param id: module id number.
 	 */

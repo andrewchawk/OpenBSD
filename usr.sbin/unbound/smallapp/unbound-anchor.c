@@ -155,7 +155,7 @@
 #define HTTPS_PORT 443
 
 #ifdef USE_WINSOCK
-/* sneakily reuse the the wsa_strerror function, on windows */
+/* sneakily reuse the wsa_strerror function, on windows */
 char* wsa_strerror(int err);
 #endif
 
@@ -187,7 +187,9 @@ static const char DS_TRUST_ANCHOR[] =
 	/* The anchors must start on a new line with ". IN DS and end with \n"[;]
 	 * because the makedist script greps on the source here */
 	/* anchor 20326 is from 2017 */
-". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n";
+". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n"
+	/* anchor 38696 is from 2024 */
+". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16\n";
 
 /** verbosity for this application */
 static int verb = 0;
@@ -384,7 +386,7 @@ read_cert_file(const char* file)
 	STACK_OF(X509)* sk;
 	FILE* in;
 	int content = 0;
-	char buf[128];
+	long flen;
 	if(file == NULL || strcmp(file, "") == 0) {
 		return NULL;
 	}
@@ -401,6 +403,11 @@ read_cert_file(const char* file)
 #endif
 		return NULL;
 	}
+	if(fseek(in, 0, SEEK_END) < 0)
+		printf("%s fseek: %s\n", file, strerror(errno));
+	flen = ftell(in);
+	if(fseek(in, 0, SEEK_SET) < 0)
+		printf("%s fseek: %s\n", file, strerror(errno));
 	while(!feof(in)) {
 		X509* x = PEM_read_X509(in, NULL, NULL, NULL);
 		if(x == NULL) {
@@ -416,8 +423,9 @@ read_cert_file(const char* file)
 			exit(0);
 		}
 		content = 1;
-		/* read away newline after --END CERT-- */
-		if(!fgets(buf, (int)sizeof(buf), in))
+		/* feof may not be true yet, but if the position is
+		 * at end of file, stop reading more certificates. */
+		if(ftell(in) == flen)
 			break;
 	}
 	fclose(in);
@@ -809,7 +817,11 @@ TLS_initiate(SSL_CTX* sslctx, int fd, const char* urlname, int use_sni)
 		}
 		/* wants to be called again */
 	}
+#ifdef HAVE_SSL_GET1_PEER_CERTIFICATE
+	x = SSL_get1_peer_certificate(ssl);
+#else
 	x = SSL_get_peer_certificate(ssl);
+#endif
 	if(!x) {
 		if(verb) printf("Server presented no peer certificate\n");
 		SSL_free(ssl);
@@ -2424,12 +2436,20 @@ int main(int argc, char* argv[])
 #else
 	OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS
 		| OPENSSL_INIT_ADD_ALL_DIGESTS
-		| OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+		| OPENSSL_INIT_LOAD_CRYPTO_STRINGS
+#  if defined(OPENSSL_INIT_NO_LOAD_CONFIG) && defined(UB_ON_WINDOWS)
+		| OPENSSL_INIT_NO_LOAD_CONFIG
+#  endif
+		, NULL);
 #endif
 #if OPENSSL_VERSION_NUMBER < 0x10100000 || !defined(HAVE_OPENSSL_INIT_SSL)
 	(void)SSL_library_init();
 #else
-	(void)OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS, NULL);
+	(void)OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS
+#  if defined(OPENSSL_INIT_NO_LOAD_CONFIG) && defined(UB_ON_WINDOWS)
+		| OPENSSL_INIT_NO_LOAD_CONFIG
+#  endif
+		, NULL);
 #endif
 
 	if(dolist) do_list_builtin();

@@ -12,9 +12,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "ReduceAliases.h"
-#include "Delta.h"
-#include "Utils.h"
-#include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
@@ -22,7 +19,7 @@ using namespace llvm;
 
 /// Removes all aliases aren't inside any of the
 /// desired Chunks.
-static void extractAliasesFromModule(Oracle &O, ReducerWorkItem &Program) {
+void llvm::reduceAliasesDeltaPass(Oracle &O, ReducerWorkItem &Program) {
   for (auto &GA : make_early_inc_range(Program.getModule().aliases())) {
     if (!O.shouldKeep()) {
       GA.replaceAllUsesWith(GA.getAliasee());
@@ -31,21 +28,15 @@ static void extractAliasesFromModule(Oracle &O, ReducerWorkItem &Program) {
   }
 }
 
-static void extractIFuncsFromModule(Oracle &O, Module &Program) {
+void llvm::reduceIFuncsDeltaPass(Oracle &O, ReducerWorkItem &WorkItem) {
+  Module &Mod = WorkItem.getModule();
+
   std::vector<GlobalIFunc *> IFuncs;
-  for (GlobalIFunc &GI : Program.ifuncs()) {
+  for (GlobalIFunc &GI : Mod.ifuncs()) {
     if (!O.shouldKeep())
       IFuncs.push_back(&GI);
   }
 
   if (!IFuncs.empty())
-    lowerGlobalIFuncUsersAsGlobalCtor(Program, IFuncs);
-}
-
-void llvm::reduceAliasesDeltaPass(TestRunner &Test) {
-  runDeltaPass(Test, extractAliasesFromModule, "Reducing Aliases");
-}
-
-void llvm::reduceIFuncsDeltaPass(TestRunner &Test) {
-  runDeltaPass(Test, extractIFuncsFromModule, "Reducing Ifuncs");
+    lowerGlobalIFuncUsersAsGlobalCtor(Mod, IFuncs);
 }

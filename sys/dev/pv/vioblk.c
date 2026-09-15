@@ -1,4 +1,4 @@
-/*	$OpenBSD: vioblk.c,v 1.41 2024/08/01 11:13:19 sf Exp $	*/
+/*	$OpenBSD: vioblk.c,v 1.47 2025/09/16 12:18:10 hshoexer Exp $	*/
 
 /*
  * Copyright (c) 2012 Stefan Fritsch.
@@ -67,7 +67,7 @@
 /* In the virtqueue, we need space for header and footer, too */
 #define ALLOC_SEGS	(SEG_MAX + 2)
 
-struct virtio_feature_name vioblk_feature_names[] = {
+static const struct virtio_feature_name vioblk_feature_names[] = {
 #if VIRTIO_DEBUG
 	{ VIRTIO_BLK_F_BARRIER,		"Barrier" },
 	{ VIRTIO_BLK_F_SIZE_MAX,	"SizeMax" },
@@ -146,7 +146,7 @@ const struct cfattach vioblk_ca = {
 };
 
 struct cfdriver vioblk_cd = {
-	NULL, "vioblk", DV_DULL
+	NULL, "vioblk", DV_DULL, CD_COCOVM
 };
 
 const struct scsi_adapter vioblk_switch = {
@@ -156,8 +156,8 @@ const struct scsi_adapter vioblk_switch = {
 int
 vioblk_match(struct device *parent, void *match, void *aux)
 {
-	struct virtio_softc *va = aux;
-	if (va->sc_childdevid == PCI_PRODUCT_VIRTIO_BLOCK)
+	struct virtio_attach_args *va = aux;
+	if (va->va_devid == PCI_PRODUCT_VIRTIO_BLOCK)
 		return 1;
 	return 0;
 }
@@ -170,12 +170,12 @@ vioblk_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct vioblk_softc *sc = (struct vioblk_softc *)self;
 	struct virtio_softc *vsc = (struct virtio_softc *)parent;
+	struct virtio_attach_args *va = aux;
 	struct scsibus_attach_args saa;
 	int qsize;
 
 	vsc->sc_vqs = &sc->sc_vq[0];
 	vsc->sc_nvqs = 1;
-	vsc->sc_config_change = NULL;
 	if (vsc->sc_child)
 		panic("already attached to something else");
 	vsc->sc_child = self;
@@ -184,7 +184,8 @@ vioblk_attach(struct device *parent, struct device *self, void *aux)
 	vsc->sc_driver_features = VIRTIO_BLK_F_RO | VIRTIO_F_NOTIFY_ON_EMPTY |
 	     VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_FLUSH;
 
-        virtio_negotiate_features(vsc, vioblk_feature_names);
+        if (virtio_negotiate_features(vsc, vioblk_feature_names) != 0)
+		goto err;
 
 	if (virtio_has_feature(vsc, VIRTIO_BLK_F_SIZE_MAX)) {
 		uint32_t size_max = virtio_read_device_config_4(vsc,
@@ -208,8 +209,8 @@ vioblk_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_capacity = virtio_read_device_config_8(vsc,
 	    VIRTIO_BLK_CONFIG_CAPACITY);
 
-	if (virtio_alloc_vq(vsc, &sc->sc_vq[0], 0, MAXPHYS, ALLOC_SEGS,
-	    "I/O request") != 0) {
+	if (virtio_alloc_vq(vsc, &sc->sc_vq[0], 0, ALLOC_SEGS, "I/O request")
+	    != 0) {
 		printf("\nCan't alloc virtqueue\n");
 		goto err;
 	}
@@ -252,10 +253,11 @@ vioblk_attach(struct device *parent, struct device *self, void *aux)
 	saa.saa_quirks = 0;
 	saa.saa_wwpn = saa.saa_wwnn = 0;
 
-	virtio_set_status(vsc, VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK);
+	if (virtio_attach_finish(vsc, va) != 0)
+		goto err;
 	config_found(self, &saa, scsiprint);
-
 	return;
+
 err:
 	vsc->sc_child = VIRTIO_CHILD_ERROR;
 	return;
@@ -644,7 +646,7 @@ vioblk_alloc_reqs(struct vioblk_softc *sc, int qsize)
 
 	allocsize = sizeof(struct virtio_blk_req) * nreqs;
 	r = bus_dmamem_alloc(sc->sc_virtio->sc_dmat, allocsize, 0, 0,
-	    &sc->sc_reqs_segs[0], 1, &rsegs, BUS_DMA_NOWAIT);
+	    &sc->sc_reqs_segs[0], 1, &rsegs, BUS_DMA_NOWAIT | BUS_DMA_64BIT);
 	if (r != 0) {
 		printf("DMA memory allocation failed, size %d, error %d\n",
 		    allocsize, r);
@@ -695,7 +697,8 @@ vioblk_alloc_reqs(struct vioblk_softc *sc, int qsize)
 
 		r = bus_dmamap_create(sc->sc_virtio->sc_dmat,
 		    VR_DMA_END, 1, VR_DMA_END, 0,
-		    BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW, &vr->vr_cmdsts);
+		    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
+		    &vr->vr_cmdsts);
 		if (r != 0) {
 			printf("cmd dmamap creation failed, err %d\n", r);
 			nreqs = i;
@@ -709,7 +712,8 @@ vioblk_alloc_reqs(struct vioblk_softc *sc, int qsize)
 			goto err_reqs;
 		}
 		r = bus_dmamap_create(sc->sc_virtio->sc_dmat, MAXPHYS,
-		    SEG_MAX, MAXPHYS, 0, BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW,
+		    SEG_MAX, MAXPHYS, 0,
+		    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
 		    &vr->vr_payload);
 		if (r != 0) {
 			printf("payload dmamap creation failed, err %d\n", r);

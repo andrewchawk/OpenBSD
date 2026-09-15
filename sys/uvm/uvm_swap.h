@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_swap.h,v 1.20 2023/10/27 19:18:53 mpi Exp $	*/
+/*	$OpenBSD: uvm_swap.h,v 1.23 2026/07/11 13:13:16 kettenis Exp $	*/
 /*	$NetBSD: uvm_swap.h,v 1.5 2000/01/11 06:57:51 chs Exp $	*/
 
 /*
@@ -37,6 +37,8 @@
 
 #ifdef _KERNEL
 
+int			uvm_swap_dropcluster(struct vm_page **, int, int,
+			    vaddr_t);
 int			uvm_swap_get(struct vm_page *, int, int);
 int			uvm_swap_put(int, struct vm_page **, int, int);
 int			uvm_swap_alloc(int *, boolean_t);
@@ -45,13 +47,20 @@ void			uvm_swap_markbad(int, int);
 int			uvm_swapisfilled(void);
 int			uvm_swapisfull(void);
 void			uvm_swap_freepages(struct vm_page **, int);
+struct swapdev		*uvm_swap_getsdp(int);
 #ifdef HIBERNATE
 int			uvm_hibswap(dev_t, u_long *, u_long *);
 #endif /* HIBERNATE */
 #ifdef UVM_SWAP_ENCRYPT
 void			uvm_swap_initcrypt_all(void);
 void			uvm_swap_finicrypt_all(void);
+void			uvm_swap_encryptpg(struct swapdev *, caddr_t, caddr_t,
+			    int);
+int			uvm_swap_decryptpg(struct swapdev *, caddr_t, caddr_t,
+			    int);
 #endif
+
+extern volatile int seb_free;
 
 #endif /* _KERNEL */
 

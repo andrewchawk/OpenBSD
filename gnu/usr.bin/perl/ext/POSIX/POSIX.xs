@@ -13,6 +13,25 @@
 
 static int not_here(const char *s);
 
+#if defined(__MINGW32__) && !defined(USE_QUADMATH)
+
+/* If nvtype is long double, the bessel functions still
+ * operate at "double precision" only - as in the past.
+ * Mingw's math.h makes no provision for j0l, y0l, etc.
+ *
+ * Unfortunately the mingw64 supplied headers cannot be
+ * convinced to declare these functions with -std=c99.
+ */
+   double __cdecl _hypot(double x, double y);
+   double __cdecl _j0(double d);
+   double __cdecl _j1(double d);
+   double __cdecl _jn(int n, double d);
+   double __cdecl _y0(double d);
+   double __cdecl _y1(double d);
+   double __cdecl _yn(int n, double d);
+
+#endif
+
 #if defined(PERL_IMPLICIT_SYS)
 #  undef signal
 #  undef open
@@ -572,7 +591,7 @@ static int not_here(const char *s);
 #  undef c99_trunc
 #endif
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || (defined(__MINGW32__) && !defined(USE_QUADMATH))
 
 /* Some APIs exist under Win32 with "underbar" names. */
 #  undef c99_hypot
@@ -1380,7 +1399,7 @@ char *tzname[] = { "" , "" };
 #if defined (WIN32)
 #  undef mkfifo
 #  define mkfifo(a,b) not_here("mkfifo")
-#  define ttyname(a) (char*)not_here("ttyname")
+#  define ttyname(a) (not_here("ttyname"), (char *)NULL)
 #  define sigset_t long
 #  define pid_t long
 #  ifdef _MSC_VER
@@ -1445,10 +1464,8 @@ typedef sigset_t* POSIX__SigSet;
 typedef HV* POSIX__SigAction;
 typedef int POSIX__SigNo;
 typedef int POSIX__Fd;
-#ifdef I_TERMIOS
 typedef struct termios* POSIX__Termios;
-#else /* Define termios types to int, and call not_here for the functions.*/
-#define POSIX__Termios int
+#ifndef I_TERMIOS /* Define termios types to int, and call not_here for the functions.*/
 #define speed_t int
 #define tcflag_t int
 #define cc_t int
@@ -1459,7 +1476,7 @@ typedef struct termios* POSIX__Termios;
 #define tcsendbreak(x,y) not_here("tcsendbreak")
 #define cfsetispeed(x,y) not_here("cfsetispeed")
 #define cfsetospeed(x,y) not_here("cfsetospeed")
-#define ctermid(x) (char *) not_here("ctermid")
+#define ctermid(x) (not_here("ctermid"), (char *)NULL)
 #define tcflow(x,y) not_here("tcflow")
 #define tcgetattr(x,y) not_here("tcgetattr")
 #define tcsetattr(x,y,z) not_here("tcsetattr")
@@ -1724,7 +1741,7 @@ fix_win32_tzenv(void)
         newenv = (char*)malloc((strlen(perl_tz_env) + 4) * sizeof(char));
         if (newenv != NULL) {
             sprintf(newenv, "TZ=%s", perl_tz_env);
-            putenv(newenv);
+            _putenv(newenv);
             if (oldenv != NULL)
                 free(oldenv);
             oldenv = newenv;
@@ -2057,12 +2074,7 @@ open(filename, flags = O_RDONLY, mode = 0666)
 HV *
 localeconv()
     CODE:
-#ifndef HAS_LOCALECONV
-        RETVAL = NULL;
-        not_here("localeconv");
-#else
         RETVAL = Perl_localeconv(aTHX);
-#endif  /* HAS_LOCALECONV */
     OUTPUT:
 	RETVAL
 
@@ -3181,6 +3193,7 @@ mblen(s, n = ~0)
     CODE:
         errno = 0;
 
+        CHECK_AND_WARN_PROBLEMATIC_LOCALE_;
         SvGETMAGIC(s);
         if (! SvOK(s)) {
 #ifdef USE_MBRLEN
@@ -3275,6 +3288,7 @@ wctomb(s, wchar)
 	wchar_t		wchar
     CODE:
         errno = 0;
+        CHECK_AND_WARN_PROBLEMATIC_LOCALE_;
         SvGETMAGIC(s);
         if (s == &PL_sv_undef) {
 #ifdef USE_WCRTOMB
@@ -3314,7 +3328,8 @@ strcoll(s1, s2)
 	char *		s1
 	char *		s2
     CODE:
-        LC_COLLATE_LOCK;
+        CHECK_AND_WARN_PROBLEMATIC_LOCALE_;
+	LC_COLLATE_LOCK;
         RETVAL = strcoll(s1, s2);
         LC_COLLATE_UNLOCK;
     OUTPUT:
@@ -3372,6 +3387,7 @@ strtol(str, base = 0)
 	long num;
 	char *unparsed;
     PPCODE:
+        CHECK_AND_WARN_PROBLEMATIC_LOCALE_;
 	if (base == 0 || inRANGE(base, 2, 36)) {
             num = strtol(str, &unparsed, base);
 #if IVSIZE < LONGSIZE
@@ -3406,6 +3422,7 @@ strtoul(str, base = 0)
     PPCODE:
 	PERL_UNUSED_VAR(str);
 	PERL_UNUSED_VAR(base);
+        CHECK_AND_WARN_PROBLEMATIC_LOCALE_;
 	if (base == 0 || inRANGE(base, 2, 36)) {
             num = strtoul(str, &unparsed, base);
 #if UVSIZE < LONGSIZE
@@ -3435,6 +3452,7 @@ strxfrm(src)
 	SV *		src
     CODE:
 #ifdef USE_LOCALE_COLLATE
+      CHECK_AND_WARN_PROBLEMATIC_LOCALE_;
       ST(0) = Perl_strxfrm(aTHX_ src);
 #else
       ST(0) = src;
@@ -3528,6 +3546,8 @@ asctime(sec, min, hour, mday, mon, year, wday = 0, yday = 0, isdst = -1)
 		    SvOK_off(TARG);
 		else if (result == 0)
 		    sv_setpvs(TARG, "0 but true");
+		else if (sizeof (IV) < sizeof (time_t) && (result < IV_MIN || IV_MAX < result))
+                    sv_setnv(TARG, result);
 		else
 		    sv_setiv(TARG, (IV)result);
 	    } else {
@@ -3581,33 +3601,26 @@ strftime(fmt, sec, min, hour, mday, mon, year, wday = -1, yday = -1, isdst = -1)
 	int		isdst
     CODE:
 	{
-	    char *buf;
-            SV *sv;
-            utf8ness_t is_utf8;
+            PERL_UNUSED_ARG(wday);
+            PERL_UNUSED_ARG(yday);
 
-            /* allowing user-supplied (rather than literal) formats
-             * is normally frowned upon as a potential security risk;
-             * but this is part of the API so we have to allow it */
-            GCC_DIAG_IGNORE_STMT(-Wformat-nonliteral);
-	    buf = my_strftime8_temp(SvPV_nolen(fmt), sec, min, hour, mday, mon, year, wday, yday, isdst, &is_utf8);
-            GCC_DIAG_RESTORE_STMT;
-            sv = sv_newmortal();
-	    if (buf) {
-                STRLEN len = strlen(buf);
-		sv_usepvn_flags(sv, buf, len, SV_HAS_TRAILING_NUL);
-		if (SvUTF8(fmt) || is_utf8 == UTF8NESS_YES) {
-		    SvUTF8_on(sv);
-		}
+            SV *sv = sv_strftime_ints(fmt, sec, min, hour, mday, mon, year,
+                                      isdst);
+	    if (sv) {
+                sv = sv_2mortal(sv);
             }
-            else {  /* We can't distinguish between errors and just an empty
-                     * return; in all cases just return an empty string */
-                SvUPGRADE(sv, SVt_PV);
+            else {
+                /* strftime() doesn't distinguish between errors and just an
+                 * empty return, so even though sv_strftime_ints() has figured
+                 * out the difference, return an empty string in all cases to
+                 * mimic strftime() behavior */
+                sv = newSV_type_mortal(SVt_PV);
                 SvPV_set(sv, (char *) "");
                 SvPOK_on(sv);
-                SvCUR_set(sv, 0);
                 SvLEN_set(sv, 0);   /* Won't attempt to free the string when sv
                                        gets destroyed */
             }
+
             ST(0) = sv;
 	}
 

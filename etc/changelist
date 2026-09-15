@@ -1,4 +1,4 @@
-#	$OpenBSD: changelist,v 1.139 2024/06/03 10:07:27 florian Exp $
+#	$OpenBSD: changelist,v 1.144 2026/06/26 15:26:52 bket Exp $
 #
 # List of files which the security script backs up and checks
 # for modifications.
@@ -11,6 +11,13 @@
 /etc/acme-client.conf
 /etc/adduser.conf
 /etc/adduser.message
+/etc/apm/hibernate
+/etc/apm/powerdown
+/etc/apm/powerup
+/etc/apm/resume
+/etc/apm/standby
+/etc/apm/suspend
+/etc/apm/warnlow
 /etc/bgpd.conf
 /etc/boot.conf
 /etc/bootparams
@@ -138,6 +145,8 @@
 /etc/ssh/ssh_host_ed25519_key.pub
 +/etc/ssh/ssh_host_key
 /etc/ssh/ssh_host_key.pub
++/etc/ssh/ssh_host_mldsa44_ed25519_key
+/etc/ssh/ssh_host_mldsa44_ed25519_key.pub
 +/etc/ssh/ssh_host_rsa_key
 /etc/ssh/ssh_host_rsa_key.pub
 /etc/ssh/sshd_config
@@ -163,11 +172,13 @@
 /root/.shosts
 /root/.ssh/authorized_keys
 /root/.ssh/authorized_keys2
+/upgrade.site
 /var/cron/at.allow
 /var/cron/at.deny
 /var/cron/cron.allow
 /var/cron/cron.deny
 /var/cron/tabs/root
++/var/db/dhcp6leased/uuid
 /var/db/unwind.key
 +/var/nsd/etc/nsd.conf
 /var/unbound/etc/unbound.conf

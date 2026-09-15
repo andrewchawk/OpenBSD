@@ -1,4 +1,4 @@
-/*	$OpenBSD: spec_vnops.c,v 1.112 2024/02/03 18:51:58 beck Exp $	*/
+/*	$OpenBSD: spec_vnops.c,v 1.114 2025/03/27 23:30:54 tedu Exp $	*/
 /*	$NetBSD: spec_vnops.c,v 1.29 1996/04/22 01:42:38 christos Exp $	*/
 
 /*
@@ -416,7 +416,7 @@ loop:
 			continue;
 		if ((bp->b_flags & B_DELWRI) == 0)
 			panic("spec_fsync: not dirty");
-		bremfree(bp);
+		bufcache_take(bp);
 		buf_acquire(bp);
 		splx(s);
 		bawrite(bp);
@@ -608,10 +608,12 @@ spec_access(void *v)
 int
 spec_print(void *v)
 {
+#if defined(DEBUG) || defined(DIAGNOSTIC) || defined(VFSLCKDEBUG)
 	struct vop_print_args *ap = v;
 
 	printf("tag VT_NON, dev %d, %d\n", major(ap->a_vp->v_rdev),
 		minor(ap->a_vp->v_rdev));
+#endif
 	return 0;
 }
 

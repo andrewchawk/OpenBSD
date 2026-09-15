@@ -1,11 +1,15 @@
-#	$OpenBSD: Makefile.inc,v 1.25 2019/08/30 22:20:43 deraadt Exp $
+#	$OpenBSD: Makefile.inc,v 1.28 2026/08/21 14:52:57 jsing Exp $
 
 # hash functions
-.PATH: ${LIBCSRCDIR}/hash
+.PATH: ${LIBCSRCDIR}/arch/${MACHINE_CPU}/hash ${LIBCSRCDIR}/hash
 
 HELPER=	md5hl.c rmd160hl.c sha1hl.c sha224hl.c sha256hl.c sha384hl.c sha512hl.c sha512_256hl.c
-SRCS+=	md5.c rmd160.c sha1.c sha2.c ${HELPER} siphash.c
+SRCS+=	md5.c rmd160.c sha1.c sha256.c sha512.c ${HELPER} siphash.c
 MAN+=	MD5Init.3 RMD160Init.3 SHA1Init.3 SHA256Init.3 SipHash24_Init.3
+
+.if ${MACHINE_CPU} == "amd64" || ${MACHINE_CPU} == "aarch64"
+.include "${LIBCSRCDIR}/arch/${MACHINE_CPU}/hash/Makefile.inc"
+.endif
 
 CLEANFILES+= ${HELPER}
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: fmt_test.c,v 1.19 2022/12/04 23:50:46 cheloha Exp $ */
+/* $OpenBSD: fmt_test.c,v 1.22 2026/06/09 06:01:28 tb Exp $ */
 
 /*
  * Combined tests for fmt_scaled and scan_scaled.
@@ -150,6 +150,13 @@ fmt_test(void)
 
 #define	IMPROBABLE	(-42)
 
+#define K (1024LL)
+#define M (K * K)
+#define G (M * K)
+#define T (G * K)
+#define P (T * K)
+#define E (P * K)
+
 struct {					/* the test cases */
 	char *input;
 	long long result;
@@ -157,22 +164,29 @@ struct {					/* the test cases */
 } sdata[] = {
 	{ "0",		0, 0 },
 	{ "123",	123, 0 },
-	{ "1k",		1024, 0 },		/* lower case */
+	{ "1k",		K, 0 },		/* lower case */
 	{ "100.944", 100, 0 },	/* should --> 100 (truncates fraction) */
 	{ "10099",	10099LL, 0 },
-	{ "1M",		1048576LL, 0 },
-	{ "1.1M",	1153433LL, 0 },		/* fractions */
-	{ "1.111111111111111111M",	1165084LL, 0 },		/* fractions */
-	{ "1.55M",	1625292LL, 0 },	/* fractions */
-	{ "1.9M",	1992294LL, 0 },		/* fractions */
-	{ "-2K",	-2048LL, 0 },		/* negatives */
-	{ "-2.2K",	-2252LL, 0 },	/* neg with fract */
-	{ "4.5k", 4608, 0 },
-	{ "3.333755555555t", 3665502936412, 0 },
-	{ "-3.333755555555t", -3665502936412, 0 },
+	{ "1M",		M, 0 },
+	{ "1.1M",	M + (M / 10), 0 },		/* fractions */
+	{ "1.111111111111111111M",	1165084LL, 0 },	/* fractions */
+	{ "1.55M",	M + (M / 2) + (M / 20), 0 },	/* fractions */
+	{ "1.9M",	M + (9 * (M / 10)), 0 },	/* fractions */
+	{ "-2K",	-2 * K, 0 },		/* negatives */
+	{ "-2.2K",	-((2 * K) + (2 * (K / 10))), 0 },/* neg with fract */
+	{ "4.5k",	(4 * K) + (5 * (K / 10)), 0 },
+	{ "3.333755555555t", 3665502997495, 0 },  /* exact 3665502997495.561 */
+	{ "-3.333755555555t", -3665502997495, 0 },
 	{ "4.5555555555555555K", 4664, 0 },
 	{ "4.5555555555555555555K", 4664, 0 },	/* handle enough digits? */
 	{ "4.555555555555555555555555555555K", 4664, 0 }, /* ignores extra digits? */
+	{ "0.9E",	E - (E / 10), 0 },
+	{ "0.1E",	E/10, 0 },
+	{ "1.9E",	E + (E - (E / 10)), 0 },
+	{ "3.7E",	(3 * E) + (7 * (E / 10)), 0 },
+	{ "7.9E",	(7 * E) + (9 * (E / 10)), 0 },
+	{ "1.234567T",	T + (T * 234567LL) / 1000000LL, 0 },
+	{ "0.0001P",	P / 10000, 0 },
 	{ "1G",		1073741824LL, 0 },
 	{ "G", 		0, 0 },			/* should == 0G? */
 	{ "1234567890", 1234567890LL, 0 },	/* should work */
@@ -204,12 +218,17 @@ struct {					/* the test cases */
 	{ "NEGATIVE_LLONG_MAX", LLONG_MAX*-1, 0 },	/* lower limit */
 	{ "LLONG_MIN", 0, ERANGE },	/* can't handle */
 #if LLONG_MAX == 0x7fffffffffffffffLL
+	{ "7.9999999999999999990E", 0, ERANGE },
+	{ "7.999999999999999999E", LLONG_MAX, 0 },
 	{ "-9223372036854775807", -9223372036854775807, 0 },
 	{ "9223372036854775807", 9223372036854775807, 0 },
 	{ "9223372036854775808", 0, ERANGE },
 	{ "9223372036854775809", 0, ERANGE },
 #endif
 #if LLONG_MIN == (-0x7fffffffffffffffLL-1)
+	{ "-8E", LLONG_MIN, 0 },
+	{ "-8.0000000000000000008E", LLONG_MIN, 0 },
+	{ "-8.0000000000000000009E", 0, ERANGE },
 	{ "-9223372036854775808", 0, ERANGE },
 	{ "-9223372036854775809", 0, ERANGE },
 	{ "-9223372036854775810", 0, ERANGE },
@@ -324,10 +343,23 @@ assert_errno(int testnum, int check, int expect, int result)
 static int
 assert_llong(int testnum, int check, long long expect, long long result)
 {
+	long long tmp, abs_expect, abs_diff, diff, tolerance = 0;
+
 	if (expect == result)
 		return 0;
-	printf("** FAILURE: test %d check %d, expect %lld, result %lld **\n",
-		testnum, check, expect, result);
+	abs_expect = expect < 0 ? -expect : expect;
+	if (abs_expect > 1024) {
+		tolerance = 1;
+		for (tmp = abs_expect; tmp != 0; tmp /= 1024)
+			tolerance *= 10;
+	}
+	diff = expect - result;
+	abs_diff = diff < 0 ? -diff : diff;
+	if (abs_diff < tolerance)
+		return 0;
+	printf("** FAILURE: test %d check %d, expect %lld, result %lld "
+	    "diff %lld > tolerance %lld **\n", testnum, check, expect,
+	    result, diff, tolerance);
 	return 1;
 }
 

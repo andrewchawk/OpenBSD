@@ -1,10 +1,14 @@
+=pod
+
+=encoding UTF-8
+
 =head1 NAME
 
 perlfaq5 - Files and Formats
 
 =head1 VERSION
 
-version 5.20210520
+version 5.20250619
 
 =head1 DESCRIPTION
 
@@ -139,8 +143,8 @@ the loop that prints the existing lines.
 
 To change existing lines, insert the code to modify the lines inside
 the C<while> loop. In this case, the code finds all lowercased
-versions of "perl" and uppercases them. The happens for every line, so
-be sure that you're supposed to do that on every line!
+versions of "perl" and uppercases them. This happens for every line,
+so be sure that you're supposed to do that on every line!
 
     open my $in,  '<',  $file      or die "Can't read old file: $!";
     open my $out, '>', "$file.new" or die "Can't write new file: $!";
@@ -195,7 +199,7 @@ If, for some odd reason, you really want to see the whole file at once
 rather than processing line-by-line, you can slurp it in (as long as
 you can fit the whole thing in memory!):
 
-    open my $in,  '<',  $file      or die "Can't read old file: $!"
+    open my $in,  '<',  $file      or die "Can't read old file: $!";
     open my $out, '>', "$file.new" or die "Can't write new file: $!";
 
     my $content = do { local $/; <$in> }; # slurp!
@@ -293,7 +297,7 @@ times the input record separator, C<$/>, shows up:
     my $lines = 0;
     open my($fh), '<:raw', $filename or die "Can't open $filename: $!";
     while( sysread $fh, $buffer, 4096 ) {
-        $lines += ( $buffer =~ s|$/||g; );
+        $lines += ( $buffer =~ s|$/||g );
     }
     close $fh;
 
@@ -307,7 +311,7 @@ have an untainted filename though:
 
     my $lines;
     if( $filename =~ /^([0-9a-z_.]+)\z/ ) {
-        $lines = `/usr/bin/wc -l $1`
+        $lines = `/usr/bin/wc -l $1`;
         chomp $lines;
     }
 
@@ -559,7 +563,7 @@ or a scalar variable containing one:
 
     ($ifh, $ofh, $efh) = (*STDIN, *STDOUT, *STDERR);
     print $ofh "Type it: ";
-    my $got = <$ifh>
+    my $got = <$ifh>;
     print $efh "What was that: $got";
 
 If you're passing a filehandle to a function, you can write
@@ -708,12 +712,37 @@ X<number, commify>
 
 (contributed by brian d foy and Benjamin Goldberg)
 
-You can use L<Number::Format> to separate places in a number.
-It handles locale information for those of you who want to insert
-full stops instead (or anything else that they want to use,
-really).
+The L<CLDR::Number> module (the Unicode Common Locale Data Repository)
+knows how to format numbers based on a locale to use its
+digit grouping and separator:
 
-This subroutine will add commas to your number:
+    use CLDR::Number;
+
+    my $number = 1234567890;
+
+    foreach my $locale ( qw(en-US de-DE en-IN) ) {
+        my $cldr = CLDR::Number->new( locale => $locale );
+        my $decimal = $cldr->decimal_formatter;
+        printf "%-5s %s\n", $locale, $decimal->format( $number );
+        }
+
+The output shows the same number formatted according to each locale's
+rules. The bare C<en> uses commas between groups of three, the C<de>
+uses dots and groups of three, and the C<en-IN> uses the 3:2:2 rule with
+commas:
+
+    en-US 1,234,567,890
+    de-DE 1.234.567.890
+    en-IN 1,23,45,67,890
+
+L<CLDR::Number> has many more advanced features to handle just about
+anything that you might want. Olaf Alders' article "Stop Writing Your Own
+Commify Functions" has more examples
+(L<https://www.olafalders.com/2015/09/04/stop-writing-your-own-commify-functions/>).
+
+If you know exactly what you want, a simple subroutine might suffice.
+This example will add separators to your number between groups of three
+digits (or whatever grouping). This uses groups of three and a comma:
 
     sub commify {
         local $_  = shift;
@@ -721,7 +750,7 @@ This subroutine will add commas to your number:
         return $_;
     }
 
-This regex from Benjamin Goldberg will add commas to numbers:
+This regex from Benjamin Goldberg does the same thing without the loop:
 
     s/(^[-+]?\d+?(?=(?>(?:\d{3})+)(?!\d))|\G\d{3}(?=\d))/$1,/g;
 
@@ -762,7 +791,7 @@ Within Perl, you may use this directly:
           : ( $ENV{HOME} || $ENV{LOGDIR} )
     }ex;
 
-=head2 How come when I open a file read-write it wipes it out?
+=head2 When I open a file read-write, why does it wipe it out?
 X<clobber> X<read-write> X<clobbering> X<truncate> X<truncating>
 
 Because you're using something like this, which truncates the file
@@ -827,7 +856,7 @@ To open file for update, file must not exist:
 To open a file without blocking, creating if necessary:
 
     sysopen my $fh, '/foo/somefile', O_WRONLY|O_NDELAY|O_CREAT
-        or die "can't open /foo/somefile: $!":
+        or die "can't open /foo/somefile: $!";
 
 Be warned that neither creation nor deletion of files is guaranteed to
 be an atomic operation over NFS. That is, two processes might both
@@ -1091,7 +1120,7 @@ the filesystems, not of utime().
 X<print, to multiple files>
 
 To connect one filehandle to several output filehandles,
-you can use the L<IO::Tee> or L<Tie::FileHandle::Multiplex> modules.
+you can use the L<IO::Tee> or L<Tie::FileHandle::MultiPlex> modules.
 
 If you only have to do this once, you can print individually
 to each filehandle.
@@ -1373,7 +1402,7 @@ to, you may be able to do this:
 
     require './sys/syscall.ph';
     my $rc = syscall(SYS_close(), $fd + 0);  # must force numeric
-    die "can't sysclose $fd: $!" unless $rc == -1;
+    die "can't sysclose $fd: $!" if $rc == -1;
 
 Or, just use the fdopen(3S) feature of C<open()>:
 
@@ -1494,7 +1523,7 @@ array in double quotes. You can send it to print without them:
 (contributed by brian d foy)
 
 The L<File::Find> module, which comes with Perl, does all of the hard
-work to traverse a directory structure. It comes with Perl. You simply
+work to traverse a directory structure. You simply
 call the C<find> subroutine with a callback subroutine and the
 directories you want to traverse:
 
@@ -1571,3 +1600,5 @@ domain. You are permitted and encouraged to use this code and any
 derivatives thereof in your own programs for fun or for profit as you
 see fit. A simple comment in the code giving credit to the FAQ would
 be courteous but is not required.
+
+=cut

@@ -1,4 +1,4 @@
-/*	$OpenBSD: landisk_installboot.c,v 1.12 2022/12/28 21:30:16 jmc Exp $	*/
+/*	$OpenBSD: landisk_installboot.c,v 1.14 2025/11/19 15:05:04 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2013 Joel Sing <jsing@openbsd.org>
@@ -171,7 +171,7 @@ md_bootstrap(int devfd, char *dev, char *bootfile)
 			    "ensuring used partitions do not overlap "
 			    "with bootstrap sectors 0-%zu\n", bootsec);
 		for (i = 0; i < dl.d_npartitions; i++) {
-			part = 'a' + i;
+			part = DL_PARTNUM2NAME(i);
 			pp = &dl.d_partitions[i];
 			if (i == RAW_PART)
 				continue;
@@ -208,12 +208,12 @@ md_bootstrap(int devfd, char *dev, char *bootfile)
 	 */
 	lp = (struct disklabel *)(boot + (LABELSECTOR * DEV_BSIZE) +
 	    LABELOFFSET);
-	for (i = 0, p = (char *)lp; i < (int)sizeof(*lp); i++)
+	for (i = 0, p = (char *)lp; i < dl16sz; i++)
 		if (p[i] != 0)
 			errx(1, "bootstrap has data in disklabel area");
 
 	/* Patch the disklabel into the bootstrap code. */
-	memcpy(lp, &dl, sizeof(dl));
+	memcpy(lp, &dl, dl16sz);
 
 	/* Write the bootstrap out to the disk. */
 	bootpos *= dl.d_secsize;

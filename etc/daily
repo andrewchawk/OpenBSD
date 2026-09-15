@@ -1,5 +1,5 @@
 #
-#	$OpenBSD: daily,v 1.100 2024/07/04 05:06:58 bket Exp $
+#	$OpenBSD: daily,v 1.103 2026/06/02 07:17:35 jca Exp $
 #	From: @(#)daily	8.2 (Berkeley) 1/25/94
 #
 # For local additions, create the file /etc/daily.local.
@@ -52,8 +52,8 @@ if [ -d /tmp -a ! -L /tmp ]; then
 		-o -path './tmux-*' \) -prune -o \
 	    -type f -and ! -path './*.s[eh]m' -atime +7 -delete 2>/dev/null
 	find -x . -type d -mtime +1 ! -path ./vi.recover ! -path ./.X11-unix \
-	    ! -path ./.ICE-unix ! -name . \
-	    -delete >/dev/null 2>&1; }
+	    ! -path ./.ICE-unix ! -path ./run/user ! -path './run/user/*' \
+	    ! -name . -delete >/dev/null 2>&1; }
 fi
 
 # Additional junk directory cleanup would go like this:
@@ -173,7 +173,7 @@ MAINOUT=/var/log/security.out
 install -o 0 -g 0 -m 600 -b /dev/null $MAINOUT
 
 start_part "Running security(8):"
-export SUIDSKIP
+export PASSWDSKIP SUIDSKIP
 /usr/libexec/security
 end_part
 rm -f $PARTOUT

@@ -1,4 +1,4 @@
-/*	$OpenBSD: strptime.c,v 1.31 2023/03/02 16:21:51 millert Exp $ */
+/*	$OpenBSD: strptime.c,v 1.34 2025/11/20 10:59:56 tb Exp $ */
 /*	$NetBSD: strptime.c,v 1.12 1998/01/20 21:39:40 mycroft Exp $	*/
 /*-
  * Copyright (c) 1997, 1998, 2005, 2008 The NetBSD Foundation, Inc.
@@ -59,8 +59,8 @@
 #define FIELD_TM_YDAY	(1 << 3)
 #define FIELD_TM_YEAR	(1 << 4)
 
-static char gmt[] = { "GMT" };
-static char utc[] = { "UTC" };
+static char const gmt[] = { "GMT" };
+static char const utc[] = { "UTC" };
 /* RFC-822/RFC-2822 */
 static const char * const nast[5] = {
        "EST",    "CST",    "MST",    "PST",    "\0\0\0"
@@ -181,6 +181,12 @@ literal:
 		case 'T':	/* The time as "%H:%M:%S". */
 			_LEGAL_ALT(0);
 			if (!(bp = _strptime(bp, "%H:%M:%S", tm, 0)))
+				return (NULL);
+			break;
+
+		case 'v':	/* The date as "%e-%b-%Y". */
+			_LEGAL_ALT(0);
+			if (!(bp = _strptime(bp, "%e-%b-%Y", tm, 0)))
 				return (NULL);
 			break;
 
@@ -478,7 +484,7 @@ literal:
 				ep = _find_string(bp, &i, nast, NULL, 4);
 				if (ep != NULL) {
 					tm->tm_gmtoff = (-5 - i) * SECSPERHOUR;
-					tm->tm_zone = (char *)nast[i];
+					tm->tm_zone = nast[i];
 					bp = ep;
 					continue;
 				}
@@ -486,7 +492,7 @@ literal:
 				if (ep != NULL) {
 					tm->tm_isdst = 1;
 					tm->tm_gmtoff = (-4 - i) * SECSPERHOUR;
-					tm->tm_zone = (char *)nadt[i];
+					tm->tm_zone = nadt[i];
 					bp = ep;
 					continue;
 				}

@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_var.h,v 1.178 2024/05/13 01:15:53 jsg Exp $	*/
+/*	$OpenBSD: tcp_var.h,v 1.196 2025/09/16 17:29:35 bluhm Exp $	*/
 /*	$NetBSD: tcp_var.h,v 1.17 1996/02/13 23:44:24 christos Exp $	*/
 
 /*
@@ -96,14 +96,12 @@ struct tcpcb {
 #define TF_LASTIDLE	0x00100000U	/* no outstanding ACK on last send */
 #define TF_PMTUD_PEND	0x00400000U	/* Path MTU Discovery pending */
 #define TF_NEEDOUTPUT	0x00800000U	/* call tcp_output after tcp_input */
-#define TF_BLOCKOUTPUT	0x01000000U	/* avert tcp_output during tcp_input */
 #define TF_NOPUSH	0x02000000U	/* don't push */
 #define TF_TMR_REXMT	0x04000000U	/* retransmit timer armed */
 #define TF_TMR_PERSIST	0x08000000U	/* retransmit persistence timer armed */
 #define TF_TMR_KEEP	0x10000000U	/* keep alive timer armed */
 #define TF_TMR_2MSL	0x20000000U	/* 2*msl quiet time timer armed */
-#define TF_TMR_REAPER	0x40000000U	/* delayed cleanup timer armed, dead */
-#define TF_TMR_DELACK	0x80000000U	/* delayed ack timer armed */
+#define TF_TMR_DELACK	0x40000000U	/* delayed ack timer armed */
 #define TF_TIMER	TF_TMR_REXMT	/* used to shift with TCPT values */
 
 	struct	mbuf *t_template;	/* skeletal packet for transmit */
@@ -230,6 +228,7 @@ struct tcp_opt_info {
  *	I	immutable after creation
  *	N	net lock
  *	S	syn_cache_mtx		tcp syn cache global mutex
+ *	s	so_lock			socket lock of listen socket
  */
 
 extern struct mutex syn_cache_mtx;
@@ -247,11 +246,11 @@ struct syn_cache {
 	TAILQ_ENTRY(syn_cache) sc_bucketq;	/* [S] link on bucket list */
 	struct refcnt sc_refcnt;		/* ref count list and timer */
 	struct timeout sc_timer;		/* rexmt timer */
-	struct route sc_route;			/* [N] cached route */
+	struct route sc_route;			/* [s] cached route */
 	long sc_win;				/* [I] advertised window */
 	struct syn_cache_head *sc_buckethead;	/* [S] our bucket index */
 	struct syn_cache_set *sc_set;		/* [S] our syn cache set */
-	u_int64_t sc_timestamp;		/* [N] timestamp from SYN */
+	u_int64_t sc_timestamp;		/* [s] timestamp from SYN */
 	u_int32_t sc_hash;		/* [S] */
 	u_int32_t sc_modulate;		/* [I] our timestamp modulator */
 	union syn_cache_sa sc_src;	/* [I] */
@@ -264,7 +263,6 @@ struct syn_cache {
 	u_int sc_rxtshift;		/* [S] for computing backoff */
 	u_int sc_dynflags;		/* [S] flags accessed with mutex */
 #define SCF_UNREACH	0x0001U		/* we've had an unreach error */
-#define SCF_DEAD	0x0002U		/* this entry to be released */
 
 	u_short sc_fixflags;		/* [I] set during initialization */
 #define SCF_TIMESTAMP	0x0010U		/* peer will do timestamps */
@@ -272,13 +270,13 @@ struct syn_cache {
 #define SCF_ECN_PERMIT	0x0040U		/* permit ecn */
 #define SCF_SIGNATURE	0x0080U		/* enforce tcp signatures */
 
-	struct mbuf *sc_ipopts;			/* [N] IP options */
+	struct mbuf *sc_ipopts;			/* [s] IP options */
 	u_int16_t sc_peermaxseg;		/* [I] */
 	u_int16_t sc_ourmaxseg;			/* [I] */
 	u_int     sc_request_r_scale	: 4,	/* [I] */
 		  sc_requested_s_scale	: 4;	/* [I] */
 
-	struct tcpcb *sc_tp;		/* [S] tcb for listening socket */
+	struct inpcb *sc_inplisten;	/* [S] inpcb for listening socket */
 	LIST_ENTRY(syn_cache) sc_tpq;	/* [S] list of entries by same tp */
 };
 
@@ -393,6 +391,7 @@ struct	tcpstat {
 
 	u_int32_t tcps_pcbhashmiss;	/* input packets missing pcb hash */
 	u_int32_t tcps_noport;		/* no socket on port */
+	u_int32_t tcps_closing;		/* inpcb exists, socket is closing */
 	u_int32_t tcps_badsyn;		/* SYN packet with src==dst rcv'ed */
 	u_int32_t tcps_dropsyn;		/* SYN packet dropped */
 
@@ -583,6 +582,7 @@ enum tcpstat_counters {
 	tcps_preddat,
 	tcps_pcbhashmiss,
 	tcps_noport,
+	tcps_closing,
 	tcps_badsyn,
 	tcps_dropsyn,
 	tcps_rcvbadsig,
@@ -641,20 +641,26 @@ extern struct cpumem *tcpcounters;
 static inline void
 tcpstat_inc(enum tcpstat_counters c)
 {
+	int s = splnet();
 	counters_inc(tcpcounters, c);
+	splx(s);
 }
 
 static inline void
 tcpstat_add(enum tcpstat_counters c, uint64_t v)
 {
+	int s = splnet();
 	counters_add(tcpcounters, c, v);
+	splx(s);
 }
 
 static inline void
 tcpstat_pkt(enum tcpstat_counters pcounter, enum tcpstat_counters bcounter,
     uint64_t v)
 {
+	int s = splnet();
 	counters_pkt(tcpcounters, pcounter, bcounter, v);
+	splx(s);
 }
 
 extern uint64_t tcp_starttime;
@@ -677,17 +683,17 @@ extern	const struct pr_usrreqs tcp6_usrreqs;
 
 extern	struct pool tcpcb_pool;
 extern	struct inpcbtable tcbtable, tcb6table;	/* queue of active tcpcb's */
-extern	int tcp_do_rfc1323;	/* enabled/disabled? */
-extern	int tcptv_keep_init;	/* [N] time to keep alive initial SYN packet */
-extern	int tcp_mssdflt;	/* default maximum segment size */
-extern	int tcp_rst_ppslim;	/* maximum outgoing RST packet per second */
-extern	int tcp_ack_on_push;	/* ACK immediately on PUSH */
-extern	int tcp_do_sack;	/* SACK enabled/disabled */
+extern	int tcp_do_rfc1323;	/* [a] enabled/disabled? */
+extern	const int tcprexmtthresh;
+extern	int tcp_mssdflt;	/* [a] default maximum segment size */
+extern	int tcp_rst_ppslim;	/* [a] maximum outgoing RST packet per second */
+extern	int tcp_ack_on_push;	/* [a] ACK immediately on PUSH */
+extern	int tcp_do_sack;	/* [a] SACK enabled/disabled */
 extern	struct pool sackhl_pool;
 extern	int tcp_sackhole_limit;	/* max entries for tcp sack queues */
-extern	int tcp_do_ecn;		/* RFC3168 ECN enabled/disabled? */
-extern	int tcp_do_rfc3390;	/* RFC3390 Increasing TCP's Initial Window */
-extern	int tcp_do_tso;		/* enable TSO for TCP output packets */
+extern	int tcp_do_ecn;		/* [a] RFC3168 ECN enabled/disabled? */
+extern	int tcp_do_rfc3390;	/* [a] RFC3390 Increasing TCP Initial Window */
+extern	int tcp_do_tso;		/* [a] enable TSO for TCP output packets */
 
 extern	struct pool tcpqe_pool;
 extern	int tcp_reass_limit;	/* max entries for tcp reass queues */
@@ -717,9 +723,11 @@ struct tcpcb *
 int	 tcp_dooptions(struct tcpcb *, u_char *, int, struct tcphdr *,
 		struct mbuf *, int, struct tcp_opt_info *, u_int, uint64_t);
 void	 tcp_init(void);
-int	 tcp_input(struct mbuf **, int *, int, int);
+int	 tcp_input(struct mbuf **, int *, int, int, struct netstack *);
+void	 tcp_input_mlist(struct mbuf_list *, int);
 int	 tcp_mss(struct tcpcb *, int);
 void	 tcp_mss_update(struct tcpcb *);
+void	 tcp_softlro_glue(struct mbuf_list *, struct mbuf *, struct ifnet *);
 u_int	 tcp_hdrsz(struct tcpcb *);
 void	 tcp_mtudisc(struct inpcb *, int);
 void	 tcp_mtudisc_increase(struct inpcb *, int);
@@ -730,7 +738,8 @@ struct tcpcb *
 	 tcp_newtcpcb(struct inpcb *, int);
 void	 tcp_notify(struct inpcb *, int);
 int	 tcp_output(struct tcpcb *);
-int	 tcp_chopper(struct mbuf *, struct mbuf_list *, struct ifnet *, u_int);
+int	 tcp_softtso_chop(struct mbuf_list *, struct mbuf *, struct ifnet *,
+	    u_int);
 int	 tcp_if_output_tso(struct ifnet *, struct mbuf **, struct sockaddr *,
 	    struct rtentry *, uint32_t, u_int);
 void	 tcp_pulloutofband(struct socket *, u_int, struct mbuf *, int);
@@ -786,7 +795,7 @@ int	tcp_signature_apply(caddr_t, caddr_t, unsigned int);
 int	tcp_signature(struct tdb *, int, struct mbuf *, struct tcphdr *,
 	    int, int, char *);
 #endif /* TCP_SIGNATURE */
-void     tcp_set_iss_tsm(struct tcpcb *);
+void	 tcp_set_iss_tsm(struct tcpcb *);
 
 void	 syn_cache_unreach(const struct sockaddr *, const struct sockaddr *,
 	   struct tcphdr *, u_int);

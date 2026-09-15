@@ -1,4 +1,4 @@
-/*	$OpenBSD: seq.c,v 1.14 2017/04/18 01:45:35 deraadt Exp $	*/
+/*	$OpenBSD: seq.c,v 1.15 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -351,11 +351,11 @@ int
 e_memcmp(CHAR_T *p1, EVENT *ep, size_t n)
 {
 	if (n != 0) {
-                do {
-                        if (*p1++ != ep->e_c)
-                                return (*--p1 - ep->e_c);
+		do {
+			if (*p1++ != ep->e_c)
+				return (*--p1 - ep->e_c);
 			++ep;
-                } while (--n != 0);
-        }
-        return (0);
+		} while (--n != 0);
+	}
+	return (0);
 }

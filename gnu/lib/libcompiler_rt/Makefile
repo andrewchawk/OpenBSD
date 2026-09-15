@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.8 2024/02/06 05:07:28 jca Exp $
+# $OpenBSD: Makefile,v 1.16 2026/08/31 08:58:48 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -13,7 +13,7 @@ LIB=	compiler_rt
 NOPIC=
 NOPROFILE=
 
-CFLAGS+=	-fPIC -std=gnu99 -fvisibility=hidden -fno-stack-protector
+CFLAGS+=	-fPIC -std=gnu11 -fvisibility=hidden -fno-stack-protector
 CPPFLAGS+=	-I${.CURDIR}/../../llvm/compiler-rt/lib/builtins
 CPPFLAGS+=	-DVISIBILITY_HIDDEN
 
@@ -30,10 +30,24 @@ RTARCH=	${MACHINE_ARCH}
 .PATH: ${.CURDIR}/../../llvm/compiler-rt/lib/builtins/${RTARCH}
 .PATH: ${.CURDIR}/../../llvm/compiler-rt/lib/builtins
 
+# Enable Float16 support for aarch64 and x86_64
+.if ${RTARCH} == "aarch64" || ${RTARCH} == "x86_64"
+CPPFLAGS+=	-DCOMPILER_RT_HAS_FLOAT16
+.endif
+
+# Enable BFloat16 support for aarch64 and x86_64
+.if ${RTARCH} == "aarch64" || ${RTARCH} == "x86_64"
+CPPFLAGS+=	-DCOMPILER_RT_HAS_BFLOAT16
+SRCS+=	extendbfsf2.c \
+	truncdfbf2.c \
+	truncxfbf2.c \
+	truncsfbf2.c \
+	trunctfbf2.c
+.endif
+
 GEN_SRCS=	absvdi2 \
 		absvsi2 \
 		absvti2 \
-		addtf3 \
 		addvdi3 \
 		addvsi3 \
 		addvti3 \
@@ -53,7 +67,6 @@ GEN_SRCS=	absvdi2 \
 		cmpti2 \
 		comparedf2 \
 		comparesf2 \
-		cpu_model \
 		ctzdi2 \
 		ctzsi2 \
 		ctzti2 \
@@ -62,14 +75,12 @@ GEN_SRCS=	absvdi2 \
 		divmoddi4 \
 		divmodsi4 \
 		divsc3 \
-		divtc3 \
 		divti3 \
-		divtf3 \
-		divxc3 \
 		emutls \
 		enable_execute_stack \
 		eprintf \
 		extendhfsf2 \
+		extendhfdf2 \
 		ffsdi2 \
 		ffssi2 \
 		ffsti2 \
@@ -79,19 +90,12 @@ GEN_SRCS=	absvdi2 \
 		fixunsdfti \
 		fixunssfsi \
 		fixunssfti \
-		fixunsxfdi \
-		fixunsxfsi \
-		fixunsxfti \
-		fixxfdi \
-		fixxfti \
 		floattidf \
 		floattisf \
-		floattixf \
 		floatunsidf \
 		floatunsisf \
 		floatuntidf \
 		floatuntisf \
-		floatuntixf \
 		fp_mode \
 		gcc_personality_v0 \
 		int_util \
@@ -107,11 +111,9 @@ GEN_SRCS=	absvdi2 \
 		muloti4 \
 		mulsc3 \
 		multi3 \
-		multf3 \
 		mulvdi3 \
 		mulvsi3 \
 		mulvti3 \
-		mulxc3 \
 		negdf2 \
 		negdi2 \
 		negsf2 \
@@ -127,12 +129,9 @@ GEN_SRCS=	absvdi2 \
 		popcountti2 \
 		powidf2 \
 		powisf2 \
-		powitf2 \
-		powixf2 \
 		subvdi3 \
 		subvsi3 \
 		subvti3 \
-		subtf3 \
 		trampoline_setup \
 		truncdfhf2 \
 		truncsfhf2 \
@@ -170,49 +169,53 @@ GEN_SRCS+=	adddf3 \
 		udivsi3
 .endif
 
+# Architecture-specific TF (quad-precision) functions
+GEN_TF_SRCS=	addtf3 \
+		comparetf2 \
+		divtc3 \
+		divtf3 \
+		extenddftf2 \
+		extendhftf2 \
+		extendsftf2 \
+		fixtfdi \
+		fixtfsi \
+		fixtfti \
+		fixunstfdi \
+		fixunstfsi \
+		fixunstfti \
+		floatditf \
+		floatsitf \
+		floattitf \
+		floatunditf \
+		floatunsitf \
+		floatuntitf \
+		multc3 \
+		multf3 \
+		powitf2 \
+		subtf3 \
+		trunctfdf2 \
+		trunctfhf2 \
+		trunctfsf2
+
 .if ${RTARCH} == "i386"
 SRCS+=	floatdidf.c \
 	floatdisf.c \
-	floatdixf.c \
 	floatundidf.c \
-	floatundisf.c \
-	floatundixf.c
+	floatundisf.c
 .else
 GEN_SRCS+=	floatdidf \
-		floatdisf \
-		floatdixf \
-		floatundidf \
-		floatundisf \
-		floatundixf
+	floatdisf \
+	floatundidf \
+	floatundisf
 .endif
 
-.for file in ${GEN_SRCS}
-.	if exists(${.CURDIR}/../../llvm/compiler-rt/lib/builtins/${RTARCH}/${file}.S)
-SRCS+=	${file}.S
-.	else
-SRCS+=	${file}.c
-.	endif
-.endfor
-
 .if ${RTARCH} == "aarch64"
-SRCS+=	comparetf2.c \
-	extenddftf2.c \
-	extendsftf2.c \
-	fixtfdi.c \
-	fixtfsi.c \
-	fixtfti.c \
-	fixunstfdi.c \
-	fixunstfsi.c \
-	fixunstfti.c \
-	floatditf.c \
-	floatsitf.c \
-	floattitf.c \
-	floatunditf.c \
-	floatunsitf.c \
-	floatuntitf.c \
-	multc3.c \
-	trunctfdf2.c \
-	trunctfsf2.c
+# Add CPU model detection
+.PATH: ${.CURDIR}/../../llvm/compiler-rt/lib/builtins/cpu_model
+SRCS+=	aarch64.c
+
+# Quad-precision float support
+GEN_SRCS+=	${GEN_TF_SRCS}
 
 # Prepare multiple versions of the LSE-helper
 CPPFLAGS+=-DHAS_ASM_LSE
@@ -226,10 +229,17 @@ outline_atomic_${pat}${size}_${model}.S: Makefile ${.CURDIR}/../../llvm/compiler
 	@mv $@.tmp $@
 
 SRCS+=	outline_atomic_${pat}${size}_${model}.S
+CLEANFILES+=	outline_atomic_${pat}${size}_${model}.S
 .      endif
 .    endfor
 .  endfor
 .endfor
+
+
+# XXX SME (Scalable Matrix Extension) support
+#SRCS+=	sme-abi.S \
+#	sme-abi-init.c \
+#	sme-abi-vg.c
 
 .endif
 
@@ -276,76 +286,64 @@ SRCS+=	aeabi_cdcmp.S \
 	sync_synchronize.S
 .endif
 
+.if ${RTARCH} == "i386" || ${RTARCH} == "x86_64"
+# CPU model detection
+.PATH: ${.CURDIR}/../../llvm/compiler-rt/lib/builtins/cpu_model
+SRCS+=	x86.c
+
+# Extended precision (80-bit) support
+SRCS+=	divxc3.c \
+	extendhfxf2.c \
+	extendxftf2.c \
+	fixxfdi.c \
+	fixxfti.c \
+	fixunsxfdi.c \
+	fixunsxfsi.c \
+	fixunsxfti.c \
+	floatdixf.c \
+	floattixf.c \
+	floatundixf.c \
+	floatuntixf.c \
+	mulxc3.c \
+	powixf2.c \
+	trunctfxf2.c \
+	truncxfhf2.c
+
+.if ${RTARCH} == "x86_64"
+# Quad-precision float support (for __float128)
+GEN_SRCS+=	${GEN_TF_SRCS}
+.endif
+.endif
+
 .if ${RTARCH} == "mips64" || ${RTARCH} == "mips64el"
-SRCS+=	comparetf2.c \
-	extenddftf2.c \
-	extendsftf2.c \
-	fixtfdi.c \
-	fixtfsi.c \
-	fixtfti.c \
-	fixunstfdi.c \
-	fixunstfsi.c \
-	fixunstfti.c \
-	floatditf.c \
-	floatsitf.c \
-	floattitf.c \
-	floatunditf.c \
-	floatunsitf.c \
-	floatuntitf.c \
-	multc3.c \
-	trunctfdf2.c \
-	trunctfsf2.c
+# Quad-precision float support
+GEN_SRCS+=	${GEN_TF_SRCS}
 .endif
 
 .if ${RTARCH} == "ppc"
 # Omit "double-double" functions since long double is the same as
 # double on OpenBSD.
-SRCS+=	atomic_lock_free.c
 .endif
 
 .if ${RTARCH} == "riscv"
-SRCS+=	comparetf2.c \
-	extenddftf2.c \
-	extendsftf2.c \
-	fixtfdi.c \
-	fixtfsi.c \
-	fixtfti.c \
-	fixunstfdi.c \
-	fixunstfsi.c \
-	fixunstfti.c \
-	floatditf.c \
-	floatsitf.c \
-	floattitf.c \
-	floatunditf.c \
-	floatunsitf.c \
-	floatuntitf.c \
-	multc3.c \
-	restore.S \
-	save.S \
-	trunctfdf2.c \
-	trunctfsf2.c
+# Quad-precision float support
+GEN_SRCS+=	${GEN_TF_SRCS}
+SRCS+=	restore.S \
+	save.S
 .endif
 
 .if ${RTARCH} == "sparc64"
-SRCS+=	comparetf2.c \
-	extenddftf2.c \
-	extendsftf2.c \
-	fixtfdi.c \
-	fixtfsi.c \
-	fixtfti.c \
-	fixunstfdi.c \
-	fixunstfsi.c \
-	fixunstfti.c \
-	floatditf.c \
-	floatsitf.c \
-	floattitf.c \
-	floatunditf.c \
-	floatunsitf.c \
-	floatuntitf.c \
-	multc3.c \
-	trunctfdf2.c \
-	trunctfsf2.c
+# Quad-precision float support
+GEN_SRCS+=	${GEN_TF_SRCS}
 .endif
+
+.for file in ${GEN_SRCS}
+.	if exists(${.CURDIR}/../../llvm/compiler-rt/lib/builtins/${RTARCH}/${file}.S)
+SRCS+=	${file}.S
+.	else
+SRCS+=	${file}.c
+.	endif
+.endfor
 
 .include <bsd.lib.mk>
 

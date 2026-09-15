@@ -1,4 +1,4 @@
-.\"	$OpenBSD: systat.1,v 1.122 2022/11/27 22:52:21 kn Exp $
+.\"	$OpenBSD: systat.1,v 1.125 2025/02/25 11:29:17 mpi Exp $
 .\"	$NetBSD: systat.1,v 1.6 1996/05/10 23:16:39 thorpej Exp $
 .\"
 .\" Copyright (c) 1985, 1990, 1993
@@ -30,7 +30,7 @@
 .\"
 .\"	@(#)systat.1	8.2 (Berkeley) 12/30/93
 .\"
-.Dd $Mdocdate: November 27 2022 $
+.Dd $Mdocdate: February 25 2025 $
 .Dt SYSTAT 1
 .Os
 .Sh NAME
@@ -265,10 +265,8 @@ The
 .Dq State
 column has the format
 .Sm off
-.Xo
 .Cm up | dn
 .Bq : Cm U | D .
-.Xc
 .Sm on
 .Sq up
 and
@@ -652,9 +650,13 @@ fault had to wait on a page
 .It fltpgrele
 fault found a released page
 .It fltrelck
-fault relock called
-.It fltrelckok
 fault relock was a success
+.It fltnorelck
+fault relock failed
+.It fltup
+fault upgrade was a success
+.It fltnoup
+fault upgrade failed
 .It fltanget
 fault got anon page
 .It fltanretry
@@ -689,18 +691,12 @@ target number of free pages
 target number of inactive pages
 .It wiredmax
 maximum number of wired pages
-.It anonmin
-minimum threshold for anon pages
-.It vtextmin
-minimum threshold for vtext pages
-.It vnodemin
-minimum threshold for vnode pages
-.It anonminpct
-minimum percent anon pages
-.It vtextminpct
-minimum percent vtext pages
-.It vnodeminpct
-minimum percent vnode pages
+.Pp
+.It Per-CPU Counters:
+.It pcphit
+pages allocated from a per-CPU cache since boot
+.It pcpmiss
+times a per-CPU cache was empty when allocating a page
 .Pp
 .It Swap Counters:
 .It nswapdev

@@ -1,4 +1,4 @@
-/*	$OpenBSD: print-ppp.c,v 1.36 2021/12/01 18:28:46 deraadt Exp $	*/
+/*	$OpenBSD: print-ppp.c,v 1.39 2025/12/27 06:34:31 dlg Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1993, 1994, 1995, 1996, 1997
@@ -260,9 +260,13 @@ static const char *eaptype[] = {
 #define IPCP_CODE_MIN IPCP_CODE_CFG_REQ
 #define IPCP_CODE_MAX IPCP_CODE_COD_REJ
 
-#define IPCP_2ADDR	1
-#define IPCP_CP		2
-#define IPCP_ADDR	3
+#define IPCP_2ADDR		1
+#define IPCP_CP			2
+#define IPCP_ADDR		3
+#define IPCP_DNS1		129
+#define IPCP_NBNS1		130
+#define IPCP_DNS2		131
+#define IPCP_NBNS2		132
 
 /* IPV6CP */
 
@@ -982,6 +986,18 @@ print_ipcp_config_options(const u_char *p, int l)
 	case IPCP_ADDR:
 		printf(" IP-Address");
 		break;
+	case IPCP_DNS1:
+		printf(" Primary-DNS-Server");
+		break;
+	case IPCP_NBNS1:
+		printf(" Primary-NBNS-Server");
+		break;
+	case IPCP_DNS2:
+		printf(" Secondary-DNS-Server");
+		break;
+	case IPCP_NBNS2:
+		printf(" Secondary-NBNS-Server");
+		break;
 	default:
 		printf(" ipcp-type-%u", type);
 		break;
@@ -1029,6 +1045,10 @@ print_ipcp_config_options(const u_char *p, int l)
 		}
 		break;
 	case IPCP_ADDR:
+	case IPCP_DNS1:
+	case IPCP_NBNS1:
+	case IPCP_DNS2:
+	case IPCP_NBNS2:
 		if (length != 6)
 			goto invalid;
 		if (l < IP_LEN)
@@ -1291,6 +1311,7 @@ pppoe_if_print(u_short ethertype, const u_char *p, u_int length, u_int l)
 	if (ethertype == ETHERTYPE_PPPOEDISC) {
 		while (l > 0) {
 			u_int16_t t_type, t_len;
+			int text = 0;
 
 			if (l < 4)
 				goto trunc;
@@ -1310,9 +1331,11 @@ pppoe_if_print(u_short ethertype, const u_char *p, u_int length, u_int l)
 				break;
 			case PPPOE_TAG_SERVICE_NAME:
 				printf("Service-Name");
+				text = 1;
 				break;
 			case PPPOE_TAG_AC_NAME:
 				printf("AC-Name");
+				text = 1;
 				break;
 			case PPPOE_TAG_HOST_UNIQ:
 				printf("Host-Uniq");
@@ -1331,25 +1354,32 @@ pppoe_if_print(u_short ethertype, const u_char *p, u_int length, u_int l)
 				break;
 			case PPPOE_TAG_SERVICE_NAME_ERROR:
 				printf("Service-Name-Error");
+				text = 1;
 				break;
 			case PPPOE_TAG_AC_SYSTEM_ERROR:
 				printf("AC-System-Error");
+				text = 1;
 				break;
 			case PPPOE_TAG_GENERIC_ERROR:
 				printf("Generic-Error");
+				text = 1;
 				break;
 			default:
 				printf("Unknown(0x%04x)", t_type);
 			}
 			printf(", length %u%s", t_len, t_len ? " " : "");
 
-			if (t_len) {
+			if (t_len && text == 1) {
 				for (t_type = 0; t_type < t_len; t_type++) {
 					if (isprint(p[t_type]))
 						printf("%c", p[t_type]);
 					else
 						printf("\\%03o", p[t_type]);
 				}
+			} else if (t_len) {
+				printf("0x");
+				for (t_type = 0; t_type < t_len; t_type++)
+					printf("%02x", p[t_type]);
 			}
 			p += t_len;
 			l -= t_len;

@@ -1,4 +1,4 @@
-/* $OpenBSD: tls_internal.h,v 1.85 2024/03/26 06:24:52 joshua Exp $ */
+/* $OpenBSD: tls_internal.h,v 1.87 2026/06/06 16:23:30 sthen Exp $ */
 /*
  * Copyright (c) 2014 Jeremie Courreges-Anglas <jca@openbsd.org>
  * Copyright (c) 2014 Joel Sing <jsing@openbsd.org>
@@ -37,7 +37,7 @@ __BEGIN_HIDDEN_DECLS
 #define TLS_CIPHERS_LEGACY	"HIGH:MEDIUM:!aNULL"
 #define TLS_CIPHERS_ALL		"ALL:!aNULL:!eNULL"
 
-#define TLS_ECDHE_CURVES	"X25519,P-256,P-384"
+#define TLS_ECDHE_CURVES	"X25519MLKEM768,X25519,P-256,P-384"
 
 union tls_addr {
 	struct in_addr ip4;
@@ -129,6 +129,7 @@ struct tls_conninfo {
 	int session_resumed;
 	char *version;
 
+	char *common_name;
 	char *hash;
 	char *issuer;
 	char *subject;
@@ -238,6 +239,8 @@ struct tls_config *tls_config_new_internal(void);
 struct tls *tls_new(void);
 struct tls *tls_server_conn(struct tls *ctx);
 
+int tls_get_common_name(struct tls *_ctx, X509 *_cert, const char *_in_name,
+    char **_out_common_name);
 int tls_check_name(struct tls *ctx, X509 *cert, const char *servername,
     int *match);
 int tls_configure_server(struct tls *ctx);

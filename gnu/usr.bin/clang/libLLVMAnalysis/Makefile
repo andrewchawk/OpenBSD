@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.14 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.16 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMAnalysis
 NOPROFILE=
@@ -7,7 +7,6 @@ CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Analysis
 
 SRCS+=	AliasAnalysis.cpp \
 	AliasAnalysisEvaluator.cpp \
-	AliasAnalysisSummary.cpp \
 	AliasSetTracker.cpp \
 	AnalysisAnalysis.cpp \
 	AssumeBundleQueries.cpp \
@@ -28,6 +27,7 @@ SRCS+=	AliasAnalysis.cpp \
 	CostModel.cpp \
 	CodeMetrics.cpp \
 	ConstantFolding.cpp \
+	CtxProfAnalysis.cpp \
 	CycleAnalysis.cpp \
 	DDG.cpp \
 	DDGPrinter.cpp \
@@ -37,15 +37,20 @@ SRCS+=	AliasAnalysis.cpp \
 	DependenceAnalysis.cpp \
 	DependenceGraphBuilder.cpp \
 	DevelopmentModeInlineAdvisor.cpp \
-	DivergenceAnalysis.cpp \
+	DomConditionCache.cpp \
 	DomPrinter.cpp \
 	DomTreeUpdater.cpp \
 	DominanceFrontier.cpp \
-	EHPersonalities.cpp \
+	DXILResource.cpp \
+	DXILMetadataAnalysis.cpp \
+	EphemeralValuesCache.cpp \
+	FloatingPointPredicateUtils.cpp \
 	FunctionPropertiesAnalysis.cpp \
 	GlobalsModRef.cpp \
 	GuardUtils.cpp \
+	HashRecognize.cpp \
 	HeatUtils.cpp \
+	IR2Vec.cpp \
 	IRSimilarityIdentifier.cpp \
 	IVDescriptors.cpp \
 	IVUsers.cpp \
@@ -54,17 +59,16 @@ SRCS+=	AliasAnalysis.cpp \
 	InlineCost.cpp \
 	InlineAdvisor.cpp \
 	InlineOrder.cpp \
-	InlineSizeEstimatorAnalysis.cpp \
 	InstCount.cpp \
 	InstructionPrecedenceTracking.cpp \
 	InstructionSimplify.cpp \
-	Interval.cpp \
-	IntervalPartition.cpp \
+	InteractiveModelRunner.cpp \
+	KernelInfo.cpp \
+	LastRunTrackingAnalysis.cpp \
 	LazyBranchProbabilityInfo.cpp \
 	LazyBlockFrequencyInfo.cpp \
 	LazyCallGraph.cpp \
 	LazyValueInfo.cpp \
-	LegacyDivergenceAnalysis.cpp \
 	Lint.cpp \
 	Loads.cpp \
 	Local.cpp \
@@ -76,7 +80,6 @@ SRCS+=	AliasAnalysis.cpp \
 	LoopInfo.cpp \
 	LoopPass.cpp \
 	MLInlineAdvisor.cpp \
-	MemDepPrinter.cpp \
 	MemDerefPrinter.cpp \
 	MemoryBuiltins.cpp \
 	MemoryDependenceAnalysis.cpp \
@@ -103,13 +106,15 @@ SRCS+=	AliasAnalysis.cpp \
 	RegionPass.cpp \
 	RegionPrinter.cpp \
 	ReplayInlineAdvisor.cpp \
+	RuntimeLibcallInfo.cpp \
 	ScalarEvolution.cpp \
 	ScalarEvolutionAliasAnalysis.cpp \
 	ScalarEvolutionDivision.cpp \
 	ScalarEvolutionNormalization.cpp \
+	StaticDataProfileInfo.cpp \
 	StackLifetime.cpp \
 	StackSafetyAnalysis.cpp \
-	SyncDependenceAnalysis.cpp \
+	AnalysisStructuralHash.cpp \
 	SyntheticCountsUtils.cpp \
 	TFLiteUtils.cpp \
 	TargetLibraryInfo.cpp \
@@ -124,11 +129,13 @@ SRCS+=	AliasAnalysis.cpp \
 	ValueLattice.cpp \
 	ValueLatticeUtils.cpp \
 	ValueTracking.cpp \
-	VectorUtils.cpp \
-	VFABIDemangling.cpp
+	VectorUtils.cpp
 
 AnalysisAnalysis.cpp:
 	ln -s ${LLVM_SRCS}/lib/Analysis/Analysis.cpp $@
+
+AnalysisStructuralHash.cpp:
+	ln -s ${LLVM_SRCS}/lib/Analysis/StructuralHash.cpp $@
 
 .PATH:	${.CURDIR}/../../../llvm/llvm/lib/Analysis
 

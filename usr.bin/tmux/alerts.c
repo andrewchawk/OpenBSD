@@ -1,4 +1,4 @@
-/* $OpenBSD: alerts.c,v 1.33 2021/04/12 09:36:12 nicm Exp $ */
+/* $OpenBSD: alerts.c,v 1.35 2026/07/10 13:38:45 nicm Exp $ */
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -206,7 +206,7 @@ alerts_check_bell(struct window *w)
 		}
 		if (!alerts_action_applies(wl, "bell-action"))
 			continue;
-		notify_winlink("alert-bell", wl);
+		events_fire_winlink("alert-bell", wl);
 
 		if (s->flags & SESSION_ALERTED)
 			continue;
@@ -242,7 +242,7 @@ alerts_check_activity(struct window *w)
 		}
 		if (!alerts_action_applies(wl, "activity-action"))
 			continue;
-		notify_winlink("alert-activity", wl);
+		events_fire_winlink("alert-activity", wl);
 
 		if (s->flags & SESSION_ALERTED)
 			continue;
@@ -278,7 +278,7 @@ alerts_check_silence(struct window *w)
 		}
 		if (!alerts_action_applies(wl, "silence-action"))
 			continue;
-		notify_winlink("alert-silence", wl);
+		events_fire_winlink("alert-silence", wl);
 
 		if (s->flags & SESSION_ALERTED)
 			continue;
@@ -316,11 +316,11 @@ alerts_set_message(struct winlink *wl, const char *type, const char *option)
 		if (visual == VISUAL_OFF)
 			continue;
 		if (c->session->curw == wl) {
-			status_message_set(c, -1, 1, 0, "%s in current window",
-			    type);
+			status_message_set(c, -1, 1, 0, 0,
+			    "%s in current window", type);
 		} else {
-			status_message_set(c, -1, 1, 0, "%s in window %d", type,
-			    wl->idx);
+			status_message_set(c, -1, 1, 0, 0,
+			    "%s in window %d", type, wl->idx);
 		}
 	}
 }

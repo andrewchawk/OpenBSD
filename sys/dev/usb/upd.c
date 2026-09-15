@@ -1,4 +1,4 @@
-/*	$OpenBSD: upd.c,v 1.32 2024/05/23 03:21:09 jsg Exp $ */
+/*	$OpenBSD: upd.c,v 1.34 2025/03/02 08:18:12 landry Exp $ */
 
 /*
  * Copyright (c) 2015 David Higgs <higgsd@gmail.com>
@@ -60,6 +60,8 @@ static struct upd_usage_entry upd_usage_batdep[] = {
 	    SENSOR_PERCENT,	 "RemainingCapacity" },
 	{ HUP_BATTERY,	HUB_FULLCHARGE_CAPACITY,
 	    SENSOR_PERCENT,	 "FullChargeCapacity" },
+	{ HUP_POWER,	HUP_PERCENT_LOAD,
+	    SENSOR_PERCENT,	 "PercentLoad" },
 	{ HUP_BATTERY,	HUB_CHARGING,
 	    SENSOR_INDICATOR,	 "Charging" },
 	{ HUP_BATTERY,	HUB_DISCHARGING,
@@ -411,6 +413,7 @@ upd_sensor_update(struct upd_softc *sc, struct upd_sensor *sensor,
 	case HUB_ABS_STATEOF_CHARGE:
 	case HUB_REM_CAPACITY:
 	case HUB_FULLCHARGE_CAPACITY:
+	case HUP_PERCENT_LOAD:
 		adjust = 1000; /* scale adjust */
 		break;
 	case HUB_ATRATE_TIMETOFULL:
@@ -425,6 +428,20 @@ upd_sensor_update(struct upd_softc *sc, struct upd_sensor *sensor,
 	}
 
 	hdata = hid_get_data(buf, len, &sensor->hitem.loc);
+	switch (HID_GET_USAGE(sensor->hitem.usage)) {
+	case HUB_RUNTIMETO_EMPTY:
+		/*
+		 * If the value is reported as a 4-byte item,
+		 * assume the lowest 8 bits of the value are
+		 * extra, unnecessary, precision, and discard
+		 * them.
+		 * This happens to match what sysutils/nut
+		 * reports.
+		 */
+		if (len == 4)
+			hdata = hdata >> 8;
+		break;
+	}
 	if (sensor->ksensor.type == SENSOR_INDICATOR)
 		sensor->ksensor.value = hdata ? 1 : 0;
 	else

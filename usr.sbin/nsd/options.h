@@ -11,6 +11,9 @@
 #define OPTIONS_H
 
 #include <stdarg.h>
+#ifdef HAVE_SSL
+#include <openssl/ssl.h>
+#endif
 #include "region-allocator.h"
 #include "rbtree.h"
 struct query;
@@ -100,6 +103,7 @@ struct nsd_options {
 	int tcp_timeout;
 	int tcp_mss;
 	int outgoing_tcp_mss;
+	int tcp_listen_queue;
 	size_t ipv4_edns_size;
 	size_t ipv6_edns_size;
 	const char* pidfile;
@@ -113,9 +117,11 @@ struct nsd_options {
 	const char* zonelistfile;
 	const char* nsid;
 	int xfrd_reload_timeout;
+	int reload_config;
 	int zonefiles_check;
 	int zonefiles_write;
 	int log_time_ascii;
+	int log_time_iso;
 	int round_robin;
 	int minimal_responses;
 	int refuse_any;
@@ -133,8 +139,12 @@ struct nsd_options {
 	char* tls_service_pem;
 	/* TLS dedicated port */
 	const char* tls_port;
+	/* TLS-AUTH dedicated port */
+	const char* tls_auth_port;
 	/* TLS certificate bundle */
 	const char* tls_cert_bundle;
+	/* Answer XFR only from tls_auth_port and after authentication */
+	int tls_auth_xfr_only;
 
 	/* proxy protocol port list */
 	struct proxy_protocol_port_list* proxy_protocol_port;
@@ -153,6 +163,30 @@ struct nsd_options {
 	char* control_key_file;
 	/** certificate file for nsd-control */
 	char* control_cert_file;
+
+#ifdef USE_XDP
+	/** XDP interface name */
+	const char* xdp_interface;
+	/** XDP/eBPF program file path */
+	const char* xdp_program_path;
+	/** if NSD should load the XDP/eBPF program */
+	int xdp_program_load;
+	/** path to bpffs for pinned BPF objects */
+	const char* xdp_bpffs_path;
+	/** force copy mode instead of zero copy mode */
+	int xdp_force_copy;
+#endif
+
+#ifdef USE_METRICS
+	/** metrics section. enable toggle. */
+	int metrics_enable;
+	/** the interfaces the metrics endpoint should listen on */
+	struct ip_address_option* metrics_interface;
+	/** port number for the metrics endpoint */
+	int metrics_port;
+	/** HTTP path for the metrics endpoint */
+	char* metrics_path;
+#endif /* USE_METRICS */
 
 #ifdef RATELIMIT
 	/** number of buckets in rrl hashtable */
@@ -200,8 +234,12 @@ struct nsd_options {
 	int answer_cookie;
 	/** cookie secret */
 	char *cookie_secret;
+	/** cookie staging secret */
+	char *cookie_staging_secret;
 	/** path to cookie secret store */
-	char const* cookie_secret_file;
+	char *cookie_secret_file;
+	/** set when the cookie_secret_file whas not explicitely configured */
+	uint8_t cookie_secret_file_is_default;
 	/** enable verify */
 	int verify_enable;
 	/** list of ip addresses used to serve zones for verification */
@@ -557,6 +595,9 @@ int acl_check_incoming(struct acl_options* acl, struct query* q,
 int acl_addr_matches_host(struct acl_options* acl, struct acl_options* host);
 int acl_addr_matches(struct acl_options* acl, struct query* q);
 int acl_addr_matches_proxy(struct acl_options* acl, struct query* q);
+#ifdef HAVE_SSL
+int acl_tls_hostname_matches(SSL* ssl, const char* acl_cert_cn);
+#endif
 int acl_key_matches(struct acl_options* acl, struct query* q);
 int acl_addr_match_mask(uint32_t* a, uint32_t* b, uint32_t* mask, size_t sz);
 int acl_addr_match_range_v6(uint32_t* minval, uint32_t* x, uint32_t* maxval, size_t sz);
@@ -600,6 +641,7 @@ const char* config_make_zonefile(struct zone_options* zone, struct nsd* nsd);
 
 /* parsing helpers */
 void c_error(const char* msg, ...) ATTR_FORMAT(printf, 1,2);
+void c_warning(const char* msg, ...) ATTR_FORMAT(printf, 1,2);
 int c_wrap(void);
 struct acl_options* parse_acl_info(region_type* region, char* ip,
 	const char* key);

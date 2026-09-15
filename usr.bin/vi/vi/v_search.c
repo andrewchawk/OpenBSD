@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_search.c,v 1.14 2016/01/06 22:28:52 millert Exp $	*/
+/*	$OpenBSD: v_search.c,v 1.15 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -137,7 +137,7 @@ v_exaddr(SCR *sp, VICMD *vp, dir_t dir)
 	 */
 	if (!KEYS_WAITING(sp))
 		F_SET(&gp->excmd, E_SEARCH_WMSG);
-		
+
 	/* Save the current line/column. */
 	s_lno = sp->lno;
 	s_cno = sp->cno;
@@ -169,7 +169,7 @@ v_exaddr(SCR *sp, VICMD *vp, dir_t dir)
 	cmdp = &gp->excmd;
 	if (ex_range(sp, cmdp, &err))
 		return (1);
-	
+
 	/*
 	 * Remember where any remaining command information is, and clean
 	 * up the fake ex command.
@@ -204,7 +204,7 @@ v_exaddr(SCR *sp, VICMD *vp, dir_t dir)
 	 */
 	if (ISMOTION(vp))
 		return (v_correct(sp, vp, F_ISSET(cmdp, E_DELTA)));
-		
+
 	/*
 	 * !!!
 	 * Historically, if it wasn't a motion command, a delta in the search
@@ -250,7 +250,7 @@ v_exaddr(SCR *sp, VICMD *vp, dir_t dir)
 			tlen = sizeof(buf) - 1;
 		if (v_event_push(sp, NULL, buf, tlen, CH_NOMAP | CH_QUOTED))
 			return (1);
-		 
+
 		/* Don't refresh until after 'z' happens. */
 		F_SET(VIP(sp), VIP_S_REFRESH);
 	}
@@ -352,7 +352,7 @@ v_search(SCR *sp, VICMD *vp, char *ptrn, size_t plen, u_int flags, dir_t dir)
 	 */
 	if (!KEYS_WAITING(sp))
 		LF_SET(SEARCH_WMSG);
-		
+
 	switch (dir) {
 	case BACKWARD:
 		if (b_search(sp,

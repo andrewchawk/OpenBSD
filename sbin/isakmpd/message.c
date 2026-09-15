@@ -1,4 +1,4 @@
-/* $OpenBSD: message.c,v 1.129 2016/04/04 17:35:07 yasuoka Exp $	 */
+/* $OpenBSD: message.c,v 1.135 2026/06/24 09:57:32 hshoexer Exp $	 */
 /* $EOM: message.c,v 1.156 2000/10/10 12:36:39 provos Exp $	 */
 
 /*
@@ -162,6 +162,8 @@ message_alloc_reply(struct message *msg)
 	struct message *reply;
 
 	reply = message_alloc(msg->transport, 0, ISAKMP_HDR_SZ);
+	if (!reply)
+		return NULL;
 	reply->exchange = msg->exchange;
 	reply->isakmp_sa = msg->isakmp_sa;
 	reply->flags = msg->flags;
@@ -335,13 +337,26 @@ next_payload:
  * Parse a proposal payload found in message MSG.  PAYLOAD is always
  * ISAKMP_PAYLOAD_PROPOSAL and ignored in here.  It's needed as the API for
  * message_parse_payloads requires it.  BUF points to the proposal's
- * generic payload header.
+ * generic payload header.  P is the outer SA payload.
  */
 static int
 message_parse_proposal(struct message *msg, struct payload *p,
     u_int8_t payload, u_int8_t *buf)
 {
 	set	payload_set;
+
+	/* Proposal must lie within outer SA payload. */
+	if (buf + GET_ISAKMP_GEN_LENGTH(buf) >
+	    p->p + GET_ISAKMP_GEN_LENGTH(p->p)) {
+		message_drop(msg, ISAKMP_NOTIFY_PAYLOAD_MALFORMED, 0, 1, 1);
+		return -1;
+	}
+
+	if ((ISAKMP_PROP_SPI_OFF + GET_ISAKMP_PROP_SPI_SZ(buf) +
+	    ISAKMP_GEN_SZ) > GET_ISAKMP_GEN_LENGTH(buf)) {
+		message_drop(msg, ISAKMP_NOTIFY_PAYLOAD_MALFORMED, 0, 1, 1);
+		return -1;
+	}
 
 	/* Put the proposal into the proposal bucket.  */
 	if (message_index_payload(msg, p, payload, buf) == -1)
@@ -363,6 +378,13 @@ static int
 message_parse_transform(struct message *msg, struct payload *p,
     u_int8_t payload, u_int8_t *buf)
 {
+	/* Transform must lie within outer proposal payload. */
+	if (buf + GET_ISAKMP_GEN_LENGTH(buf) >
+	    p->p + GET_ISAKMP_GEN_LENGTH(p->p)) {
+		message_drop(msg, ISAKMP_NOTIFY_PAYLOAD_MALFORMED, 0, 1, 1);
+		return -1;
+	}
+
 	/* Put the transform into the transform bucket.  */
 	if (message_index_payload(msg, p, payload, buf) == -1)
 		return -1;
@@ -600,9 +622,10 @@ message_validate_delete(struct message *msg, struct payload *p)
 	struct doi     *doi;
 	struct sa      *sa, *isakmp_sa;
 	struct sockaddr *dst, *dst_isa;
+	size_t		spisz, len;
 	u_int32_t       nspis = GET_ISAKMP_DELETE_NSPIS(p->p);
 	u_int8_t       *spis = (u_int8_t *)p->p + ISAKMP_DELETE_SPI_OFF;
-	u_int32_t       i;
+	u_int32_t       i, spi;
 	char           *addr;
 
 	/* Only accept authenticated DELETEs. */
@@ -646,6 +669,24 @@ message_validate_delete(struct message *msg, struct payload *p)
 		message_free(msg);
 		return -1;
 	}
+	/* Enforce that SPI size matches the protocol. */
+	spisz = (proto == ISAKMP_PROTO_ISAKMP) ?
+	    ISAKMP_HDR_COOKIES_LEN : sizeof(u_int32_t);
+	if (GET_ISAKMP_DELETE_SPI_SZ(p->p) != spisz) {
+		log_print("message_validate_delete: invalid SPI size %u "
+		    "for protocol %u", GET_ISAKMP_DELETE_SPI_SZ(p->p), proto);
+		message_free(msg);
+		return -1;
+	}
+	/* All SPIs must fit into the DELETE payload. */
+	len = GET_ISAKMP_GEN_LENGTH(p->p);
+	if (len < ISAKMP_DELETE_SPI_OFF ||
+	    (len - ISAKMP_DELETE_SPI_OFF) / spisz < nspis) {
+		log_print("message_validate_delete: SPI count %u exceeds "
+		    "payload length %zu", nspis, len);
+		message_free(msg);
+		return -1;
+	}
 	/* Validate the SPIs.  */
 	for (i = 0; i < nspis; i++) {
 		/* Get ISAKMP SA protecting this message. */
@@ -665,9 +706,11 @@ message_validate_delete(struct message *msg, struct payload *p)
 		if (proto == ISAKMP_PROTO_ISAKMP)
 			sa = sa_lookup_isakmp_sa(dst, spis + i
 			    * ISAKMP_HDR_COOKIES_LEN);
-		else
-			sa = ipsec_sa_lookup(dst, ((u_int32_t *) spis)[i],
-			    proto);
+		else {
+			/* Ensure correct alignment of SPI. */
+			memcpy(&spi, spis + i * sizeof(spi), sizeof(spi));
+			sa = ipsec_sa_lookup(dst, spi, proto);
+		}
 		if (!sa) {
 			LOG_DBG((LOG_MESSAGE, 50, "message_validate_delete: "
 			    "invalid spi (no valid SA found)"));
@@ -1010,7 +1053,8 @@ message_validate_sa(struct message *msg, struct payload *p)
 		if (zero_test(pkt + ISAKMP_HDR_RCOOKIE_OFF,
 		    ISAKMP_HDR_RCOOKIE_LEN))
 			exchange = exchange_setup_p1(msg, doi_id);
-		else if (msg->isakmp_sa->flags & SA_FLAG_READY)
+		else if (msg->isakmp_sa &&
+		    (msg->isakmp_sa->flags & SA_FLAG_READY))
 			exchange = exchange_setup_p2(msg, doi_id);
 		else {
 			/* XXX What to do here?  */
@@ -1425,7 +1469,7 @@ message_recv(struct message *msg)
 		msg->orig = malloc(sz);
 		if (!msg->orig) {
 			message_free(msg);
-			free(ks);
+			freezero(ks, sizeof(*ks));
 			return -1;
 		}
 		memcpy(msg->orig, buf, sz);
@@ -1443,7 +1487,7 @@ message_recv(struct message *msg)
 	 */
 	if (GET_ISAKMP_HDR_NEXT_PAYLOAD(buf) != ISAKMP_PAYLOAD_NONE &&
 	    message_sort_payloads(msg, GET_ISAKMP_HDR_NEXT_PAYLOAD(buf))) {
-		free(ks);
+		freezero(ks, sizeof(*ks));
 		return -1;
 	}
 	/*
@@ -1453,7 +1497,7 @@ message_recv(struct message *msg)
 	 * XXX Should SAs and even transports be cleaned up then too?
 	 */
 	if (message_validate_payloads(msg)) {
-		free(ks);
+		freezero(ks, sizeof(*ks));
 		return -1;
 	}
 	/*
@@ -1463,7 +1507,7 @@ message_recv(struct message *msg)
 	if (!msg->exchange) {
 		log_print("message_recv: no exchange");
 		message_drop(msg, ISAKMP_NOTIFY_PAYLOAD_MALFORMED, 0, 1, 1);
-		free(ks);
+		freezero(ks, sizeof(*ks));
 		return -1;
 	}
 	/*
@@ -1488,7 +1532,7 @@ message_recv(struct message *msg)
 		    exch_type);
 		message_drop(msg, ISAKMP_NOTIFY_INVALID_EXCHANGE_TYPE, 0, 1,
 		    1);
-		free(ks);
+		freezero(ks, sizeof(*ks));
 		return -1;
 	}
 	/* Make sure the IV we used gets saved in the proper SA.  */
@@ -1497,7 +1541,7 @@ message_recv(struct message *msg)
 			msg->exchange->keystate = ks;
 			msg->exchange->crypto = ks->xf;
 		} else
-			free(ks);
+			freezero(ks, sizeof(*ks));
 	}
 	/* Handle the flags.  */
 	if (flags & ISAKMP_FLAGS_ENC)

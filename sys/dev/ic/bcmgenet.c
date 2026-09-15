@@ -1,4 +1,4 @@
-/* $OpenBSD: bcmgenet.c,v 1.7 2023/11/10 15:51:20 bluhm Exp $ */
+/* $OpenBSD: bcmgenet.c,v 1.12 2026/01/24 05:33:11 mvs Exp $ */
 /* $NetBSD: bcmgenet.c,v 1.3 2020/02/27 17:30:07 jmcneill Exp $ */
 
 /*-
@@ -70,7 +70,7 @@ CTASSERT(MCLBYTES == 2048);
 #define	TX_NEXT(n)		TX_SKIP(n, 1)
 #define	RX_NEXT(n)		(((n) + 1) & (GENET_DMA_DESC_COUNT - 1))
 
-#define	TX_MAX_SEGS		128
+#define	TX_MAX_SEGS		20
 #define	TX_DESC_COUNT		GENET_DMA_DESC_COUNT
 #define	RX_DESC_COUNT		GENET_DMA_DESC_COUNT
 #define	MII_BUSY_RETRY		1000
@@ -82,7 +82,7 @@ CTASSERT(MCLBYTES == 2048);
 	bus_space_write_4((sc)->sc_bst, (sc)->sc_bsh, (reg), (val))
 
 struct cfdriver bse_cd = {
-	0, "bse", DV_IFNET
+	NULL, "bse", DV_IFNET
 };
 
 int
@@ -195,7 +195,6 @@ genet_setup_txdesc(struct genet_softc *sc, int index, int flags,
 	uint32_t status;
 
 	status = flags | __SHIFTIN(len, GENET_TX_DESC_STATUS_BUFLEN);
-	++sc->sc_tx.queued;
 
 	WR4(sc, GENET_TX_DESC_ADDRESS_LO(index), (uint32_t)paddr);
 	WR4(sc, GENET_TX_DESC_ADDRESS_HI(index), (uint32_t)(paddr >> 32));
@@ -233,12 +232,6 @@ genet_setup_txbuf(struct genet_softc *sc, int index, struct mbuf *m)
 
 	segs = sc->sc_tx.buf_map[index].map->dm_segs;
 	nsegs = sc->sc_tx.buf_map[index].map->dm_nsegs;
-
-	if (sc->sc_tx.queued >= GENET_DMA_DESC_COUNT - nsegs) {
-		bus_dmamap_unload(sc->sc_tx.buf_tag,
-		    sc->sc_tx.buf_map[index].map);
-		return -1;
-	}
 
 	flags = GENET_TX_DESC_STATUS_SOP |
 		GENET_TX_DESC_STATUS_CRC |
@@ -520,7 +513,6 @@ genet_init_rings(struct genet_softc *sc, int qid)
 	/* TX ring */
 
 	sc->sc_tx.next = 0;
-	sc->sc_tx.queued = 0;
 	sc->sc_tx.cidx = sc->sc_tx.pidx = 0;
 
 	WR4(sc, GENET_TX_SCB_BURST_SIZE, 0x08);
@@ -656,8 +648,8 @@ genet_stop(struct genet_softc *sc)
 
 	ifp->if_flags &= ~IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
-	ifp->if_timer = 0;
 
+	ifq_barrier(&ifp->if_snd);
 	intr_barrier(sc->sc_ih);
 
 	/* Clean RX ring. */
@@ -750,17 +742,15 @@ genet_txintr(struct genet_softc *sc, int qid)
 {
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
 	struct genet_bufmap *bmap;
-	uint32_t cidx, total;
-	int i;
+	uint32_t queued;
 
-	cidx = RD4(sc, GENET_TX_DMA_CONS_INDEX(qid)) & 0xffff;
-	total = (cidx - sc->sc_tx.cidx) & 0xffff;
+	queued = (RD4(sc, GENET_TX_DMA_PROD_INDEX(qid)) -
+	    sc->sc_tx.cidx) & 0xffff;
 
-	for (i = sc->sc_tx.next; sc->sc_tx.queued > 0 && total > 0;
-	     i = TX_NEXT(i), total--) {
+	while (queued > 0) {
 		/* XXX check for errors */
 
-		bmap = &sc->sc_tx.buf_map[i];
+		bmap = &sc->sc_tx.buf_map[sc->sc_tx.next];
 		if (bmap->mbuf != NULL) {
 			bus_dmamap_sync(sc->sc_tx.buf_tag, bmap->map,
 			    0, bmap->map->dm_mapsize,
@@ -770,55 +760,44 @@ genet_txintr(struct genet_softc *sc, int qid)
 			bmap->mbuf = NULL;
 		}
 
-		--sc->sc_tx.queued;
+		queued--;
+
+		sc->sc_tx.cidx++;
+		sc->sc_tx.next = TX_NEXT(sc->sc_tx.next);
 	}
 
-	if (sc->sc_tx.queued == 0)
-		ifp->if_timer = 0;
-
-	if (sc->sc_tx.cidx != cidx) {
-		sc->sc_tx.next = i;
-		sc->sc_tx.cidx = cidx;
-
-		if (ifq_is_oactive(&ifp->if_snd))
-			ifq_restart(&ifp->if_snd);
-	}
+	if (ifq_is_oactive(&ifp->if_snd))
+		ifq_restart(&ifp->if_snd);
 }
 
 void
-genet_start(struct ifnet *ifp)
+genet_qstart(struct ifqueue *ifq)
 {
+	struct ifnet *ifp = ifq->ifq_if;
 	struct genet_softc *sc = ifp->if_softc;
 	struct mbuf *m;
 	const int qid = GENET_DMA_DEFAULT_QUEUE;
-	int nsegs, index, cnt;
-
-	if ((ifp->if_flags & IFF_RUNNING) == 0)
-		return;
-	if (ifq_is_oactive(&ifp->if_snd))
-		return;
+	int queued, nsegs, index, cnt;
 
 	index = sc->sc_tx.pidx & (TX_DESC_COUNT - 1);
 	cnt = 0;
 
 	for (;;) {
-		m = ifq_deq_begin(&ifp->if_snd);
+		queued = (sc->sc_tx.pidx - sc->sc_tx.cidx) & 0xffff;
+		if (queued >= TX_DESC_COUNT - TX_MAX_SEGS)
+			break;
+
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 
 		nsegs = genet_setup_txbuf(sc, index, m);
-		if (nsegs == -1) {
-			ifq_deq_rollback(&ifp->if_snd, m);
-			ifq_set_oactive(&ifp->if_snd);
-			break;
-		}
 		if (nsegs == 0) {
-			ifq_deq_commit(&ifp->if_snd, m);
 			m_freem(m);
 			ifp->if_oerrors++;
 			continue;
 		}
-		ifq_deq_commit(&ifp->if_snd, m);
+
 		if (ifp->if_bpf)
 			bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_OUT);
 
@@ -828,10 +807,8 @@ genet_start(struct ifnet *ifp)
 		cnt++;
 	}
 
-	if (cnt != 0) {
+	if (cnt != 0)
 		WR4(sc, GENET_TX_DMA_PROD_INDEX(qid), sc->sc_tx.pidx);
-		ifp->if_timer = 5;
-	}
 }
 
 int
@@ -982,7 +959,8 @@ genet_attach(struct genet_softc *sc)
 	ifp->if_softc = sc;
 	snprintf(ifp->if_xname, IFNAMSIZ, "%s", sc->sc_dev.dv_xname);
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
-	ifp->if_start = genet_start;
+	ifp->if_xflags = IFXF_MPSAFE;
+	ifp->if_qstart = genet_qstart;
 	ifp->if_ioctl = genet_ioctl;
 	ifq_init_maxlen(&ifp->if_snd, IFQ_MAXLEN);
 

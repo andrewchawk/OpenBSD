@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_decide.c,v 1.102 2023/10/12 14:22:08 claudio Exp $ */
+/*	$OpenBSD: rde_decide.c,v 1.110 2026/07/02 10:01:37 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Claudio Jeker <claudio@openbsd.org>
@@ -232,10 +232,12 @@ prefix_cmp(struct prefix *p1, struct prefix *p2, int *testall)
 	 * evaluation is enabled.
 	 */
 	if (rde_decisionflags() & BGPD_FLAG_DECISION_ROUTEAGE) {
-		if (p1->lastchange < p2->lastchange) /* p1 is older */
+		switch (monotime_cmp(p1->lastchange, p2->lastchange)) {
+		case -1:	/* p1 is older */
 			return rv;
-		if (p1->lastchange > p2->lastchange)
+		case 1:		/* p2 is older */
 			return -rv;
+		}
 	}
 
 	/* 10. lowest BGP Id wins, use ORIGINATOR_ID if present */
@@ -341,7 +343,7 @@ prefix_insert(struct prefix *new, struct prefix *ep, struct rib_entry *re)
 		ep = TAILQ_FIRST(&re->prefix_h);
 
 	for (xp = ep; xp != NULL; xp = np) {
-		np = TAILQ_NEXT(xp, entry.list.rib);
+		np = TAILQ_NEXT(xp, rib_l);
 
 		if ((preferred = (prefix_cmp(new, xp, &testall) > 0))) {
 			/* new is preferred over xp */
@@ -350,8 +352,8 @@ prefix_insert(struct prefix *new, struct prefix *ep, struct rib_entry *re)
 				 * MED inversion, take out prefix and
 				 * put it onto redo queue.
 				 */
-				TAILQ_REMOVE(&re->prefix_h, xp, entry.list.rib);
-				TAILQ_INSERT_TAIL(&redo, xp, entry.list.rib);
+				TAILQ_REMOVE(&re->prefix_h, xp, rib_l);
+				TAILQ_INSERT_TAIL(&redo, xp, rib_l);
 				removed = 1;
 				continue;
 			}
@@ -386,7 +388,7 @@ prefix_insert(struct prefix *new, struct prefix *ep, struct rib_entry *re)
 		 */
 		if (removed) {
 			prefix_set_dmetric(TAILQ_PREV(xp, prefix_queue,
-			    entry.list.rib), xp);
+			    rib_l), xp);
 			removed = 0;
 		}
 
@@ -395,18 +397,18 @@ prefix_insert(struct prefix *new, struct prefix *ep, struct rib_entry *re)
 	}
 
 	if (insertp == NULL) {
-		TAILQ_INSERT_HEAD(&re->prefix_h, new, entry.list.rib);
+		TAILQ_INSERT_HEAD(&re->prefix_h, new, rib_l);
 	} else {
-		TAILQ_INSERT_AFTER(&re->prefix_h, insertp, new, entry.list.rib);
+		TAILQ_INSERT_AFTER(&re->prefix_h, insertp, new, rib_l);
 	}
 
 	prefix_set_dmetric(insertp, new);
-	prefix_set_dmetric(new, TAILQ_NEXT(new, entry.list.rib));
+	prefix_set_dmetric(new, TAILQ_NEXT(new, rib_l));
 
 	/* Fixup MED order again. All elements are < new */
 	while (!TAILQ_EMPTY(&redo)) {
 		xp = TAILQ_FIRST(&redo);
-		TAILQ_REMOVE(&redo, xp, entry.list.rib);
+		TAILQ_REMOVE(&redo, xp, rib_l);
 
 		prefix_insert(xp, new, re);
 	}
@@ -428,16 +430,16 @@ prefix_remove(struct prefix *old, struct rib_entry *re)
 	struct prefix *xp, *np, *pp;
 	int testall, removed = 0;
 
-	xp = TAILQ_NEXT(old, entry.list.rib);
-	pp = TAILQ_PREV(old, prefix_queue, entry.list.rib);
-	TAILQ_REMOVE(&re->prefix_h, old, entry.list.rib);
+	xp = TAILQ_NEXT(old, rib_l);
+	pp = TAILQ_PREV(old, prefix_queue, rib_l);
+	TAILQ_REMOVE(&re->prefix_h, old, rib_l);
 
 	/* check if a MED inversion could be possible */
 	prefix_cmp(old, xp, &testall);
 	if (testall > 0) {
 		/* maybe MED route, scan tail for other possible routes */
 		for (; xp != NULL; xp = np) {
-			np = TAILQ_NEXT(xp, entry.list.rib);
+			np = TAILQ_NEXT(xp, rib_l);
 
 			/* only interested in the testall result */
 			prefix_cmp(old, xp, &testall);
@@ -446,8 +448,8 @@ prefix_remove(struct prefix *old, struct rib_entry *re)
 				 * possible MED inversion, take out prefix and
 				 * put it onto redo queue.
 				 */
-				TAILQ_REMOVE(&re->prefix_h, xp, entry.list.rib);
-				TAILQ_INSERT_TAIL(&redo, xp, entry.list.rib);
+				TAILQ_REMOVE(&re->prefix_h, xp, rib_l);
+				TAILQ_INSERT_TAIL(&redo, xp, rib_l);
 				removed = 1;
 				continue;
 			}
@@ -458,7 +460,7 @@ prefix_remove(struct prefix *old, struct rib_entry *re)
 			 */
 			if (removed) {
 				prefix_set_dmetric(TAILQ_PREV(xp, prefix_queue,
-				    entry.list.rib), xp);
+				    rib_l), xp);
 				removed = 0;
 			}
 			if (testall == 0)
@@ -467,14 +469,14 @@ prefix_remove(struct prefix *old, struct rib_entry *re)
 	}
 
 	if (pp)
-		prefix_set_dmetric(pp, TAILQ_NEXT(pp, entry.list.rib));
+		prefix_set_dmetric(pp, TAILQ_NEXT(pp, rib_l));
 	else
 		prefix_set_dmetric(NULL, TAILQ_FIRST(&re->prefix_h));
 
 	/* Fixup MED order again, reinsert prefixes from the start */
 	while (!TAILQ_EMPTY(&redo)) {
 		xp = TAILQ_FIRST(&redo);
-		TAILQ_REMOVE(&redo, xp, entry.list.rib);
+		TAILQ_REMOVE(&redo, xp, rib_l);
 
 		prefix_insert(xp, NULL, re);
 	}
@@ -485,6 +487,10 @@ int
 prefix_eligible(struct prefix *p)
 {
 	struct rde_aspath *asp = prefix_aspath(p);
+
+	/* prefix itself is marked ineligible */
+	if (prefix_filtered(p))
+		return 0;
 
 	/* The aspath needs to be loop and error free */
 	if (asp == NULL ||
@@ -518,33 +524,51 @@ prefix_best(struct rib_entry *re)
 /*
  * Find the correct place to insert the prefix in the prefix list.
  * If the active prefix has changed we need to send an update also special
- * treatment is needed if 'rde evaluate all' is used on some peers.
- * To re-evaluate a prefix just call prefix_evaluate with old and new pointing
- * to the same prefix.
+ * treatment is needed if 'rde evaluate all' or add-path is used on some peers.
+ * To re-evaluate a prefix it is best to first call prefix_evaluate with
+ * new = NULL, old = prefix, adjust the prefix and then call prefix_evaluate
+ * with new = prefix, old = NULL. This ensures proper evaluation in case
+ * the prefix change influences prefix_eligible() or MED handling.
  */
 void
 prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 {
 	struct prefix	*newbest, *oldbest;
+	struct rde_peer	*peer = NULL;
 	struct rib	*rib;
+	uint32_t	 old_pathid_tx = 0;
+
+	if (old == NULL && new == NULL)
+		fatalx("king bula sez: nothing to evaluate");
 
 	rib = re_rib(re);
 	if (rib->flags & F_RIB_NOEVALUATE) {
 		/* decision process is turned off */
 		if (old != NULL)
-			TAILQ_REMOVE(&re->prefix_h, old, entry.list.rib);
+			TAILQ_REMOVE(&re->prefix_h, old, rib_l);
 		if (new != NULL) {
-			TAILQ_INSERT_HEAD(&re->prefix_h, new, entry.list.rib);
+			TAILQ_INSERT_HEAD(&re->prefix_h, new, rib_l);
 			new->dmetric = PREFIX_DMETRIC_INVALID;
 		}
 		return;
 	}
 
 	oldbest = prefix_best(re);
-	if (old != NULL)
+	if (old != NULL) {
 		prefix_remove(old, re);
-	if (new != NULL)
+		old_pathid_tx = old->path_id_tx;
+		peer = prefix_peer(old);
+	}
+	if (new != NULL) {
 		prefix_insert(new, NULL, re);
+		if (prefix_eligible(new)) {
+			old = NULL;
+			old_pathid_tx = 0;
+			peer = prefix_peer(new);
+		} else {
+			new = NULL;
+		}
+	}
 	newbest = prefix_best(re);
 
 	/*
@@ -559,20 +583,20 @@ prefix_evaluate(struct rib_entry *re, struct prefix *new, struct prefix *old)
 		 */
 		if ((rib->flags & F_RIB_NOFIB) == 0)
 			rde_send_kroute(rib, newbest, oldbest);
-		rde_generate_updates(re, new, old, EVAL_DEFAULT);
+		rde_enqueue_updates(re, peer, new, old_pathid_tx, EVAL_DEFAULT);
 		return;
 	}
 
 	/*
 	 * If there are peers with 'rde evaluate all' every update needs
 	 * to be passed on (not only a change of the best prefix).
-	 * rde_generate_updates() will then take care of distribution.
+	 * rde_enqueue_updates() will then take care of distribution.
 	 */
 	if (rde_evaluate_all()) {
-		if (new != NULL && !prefix_eligible(new))
-			new = NULL;
-		if (new != NULL || old != NULL)
-			rde_generate_updates(re, new, old, EVAL_ALL);
+		/* no old path to remove and path is ineligible, skip rest */
+		if (old == NULL && new == NULL)
+			return;
+		rde_enqueue_updates(re, peer, new, old_pathid_tx, EVAL_ALL);
 	}
 }
 
@@ -582,7 +606,9 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 {
 	struct rib_entry *re = prefix_re(p);
 	struct prefix	*newbest, *oldbest, *new, *old;
+	struct rde_peer	*peer;
 	struct rib	*rib;
+	uint32_t	 old_pathid_tx = 0;
 
 	/* Skip non local-RIBs or RIBs that are flagged as noeval. */
 	rib = re_rib(re);
@@ -611,26 +637,38 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 	 * Re-evaluate the prefix by removing the prefix then updating the
 	 * nexthop state and reinserting the prefix again.
 	 */
-	old = p;
 	oldbest = prefix_best(re);
-	prefix_remove(p, re);
+
+	old = p;
+	peer = prefix_peer(p);
+
+	prefix_remove(old, re);
+	if (prefix_eligible(old))
+		old_pathid_tx = old->path_id_tx;
 
 	if (state == NEXTHOP_REACH)
 		p->nhflags |= NEXTHOP_VALID;
 	else
 		p->nhflags &= ~NEXTHOP_VALID;
 
-	prefix_insert(p, NULL, re);
-	newbest = prefix_best(re);
 	new = p;
+	prefix_insert(new, NULL, re);
+	newbest = prefix_best(re);
+
 	if (!prefix_eligible(new))
 		new = NULL;
+	else
+		old_pathid_tx = 0;
+
+	/* path was and still is ineligible, skip rest */
+	if (old_pathid_tx == 0 && new == NULL)
+		return;
 
 	/*
 	 * If the active prefix changed or the active prefix was removed
 	 * and added again then generate an update.
 	 */
-	if (oldbest != newbest || newbest == p) {
+	if (oldbest != newbest || newbest == old) {
 		/*
 		 * Send update withdrawing oldbest and adding newbest
 		 * but remember that newbest may be NULL aka ineligible.
@@ -638,15 +676,15 @@ prefix_evaluate_nexthop(struct prefix *p, enum nexthop_state state,
 		 */
 		if ((rib->flags & F_RIB_NOFIB) == 0)
 			rde_send_kroute(rib, newbest, oldbest);
-		rde_generate_updates(re, new, old, EVAL_DEFAULT);
+		rde_enqueue_updates(re, peer, new, old_pathid_tx, EVAL_DEFAULT);
 		return;
 	}
 
 	/*
 	 * If there are peers with 'rde evaluate all' every update needs
 	 * to be passed on (not only a change of the best prefix).
-	 * rde_generate_updates() will then take care of distribution.
+	 * rde_enqueue_updates() will then take care of distribution.
 	 */
 	if (rde_evaluate_all())
-		rde_generate_updates(re, new, old, EVAL_ALL);
+		rde_enqueue_updates(re, peer, new, old_pathid_tx, EVAL_ALL);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospf6d.c,v 1.54 2023/06/21 09:47:03 sthen Exp $ */
+/*	$OpenBSD: ospf6d.c,v 1.64 2026/08/17 08:59:08 claudio Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -254,9 +254,12 @@ main(int argc, char *argv[])
 	if ((iev_ospfe = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_rde = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_ospfe->ibuf, pipe_parent2ospfe[0]);
+	if (imsgbuf_init(&iev_ospfe->ibuf, pipe_parent2ospfe[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_ospfe->ibuf);
 	iev_ospfe->handler = main_dispatch_ospfe;
-	imsg_init(&iev_rde->ibuf, pipe_parent2rde[0]);
+	if (imsgbuf_init(&iev_rde->ibuf, pipe_parent2rde[0]) == -1)
+		fatal(NULL);
 	iev_rde->handler = main_dispatch_rde;
 
 	/* setup event handler */
@@ -299,9 +302,9 @@ ospfd_shutdown(void)
 	int	status;
 
 	/* close pipes */
-	msgbuf_clear(&iev_ospfe->ibuf.w);
+	imsgbuf_clear(&iev_ospfe->ibuf);
 	close(iev_ospfe->ibuf.fd);
-	msgbuf_clear(&iev_rde->ibuf.w);
+	imsgbuf_clear(&iev_rde->ibuf);
 	close(iev_rde->ibuf.fd);
 
 	control_cleanup();
@@ -336,26 +339,26 @@ main_dispatch_ospfe(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
 	struct demote_msg	 dmsg;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -386,9 +389,11 @@ main_dispatch_ospfe(int fd, short event, void *bula)
 			carp_demote_set(dmsg.demote_group, dmsg.level);
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by ospfe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_setverbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warn("wrong imsg len");
+			else
+				log_setverbose(verbose);
 			break;
 		default:
 			log_debug("main_dispatch_ospfe: error handling imsg %d",
@@ -412,26 +417,26 @@ main_dispatch_rde(int fd, short event, void *bula)
 	struct imsgev	*iev = bula;
 	struct imsgbuf	*ibuf = &iev->ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 count, shut = 0;
+	int		 n, count, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -492,7 +497,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ntp.c,v 1.174 2024/02/21 03:31:28 deraadt Exp $ */
+/*	$OpenBSD: ntp.c,v 1.186 2026/09/10 15:06:22 deraadt Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -27,6 +27,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <syslog.h>
 #include <time.h>
@@ -92,12 +93,16 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 	time_t			 nextaction, last_sensor_scan = 0, now;
 	time_t			 last_action = 0, interval, last_cdns_reset = 0;
 	void			*newp;
+	char			 execpath[PATH_MAX];
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		fatal("getexecpath");
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, PF_UNSPEC,
 	    pipe_dns) == -1)
 		fatal("socketpair");
 
-	start_child(NTPDNS_PROC_NAME, pipe_dns[1], argc, argv);
+	start_child(NTPDNS_PROC_NAME, pipe_dns[1], execpath, argc, argv);
 
 	log_init(nconf->debug ? LOG_TO_STDERR : LOG_TO_SYSLOG, nconf->verbose,
 	    LOG_DAEMON);
@@ -159,10 +164,12 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 
 	if ((ibuf_main = malloc(sizeof(struct imsgbuf))) == NULL)
 		fatal(NULL);
-	imsg_init(ibuf_main, PARENT_SOCK_FILENO);
+	if (imsgbuf_init(ibuf_main, PARENT_SOCK_FILENO) == -1)
+		fatal(NULL);
 	if ((ibuf_dns = malloc(sizeof(struct imsgbuf))) == NULL)
 		fatal(NULL);
-	imsg_init(ibuf_dns, pipe_dns[0]);
+	if (imsgbuf_init(ibuf_dns, pipe_dns[0]) == -1)
+		fatal(NULL);
 
 	constraint_cnt = 0;
 	conf->constraint_median = 0;
@@ -332,15 +339,15 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 				clear_cdns = 0;
 		}
 
-		if (ibuf_main->w.queued > 0)
+		if (imsgbuf_queuelen(ibuf_main) > 0)
 			pfd[PFD_PIPE_MAIN].events |= POLLOUT;
-		if (ibuf_dns->w.queued > 0)
+		if (imsgbuf_queuelen(ibuf_dns) > 0)
 			pfd[PFD_PIPE_DNS].events |= POLLOUT;
 
 		TAILQ_FOREACH(cc, &ctl_conns, entry) {
 			pfd[i].fd = cc->ibuf.fd;
 			pfd[i].events = POLLIN;
-			if (cc->ibuf.w.queued > 0)
+			if (imsgbuf_queuelen(&cc->ibuf) > 0)
 				pfd[i].events |= POLLOUT;
 			i++;
 		}
@@ -365,8 +372,7 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 			}
 
 		if (nfds > 0 && (pfd[PFD_PIPE_MAIN].revents & POLLOUT))
-			if (msgbuf_write(&ibuf_main->w) <= 0 &&
-			    errno != EAGAIN) {
+			if (imsgbuf_write(ibuf_main) == -1) {
 				log_warn("pipe write error (to parent)");
 				ntp_quit = 1;
 			}
@@ -380,8 +386,7 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 		}
 
 		if (nfds > 0 && (pfd[PFD_PIPE_DNS].revents & POLLOUT))
-			if (msgbuf_write(&ibuf_dns->w) <= 0 &&
-			    errno != EAGAIN) {
+			if (imsgbuf_write(ibuf_dns) == -1) {
 				log_warn("pipe write error (to dns engine)");
 				ntp_quit = 1;
 			}
@@ -462,11 +467,11 @@ ntp_main(struct ntpd_conf *nconf, struct passwd *pw, int argc, char **argv)
 		}
 	}
 
-	msgbuf_write(&ibuf_main->w);
-	msgbuf_clear(&ibuf_main->w);
+	imsgbuf_write(ibuf_main);
+	imsgbuf_clear(ibuf_main);
 	free(ibuf_main);
-	msgbuf_write(&ibuf_dns->w);
-	msgbuf_clear(&ibuf_dns->w);
+	imsgbuf_write(ibuf_dns);
+	imsgbuf_clear(ibuf_dns);
 	free(ibuf_dns);
 
 	log_info("ntp engine exiting");
@@ -477,27 +482,27 @@ int
 ntp_dispatch_imsg(void)
 {
 	struct imsg		 imsg;
-	int			 n;
+	int			 n, synced;
 
-	if (((n = imsg_read(ibuf_main)) == -1 && errno != EAGAIN) || n == 0)
+	if (imsgbuf_read(ibuf_main) != 1)
 		return (-1);
 
 	for (;;) {
-		if ((n = imsg_get(ibuf_main, &imsg)) == -1)
+		if ((n = imsgbuf_get(ibuf_main, &imsg)) == -1)
 			return (-1);
-
 		if (n == 0)
 			break;
 
 		switch (imsg.hdr.type) {
 		case IMSG_ADJTIME:
-			memcpy(&n, imsg.data, sizeof(n));
-			if (n == 1 && !conf->status.synced) {
+			if (imsg_get_data(&imsg, &synced, sizeof(synced)) == -1)
+				fatal("IMSG_ADJTIME");
+			if (synced == 1 && !conf->status.synced) {
 				log_info("clock is now synced");
 				conf->status.synced = 1;
 				priv_dns(IMSG_SYNCED, NULL, 0);
 				constraint_reset();
-			} else if (n == 0 && conf->status.synced) {
+			} else if (synced == 0 && conf->status.synced) {
 				log_info("clock is now unsynced");
 				conf->status.synced = 0;
 				priv_dns(IMSG_UNSYNCED, NULL, 0);
@@ -521,11 +526,11 @@ ntp_dispatch_imsg(void)
 
 int
 inpool(struct sockaddr_storage *a,
-    struct sockaddr_storage old[MAX_SERVERS_DNS], size_t n)
+    struct sockaddr_storage old[MAX_SERVERS_DNS], size_t oldcnt)
 {
 	size_t i;
 
-	for (i = 0; i < n; i++) {
+	for (i = 0; i < oldcnt; i++) {
 		if (a->ss_family != old[i].ss_family)
 			continue;
 		if (a->ss_family == AF_INET) {
@@ -550,16 +555,15 @@ ntp_dispatch_imsg_dns(void)
 	u_int16_t		 dlen;
 	u_char			*p;
 	struct ntp_addr		*h;
-	size_t			 addrcount, peercount;
-	int			 n;
+	size_t			 addrcount, peercount, excount;
+	int			 n, probe;
 
-	if (((n = imsg_read(ibuf_dns)) == -1 && errno != EAGAIN) || n == 0)
+	if (imsgbuf_read(ibuf_dns) != 1)
 		return (-1);
 
 	for (;;) {
-		if ((n = imsg_get(ibuf_dns, &imsg)) == -1)
+		if ((n = imsgbuf_get(ibuf_dns, &imsg)) == -1)
 			return (-1);
-
 		if (n == 0)
 			break;
 
@@ -577,9 +581,9 @@ ntp_dispatch_imsg_dns(void)
 				break;
 			}
 
+			peercount = 0;
+			excount = 0;
 			if (peer->addr_head.pool) {
-				n = 0;
-				peercount = 0;
 
 				TAILQ_FOREACH_SAFE(npeer, &conf->ntp_peers,
 				    entry, tmp) {
@@ -590,7 +594,8 @@ ntp_dispatch_imsg_dns(void)
 					if (npeer->id == peer->id)
 						continue;
 					if (npeer->addr != NULL)
-						existing[n++] = npeer->addr->ss;
+						existing[excount++] =
+						    npeer->addr->ss;
 				}
 			}
 
@@ -623,8 +628,7 @@ ntp_dispatch_imsg_dns(void)
 						free(h);
 						continue;
 					}
-					if (inpool(&h->ss, existing,
-					    n)) {
+					if (inpool(&h->ss, existing, excount)) {
 						free(h);
 						continue;
 					}
@@ -632,6 +636,7 @@ ntp_dispatch_imsg_dns(void)
 					    log_ntp_addr(h), peer->addr_head.name);
 					npeer = new_peer();
 					npeer->weight = peer->weight;
+					npeer->trusted = peer->trusted;
 					npeer->query_addr4 = peer->query_addr4;
 					npeer->query_addr6 = peer->query_addr6;
 					h->next = NULL;
@@ -664,11 +669,9 @@ ntp_dispatch_imsg_dns(void)
 			    imsg.data, imsg.hdr.len - IMSG_HEADER_SIZE);
 			break;
 		case IMSG_PROBE_ROOT:
-			dlen = imsg.hdr.len - IMSG_HEADER_SIZE;
-			if (dlen != sizeof(int))
-				fatalx("IMSG_PROBE_ROOT");
-			memcpy(&n, imsg.data, sizeof(int));
-			if (n < 0)
+			if (imsg_get_data(&imsg, &probe, sizeof(probe)) == -1)
+				fatal("IMSG_PROBE_ROOT");
+			if (probe < 0)
 				priv_settime(0, "dns probe failed");
 			break;
 		default:

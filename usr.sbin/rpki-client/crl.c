@@ -1,4 +1,4 @@
-/*	$OpenBSD: crl.c,v 1.42 2024/06/17 18:52:50 tb Exp $ */
+/*	$OpenBSD: crl.c,v 1.53 2026/09/12 12:46:04 job Exp $ */
 /*
  * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -17,6 +17,7 @@
  */
 
 #include <err.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,31 +26,40 @@
 
 #include "extern.h"
 
+static pthread_rwlock_t	 crl_lk = PTHREAD_RWLOCK_INITIALIZER;
+
 /*
- * Check that the CRL number extension is present and that it is non-critical.
+ * Check CRL Number is present, non-critical and in [0, 2^159-1].
  * Otherwise ignore it per draft-spaghetti-sidrops-rpki-crl-numbers.
  */
 static int
-crl_has_crl_number(const char *fn, const X509_CRL *x509_crl)
+crl_check_crl_number(const char *fn, const X509_CRL *x509_crl)
 {
-	const X509_EXTENSION	*ext;
-	int			 idx;
+	ASN1_INTEGER		*aint = NULL;
+	int			 crit;
+	int			 ret = 0;
 
-	if ((idx = X509_CRL_get_ext_by_NID(x509_crl, NID_crl_number, -1)) < 0) {
-		warnx("%s: RFC 6487, section 5: missing CRL number", fn);
-		return 0;
+	aint = X509_CRL_get_ext_d2i(x509_crl, NID_crl_number, &crit, NULL);
+	if (aint == NULL) {
+		if (crit != -1)
+			warnx("%s: RFC 6487, section 5: "
+			    "failed to parse CRL number", fn);
+		else
+			warnx("%s: RFC 6487, section 5: missing CRL number",
+			    fn);
+		goto out;
 	}
-	if ((ext = X509_CRL_get_ext(x509_crl, idx)) == NULL) {
-		warnx("%s: RFC 6487, section 5: failed to get CRL number", fn);
-		return 0;
-	}
-	if (X509_EXTENSION_get_critical(ext) != 0) {
+	if (crit != 0) {
 		warnx("%s: RFC 6487, section 5: CRL number not non-critical",
 		    fn);
-		return 0;
+		goto out;
 	}
 
-	return 1;
+	ret = x509_valid_seqnum(fn, "CRL number", aint);
+
+ out:
+	ASN1_INTEGER_free(aint);
+	return ret;
 }
 
 /*
@@ -95,8 +105,8 @@ crl_get_aki(const char *fn, X509_CRL *x509_crl)
 		goto out;
 	}
 
-	d = os->data;
-	dsz = os->length;
+	d = ASN1_STRING_get0_data(os);
+	dsz = ASN1_STRING_length(os);
 
 	if (dsz != SHA_DIGEST_LENGTH) {
 		warnx("%s: RFC 6487 section 4.8.3: AKI: "
@@ -162,6 +172,33 @@ crl_check_revoked(const char *fn, X509_CRL *x509_crl)
 	return 1;
 }
 
+static int
+crl_check_sigalg(const char *fn, const struct crl *crl)
+{
+	const X509_CRL		*x = crl->x509_crl;
+	const X509_ALGOR	*alg = NULL, *tbsalg;
+
+	/* Retrieve AlgorithmIdentifier from CertificateList and TBSCertList. */
+	X509_CRL_get0_signature(x, NULL, &alg);
+	if (alg == NULL) {
+		warnx("%s: missing signatureAlgorithm in certificateList", fn);
+		return 0;
+	}
+	if ((tbsalg = X509_CRL_get0_tbs_sigalg(x)) == NULL) {
+		warnx("%s: missing signature in tbsCertList", fn);
+		return 0;
+	}
+
+	/* Unlike X509_verify(), X509_CRL_verify() does not check this. */
+	if (X509_ALGOR_cmp(alg, tbsalg) != 0) {
+		warnx("%s: RFC 5280, 5.1.1.2: signatureAlgorithm and signature "
+		    "AlgorithmIdentifier mismatch", fn);
+		return 0;
+	}
+
+	return x509_check_tbs_sigalg(fn, tbsalg);
+}
+
 struct crl *
 crl_parse(const char *fn, const unsigned char *der, size_t len)
 {
@@ -169,7 +206,7 @@ crl_parse(const char *fn, const unsigned char *der, size_t len)
 	struct crl		*crl;
 	const X509_NAME		*name;
 	const ASN1_TIME		*at;
-	int			 count, nid, rc = 0;
+	int			 count, rc = 0;
 
 	/* just fail for empty buffers, the warning was printed elsewhere */
 	if (der == NULL)
@@ -197,21 +234,11 @@ crl_parse(const char *fn, const unsigned char *der, size_t len)
 		warnx("%s: X509_CRL_get_issuer", fn);
 		goto out;
 	}
-	if (!x509_valid_name(fn, "issuer", name))
+	if (!x509_valid_issuer_name(fn, name))
 		goto out;
 
-	if ((nid = X509_CRL_get_signature_nid(crl->x509_crl)) == NID_undef) {
-		warnx("%s: unknown signature type", fn);
+	if (!crl_check_sigalg(fn, crl))
 		goto out;
-	}
-	if (experimental && nid == NID_ecdsa_with_SHA256) {
-		if (verbose)
-			warnx("%s: P-256 support is experimental", fn);
-	} else if (nid != NID_sha256WithRSAEncryption) {
-		warnx("%s: RFC 7935: wrong signature algorithm %s, want %s",
-		    fn, nid2str(nid), LN_sha256WithRSAEncryption);
-		goto out;
-	}
 
 	/*
 	 * RFC 6487, section 5: AKI and crlNumber MUST be present, no other
@@ -222,7 +249,7 @@ crl_parse(const char *fn, const unsigned char *der, size_t len)
 		    "%d != 2", fn, count);
 		goto out;
 	}
-	if (!crl_has_crl_number(fn, crl->x509_crl))
+	if (!crl_check_crl_number(fn, crl->x509_crl))
 		goto out;
 	if ((crl->aki = crl_get_aki(fn, crl->x509_crl)) == NULL)
 		goto out;
@@ -289,12 +316,13 @@ crlcmp(struct crl *a, struct crl *b)
 RB_GENERATE_STATIC(crl_tree, crl, entry, crlcmp);
 
 /*
- * Find a CRL based on the auth SKI value.
+ * Find a CRL based on the auth SKI value and manifest path.
  */
 struct crl *
-crl_get(struct crl_tree *crlt, const struct auth *a)
+crl_get(struct crl_tree *crls, const struct auth *a)
 {
-	struct crl	find;
+	struct crl	find, *crl;
+	int		error;
 
 	/* XXX - this should be removed, but filemode relies on it. */
 	if (a == NULL)
@@ -303,13 +331,26 @@ crl_get(struct crl_tree *crlt, const struct auth *a)
 	find.aki = a->cert->ski;
 	find.mftpath = a->cert->mft;
 
-	return RB_FIND(crl_tree, crlt, &find);
+	if ((error = pthread_rwlock_rdlock(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_rdlock: %s", strerror(error));
+	crl = RB_FIND(crl_tree, crls, &find);
+	if ((error = pthread_rwlock_unlock(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_unlock: %s", strerror(error));
+	return crl;
 }
 
 int
-crl_insert(struct crl_tree *crlt, struct crl *crl)
+crl_insert(struct crl_tree *crls, struct crl *crl)
 {
-	return RB_INSERT(crl_tree, crlt, crl) == NULL;
+	int error, rv;
+
+	if ((error = pthread_rwlock_wrlock(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_wrlock: %s", strerror(error));
+	rv = RB_INSERT(crl_tree, crls, crl) == NULL;
+	if ((error = pthread_rwlock_unlock(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_unlock: %s", strerror(error));
+
+	return rv;
 }
 
 void
@@ -319,17 +360,25 @@ crl_free(struct crl *crl)
 		return;
 	free(crl->aki);
 	free(crl->mftpath);
+	free(crl->mftcrldp);
 	X509_CRL_free(crl->x509_crl);
 	free(crl);
 }
 
 void
-crl_tree_free(struct crl_tree *crlt)
+crl_tree_free(struct crl_tree *crls)
 {
 	struct crl	*crl, *tcrl;
+	int error;
 
-	RB_FOREACH_SAFE(crl, crl_tree, crlt, tcrl) {
-		RB_REMOVE(crl_tree, crlt, crl);
+	if ((error = pthread_rwlock_wrlock(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_wrlock: %s", strerror(error));
+	RB_FOREACH_SAFE(crl, crl_tree, crls, tcrl) {
+		RB_REMOVE(crl_tree, crls, crl);
 		crl_free(crl);
 	}
+	if ((error = pthread_rwlock_unlock(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_unlock: %s", strerror(error));
+	if ((error = pthread_rwlock_destroy(&crl_lk)) != 0)
+		errx(1, "pthread_rwlock_destroy: %s", strerror(error));
 }

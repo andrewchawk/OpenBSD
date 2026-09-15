@@ -388,7 +388,7 @@ static int http2_frame_recv_cb(nghttp2_session *session,
 	}
 	if(((frame->hd.type != NGHTTP2_DATA &&
 		frame->hd.type != NGHTTP2_HEADERS) ||
-		frame->hd.flags & NGHTTP2_FLAG_END_STREAM) &&
+		(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) &&
 			h2_stream->res_status == 200) {
 			char* pktstr;
 			sldns_buffer_flip(h2_stream->buf);
@@ -642,12 +642,20 @@ int main(int argc, char** argv)
 #else
 		OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS
 			| OPENSSL_INIT_ADD_ALL_DIGESTS
-			| OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+			| OPENSSL_INIT_LOAD_CRYPTO_STRINGS
+#  if defined(OPENSSL_INIT_NO_LOAD_CONFIG) && defined(UB_ON_WINDOWS)
+			| OPENSSL_INIT_NO_LOAD_CONFIG
+#  endif
+			, NULL);
 #endif
 #if OPENSSL_VERSION_NUMBER < 0x10100000 || !defined(HAVE_OPENSSL_INIT_SSL)
 		(void)SSL_library_init();
 #else
-		(void)OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS, NULL);
+		(void)OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS
+#  if defined(OPENSSL_INIT_NO_LOAD_CONFIG) && defined(UB_ON_WINDOWS)
+			| OPENSSL_INIT_NO_LOAD_CONFIG
+#  endif
+			, NULL);
 #endif
 	}
 	run(h2_session, port, no_tls, argc, argv);

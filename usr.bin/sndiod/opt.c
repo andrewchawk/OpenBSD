@@ -1,4 +1,4 @@
-/*	$OpenBSD: opt.c,v 1.12 2024/05/24 15:21:35 ratchov Exp $	*/
+/*	$OpenBSD: opt.c,v 1.27 2026/08/12 11:03:19 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2011 Alexandre Ratchov <alex@caoua.org>
  *
@@ -15,6 +15,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <string.h>
+#include <stdio.h>
 
 #include "dev.h"
 #include "midi.h"
@@ -36,16 +37,115 @@ struct midiops opt_midiops = {
 	opt_midi_exit
 };
 
+const struct opt_mode opt_modes[] = {
+	{MODE_PLAY, "play"},
+	{MODE_REC, "rec"},
+	{MODE_MON, "mon"},
+};
+
+struct app *
+opt_mkapp(struct opt *o, char *who)
+{
+	char *p;
+	char name[CTL_NAMEMAX];
+	unsigned int i, ser, bestser, bestidx, inuse;
+	struct app *a;
+	struct slot *s;
+
+	/*
+	 * create a valid control name (lowcase, remove [^a-z], truncate)
+	 */
+	for (i = 0, p = who; ; p++) {
+		if (i == CTL_NAMEMAX - 1 || *p == '\0') {
+			name[i] = '\0';
+			break;
+		} else if (*p >= 'A' && *p <= 'Z') {
+			name[i++] = *p + 'a' - 'A';
+		} else if (*p >= 'a' && *p <= 'z')
+			name[i++] = *p;
+	}
+	if (i == 0)
+		strlcpy(name, "noname", CTL_NAMEMAX);
+
+	/*
+	 * return the app with this name (if any)
+	 */
+	for (i = 0, a = o->app_array; i < OPT_NAPP; i++, a++) {
+		if (strcmp(a->name, name) == 0)
+			return a;
+	}
+
+	/*
+	 * build a bitmap of app structures currently in use
+	 */
+	inuse = 0;
+	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
+		if (s->app != NULL && s->ops != NULL)
+			inuse |= 1 << (s->app - o->app_array);
+	}
+
+	if (inuse == (1 << OPT_NAPP) - 1) {
+		logx(1, "%s: too many programs", name);
+		return NULL;
+	}
+
+	/*
+	 * recycle the oldest free structure
+	 */
+
+	o->app_serial++;
+	bestser = 0;
+	bestidx = OPT_NAPP;
+	for (i = 0, a = o->app_array; i < OPT_NAPP; i++, a++) {
+		if (inuse & (1 << i))
+			continue;
+		ser = o->app_serial - a->serial;
+		if (ser > bestser) {
+			bestser = ser;
+			bestidx = i;
+		}
+	}
+
+	a = o->app_array + bestidx;
+
+	ctl_del(CTL_APP_LEVEL, o, a);
+
+	strlcpy(a->name, name, sizeof(a->name));
+	a->serial = o->app_serial;
+	a->vol = MIDI_MAXCTL;
+	ctl_new(CTL_APP_LEVEL, o, a,
+	    CTL_NUM, "", "app", a->name, -1, "level",
+	    NULL, -1, 127, a->vol);
+	opt_midi_appdesc(o, a);
+	opt_midi_vol(o, a);
+
+	return a;
+}
+
+void
+opt_appvol(struct opt *o, struct app *a, int vol)
+{
+	struct slot *s;
+	int i;
+
+	a->vol = vol;
+
+	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
+		if (s->app != a || s->opt != o)
+			continue;
+		s->mix.vol = MIDI_TO_ADATA(vol);
+#ifdef DEBUG
+		logx(3, "%s/%s: setting volume %u", o->name, a->name, vol);
+#endif
+	}
+}
+
 void
 opt_midi_imsg(void *arg, unsigned char *msg, int len)
 {
-#ifdef DEBUG
 	struct opt *o = arg;
 
-	log_puts(o->name);
-	log_puts(": can't receive midi messages\n");
-	panic();
-#endif
+	midi_send(o->midi, msg, len);
 }
 
 void
@@ -57,12 +157,10 @@ opt_midi_omsg(void *arg, unsigned char *msg, int len)
 
 	if ((msg[0] & MIDI_CMDMASK) == MIDI_CTL && msg[1] == MIDI_CTL_VOL) {
 		chan = msg[0] & MIDI_CHANMASK;
-		if (chan >= DEV_NSLOT)
+		if (chan >= OPT_NAPP)
 			return;
-		if (slot_array[chan].opt != o)
-			return;
-		slot_setvol(slot_array + chan, msg[2]);
-		ctl_onval(CTL_SLOT_LEVEL, slot_array + chan, NULL, msg[2]);
+		opt_appvol(o, o->app_array + chan, msg[2]);
+		ctl_onval(CTL_APP_LEVEL, o, o->app_array + chan, msg[2]);
 		return;
 	}
 	x = (struct sysex *)msg;
@@ -91,10 +189,7 @@ opt_midi_omsg(void *arg, unsigned char *msg, int len)
 			if (o->mtc == NULL)
 				return;
 			mtc_setdev(o->mtc, o->dev);
-			if (log_level >= 2) {
-				log_puts(o->name);
-				log_puts(": mmc stop\n");
-			}
+			logx(2, "%s: mmc stop", o->name);
 			mtc_stop(o->mtc);
 			break;
 		case SYSEX_MMC_START:
@@ -103,10 +198,7 @@ opt_midi_omsg(void *arg, unsigned char *msg, int len)
 			if (o->mtc == NULL)
 				return;
 			mtc_setdev(o->mtc, o->dev);
-			if (log_level >= 2) {
-				log_puts(o->name);
-				log_puts(": mmc start\n");
-			}
+			logx(2, "%s: mmc start", o->name);
 			mtc_start(o->mtc);
 			break;
 		case SYSEX_MMC_LOC:
@@ -144,7 +236,7 @@ opt_midi_omsg(void *arg, unsigned char *msg, int len)
 			return;
 		if (len != SYSEX_SIZE(dumpreq))
 			return;
-		dev_midi_dump(o->dev);
+		opt_midi_dump(o);
 		break;
 	}
 }
@@ -160,11 +252,65 @@ opt_midi_exit(void *arg)
 {
 	struct opt *o = arg;
 
-	if (log_level >= 1) {
-		log_puts(o->name);
-		log_puts(": midi end point died\n");
-		panic();
+	logx(1, "%s: midi end point died", o->name);
+}
+
+/*
+ * send a volume change MIDI message
+ */
+void
+opt_midi_vol(struct opt *o, struct app *a)
+{
+	unsigned char msg[3];
+
+	msg[0] = MIDI_CTL | (a - o->app_array);
+	msg[1] = MIDI_CTL_VOL;
+	msg[2] = a->vol;
+	midi_in(o->midi, msg, sizeof(msg));
+}
+
+/*
+ * send a sndiod-specific slot description MIDI message
+ */
+void
+opt_midi_appdesc(struct opt *o, struct app *a)
+{
+	struct sysex x;
+
+	memset(&x, 0, sizeof(struct sysex));
+	x.start = SYSEX_START;
+	x.type = SYSEX_TYPE_EDU;
+	x.dev = SYSEX_DEV_ANY;
+	x.id0 = SYSEX_AUCAT;
+	x.id1 = SYSEX_AUCAT_SLOTDESC;
+	strlcpy(x.u.slotdesc.name, a->name, SYSEX_NAMELEN);
+	x.u.slotdesc.chan = (a - o->app_array);
+	x.u.slotdesc.end = SYSEX_END;
+	midi_in(o->midi, (unsigned char *)&x, SYSEX_SIZE(slotdesc));
+}
+
+/*
+ * send a MIDI dump: master volume, state of MIDI channels
+ */
+void
+opt_midi_dump(struct opt *o)
+{
+	struct sysex x;
+	struct app *a;
+	int i;
+
+	dev_midi_master(o->dev);
+	for (i = 0, a = o->app_array; i < OPT_NAPP; i++, a++) {
+		opt_midi_appdesc(o, a);
+		opt_midi_vol(o, a);
 	}
+	x.start = SYSEX_START;
+	x.type = SYSEX_TYPE_EDU;
+	x.dev = SYSEX_DEV_ANY;
+	x.id0 = SYSEX_AUCAT;
+	x.id1 = SYSEX_AUCAT_DUMPEND;
+	x.u.dumpend.end = SYSEX_END;
+	midi_in(o->midi, (unsigned char *)&x, SYSEX_SIZE(dumpend));
 }
 
 /*
@@ -175,70 +321,28 @@ opt_new(struct dev *d, char *name,
     int pmin, int pmax, int rmin, int rmax,
     int maxweight, int mmc, int dup, unsigned int mode)
 {
-	struct dev *a;
-	struct opt *o, **po;
-	unsigned int len, num;
-	char c;
-
-	if (name == NULL) {
-		name = d->name;
-		len = strlen(name);
-	} else {
-		for (len = 0; name[len] != '\0'; len++) {
-			if (len == OPT_NAMEMAX) {
-				log_puts(name);
-				log_puts(": too long\n");
-				return NULL;
-			}
-			c = name[len];
-			if ((c < 'a' || c > 'z') &&
-			    (c < 'A' || c > 'Z')) {
-				log_puts(name);
-				log_puts(": only alphabetic chars allowed\n");
-				return NULL;
-			}
-		}
-	}
-	num = 0;
-	for (po = &opt_list; *po != NULL; po = &(*po)->next)
-		num++;
-	if (num >= OPT_NMAX) {
-		log_puts(name);
-		log_puts(": too many opts\n");
-		return NULL;
-	}
+	struct opt *o;
+	char str[64];
 
 	if (opt_byname(name)) {
-		log_puts(name);
-		log_puts(": already defined\n");
+		logx(1, "%s: already defined", name);
 		return NULL;
 	}
 
 	if (mmc) {
 		if (mtc_array[0].dev != NULL && mtc_array[0].dev != d) {
-			log_puts(name);
-			log_puts(": MTC already setup for another device\n");
+			logx(0, "%s: MTC already setup for another device", name);
 			return NULL;
 		}
 		mtc_array[0].dev = d;
-		if (log_level >= 2) {
-			dev_log(d);
-			log_puts(": initial MTC source, controlled by MMC\n");
-		}
-	}
-
-	if (strcmp(d->name, name) == 0)
-		a = d;
-	else {
-		/* circulate to the first "alternate" device (greatest num) */
-		for (a = d; a->alt_next->num > a->num; a = a->alt_next)
-			;
+		logx(2, "%s: initial MTC source, controlled by MMC", d->path);
 	}
 
 	o = xmalloc(sizeof(struct opt));
-	o->num = num;
-	o->alt_first = o->dev = a;
+	o->dev = d;
+	o->alt_list = NULL;
 	o->refcnt = 0;
+	memset(o->app_array, 0, sizeof(o->app_array));
 
 	/*
 	 * XXX: below, we allocate a midi input buffer, since we don't
@@ -248,57 +352,61 @@ opt_new(struct dev *d, char *name,
 	 *	allocated
 	 */
 	o->midi = midi_new(&opt_midiops, o, MODE_MIDIIN | MODE_MIDIOUT);
-	midi_tag(o->midi, o->num);
+	o->midithru = midithru_new("");
+	midithru_addprog(o->midithru, o->midi);
 
-	if (mode & MODE_PLAY) {
-		o->pmin = pmin;
-		o->pmax = pmax;
-	}
-	if (mode & MODE_RECMASK) {
-		o->rmin = rmin;
-		o->rmax = rmax;
-	}
+	o->pmin = pmin;
+	o->pmax = pmax;
+	o->rmin = rmin;
+	o->rmax = rmax;
 	o->maxweight = maxweight;
 	o->mtc = mmc ? &mtc_array[0] : NULL;
 	o->dup = dup;
 	o->mode = mode;
-	memcpy(o->name, name, len + 1);
-	o->next = *po;
-	*po = o;
-	if (log_level >= 2) {
-		dev_log(d);
-		log_puts(".");
-		log_puts(o->name);
-		log_puts(":");
-		if (o->mode & MODE_REC) {
-			log_puts(" rec=");
-			log_putu(o->rmin);
-			log_puts(":");
-			log_putu(o->rmax);
-		}
-		if (o->mode & MODE_PLAY) {
-			log_puts(" play=");
-			log_putu(o->pmin);
-			log_puts(":");
-			log_putu(o->pmax);
-			log_puts(" vol=");
-			log_putu(o->maxweight);
-		}
-		if (o->mode & MODE_MON) {
-			log_puts(" mon=");
-			log_putu(o->rmin);
-			log_puts(":");
-			log_putu(o->rmax);
-		}
-		if (o->mode & (MODE_RECMASK | MODE_PLAY)) {
-			if (o->mtc)
-				log_puts(" mtc");
-			if (o->dup)
-				log_puts(" dup");
-		}
-		log_puts("\n");
-	}
+	strlcpy(o->name, name, sizeof(o->name));
+	opt_setalt(o, d);
+	o->next = opt_list;
+	opt_list = o;
+
+	logx(2, "%s: %s%s, vol = %d", o->name, (chans_fmt(str, sizeof(str),
+	    o->mode, o->pmin, o->pmax, o->rmin, o->rmax), str),
+	    (o->dup) ? ", dup" : "", o->maxweight);
+
 	return o;
+}
+
+/*
+ * Make the given device the first alternate device: if it's on the list
+ * make it the first, else create a new one.
+ */
+void
+opt_setalt(struct opt *o, struct dev *d)
+{
+	struct opt_alt *a, **pa;
+
+	for (pa = &o->alt_list; ; pa = &a->next) {
+		if ((a = *pa) == NULL) {
+			a = xmalloc(sizeof(struct opt_alt));
+			a->dev = d;
+			break;
+		} else if (a->dev == d) {
+			*pa = a->next;
+			break;
+		}
+	}
+	a->next = o->alt_list;
+	o->alt_list = a;
+
+#ifdef DEBUG
+	size_t n = 0;
+	char buf[128];
+
+	for (a = o->alt_list; a != NULL; a = a->next) {
+		n += snprintf(buf + n, n >= sizeof(buf) ? 0 : sizeof(buf) - n,
+		    "%s%s", a->dev->path, (a->next != NULL) ? ", " : "");
+	}
+	logx(2, "%s: alt -> %s", o->name, buf);
+#endif
 }
 
 struct opt *
@@ -313,32 +421,26 @@ opt_byname(char *name)
 	return NULL;
 }
 
-struct opt *
-opt_bynum(int num)
-{
-	struct opt *o;
-
-	for (o = opt_list; o != NULL; o = o->next) {
-		if (o->num == num)
-			return o;
-	}
-	return NULL;
-}
-
 void
 opt_del(struct opt *o)
 {
 	struct opt **po;
+	struct opt_alt *a;
 
 	for (po = &opt_list; *po != o; po = &(*po)->next) {
 #ifdef DEBUG
 		if (*po == NULL) {
-			log_puts("opt_del: not on list\n");
+			logx(0, "%s: not on list", __func__);
 			panic();
 		}
 #endif
 	}
+	midithru_del(o->midithru);
 	midi_del(o->midi);
+	while ((a = o->alt_list) != NULL) {
+		o->alt_list = a->next;
+		xfree(a);
+	}
 	*po = o->next;
 	xfree(o);
 }
@@ -346,20 +448,55 @@ opt_del(struct opt *o)
 void
 opt_init(struct opt *o)
 {
+	int i;
+
+	for (i = 0; i < sizeof(opt_modes) / sizeof(opt_modes[0]); i++) {
+		ctl_new(CTL_OPT_MODE, o, &i, CTL_VEC, "",
+		    o->name, "server", -1, "mode", opt_modes[i].name, -1,
+		    1, (o->mode & opt_modes[i].bit) ? 1 : 0);
+	}
 }
 
 void
 opt_done(struct opt *o)
 {
 	struct dev *d;
+	int i;
 
 	if (o->refcnt != 0) {
 		// XXX: all clients are already kicked, so this never happens
-		log_puts(o->name);
-		log_puts(": still has refs\n");
+		logx(0, "%s: still has refs", o->name);
 	}
+
+	for (i = 0; i < OPT_NAPP; i++)
+		ctl_del(CTL_APP_LEVEL, o, o->app_array + i);
+
+	for (i = 0; i < sizeof(opt_modes) / sizeof(opt_modes[0]); i++)
+		ctl_del(CTL_OPT_MODE, o, &i);
+
 	for (d = dev_list; d != NULL; d = d->next)
 		ctl_del(CTL_OPT_DEV, o, d);
+}
+
+/*
+ * Flip a bit of opt's mode
+ */
+void
+opt_setmode(struct opt *o, int idx, int val)
+{
+	int mode;
+
+	/*
+	 * The o->mode field is directly used by the device,
+	 * so just flipping the bit is OK.
+	 */
+	mode = opt_modes[idx].bit;
+	if (val)
+		o->mode |= mode;
+	else
+		o->mode &= ~mode;
+
+	logx(2, "%s: %s -> %d", __func__, opt_modes[idx].name, val);
 }
 
 /*
@@ -437,15 +574,6 @@ opt_setdev(struct opt *o, struct dev *ndev)
 		if (s->opt != o)
 			continue;
 
-		if (ndev != odev) {
-			dev_midi_slotdesc(odev, s);
-			dev_midi_slotdesc(ndev, s);
-			dev_midi_vol(ndev, s);
-		}
-
-		c = ctl_find(CTL_SLOT_LEVEL, s, NULL);
-		ctl_update(c);
-
 		if (s->pstate == SLOT_RUN || s->pstate == SLOT_STOP) {
 			slot_initconv(s);
 			slot_attach(s);
@@ -465,42 +593,64 @@ opt_setdev(struct opt *o, struct dev *ndev)
 }
 
 /*
+ * Move the opt structure to a new device
+ */
+void
+opt_migrate(struct opt *o, struct dev *odev)
+{
+	struct opt_alt *a;
+	struct slot *s;
+	int i;
+
+	for (a = o->alt_list; a != NULL; a = a->next) {
+		if (a->dev == odev)
+			continue;
+		if (opt_setdev(o, a->dev))
+			return;
+	}
+	for (i = 0, s = slot_array; i < DEV_NSLOT; i++, s++) {
+		if (s->opt != o)
+			continue;
+		if (s->ops) {
+			s->ops->exit(s->arg);
+			s->ops = NULL;
+		}
+	}
+}
+
+/*
  * Get a reference to opt's device
  */
 struct dev *
 opt_ref(struct opt *o)
 {
 	struct dev *d;
+	struct opt_alt *a;
 
 	if (o->refcnt == 0) {
-		if (strcmp(o->name, o->dev->name) == 0) {
-			if (!dev_ref(o->dev))
+		/* find first working one */
+		a = o->alt_list;
+		while (1) {
+			if (a == NULL)
 				return NULL;
-		} else {
-			/* find first working one */
-			d = o->alt_first;
-			while (1) {
-				if (dev_ref(d))
-					break;
-				d = d->alt_next;
-				if (d == o->alt_first)
-					return NULL;
-			}
+			if (dev_ref(a->dev))
+				break;
+			a = a->next;
+		}
 
-			/* if device changed, move everything to the new one */
-			if (d != o->dev)
-				opt_setdev(o, d);
+		/* if device changed, move everything to the new one */
+		if (a->dev != o->dev)
+			opt_setdev(o, a->dev);
 
-			/* create server.device control */
-			for (d = dev_list; d != NULL; d = d->next) {
-				d->refcnt++;
-				if (d->pstate == DEV_CFG)
-					dev_open(d);
-				ctl_new(CTL_OPT_DEV, o, d,
-				    CTL_SEL, dev_getdisplay(d),
-				    o->name, "server", -1, "device",
-				    d->name, -1, 1, o->dev == d);
-			}
+		/* create server.device control */
+		for (d = dev_list; d != NULL; d = d->next) {
+			d->refcnt++;
+			if (d->pstate == DEV_CFG)
+				dev_open(d);
+			ctl_new(CTL_OPT_DEV, o, d,
+			    CTL_SEL, dev_getdisplay(d),
+			    o->name, "server", -1, "device",
+			    d->name, -1, 1, o->dev == d);
 		}
 	}
 

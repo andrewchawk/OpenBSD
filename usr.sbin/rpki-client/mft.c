@@ -1,4 +1,4 @@
-/*	$OpenBSD: mft.c,v 1.117 2024/06/11 10:38:40 tb Exp $ */
+/*	$OpenBSD: mft.c,v 1.145 2026/09/14 09:21:41 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -33,46 +33,14 @@
 #include <openssl/x509.h>
 
 #include "extern.h"
-
-extern ASN1_OBJECT	*mft_oid;
+#include "rpki-asn1.h"
 
 /*
- * Types and templates for the Manifest eContent, RFC 6486, section 4.2.
+ * Manifest eContent definition in RFC 9286, section 4.2.
  */
 
-ASN1_ITEM_EXP FileAndHash_it;
 ASN1_ITEM_EXP Manifest_it;
-
-typedef struct {
-	ASN1_IA5STRING	*file;
-	ASN1_BIT_STRING	*hash;
-} FileAndHash;
-
-DECLARE_STACK_OF(FileAndHash);
-
-#ifndef DEFINE_STACK_OF
-#define sk_FileAndHash_dup(sk)		SKM_sk_dup(FileAndHash, (sk))
-#define sk_FileAndHash_free(sk)		SKM_sk_free(FileAndHash, (sk))
-#define sk_FileAndHash_num(sk)		SKM_sk_num(FileAndHash, (sk))
-#define sk_FileAndHash_value(sk, i)	SKM_sk_value(FileAndHash, (sk), (i))
-#define sk_FileAndHash_sort(sk)		SKM_sk_sort(FileAndHash, (sk))
-#define sk_FileAndHash_set_cmp_func(sk, cmp) \
-    SKM_sk_set_cmp_func(FileAndHash, (sk), (cmp))
-#endif
-
-typedef struct {
-	ASN1_INTEGER		*version;
-	ASN1_INTEGER		*manifestNumber;
-	ASN1_GENERALIZEDTIME	*thisUpdate;
-	ASN1_GENERALIZEDTIME	*nextUpdate;
-	ASN1_OBJECT		*fileHashAlg;
-	STACK_OF(FileAndHash)	*fileList;
-} Manifest;
-
-ASN1_SEQUENCE(FileAndHash) = {
-	ASN1_SIMPLE(FileAndHash, file, ASN1_IA5STRING),
-	ASN1_SIMPLE(FileAndHash, hash, ASN1_BIT_STRING),
-} ASN1_SEQUENCE_END(FileAndHash);
+ASN1_ITEM_EXP FileAndHash_it;
 
 ASN1_SEQUENCE(Manifest) = {
 	ASN1_EXP_OPT(Manifest, version, ASN1_INTEGER, 0),
@@ -83,14 +51,16 @@ ASN1_SEQUENCE(Manifest) = {
 	ASN1_SEQUENCE_OF(Manifest, fileList, FileAndHash),
 } ASN1_SEQUENCE_END(Manifest);
 
-DECLARE_ASN1_FUNCTIONS(Manifest);
 IMPLEMENT_ASN1_FUNCTIONS(Manifest);
 
-#define GENTIME_LENGTH 15
+ASN1_SEQUENCE(FileAndHash) = {
+	ASN1_SIMPLE(FileAndHash, file, ASN1_IA5STRING),
+	ASN1_SIMPLE(FileAndHash, hash, ASN1_BIT_STRING),
+} ASN1_SEQUENCE_END(FileAndHash);
 
 /*
  * Determine rtype corresponding to file extension. Returns RTYPE_INVALID
- * on error or unkown extension.
+ * on error or unknown extension.
  */
 enum rtype
 rtype_from_file_extension(const char *fn)
@@ -111,18 +81,18 @@ rtype_from_file_extension(const char *fn)
 		return RTYPE_MFT;
 	if (strcasecmp(fn + sz - 4, ".roa") == 0)
 		return RTYPE_ROA;
-	if (strcasecmp(fn + sz - 4, ".gbr") == 0)
-		return RTYPE_GBR;
 	if (strcasecmp(fn + sz - 4, ".sig") == 0)
 		return RTYPE_RSC;
 	if (strcasecmp(fn + sz - 4, ".asa") == 0)
 		return RTYPE_ASPA;
 	if (strcasecmp(fn + sz - 4, ".tak") == 0)
 		return RTYPE_TAK;
-	if (strcasecmp(fn + sz - 4, ".csv") == 0)
-		return RTYPE_GEOFEED;
 	if (strcasecmp(fn + sz - 4, ".spl") == 0)
 		return RTYPE_SPL;
+	if (strcasecmp(fn + sz - 4, ".ccr") == 0)
+		return RTYPE_CCR;
+	if (strcasecmp(fn + sz - 3, ".gz") == 0)
+		return RTYPE_GZ;
 
 	return RTYPE_INVALID;
 }
@@ -161,7 +131,6 @@ rtype_from_mftfile(const char *fn)
 	switch (type) {
 	case RTYPE_CER:
 	case RTYPE_CRL:
-	case RTYPE_GBR:
 	case RTYPE_ROA:
 	case RTYPE_ASPA:
 	case RTYPE_SPL:
@@ -173,32 +142,47 @@ rtype_from_mftfile(const char *fn)
 }
 
 /*
- * Parse an individual "FileAndHash", RFC 6486, sec. 4.2.
+ * Parse an individual "FileAndHash", RFC 9286, sec. 4.2.
  * Return zero on failure, non-zero on success.
  */
 static int
 mft_parse_filehash(const char *fn, struct mft *mft, const FileAndHash *fh,
     int *found_crl)
 {
+	const unsigned char	*data;
 	char			*file = NULL;
-	int			 rc = 0;
+	size_t			 len;
+	int			 length, unused_bits, rc = 0;
 	struct mftfile		*fent;
 	enum rtype		 type;
 	size_t			 new_idx = 0;
 
-	if (!valid_mft_filename(fh->file->data, fh->file->length)) {
-		warnx("%s: RFC 6486 section 4.2.2: bad filename", fn);
+	data = ASN1_STRING_get0_data(fh->file);
+	length = ASN1_STRING_length(fh->file);
+
+	if (!valid_mft_filename(data, length)) {
+		warnx("%s: RFC 9286 section 4.2.2: FileAndHash with "
+		    "invalid filename", fn);
 		goto out;
 	}
-	file = strndup(fh->file->data, fh->file->length);
+
+	file = strndup(data, length);
 	if (file == NULL)
 		err(1, NULL);
 
-	if (fh->hash->length != SHA256_DIGEST_LENGTH) {
-		warnx("%s: RFC 6486 section 4.2.1: hash: "
-		    "invalid SHA256 length, have %d", fn, fh->hash->length);
+	data = ASN1_STRING_get0_data(fh->hash);
+	if (!ASN1_BIT_STRING_get_length(fh->hash, &len, &unused_bits)) {
+		warnx("%s: RFC 9286 section 4.2.1: hash: "
+		    "invalid SHA256 length, have %d", fn, length);
 		goto out;
 	}
+	if (len != SHA256_DIGEST_LENGTH || unused_bits != 0) {
+		warnx("%s: RFC 9286 section 4.2.1: hash: "
+		    "invalid SHA256 length, have %zu (%d unused bits)",
+		    fn, len, unused_bits);
+		goto out;
+	}
+	length = len;
 
 	type = rtype_from_mftfile(file);
 	if (type == RTYPE_CRL) {
@@ -212,7 +196,7 @@ mft_parse_filehash(const char *fn, struct mft *mft, const FileAndHash *fh,
 			goto out;
 		}
 		/* remember the filehash for the CRL in struct mft */
-		memcpy(mft->crlhash, fh->hash->data, SHA256_DIGEST_LENGTH);
+		memcpy(mft->crlhash, data, length);
 		*found_crl = 1;
 	}
 
@@ -228,7 +212,7 @@ mft_parse_filehash(const char *fn, struct mft *mft, const FileAndHash *fh,
 	fent->type = type;
 	fent->file = file;
 	file = NULL;
-	memcpy(fent->hash, fh->hash->data, SHA256_DIGEST_LENGTH);
+	memcpy(fent->hash, data, length);
 
 	rc = 1;
  out:
@@ -239,21 +223,13 @@ mft_parse_filehash(const char *fn, struct mft *mft, const FileAndHash *fh,
 static int
 mft_fh_cmp_name(const FileAndHash *const *a, const FileAndHash *const *b)
 {
-	if ((*a)->file->length < (*b)->file->length)
-		return -1;
-	if ((*a)->file->length > (*b)->file->length)
-		return 1;
-
-	return memcmp((*a)->file->data, (*b)->file->data, (*b)->file->length);
+	return ASN1_STRING_cmp((*a)->file, (*b)->file);
 }
 
 static int
 mft_fh_cmp_hash(const FileAndHash *const *a, const FileAndHash *const *b)
 {
-	assert((*a)->hash->length == SHA256_DIGEST_LENGTH);
-	assert((*b)->hash->length == SHA256_DIGEST_LENGTH);
-
-	return memcmp((*a)->hash->data, (*b)->hash->data, (*b)->hash->length);
+	return ASN1_STRING_cmp((*a)->hash, (*b)->hash);
 }
 
 /*
@@ -278,7 +254,8 @@ mft_has_unique_names_and_hashes(const char *fn, const Manifest *mft)
 
 		if (mft_fh_cmp_name(&curr, &next) == 0) {
 			warnx("%s: duplicate name: %.*s", fn,
-			    curr->file->length, curr->file->data);
+			    ASN1_STRING_length(curr->file),
+			    ASN1_STRING_get0_data(curr->file));
 			goto err;
 		}
 	}
@@ -292,8 +269,10 @@ mft_has_unique_names_and_hashes(const char *fn, const Manifest *mft)
 
 		if (mft_fh_cmp_hash(&curr, &next) == 0) {
 			warnx("%s: duplicate hash for %.*s and %.*s", fn,
-			    curr->file->length, curr->file->data,
-			    next->file->length, next->file->data);
+			    ASN1_STRING_length(curr->file),
+			    ASN1_STRING_get0_data(curr->file),
+			    ASN1_STRING_length(next->file),
+			    ASN1_STRING_get0_data(next->file));
 			goto err;
 		}
 	}
@@ -307,13 +286,14 @@ mft_has_unique_names_and_hashes(const char *fn, const Manifest *mft)
 }
 
 /*
- * Handle the eContent of the manifest object, RFC 6486 sec. 4.2.
+ * Handle the eContent of the manifest object, RFC 9286 sec. 4.2.
  * Returns 0 on failure and 1 on success.
  */
 static int
-mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
+mft_parse_econtent(const char *fn, void *obj, const unsigned char *d,
     size_t dsz)
 {
+	struct mft		*mft = obj;
 	const unsigned char	*oder;
 	Manifest		*mft_asn1;
 	FileAndHash		*fh;
@@ -321,7 +301,7 @@ mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
 
 	oder = d;
 	if ((mft_asn1 = d2i_Manifest(NULL, &d, dsz)) == NULL) {
-		warnx("%s: RFC 6486 section 4: failed to parse Manifest", fn);
+		warnx("%s: RFC 9286 section 4: failed to parse Manifest", fn);
 		goto out;
 	}
 	if (d != oder + dsz) {
@@ -333,31 +313,18 @@ mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
 	if (!valid_econtent_version(fn, mft_asn1->version, 0))
 		goto out;
 
-	mft->seqnum = x509_convert_seqnum(fn, mft_asn1->manifestNumber);
+	mft->seqnum = x509_convert_seqnum(fn, "manifest number",
+	    mft_asn1->manifestNumber);
 	if (mft->seqnum == NULL)
 		goto out;
 
-	/*
-	 * OpenSSL's DER decoder implementation will accept a GeneralizedTime
-	 * which doesn't conform to RFC 5280. So, double check.
-	 */
-	if (ASN1_STRING_length(mft_asn1->thisUpdate) != GENTIME_LENGTH) {
-		warnx("%s: embedded from time format invalid", fn);
+	if (!x509_get_generalized_time(fn, "manifest thisUpdate",
+	    mft_asn1->thisUpdate, &mft->thisupdate))
 		goto out;
-	}
-	if (ASN1_STRING_length(mft_asn1->nextUpdate) != GENTIME_LENGTH) {
-		warnx("%s: embedded until time format invalid", fn);
-		goto out;
-	}
 
-	if (!x509_get_time(mft_asn1->thisUpdate, &mft->thisupdate)) {
-		warn("%s: parsing manifest thisUpdate failed", fn);
+	if (!x509_get_generalized_time(fn, "manifest nextUpdate",
+	    mft_asn1->nextUpdate, &mft->nextupdate))
 		goto out;
-	}
-	if (!x509_get_time(mft_asn1->nextUpdate, &mft->nextupdate)) {
-		warn("%s: parsing manifest nextUpdate failed", fn);
-		goto out;
-	}
 
 	if (mft->thisupdate > mft->nextupdate) {
 		warnx("%s: bad update interval", fn);
@@ -365,12 +332,16 @@ mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
 	}
 
 	if (OBJ_obj2nid(mft_asn1->fileHashAlg) != NID_sha256) {
-		warnx("%s: RFC 6486 section 4.2.1: fileHashAlg: "
+		warnx("%s: RFC 9286 section 4.2.1: fileHashAlg: "
 		    "want SHA256 object, have %s", fn,
 		    nid2str(OBJ_obj2nid(mft_asn1->fileHashAlg)));
 		goto out;
 	}
 
+	if (sk_FileAndHash_num(mft_asn1->fileList) <= 0) {
+		warnx("%s: no files in manifest fileList", fn);
+		goto out;
+	}
 	if (sk_FileAndHash_num(mft_asn1->fileList) >= MAX_MANIFEST_ENTRIES) {
 		warnx("%s: %d exceeds manifest entry limit (%d)", fn,
 		    sk_FileAndHash_num(mft_asn1->fileList),
@@ -404,99 +375,98 @@ mft_parse_econtent(const char *fn, struct mft *mft, const unsigned char *d,
 	return rc;
 }
 
-/*
- * Parse the objects that have been published in the manifest.
- * Return mft if it conforms to RFC 6486, otherwise NULL.
- */
-struct mft *
-mft_parse(X509 **x509, const char *fn, int talid, const unsigned char *der,
-    size_t len)
+static int
+mft_cert_info(const char *fn, void *obj, const struct cert *cert)
 {
-	struct mft	*mft;
-	struct cert	*cert = NULL;
-	int		 rc = 0;
-	size_t		 cmsz;
-	unsigned char	*cms;
-	char		*crldp = NULL, *crlfile;
-	time_t		 signtime = 0;
+	struct mft *mft = obj;
+	char *crlfile;
 
-	cms = cms_parse_validate(x509, fn, der, len, mft_oid, &cmsz, &signtime);
-	if (cms == NULL)
-		return NULL;
-	assert(*x509 != NULL);
+	if (!x509_inherits(cert->x509)) {
+		warnx("%s: RFC 3779 extensions not set to inherit", fn);
+		return 0;
+	}
 
-	if ((mft = calloc(1, sizeof(*mft))) == NULL)
+	if ((mft->aki = strdup(cert->aki)) == NULL)
 		err(1, NULL);
-	mft->signtime = signtime;
+	if ((mft->sia = strdup(cert->signedobj)) == NULL)
+		err(1, NULL);
+	if ((mft->crldp = strdup(cert->crl)) == NULL)
+		err(1, NULL);
 
-	if (!x509_get_aia(*x509, fn, &mft->aia))
-		goto out;
-	if (!x509_get_aki(*x509, fn, &mft->aki))
-		goto out;
-	if (!x509_get_sia(*x509, fn, &mft->sia))
-		goto out;
-	if (!x509_get_ski(*x509, fn, &mft->ski))
-		goto out;
-	if (mft->aia == NULL || mft->aki == NULL || mft->sia == NULL ||
-	    mft->ski == NULL) {
-		warnx("%s: RFC 6487 section 4.8: "
-		    "missing AIA, AKI, SIA, or SKI X509 extension", fn);
-		goto out;
-	}
-
-	if (!x509_inherits(*x509)) {
-		warnx("%s: RFC 3779 extension not set to inherit", fn);
-		goto out;
-	}
-
-	/* get CRL info for later */
-	if (!x509_get_crl(*x509, fn, &crldp))
-		goto out;
-	if (crldp == NULL) {
-		warnx("%s: RFC 6487 section 4.8.6: CRL: "
-		    "missing CRL distribution point extension", fn);
-		goto out;
-	}
-	crlfile = strrchr(crldp, '/');
+	crlfile = strrchr(cert->crl, '/');
 	if (crlfile == NULL) {
 		warnx("%s: RFC 6487 section 4.8.6: "
 		    "invalid CRL distribution point", fn);
-		goto out;
+		return 0;
 	}
 	crlfile++;
 	if (!valid_mft_filename(crlfile, strlen(crlfile)) ||
 	    rtype_from_file_extension(crlfile) != RTYPE_CRL) {
 		warnx("%s: RFC 6487 section 4.8.6: CRL: "
 		    "bad CRL distribution point extension", fn);
-		goto out;
+		return 0;
 	}
 	if ((mft->crl = strdup(crlfile)) == NULL)
 		err(1, NULL);
 
-	if (mft_parse_econtent(fn, mft, cms, cmsz) == 0)
-		goto out;
+	return 1;
+}
 
-	if ((cert = cert_parse_ee_cert(fn, talid, *x509)) == NULL)
-		goto out;
+static int
+mft_validate(const char *fn, void *obj, struct cert *cert)
+{
+	struct mft *mft = obj;
 
 	if (mft->signtime > mft->nextupdate) {
 		warnx("%s: dating issue: CMS signing-time after MFT nextUpdate",
 		    fn);
-		goto out;
+		return 0;
 	}
 
-	rc = 1;
-out:
-	if (rc == 0) {
-		mft_free(mft);
-		mft = NULL;
-		X509_free(*x509);
-		*x509 = NULL;
-	}
-	free(crldp);
-	cert_free(cert);
-	free(cms);
+	return 1;
+}
+
+static const ASN1_OBJECT *
+mft_obj_oid(void)
+{
+	return mft_oid;
+}
+
+static void *
+mft_obj_new(size_t der_len, time_t signtime)
+{
+	struct mft *mft;
+
+	if ((mft = calloc(1, sizeof(*mft))) == NULL)
+		err(1, NULL);
+	mft->mftsize = der_len;
+	mft->signtime = signtime;
+
 	return mft;
+}
+
+static void
+mft_obj_free(void *obj)
+{
+	mft_free(obj);
+}
+
+static const struct signed_obj mft_signed_obj = {
+	.rtype = RTYPE_MFT,
+
+	.new = mft_obj_new,
+	.free = mft_obj_free,
+	.cert_info = mft_cert_info,
+	.parse_econtent = mft_parse_econtent,
+	.validate = mft_validate,
+
+	.oid = mft_obj_oid,
+};
+
+const struct signed_obj *
+mft_obj(void)
+{
+	return &mft_signed_obj;
 }
 
 /*
@@ -504,25 +474,24 @@ out:
  * Safe to call with NULL.
  */
 void
-mft_free(struct mft *p)
+mft_free(struct mft *mft)
 {
 	size_t	 i;
 
-	if (p == NULL)
+	if (mft == NULL)
 		return;
 
-	for (i = 0; i < p->filesz; i++)
-		free(p->files[i].file);
+	for (i = 0; i < mft->filesz; i++)
+		free(mft->files[i].file);
 
-	free(p->path);
-	free(p->files);
-	free(p->seqnum);
-	free(p->aia);
-	free(p->aki);
-	free(p->sia);
-	free(p->ski);
-	free(p->crl);
-	free(p);
+	free(mft->path);
+	free(mft->files);
+	free(mft->seqnum);
+	free(mft->aki);
+	free(mft->sia);
+	free(mft->crldp);
+	free(mft->crl);
+	free(mft);
 }
 
 /*
@@ -530,27 +499,31 @@ mft_free(struct mft *p)
  * See mft_read() for the other side of the pipe.
  */
 void
-mft_buffer(struct ibuf *b, const struct mft *p)
+mft_buffer(struct ibuf *b, const struct mft *mft)
 {
 	size_t		 i;
 
-	io_simple_buffer(b, &p->repoid, sizeof(p->repoid));
-	io_simple_buffer(b, &p->talid, sizeof(p->talid));
-	io_simple_buffer(b, &p->certid, sizeof(p->certid));
-	io_str_buffer(b, p->path);
+	io_simple_buffer(b, &mft->repoid, sizeof(mft->repoid));
+	io_simple_buffer(b, &mft->talid, sizeof(mft->talid));
+	io_simple_buffer(b, &mft->certid, sizeof(mft->certid));
+	io_simple_buffer(b, &mft->seqnum_gap, sizeof(mft->seqnum_gap));
+	io_opt_str_buffer(b, mft->path);
 
-	io_str_buffer(b, p->aia);
-	io_str_buffer(b, p->aki);
-	io_str_buffer(b, p->ski);
+	io_str_buffer(b, mft->aki);
+	io_str_buffer(b, mft->seqnum);
+	io_str_buffer(b, mft->sia);
+	io_simple_buffer(b, &mft->thisupdate, sizeof(mft->thisupdate));
+	io_simple_buffer(b, mft->mfthash, sizeof(mft->mfthash));
+	io_simple_buffer(b, &mft->mftsize, sizeof(mft->mftsize));
 
-	io_simple_buffer(b, &p->filesz, sizeof(size_t));
-	for (i = 0; i < p->filesz; i++) {
-		io_str_buffer(b, p->files[i].file);
-		io_simple_buffer(b, &p->files[i].type,
-		    sizeof(p->files[i].type));
-		io_simple_buffer(b, &p->files[i].location,
-		    sizeof(p->files[i].location));
-		io_simple_buffer(b, p->files[i].hash, SHA256_DIGEST_LENGTH);
+	io_simple_buffer(b, &mft->filesz, sizeof(size_t));
+	for (i = 0; i < mft->filesz; i++) {
+		io_str_buffer(b, mft->files[i].file);
+		io_simple_buffer(b, &mft->files[i].type,
+		    sizeof(mft->files[i].type));
+		io_simple_buffer(b, &mft->files[i].location,
+		    sizeof(mft->files[i].location));
+		io_simple_buffer(b, mft->files[i].hash, SHA256_DIGEST_LENGTH);
 	}
 }
 
@@ -561,35 +534,40 @@ mft_buffer(struct ibuf *b, const struct mft *p)
 struct mft *
 mft_read(struct ibuf *b)
 {
-	struct mft	*p = NULL;
+	struct mft	*mft = NULL;
 	size_t		 i;
 
-	if ((p = calloc(1, sizeof(struct mft))) == NULL)
+	if ((mft = calloc(1, sizeof(struct mft))) == NULL)
 		err(1, NULL);
 
-	io_read_buf(b, &p->repoid, sizeof(p->repoid));
-	io_read_buf(b, &p->talid, sizeof(p->talid));
-	io_read_buf(b, &p->certid, sizeof(p->certid));
-	io_read_str(b, &p->path);
+	io_read_buf(b, &mft->repoid, sizeof(mft->repoid));
+	io_read_buf(b, &mft->talid, sizeof(mft->talid));
+	io_read_buf(b, &mft->certid, sizeof(mft->certid));
+	io_read_buf(b, &mft->seqnum_gap, sizeof(mft->seqnum_gap));
+	io_read_opt_str(b, &mft->path);
 
-	io_read_str(b, &p->aia);
-	io_read_str(b, &p->aki);
-	io_read_str(b, &p->ski);
-	assert(p->aia && p->aki && p->ski);
+	io_read_str(b, &mft->aki);
+	io_read_str(b, &mft->seqnum);
+	io_read_str(b, &mft->sia);
+	io_read_buf(b, &mft->thisupdate, sizeof(mft->thisupdate));
+	io_read_buf(b, &mft->mfthash, sizeof(mft->mfthash));
+	io_read_buf(b, &mft->mftsize, sizeof(mft->mftsize));
 
-	io_read_buf(b, &p->filesz, sizeof(size_t));
-	if ((p->files = calloc(p->filesz, sizeof(struct mftfile))) == NULL)
+	io_read_buf(b, &mft->filesz, sizeof(size_t));
+	if (mft->filesz == 0)
+		err(1, "mft_read: bad message");
+	if ((mft->files = calloc(mft->filesz, sizeof(struct mftfile))) == NULL)
 		err(1, NULL);
 
-	for (i = 0; i < p->filesz; i++) {
-		io_read_str(b, &p->files[i].file);
-		io_read_buf(b, &p->files[i].type, sizeof(p->files[i].type));
-		io_read_buf(b, &p->files[i].location,
-		    sizeof(p->files[i].location));
-		io_read_buf(b, p->files[i].hash, SHA256_DIGEST_LENGTH);
+	for (i = 0; i < mft->filesz; i++) {
+		io_read_str(b, &mft->files[i].file);
+		io_read_buf(b, &mft->files[i].type, sizeof(mft->files[i].type));
+		io_read_buf(b, &mft->files[i].location,
+		    sizeof(mft->files[i].location));
+		io_read_buf(b, mft->files[i].hash, SHA256_DIGEST_LENGTH);
 	}
 
-	return p;
+	return mft;
 }
 
 /*
@@ -626,4 +604,36 @@ mft_compare_seqnum(const struct mft *a, const struct mft *b)
 		return -1;
 
 	return 0;
+}
+
+/*
+ * Test if there is a gap in the sequence numbers of two MFTs.
+ * Return 1 if a gap is detected.
+ */
+int
+mft_seqnum_gap_present(const struct mft *a, const struct mft *b, BN_CTX *bn_ctx)
+{
+	BIGNUM *diff, *seqnum_a, *seqnum_b;
+	int ret = 0;
+
+	BN_CTX_start(bn_ctx);
+	if ((diff = BN_CTX_get(bn_ctx)) == NULL ||
+	    (seqnum_a = BN_CTX_get(bn_ctx)) == NULL ||
+	    (seqnum_b = BN_CTX_get(bn_ctx)) == NULL)
+		errx(1, "BN_CTX_get");
+
+	if (!BN_hex2bn(&seqnum_a, a->seqnum))
+		errx(1, "BN_hex2bn");
+
+	if (!BN_hex2bn(&seqnum_b, b->seqnum))
+		errx(1, "BN_hex2bn");
+
+	if (!BN_sub(diff, seqnum_a, seqnum_b))
+		errx(1, "BN_sub");
+
+	ret = !BN_is_one(diff);
+
+	BN_CTX_end(bn_ctx);
+
+	return ret;
 }

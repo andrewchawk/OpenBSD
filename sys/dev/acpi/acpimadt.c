@@ -1,4 +1,4 @@
-/* $OpenBSD: acpimadt.c,v 1.39 2022/11/24 04:04:39 jmatthew Exp $ */
+/* $OpenBSD: acpimadt.c,v 1.41 2025/09/16 12:18:10 hshoexer Exp $ */
 /*
  * Copyright (c) 2006 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -48,7 +48,7 @@ const struct cfattach acpimadt_ca = {
 };
 
 struct cfdriver acpimadt_cd = {
-	NULL, "acpimadt", DV_DULL
+	NULL, "acpimadt", DV_DULL, CD_COCOVM
 };
 
 int acpimadt_validate(struct acpi_madt *);
@@ -286,6 +286,7 @@ acpimadt_attach(struct device *parent, struct device *self, void *aux)
 
 			memset(&aaa, 0, sizeof(struct apic_attach_args));
 			aaa.aaa_name = "ioapic";
+			aaa.apic_memt = acpi_sc->sc_memt;
 			aaa.apic_id = entry->madt_ioapic.acpi_ioapic_id;
 			aaa.apic_address = entry->madt_ioapic.address;
 			aaa.apic_vecbase = entry->madt_ioapic.global_int_base;

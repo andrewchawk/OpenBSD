@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_peer.c,v 1.37 2024/05/22 08:41:14 claudio Exp $ */
+/*	$OpenBSD: rde_peer.c,v 1.81 2026/07/21 08:04:44 claudio Exp $ */
 
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
@@ -26,22 +26,17 @@
 #include "bgpd.h"
 #include "rde.h"
 
-struct peer_tree	 peertable;
+struct peer_tree	 peertable = RB_INITIALIZER(&peertable);
+struct peer_tree	 zombietable = RB_INITIALIZER(&zombietable);
 struct rde_peer		*peerself;
-static long		 imsg_pending;
 
-CTASSERT(sizeof(peerself->recv_eor) * 8 > AID_MAX);
-CTASSERT(sizeof(peerself->sent_eor) * 8 > AID_MAX);
-
-struct iq {
-	SIMPLEQ_ENTRY(iq)	entry;
-	struct imsg		imsg;
-};
+CTASSERT(sizeof(peerself->recv_eor) * 8 >= AID_MAX);
+CTASSERT(sizeof(peerself->sent_eor) * 8 >= AID_MAX);
 
 int
 peer_has_as4byte(struct rde_peer *peer)
 {
-	return (peer->capa.as4byte);
+	return peer->capa.as4byte;
 }
 
 /*
@@ -53,21 +48,33 @@ peer_has_add_path(struct rde_peer *peer, uint8_t aid, int mode)
 {
 	if (aid >= AID_MAX)
 		return 0;
-	return (peer->capa.add_path[aid] & mode);
+	return peer->capa.add_path[aid] & mode;
 }
 
 int
-peer_accept_no_as_set(struct rde_peer *peer)
+peer_has_ext_msg(struct rde_peer *peer)
 {
-	return (peer->flags & PEERFLAG_NO_AS_SET);
+	return peer->capa.ext_msg;
+}
+
+int
+peer_has_ext_nexthop(struct rde_peer *peer, uint8_t aid)
+{
+	if (aid >= AID_MAX)
+		return 0;
+	return peer->capa.ext_nh[aid];
+}
+
+int
+peer_permit_as_set(struct rde_peer *peer)
+{
+	return peer->flags & PEERFLAG_PERMIT_AS_SET;
 }
 
 void
 peer_init(struct filter_head *rules)
 {
 	struct peer_config pc;
-
-	RB_INIT(&peertable);
 
 	memset(&pc, 0, sizeof(pc));
 	snprintf(pc.descr, sizeof(pc.descr), "LOCAL");
@@ -80,8 +87,15 @@ peer_init(struct filter_head *rules)
 void
 peer_shutdown(void)
 {
+	struct rde_peer *peer, *np;
+
+	RB_FOREACH_SAFE(peer, peer_tree, &peertable, np)
+		peer_delete(peer);
+
 	if (!RB_EMPTY(&peertable))
 		log_warnx("%s: free non-free table", __func__);
+
+	/* XXX wait until all peer got reaped */
 }
 
 /*
@@ -140,13 +154,14 @@ peer_add(uint32_t id, struct peer_config *p_conf, struct filter_head *rules)
 
 	if ((peer = peer_get(id))) {
 		memcpy(&peer->conf, p_conf, sizeof(struct peer_config));
-		return (peer);
+		return peer;
 	}
 
 	peer = calloc(1, sizeof(struct rde_peer));
 	if (peer == NULL)
 		fatal("peer_add");
 
+	TAILQ_INIT(&peer->rib_pq_head);
 	memcpy(&peer->conf, p_conf, sizeof(struct peer_config));
 	peer->remote_bgpid = 0;
 	peer->loc_rib_id = rib_find(peer->conf.rib);
@@ -157,9 +172,12 @@ peer_add(uint32_t id, struct peer_config *p_conf, struct filter_head *rules)
 	peer->role = peer->conf.role;
 	peer->export_type = peer->conf.export_type;
 	peer->flags = peer->conf.flags;
-	SIMPLEQ_INIT(&peer->imsg_queue);
+	if ((peer->ibufq = ibufq_new()) == NULL)
+		fatal(NULL);
 
-	peer_apply_out_filter(peer, rules);
+	adjout_peer_init(peer);
+	if (peer_apply_out_filter(peer, rules) != NULL)
+		fatalx("peer add: peer_apply_out_filter failed");
 
 	/*
 	 * Assign an even random unique transmit path id.
@@ -168,8 +186,9 @@ peer_add(uint32_t id, struct peer_config *p_conf, struct filter_head *rules)
 	do {
 		struct rde_peer *p;
 
+		while ((peer->path_id_tx = arc4random() << 1) == 0)
+			continue;
 		conflict = 0;
-		peer->path_id_tx = arc4random() << 1;
 		RB_FOREACH(p, peer_tree, &peertable) {
 			if (p->path_id_tx == peer->path_id_tx) {
 				conflict = 1;
@@ -181,32 +200,33 @@ peer_add(uint32_t id, struct peer_config *p_conf, struct filter_head *rules)
 	if (RB_INSERT(peer_tree, &peertable, peer) != NULL)
 		fatalx("rde peer table corrupted");
 
-	return (peer);
+	return peer;
 }
 
-struct filter_head *
+struct rde_filter *
 peer_apply_out_filter(struct rde_peer *peer, struct filter_head *rules)
 {
-	struct filter_head *old;
-	struct filter_rule *fr, *new;
+	struct rde_filter *old, *new;
+	struct filter_rule *fr;
+	size_t count = 0;
 
 	old = peer->out_rules;
-	if ((peer->out_rules = malloc(sizeof(*peer->out_rules))) == NULL)
-		fatal(NULL);
-	TAILQ_INIT(peer->out_rules);
 
 	TAILQ_FOREACH(fr, rules, entry) {
 		if (rde_filter_skip_rule(peer, fr))
 			continue;
+		count++;
+	}
+	new = rde_filter_new(count);
 
-		if ((new = malloc(sizeof(*new))) == NULL)
-			fatal(NULL);
-		memcpy(new, fr, sizeof(*new));
-		filterset_copy(&fr->set, &new->set);
-
-		TAILQ_INSERT_TAIL(peer->out_rules, new, entry);
+	count = 0;
+	TAILQ_FOREACH(fr, rules, entry) {
+		if (rde_filter_skip_rule(peer, fr))
+			continue;
+		rde_filter_fill(new, count++, fr);
 	}
 
+	peer->out_rules = rde_filter_getcache(new);
 	return old;
 }
 
@@ -224,7 +244,6 @@ RB_GENERATE(peer_tree, rde_peer, entry, peer_cmp);
 
 static void
 peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
-    struct prefix *newpath, struct prefix *oldpath,
     enum eval_mode mode)
 {
 	uint8_t		 aid;
@@ -234,7 +253,8 @@ peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
 	/* skip ourself */
 	if (peer == peerself)
 		return;
-	if (peer->state != PEER_UP)
+	/* skip peers that never had a session open */
+	if (peer->state == PEER_NONE)
 		return;
 	/* skip peers using a different rib */
 	if (peer->loc_rib_id != re->rib_id)
@@ -247,63 +267,97 @@ peer_generate_update(struct rde_peer *peer, struct rib_entry *re,
 	    peer->export_type == EXPORT_DEFAULT_ROUTE)
 		return;
 
-	/* if reconf skip peers which don't need to reconfigure */
-	if (mode == EVAL_RECONF && peer->reconf_out == 0)
-		return;
-
 	/* handle peers with add-path */
 	if (peer_has_add_path(peer, aid, CAPA_AP_SEND)) {
 		if (peer->eval.mode == ADDPATH_EVAL_ALL)
-			up_generate_addpath_all(peer, re, newpath, oldpath);
+			up_generate_addpath_all(peer, re, mode);
 		else
-			up_generate_addpath(peer, re);
+			up_generate_addpath(peer, re, mode);
 		return;
 	}
 
 	/* skip regular peers if the best path didn't change */
 	if (mode == EVAL_ALL && (peer->flags & PEERFLAG_EVALUATE_ALL) == 0)
 		return;
-	up_generate_updates(peer, re);
+	up_generate_updates(peer, re, mode);
+}
+
+/*
+ * Enqueue updates into the peer queue specified by peer. The meaning of
+ * mode is:
+ *	EVAL_DEFAULT is triggered when the best path changes.
+ *	EVAL_ALL is sent for any other update (needed for peers with
+ *	addpath or evaluate all set).
+ *	EVAL_REEVAL is used by config reloads (a full RIB refresh is needed)
+ *	EVAL_SYNC is used for single peer RIB dumps but those call
+ *	peer_generate_update() directly.
+ * peer, newpath and old_pathid_tx are ignored if mode is EVAL_REEVAL.
+ * In the other cases either newpath or old_pathid_tx are valid but not
+ * both at the same time.
+ */
+void
+rde_enqueue_updates(struct rib_entry *re, struct rde_peer *peer,
+    struct prefix *newpath, uint32_t old_path_id_tx, enum eval_mode mode)
+{
+	struct rde_peer *p;
+	uint32_t path_id_tx;
+
+	switch (mode) {
+	case EVAL_REEVAL:
+		/* skip peers which don't need to reconfigure */
+		RB_FOREACH(p, peer_tree, &peertable) {
+			if (p->reconf_out == 0)
+				continue;
+			peer_generate_update(p, re, mode);
+		}
+		adjout_prefix_collect(re->prefix);
+		return;
+	case EVAL_DEFAULT:
+	case EVAL_ALL:
+		break;
+	case EVAL_SYNC:
+	case EVAL_NONE:
+		fatalx("bad eval mode in %s", __func__);
+	}
+
+	if (newpath != NULL)
+		path_id_tx = newpath->path_id_tx;
+	else
+		path_id_tx = old_path_id_tx;
+
+	rib_pq_enqueue(re, peer, path_id_tx, newpath);
+
+	/* don't downgrade pq_mode from EVAL_DEFAULT to EVAL_ALL */
+	if (re->pq_mode != EVAL_DEFAULT)
+		re->pq_mode = mode;
 }
 
 void
-rde_generate_updates(struct rib_entry *re, struct prefix *newpath,
-    struct prefix *oldpath, enum eval_mode mode)
+peer_process_updates(struct rde_peer *peer, void *bula)
 {
-	struct rde_peer	*peer;
+	struct rib_entry *re;
+	struct rde_peer *p;
 
-	RB_FOREACH(peer, peer_tree, &peertable)
-		peer_generate_update(peer, re, newpath, oldpath, mode);
+	re = TAILQ_FIRST(&peer->rib_pq_head);
+	if (re == NULL)
+		return;
+	TAILQ_REMOVE(&peer->rib_pq_head, re, rib_queue);
+	rdemem.rde_rib_entry_count--;
+	peer->stats.rib_entry_count--;
+
+	RB_FOREACH(p, peer_tree, &peertable)
+		peer_generate_update(p, re, re->pq_mode);
+
+	adjout_prefix_collect(re->prefix);
+	rib_pq_dequeue(re);
 }
 
 /*
  * Various RIB walker callbacks.
  */
-static void
-peer_adjout_clear_upcall(struct prefix *p, void *arg)
-{
-	prefix_adjout_destroy(p);
-}
-
-static void
-peer_adjout_stale_upcall(struct prefix *p, void *arg)
-{
-	if (p->flags & PREFIX_FLAG_DEAD) {
-		return;
-	} else if (p->flags & PREFIX_FLAG_WITHDRAW) {
-		/* no need to keep stale withdraws, they miss all attributes */
-		prefix_adjout_destroy(p);
-		return;
-	} else if (p->flags & PREFIX_FLAG_UPDATE) {
-		RB_REMOVE(prefix_tree, &prefix_peer(p)->updates[p->pt->aid], p);
-		p->flags &= ~PREFIX_FLAG_UPDATE;
-	}
-	p->flags |= PREFIX_FLAG_STALE;
-}
-
 struct peer_flush {
 	struct rde_peer *peer;
-	time_t		 staletime;
+	monotime_t	 staletime;
 };
 
 static void
@@ -313,16 +367,17 @@ peer_flush_upcall(struct rib_entry *re, void *arg)
 	struct rde_aspath *asp;
 	struct bgpd_addr addr;
 	struct prefix *p, *np, *rp;
-	time_t staletime = ((struct peer_flush *)arg)->staletime;
+	monotime_t staletime = ((struct peer_flush *)arg)->staletime;
 	uint32_t i;
 	uint8_t prefixlen;
 
 	pt_getaddr(re->prefix, &addr);
 	prefixlen = re->prefix->prefixlen;
-	TAILQ_FOREACH_SAFE(p, &re->prefix_h, entry.list.rib, np) {
+	TAILQ_FOREACH_SAFE(p, &re->prefix_h, rib_l, np) {
 		if (peer != prefix_peer(p))
 			continue;
-		if (staletime && p->lastchange > staletime)
+		if (monotime_valid(staletime) &&
+		    monotime_cmp(p->lastchange, staletime) > 0)
 			continue;
 
 		for (i = RIB_LOC_START; i < rib_size; i++) {
@@ -347,88 +402,45 @@ peer_flush_upcall(struct rib_entry *re, void *arg)
 	}
 }
 
-static void
-rde_up_adjout_force_upcall(struct prefix *p, void *ptr)
-{
-	if (p->flags & PREFIX_FLAG_STALE) {
-		/* remove stale entries */
-		prefix_adjout_destroy(p);
-	} else if (p->flags & PREFIX_FLAG_DEAD) {
-		/* ignore dead prefixes, they will go away soon */
-	} else if ((p->flags & PREFIX_FLAG_MASK) == 0) {
-		/* put entries on the update queue if not allready on a queue */
-		p->flags |= PREFIX_FLAG_UPDATE;
-		if (RB_INSERT(prefix_tree, &prefix_peer(p)->updates[p->pt->aid],
-		    p) != NULL)
-			fatalx("%s: RB tree invariant violated", __func__);
-	}
-}
-
-static void
-rde_up_adjout_force_done(void *ptr, uint8_t aid)
-{
-	struct rde_peer		*peer = ptr;
-
-	/* Adj-RIB-Out ready, unthrottle peer and inject EOR */
-	peer->throttled = 0;
-	if (peer->capa.grestart.restart)
-		prefix_add_eor(peer, aid);
-}
-
-static void
-rde_up_dump_upcall(struct rib_entry *re, void *ptr)
-{
-	struct rde_peer		*peer = ptr;
-	struct prefix		*p;
-
-	if ((p = prefix_best(re)) == NULL)
-		/* no eligible prefix, not even for 'evaluate all' */
-		return;
-
-	peer_generate_update(peer, re, NULL, NULL, 0);
-}
-
-static void
-rde_up_dump_done(void *ptr, uint8_t aid)
-{
-	struct rde_peer		*peer = ptr;
-
-	/* force out all updates of Adj-RIB-Out for this peer */
-	if (prefix_dump_new(peer, aid, 0, peer, rde_up_adjout_force_upcall,
-	    rde_up_adjout_force_done, NULL) == -1)
-		fatal("%s: prefix_dump_new", __func__);
-}
-
 /*
  * Session got established, bring peer up, load RIBs do initial table dump.
  */
 void
 peer_up(struct rde_peer *peer, struct session_up *sup)
 {
-	uint8_t	 i;
+	u_int	 i;
+	int force_sync = 1;
 
 	if (peer->state == PEER_ERR) {
 		/*
 		 * There is a race condition when doing PEER_ERR -> PEER_DOWN.
 		 * So just do a full reset of the peer here.
 		 */
-		rib_dump_terminate(peer);
-		peer_imsg_flush(peer);
-		if (prefix_dump_new(peer, AID_UNSPEC, 0, NULL,
-		    peer_adjout_clear_upcall, NULL, NULL) == -1)
-			fatal("%s: prefix_dump_new", __func__);
-		peer_flush(peer, AID_UNSPEC, 0);
-		peer->stats.prefix_cnt = 0;
-		peer->stats.prefix_out_cnt = 0;
-		peer->state = PEER_DOWN;
+		peer_down(peer);
 	}
-	peer->remote_bgpid = sup->remote_bgpid;
-	peer->short_as = sup->short_as;
+
+	/*
+	 * Check if no value changed during flap to decide if the RIB
+	 * is in sync. The capa check is maybe too strict but it should
+	 * not matter for normal operation.
+	 */
+	if (memcmp(&peer->remote_addr, &sup->remote_addr,
+	    sizeof(sup->remote_addr)) == 0 &&
+	    memcmp(&peer->local_v4_addr, &sup->local_v4_addr,
+	    sizeof(sup->local_v4_addr)) == 0 &&
+	    memcmp(&peer->local_v6_addr, &sup->local_v6_addr,
+	    sizeof(sup->local_v6_addr)) == 0 &&
+	    memcmp(&peer->capa, &sup->capa, sizeof(sup->capa)) == 0)
+		force_sync = 0;
+
 	peer->remote_addr = sup->remote_addr;
 	peer->local_v4_addr = sup->local_v4_addr;
 	peer->local_v6_addr = sup->local_v6_addr;
+	memcpy(&peer->capa, &sup->capa, sizeof(sup->capa));
+	/* the Adj-RIB-Out does not depend on those */
+	peer->remote_bgpid = sup->remote_bgpid;
 	peer->local_if_scope = sup->if_scope;
-	memcpy(&peer->capa, &sup->capa, sizeof(peer->capa));
+	peer->short_as = sup->short_as;
 
 	/* clear eor markers depending on GR flags */
 	if (peer->capa.grestart.restart) {
@@ -441,9 +453,16 @@ peer_up(struct rde_peer *peer, struct session_up *sup)
 	}
 	peer->state = PEER_UP;
 
-	for (i = AID_MIN; i < AID_MAX; i++) {
-		if (peer->capa.mp[i])
-			peer_dump(peer, i);
+	if (!force_sync) {
+		for (i = AID_MIN; i < AID_MAX; i++) {
+			if (peer->capa.mp[i])
+				peer_blast(peer, i);
+		}
+	} else {
+		for (i = AID_MIN; i < AID_MAX; i++) {
+			if (peer->capa.mp[i])
+				peer_dump(peer, i);
+		}
 	}
 }
 
@@ -452,7 +471,7 @@ peer_up(struct rde_peer *peer, struct session_up *sup)
  * this peer and clean up.
  */
 void
-peer_down(struct rde_peer *peer, void *bula)
+peer_down(struct rde_peer *peer)
 {
 	peer->remote_bgpid = 0;
 	peer->state = PEER_DOWN;
@@ -461,23 +480,58 @@ peer_down(struct rde_peer *peer, void *bula)
 	 * and flush all pending imsg from the SE.
 	 */
 	rib_dump_terminate(peer);
+	adjout_peer_flush_pending(peer);
 	peer_imsg_flush(peer);
 
-	/* flush Adj-RIB-Out */
-	if (prefix_dump_new(peer, AID_UNSPEC, 0, NULL,
-	    peer_adjout_clear_upcall, NULL, NULL) == -1)
-		fatal("%s: prefix_dump_new", __func__);
-
 	/* flush Adj-RIB-In */
-	peer_flush(peer, AID_UNSPEC, 0);
+	peer_flush(peer, AID_UNSPEC, monotime_clear());
 	peer->stats.prefix_cnt = 0;
-	peer->stats.prefix_out_cnt = 0;
+}
 
-	/* free filters */
-	filterlist_free(peer->out_rules);
+/*
+ * RIB walker callback for peer_delete / the reaper.
+ */
+static void
+peer_reaper_upcall(struct pt_entry *pte, struct adjout_prefix *p,
+    uint32_t bid, void *ptr)
+{
+	struct rde_peer		*peer = ptr;
+
+	adjout_prefix_withdraw(peer, pte, p, 1);
+}
+
+/*
+ * Called after the adj-rib-out has been cleared, time to kill the zombie.
+ */
+static void
+peer_reaper_done(void *ptr, uint8_t aid)
+{
+	struct rde_peer		*peer = ptr;
+
+	adjout_prefix_reaper(peer);
+	ibufq_free(peer->ibufq);
+	free(peer);
+}
+
+void
+peer_delete(struct rde_peer *peer)
+{
+	if (peer->state != PEER_DOWN)
+		peer_down(peer);
+
+	rde_filter_unref(peer->out_rules);
+	adjout_peer_free(peer);
+
+	TAILQ_CONCAT(&peerself->rib_pq_head, &peer->rib_pq_head, rib_queue);
+	peerself->stats.rib_entry_count += peer->stats.rib_entry_count;
+	peer->stats.rib_entry_count = 0;
 
 	RB_REMOVE(peer_tree, &peertable, peer);
-	free(peer);
+
+	/* start reaping the zombie */
+	if (adjout_prefix_dump_new(peer, AID_UNSPEC, RDE_RUNNER_ROUNDS, peer,
+	    peer_reaper_upcall, peer_reaper_done, NULL) == -1)
+		fatal("%s: adjout_prefix_dump_new", __func__);
 }
 
 /*
@@ -485,7 +539,7 @@ peer_down(struct rde_peer *peer, void *bula)
  * be flushed.
  */
 void
-peer_flush(struct rde_peer *peer, uint8_t aid, time_t staletime)
+peer_flush(struct rde_peer *peer, uint8_t aid, monotime_t staletime)
 {
 	struct peer_flush pf = { peer, staletime };
 
@@ -496,11 +550,11 @@ peer_flush(struct rde_peer *peer, uint8_t aid, time_t staletime)
 
 	/* every route is gone so reset staletime */
 	if (aid == AID_UNSPEC) {
-		uint8_t i;
+		u_int i;
 		for (i = AID_MIN; i < AID_MAX; i++)
-			peer->staletime[i] = 0;
+			peer->staletime[i] = monotime_clear();
 	} else {
-		peer->staletime[aid] = 0;
+		peer->staletime[aid] = monotime_clear();
 	}
 }
 
@@ -512,10 +566,10 @@ peer_flush(struct rde_peer *peer, uint8_t aid, time_t staletime)
 void
 peer_stale(struct rde_peer *peer, uint8_t aid, int flushall)
 {
-	time_t now;
+	monotime_t now;
 
 	/* flush the now even staler routes out */
-	if (peer->staletime[aid])
+	if (monotime_valid(peer->staletime[aid]))
 		peer_flush(peer, aid, peer->staletime[aid]);
 
 	peer->staletime[aid] = now = getmonotime();
@@ -526,49 +580,107 @@ peer_stale(struct rde_peer *peer, uint8_t aid, int flushall)
 	 * and flush all pending imsg from the SE.
 	 */
 	rib_dump_terminate(peer);
+	adjout_peer_flush_pending(peer);
 	peer_imsg_flush(peer);
 
 	if (flushall)
-		peer_flush(peer, aid, 0);
-
-	/* XXX this is not quite correct */
-	/* mark Adj-RIB-Out stale for this peer */
-	if (prefix_dump_new(peer, aid, 0, NULL,
-	    peer_adjout_stale_upcall, NULL, NULL) == -1)
-		fatal("%s: prefix_dump_new", __func__);
+		peer_flush(peer, aid, monotime_clear());
 
 	/* make sure new prefixes start on a higher timestamp */
-	while (now >= getmonotime())
-		sleep(1);
+	while (monotime_cmp(now, getmonotime()) >= 0) {
+		struct timespec ts = { .tv_nsec = 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
 }
 
 /*
- * Load the Adj-RIB-Out of a peer normally called when a session is established.
- * Once the Adj-RIB-Out is ready stale routes are removed from the Adj-RIB-Out
- * and all routes are put on the update queue so they will be sent out.
+ * RIB walker callback for peer_blast.
+ * Enqueue a prefix onto the update queue so it can be sent out.
+ */
+static void
+peer_blast_upcall(struct pt_entry *pte, struct adjout_prefix *p,
+    uint32_t bid, void *ptr)
+{
+	struct rde_peer		*peer = ptr;
+
+	pend_prefix_add(peer, p->attrs, pte, p->path_id_tx);
+}
+
+/*
+ * Called after all prefixes are put onto the update queue and we are
+ * ready to blast out updates to the peer.
+ */
+static void
+peer_blast_done(void *ptr, uint8_t aid)
+{
+	struct rde_peer		*peer = ptr;
+
+	/* Adj-RIB-Out ready, unthrottle peer and inject EOR */
+	peer->throttled = 0;
+	if (peer->capa.grestart.restart)
+		pend_eor_add(peer, aid);
+}
+
+/*
+ * Send out the full Adj-RIB-Out by putting all prefixes onto the update
+ * queue.
  */
 void
-peer_dump(struct rde_peer *peer, uint8_t aid)
+peer_blast(struct rde_peer *peer, uint8_t aid)
 {
 	if (peer->capa.enhanced_rr && (peer->sent_eor & (1 << aid)))
 		rde_peer_send_rrefresh(peer, aid, ROUTE_REFRESH_BEGIN_RR);
 
+	/* force out all updates from the Adj-RIB-Out */
+	if (adjout_prefix_dump_new(peer, aid, RDE_RUNNER_ROUNDS, peer,
+	    peer_blast_upcall, peer_blast_done, NULL) == -1)
+		fatal("%s: adjout_prefix_dump_new", __func__);
+}
+
+/* RIB walker callbacks for peer_dump. */
+static void
+peer_dump_upcall(struct rib_entry *re, void *ptr)
+{
+	struct rde_peer		*peer = ptr;
+	struct prefix		*p;
+
+	if ((p = prefix_best(re)) == NULL)
+		/* no eligible prefix, not even for 'evaluate all' */
+		return;
+
+	peer_generate_update(peer, re, EVAL_SYNC);
+	adjout_prefix_collect(re->prefix);
+}
+
+static void
+peer_dump_done(void *ptr, uint8_t aid)
+{
+	peer_blast_done(ptr, aid);
+}
+
+/*
+ * Load the Adj-RIB-Out of a peer normally called when a session comes up
+ * for the first time. Once the Adj-RIB-Out is ready it will blast the
+ * updates out.
+ */
+void
+peer_dump(struct rde_peer *peer, uint8_t aid)
+{
+	/* throttle peer until dump is done */
+	peer->throttled = 1;
+
 	if (peer->export_type == EXPORT_NONE) {
-		/* nothing to send apart from the marker */
-		if (peer->capa.grestart.restart)
-			prefix_add_eor(peer, aid);
+		peer_dump_done(peer, aid);
 	} else if (peer->export_type == EXPORT_DEFAULT_ROUTE) {
 		up_generate_default(peer, aid);
-		rde_up_dump_done(peer, aid);
+		peer_dump_done(peer, aid);
 	} else if (aid == AID_FLOWSPECv4 || aid == AID_FLOWSPECv6) {
-		prefix_flowspec_dump(aid, peer, rde_up_dump_upcall,
-		    rde_up_dump_done);
+		prefix_flowspec_dump(aid, peer, peer_dump_upcall,
+		    peer_dump_done);
 	} else {
 		if (rib_dump_new(peer->loc_rib_id, aid, RDE_RUNNER_ROUNDS, peer,
-		    rde_up_dump_upcall, rde_up_dump_done, NULL) == -1)
+		    peer_dump_upcall, peer_dump_done, NULL) == -1)
 			fatal("%s: rib_dump_new", __func__);
-		/* throttle peer until dump is done */
-		peer->throttled = 1;
 	}
 }
 
@@ -580,27 +692,41 @@ peer_dump(struct rde_peer *peer, uint8_t aid)
 void
 peer_begin_rrefresh(struct rde_peer *peer, uint8_t aid)
 {
-	time_t now;
+	monotime_t now;
 
 	/* flush the now even staler routes out */
-	if (peer->staletime[aid])
+	if (monotime_valid(peer->staletime[aid]))
 		peer_flush(peer, aid, peer->staletime[aid]);
 
 	peer->staletime[aid] = now = getmonotime();
 
 	/* make sure new prefixes start on a higher timestamp */
-	while (now >= getmonotime())
-		sleep(1);
+	while (monotime_cmp(now, getmonotime()) >= 0) {
+		struct timespec ts = { .tv_nsec = 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
 }
 
 /*
- * move an imsg from src to dst, disconnecting any dynamic memory from src.
+ * Check if any imsg are pending or any zombie peers are around.
+ * Return 0 if no work is pending.
  */
-static void
-imsg_move(struct imsg *dst, struct imsg *src)
+int
+peer_work_pending(void)
 {
-	*dst = *src;
-	memset(src, 0, sizeof(*src));
+	struct rde_peer *p;
+
+	if (!RB_EMPTY(&zombietable))
+		return 1;
+
+	RB_FOREACH(p, peer_tree, &peertable) {
+		if (ibufq_queuelen(p->ibufq) != 0)
+			return 1;
+		if (!TAILQ_EMPTY(&p->rib_pq_head))
+			return 1;
+	}
+
+	return 0;
 }
 
 /*
@@ -609,13 +735,12 @@ imsg_move(struct imsg *dst, struct imsg *src)
 void
 peer_imsg_push(struct rde_peer *peer, struct imsg *imsg)
 {
-	struct iq *iq;
+	peer->stats.ibufq_msg_count++;
+	rdemem.rde_ibufq_msg_count++;
+	peer->stats.ibufq_payload_size += imsg_get_len(imsg);
+	rdemem.rde_ibufq_payload_size += imsg_get_len(imsg);
 
-	if ((iq = calloc(1, sizeof(*iq))) == NULL)
-		fatal(NULL);
-	imsg_move(&iq->imsg, imsg);
-	SIMPLEQ_INSERT_TAIL(&peer->imsg_queue, iq, entry);
-	imsg_pending++;
+	imsg_ibufq_push(peer->ibufq, imsg);
 }
 
 /*
@@ -625,28 +750,18 @@ peer_imsg_push(struct rde_peer *peer, struct imsg *imsg)
 int
 peer_imsg_pop(struct rde_peer *peer, struct imsg *imsg)
 {
-	struct iq *iq;
-
-	iq = SIMPLEQ_FIRST(&peer->imsg_queue);
-	if (iq == NULL)
+	switch (imsg_ibufq_pop(peer->ibufq, imsg)) {
+	case 0:
 		return 0;
-
-	imsg_move(imsg, &iq->imsg);
-
-	SIMPLEQ_REMOVE_HEAD(&peer->imsg_queue, entry);
-	free(iq);
-	imsg_pending--;
-
-	return 1;
-}
-
-/*
- * Check if any imsg are pending, return 0 if none are pending
- */
-int
-peer_imsg_pending(void)
-{
-	return imsg_pending != 0;
+	case 1:
+		peer->stats.ibufq_msg_count--;
+		rdemem.rde_ibufq_msg_count--;
+		peer->stats.ibufq_payload_size -= imsg_get_len(imsg);
+		rdemem.rde_ibufq_payload_size -= imsg_get_len(imsg);
+		return 1;
+	default:
+		fatal("imsg_ibufq_pop");
+	}
 }
 
 /*
@@ -655,11 +770,10 @@ peer_imsg_pending(void)
 void
 peer_imsg_flush(struct rde_peer *peer)
 {
-	struct iq *iq;
+	ibufq_flush(peer->ibufq);
 
-	while ((iq = SIMPLEQ_FIRST(&peer->imsg_queue)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&peer->imsg_queue, entry);
-		free(iq);
-		imsg_pending--;
-	}
+	rdemem.rde_ibufq_msg_count -= peer->stats.ibufq_msg_count;
+	rdemem.rde_ibufq_payload_size -= peer->stats.ibufq_payload_size;
+	peer->stats.ibufq_msg_count = 0;
+	peer->stats.ibufq_payload_size = 0;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: nvme.c,v 1.121 2024/07/13 08:59:41 dv Exp $ */
+/*	$OpenBSD: nvme.c,v 1.130 2026/09/06 19:27:01 kettenis Exp $ */
 
 /*
  * Copyright (c) 2014 David Gwynne <dlg@openbsd.org>
@@ -60,6 +60,10 @@ void	nvme_dumpregs(struct nvme_softc *);
 int	nvme_identify(struct nvme_softc *, u_int);
 void	nvme_fill_identify(struct nvme_softc *, struct nvme_ccb *, void *);
 
+#ifndef SMALL_KERNEL
+void	nvme_refresh_sensors(void *);
+#endif
+
 int	nvme_ccbs_alloc(struct nvme_softc *, u_int);
 void	nvme_ccbs_free(struct nvme_softc *, u_int);
 
@@ -69,11 +73,9 @@ void	nvme_ccb_put(void *, void *);
 int	nvme_poll(struct nvme_softc *, struct nvme_queue *, struct nvme_ccb *,
 	    void (*)(struct nvme_softc *, struct nvme_ccb *, void *), u_int32_t);
 void	nvme_poll_fill(struct nvme_softc *, struct nvme_ccb *, void *);
-void	nvme_poll_done(struct nvme_softc *, struct nvme_ccb *,
-	    struct nvme_cqe *);
+void	nvme_poll_done(struct nvme_softc *, struct nvme_ccb *);
 void	nvme_sqe_fill(struct nvme_softc *, struct nvme_ccb *, void *);
-void	nvme_empty_done(struct nvme_softc *, struct nvme_ccb *,
-	    struct nvme_cqe *);
+void	nvme_empty_done(struct nvme_softc *, struct nvme_ccb *);
 
 struct nvme_queue *
 	nvme_q_alloc(struct nvme_softc *, u_int16_t, u_int, u_int);
@@ -121,13 +123,11 @@ const struct scsi_adapter nvme_switch = {
 
 void	nvme_scsi_io(struct scsi_xfer *, int);
 void	nvme_scsi_io_fill(struct nvme_softc *, struct nvme_ccb *, void *);
-void	nvme_scsi_io_done(struct nvme_softc *, struct nvme_ccb *,
-	    struct nvme_cqe *);
+void	nvme_scsi_io_done(struct nvme_softc *, struct nvme_ccb *);
 
 void	nvme_scsi_sync(struct scsi_xfer *);
 void	nvme_scsi_sync_fill(struct nvme_softc *, struct nvme_ccb *, void *);
-void	nvme_scsi_sync_done(struct nvme_softc *, struct nvme_ccb *,
-	    struct nvme_cqe *);
+void	nvme_scsi_sync_done(struct nvme_softc *, struct nvme_ccb *);
 
 void	nvme_scsi_inq(struct scsi_xfer *);
 void	nvme_scsi_inquiry(struct scsi_xfer *);
@@ -158,6 +158,7 @@ static const struct nvme_ops nvme_ops = {
 #define NVME_TIMO_QOP			5000	/* ms to create/delete queue */
 #define NVME_TIMO_PT			5000	/* ms to complete passthrough */
 #define NVME_TIMO_IDENT			10000	/* ms to probe/identify */
+#define NVME_TIMO_LOG_PAGE		5000	/* ms to read log pages */
 #define NVME_TIMO_DELAYNS		10	/* ns to delay() in poll loop */
 
 /*
@@ -387,8 +388,8 @@ nvme_attach(struct nvme_softc *sc)
 #ifdef HIBERNATE
 	sc->sc_hib_q = nvme_q_alloc(sc, NVME_HIB_Q, 4, sc->sc_dstrd);
 	if (sc->sc_hib_q == NULL) {
-		printf("%s: unable to allocate hibernate io queue\n", DEVNAME(sc));
-		goto free_q;
+		printf("%s: unable to allocate hibernate io queue\n",
+		    DEVNAME(sc));
 	}
 #endif
 
@@ -406,6 +407,31 @@ nvme_attach(struct nvme_softc *sc)
 	saa.saa_pool = &sc->sc_iopool;
 	saa.saa_quirks = saa.saa_flags = 0;
 	saa.saa_wwpn = saa.saa_wwnn = 0;
+
+	strlcpy(sc->sc_sensordev.xname, DEVNAME(sc), sizeof(sc->sc_sensordev.xname));
+
+#ifndef SMALL_KERNEL
+	sc->sc_temp_sensor.type = SENSOR_TEMP;
+	sc->sc_temp_sensor.status = SENSOR_S_UNKNOWN;
+	sensor_attach(&sc->sc_sensordev, &sc->sc_temp_sensor);
+
+	sc->sc_usage_sensor.type = SENSOR_PERCENT;
+	sc->sc_usage_sensor.status = SENSOR_S_UNKNOWN;
+	strlcpy(sc->sc_usage_sensor.desc, "endurance used",
+	    sizeof(sc->sc_usage_sensor.desc));
+	sensor_attach(&sc->sc_sensordev, &sc->sc_usage_sensor);
+
+	sc->sc_spare_sensor.type = SENSOR_PERCENT;
+	sc->sc_spare_sensor.status = SENSOR_S_UNKNOWN;
+	strlcpy(sc->sc_spare_sensor.desc, "available spare",
+	    sizeof(sc->sc_spare_sensor.desc));
+	sensor_attach(&sc->sc_sensordev, &sc->sc_spare_sensor);
+
+	if (sensor_task_register(sc, nvme_refresh_sensors, 60) == NULL)
+		goto free_q;
+
+	sensordev_install(&sc->sc_sensordev);
+#endif
 
 	sc->sc_scsibus = (struct scsibus_softc *)config_found(&sc->sc_dev,
 	    &saa, scsiprint);
@@ -715,12 +741,10 @@ nvme_scsi_io_fill(struct nvme_softc *sc, struct nvme_ccb *ccb, void *slot)
 }
 
 void
-nvme_scsi_io_done(struct nvme_softc *sc, struct nvme_ccb *ccb,
-    struct nvme_cqe *cqe)
+nvme_scsi_io_done(struct nvme_softc *sc, struct nvme_ccb *ccb)
 {
 	struct scsi_xfer *xs = ccb->ccb_cookie;
 	bus_dmamap_t dmap = ccb->ccb_dmamap;
-	u_int16_t flags;
 
 	if (dmap->dm_nsegs > 2) {
 		bus_dmamap_sync(sc->sc_dmat,
@@ -736,10 +760,8 @@ nvme_scsi_io_done(struct nvme_softc *sc, struct nvme_ccb *ccb,
 
 	bus_dmamap_unload(sc->sc_dmat, dmap);
 
-	flags = lemtoh16(&cqe->flags);
-
-	xs->error = (NVME_CQE_SC(flags) == NVME_CQE_SC_SUCCESS) ?
-	    XS_NOERROR : XS_DRIVER_STUFFUP;
+	xs->error = (NVME_CQE_SC(ccb->ccb_cqe_flags) ==
+	    NVME_CQE_SC_SUCCESS) ? XS_NOERROR : XS_DRIVER_STUFFUP;
 	xs->status = SCSI_OK;
 	xs->resid = 0;
 	scsi_done(xs);
@@ -775,16 +797,12 @@ nvme_scsi_sync_fill(struct nvme_softc *sc, struct nvme_ccb *ccb, void *slot)
 }
 
 void
-nvme_scsi_sync_done(struct nvme_softc *sc, struct nvme_ccb *ccb,
-    struct nvme_cqe *cqe)
+nvme_scsi_sync_done(struct nvme_softc *sc, struct nvme_ccb *ccb)
 {
 	struct scsi_xfer *xs = ccb->ccb_cookie;
-	u_int16_t flags;
 
-	flags = lemtoh16(&cqe->flags);
-
-	xs->error = (NVME_CQE_SC(flags) == NVME_CQE_SC_SUCCESS) ?
-	    XS_NOERROR : XS_DRIVER_STUFFUP;
+	xs->error = (NVME_CQE_SC(ccb->ccb_cqe_flags) ==
+	    NVME_CQE_SC_SUCCESS) ? XS_NOERROR : XS_DRIVER_STUFFUP;
 	xs->status = SCSI_OK;
 	xs->resid = 0;
 	scsi_done(xs);
@@ -941,9 +959,8 @@ nvme_passthrough_cmd(struct nvme_softc *sc, struct nvme_pt_cmd *pt, int dv_unit,
 	int				 flags;
 	int				 rv = 0;
 
-	ccb = nvme_ccb_get(sc);
-	if (ccb == NULL)
-		panic("nvme_passthrough_cmd: nvme_ccb_get returned NULL");
+	ccb = scsi_io_get(&sc->sc_iopool, 0);
+	KASSERT(ccb != NULL);
 
 	memset(&sqe, 0, sizeof(sqe));
 	sqe.opcode = pt->pt_opcode;
@@ -1023,7 +1040,9 @@ nvme_scsi_ioctl(struct scsi_link *link, u_long cmd, caddr_t addr, int flag)
 	if ((pt->pt_cdw10 & 0xff) == 0)
 		pt->pt_nsid = link->target;
 
+	rw_enter_write(&sc->sc_lock);
 	rv = nvme_passthrough_cmd(sc, pt, sc->sc_dev.dv_unit, link->target);
+	rw_exit_write(&sc->sc_lock);
 	if (rv)
 		goto done;
 
@@ -1071,20 +1090,25 @@ void
 nvme_q_submit(struct nvme_softc *sc, struct nvme_queue *q, struct nvme_ccb *ccb,
     void (*fill)(struct nvme_softc *, struct nvme_ccb *, void *))
 {
-	struct nvme_sqe *sqe = NVME_DMA_KVA(q->q_sq_dmamem);
+	struct nvme_sqe *sqe;
 	u_int32_t tail;
+	u_int sqe_size;
+
+	sqe_size = (q->q_id == NVME_ADMIN_Q) ? sizeof(struct nvme_sqe) :
+	    sc->sc_sqe_size;
 
 	tail = sc->sc_ops->op_sq_enter(sc, q, ccb);
 
-	sqe += tail;
+	sqe = (struct nvme_sqe *)((char *)NVME_DMA_KVA(q->q_sq_dmamem) +
+	    (tail * sqe_size));
 
 	bus_dmamap_sync(sc->sc_dmat, NVME_DMA_MAP(q->q_sq_dmamem),
-	    sizeof(*sqe) * tail, sizeof(*sqe), BUS_DMASYNC_POSTWRITE);
-	memset(sqe, 0, sizeof(*sqe));
+	    sqe_size * tail, sqe_size, BUS_DMASYNC_POSTWRITE);
+	memset(sqe, 0, sqe_size);
 	(*fill)(sc, ccb, sqe);
 	sqe->cid = ccb->ccb_id;
 	bus_dmamap_sync(sc->sc_dmat, NVME_DMA_MAP(q->q_sq_dmamem),
-	    sizeof(*sqe) * tail, sizeof(*sqe), BUS_DMASYNC_PREWRITE);
+	    sqe_size * tail, sqe_size, BUS_DMASYNC_PREWRITE);
 
 	sc->sc_ops->op_sq_leave(sc, q, ccb);
 }
@@ -1099,10 +1123,9 @@ nvme_poll(struct nvme_softc *sc, struct nvme_queue *q, struct nvme_ccb *ccb,
     void (*fill)(struct nvme_softc *, struct nvme_ccb *, void *), u_int32_t ms)
 {
 	struct nvme_poll_state state;
-	void (*done)(struct nvme_softc *, struct nvme_ccb *, struct nvme_cqe *);
+	void (*done)(struct nvme_softc *, struct nvme_ccb *);
 	void *cookie;
 	int64_t us;
-	u_int16_t flags;
 
 	memset(&state, 0, sizeof(state));
 	(*fill)(sc, ccb, &state.s);
@@ -1115,7 +1138,7 @@ nvme_poll(struct nvme_softc *sc, struct nvme_queue *q, struct nvme_ccb *ccb,
 
 	nvme_q_submit(sc, q, ccb, nvme_poll_fill);
 	for (us = ms * 1000; ms == 0 || us > 0; us -= NVME_TIMO_DELAYNS) {
-		if (ISSET(state.c.flags, htole16(NVME_CQE_PHASE)))
+		if (ISSET(state.c.flags, NVME_CQE_PHASE))
 			break;
 		if (nvme_q_complete(sc, q) == 0)
 			delay(NVME_TIMO_DELAYNS);
@@ -1123,11 +1146,9 @@ nvme_poll(struct nvme_softc *sc, struct nvme_queue *q, struct nvme_ccb *ccb,
 	}
 
 	ccb->ccb_cookie = cookie;
-	done(sc, ccb, &state.c);
+	done(sc, ccb);
 
-	flags = lemtoh16(&state.c.flags);
-
-	return (flags & ~NVME_CQE_PHASE);
+	return (ccb->ccb_cqe_flags & ~NVME_CQE_PHASE);
 }
 
 void
@@ -1140,13 +1161,12 @@ nvme_poll_fill(struct nvme_softc *sc, struct nvme_ccb *ccb, void *slot)
 }
 
 void
-nvme_poll_done(struct nvme_softc *sc, struct nvme_ccb *ccb,
-    struct nvme_cqe *cqe)
+nvme_poll_done(struct nvme_softc *sc, struct nvme_ccb *ccb)
 {
 	struct nvme_poll_state *state = ccb->ccb_cookie;
 
-	state->c = *cqe;
-	SET(state->c.flags, htole16(NVME_CQE_PHASE));
+	state->c.flags = ccb->ccb_cqe_flags;
+	SET(state->c.flags, NVME_CQE_PHASE);
 }
 
 void
@@ -1159,8 +1179,7 @@ nvme_sqe_fill(struct nvme_softc *sc, struct nvme_ccb *ccb, void *slot)
 }
 
 void
-nvme_empty_done(struct nvme_softc *sc, struct nvme_ccb *ccb,
-    struct nvme_cqe *cqe)
+nvme_empty_done(struct nvme_softc *sc, struct nvme_ccb *ccb)
 {
 }
 
@@ -1174,15 +1193,17 @@ nvme_op_cq_done(struct nvme_softc *sc,
 int
 nvme_q_complete(struct nvme_softc *sc, struct nvme_queue *q)
 {
-	struct nvme_ccb *ccb;
+	struct nvme_ccb *ccb, *ccbtmp;
 	struct nvme_cqe *ring = NVME_DMA_KVA(q->q_cq_dmamem), *cqe;
 	u_int32_t head;
 	u_int16_t flags;
+	struct nvme_ccb_list done_list;
 	int rv = 0;
 
 	if (!mtx_enter_try(&q->q_cq_mtx))
 		return (-1);
 
+	SIMPLEQ_INIT(&done_list);
 	head = q->q_cq_head;
 
 	nvme_dmamem_sync(sc, q->q_cq_dmamem, BUS_DMASYNC_POSTREAD);
@@ -1196,7 +1217,9 @@ nvme_q_complete(struct nvme_softc *sc, struct nvme_queue *q)
 
 		ccb = &sc->sc_ccbs[cqe->cid];
 		sc->sc_ops->op_cq_done(sc, q, ccb);
-		ccb->ccb_done(sc, ccb, cqe);
+
+		ccb->ccb_cqe_flags = lemtoh16(&cqe->flags);
+		SIMPLEQ_INSERT_TAIL(&done_list, ccb, ccb_entry);
 
 		if (++head >= q->q_entries) {
 			head = 0;
@@ -1210,6 +1233,10 @@ nvme_q_complete(struct nvme_softc *sc, struct nvme_queue *q)
 	if (rv)
 		nvme_write4(sc, q->q_cqhdbl, q->q_cq_head = head);
 	mtx_leave(&q->q_cq_mtx);
+
+	SIMPLEQ_FOREACH_SAFE(ccb, &done_list, ccb_entry, ccbtmp) {
+		ccb->ccb_done(sc, ccb);
+	}
 
 	return (rv);
 }
@@ -1260,6 +1287,9 @@ nvme_identify(struct nvme_softc *sc, u_int mpsmin)
 	}
 
 	sc->sc_nn = lemtoh32(&identify->nn);
+
+	if (sc->sc_sqe_size == 0)
+		sc->sc_sqe_size = sizeof(struct nvme_sqe);
 
 	/*
 	 * At least one Apple NVMe device presents a second, bogus disk that is
@@ -1473,7 +1503,8 @@ nvme_q_alloc(struct nvme_softc *sc, u_int16_t id, u_int entries, u_int dstrd)
 		return (NULL);
 
 	q->q_sq_dmamem = nvme_dmamem_alloc(sc,
-	    sizeof(struct nvme_sqe) * entries);
+	    (id == NVME_ADMIN_Q ? sizeof(struct nvme_sqe) : sc->sc_sqe_size) *
+	    entries);
 	if (q->q_sq_dmamem == NULL)
 		goto free;
 
@@ -1591,7 +1622,7 @@ nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
 		goto ndmfree;
 
 	if (bus_dmamem_alloc(sc->sc_dmat, size, sc->sc_mps, 0, &ndm->ndm_seg,
-	    1, &nsegs, BUS_DMA_WAITOK | BUS_DMA_ZERO) != 0)
+	    1, &nsegs, BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_64BIT) != 0)
 		goto destroy;
 
 	if (bus_dmamem_map(sc->sc_dmat, &ndm->ndm_seg, nsegs, size,
@@ -1720,7 +1751,9 @@ nvme_hibernate_io(dev_t dev, daddr_t blkno, vaddr_t addr, size_t size,
 		disk = disk_lookup(&sd_cd, DISKUNIT(dev));
 		scsibus = disk->dv_parent;
 		my->sc = (struct nvme_softc *)disk->dv_parent->dv_parent;
-
+		if (my->sc->sc_hib_q == NULL)
+			return ENXIO;
+		
 		/* find scsi_link, which tells us the target */
 		my->nsid = 0;
 		bus_sc = (struct scsibus_softc *)scsibus;
@@ -1946,7 +1979,7 @@ nvme_bioctl_inq(struct nvme_softc *sc, struct bioc_inq *bi)
 	nvme_bio_status(bs, "Max i/o %zu bytes%s%s%s, Sanitize 0x%b",
 	    sc->sc_mdts,
 	    ISSET(idctrl->lpa, NVM_ID_CTRL_LPA_PE) ?
-	    ", Persisent Event Log" : "",
+	    ", Persistent Event Log" : "",
 	    ISSET(idctrl->fna, NVM_ID_CTRL_FNA_CRYPTOFORMAT) ?
 	    ", CryptoFormat" : "",
 	    ISSET(idctrl->vwc, NVM_ID_CTRL_VWC_PRESENT) ?
@@ -2128,3 +2161,70 @@ nvme_bioctl_disk(struct nvme_softc *sc, struct bioc_disk *bd)
 	return 0;
 }
 #endif	/* NBIO > 0 */
+
+#ifndef SMALL_KERNEL
+void
+nvme_refresh_sensors(void *arg)
+{
+	struct nvme_softc 		*sc = arg;
+	struct nvme_sqe			 sqe;
+	struct nvme_dmamem		*mem = NULL;
+	struct nvme_ccb			*ccb = NULL;
+	struct nvm_smart_health 	*health;
+	uint32_t			 dwlen;
+	uint8_t 			 cw;
+	int				 flags;
+	int64_t				 temp;
+
+	ccb = nvme_ccb_get(sc);
+	if (ccb == NULL)
+		goto failed;
+
+	mem = nvme_dmamem_alloc(sc, sizeof(*health));
+	if (mem == NULL)
+		goto failed;
+	nvme_dmamem_sync(sc, mem, BUS_DMASYNC_PREREAD);
+
+	dwlen = (sizeof(*health) >> 2) - 1;
+	memset(&sqe, 0, sizeof(sqe));
+	sqe.opcode = NVM_ADMIN_GET_LOG_PG;
+	htolem32(&sqe.nsid, 0xffffffff);
+	htolem32(&sqe.cdw10, (dwlen << 16 | NVM_LOG_PAGE_SMART_HEALTH));
+	htolem64(&sqe.entry.prp[0], NVME_DMA_DVA(mem));
+
+	ccb->ccb_done = nvme_empty_done;
+	ccb->ccb_cookie = &sqe;
+	flags = nvme_poll(sc, sc->sc_admin_q, ccb, nvme_sqe_fill, NVME_TIMO_LOG_PAGE);
+
+	nvme_dmamem_sync(sc, mem, BUS_DMASYNC_POSTREAD);
+
+	if (flags != 0)
+		goto failed;
+
+	health = NVME_DMA_KVA(mem); 
+	cw = health->critical_warning;
+
+	sc->sc_temp_sensor.status = (cw & NVM_HEALTH_CW_TEMP) ?
+	    SENSOR_S_CRIT : SENSOR_S_OK;
+	temp = letoh16(health->temperature);
+	sc->sc_temp_sensor.value = (temp * 1000000) + 150000;
+
+	sc->sc_spare_sensor.status = (cw & NVM_HEALTH_CW_SPARE) ?
+	    SENSOR_S_CRIT : SENSOR_S_OK;
+	sc->sc_spare_sensor.value = health->avail_spare * 1000;
+
+	sc->sc_usage_sensor.status = SENSOR_S_OK;
+	sc->sc_usage_sensor.value = health->percent_used * 1000;
+	goto done;
+
+ failed:
+	sc->sc_temp_sensor.status = SENSOR_S_UNKNOWN;
+	sc->sc_usage_sensor.status = SENSOR_S_UNKNOWN;
+	sc->sc_spare_sensor.status = SENSOR_S_UNKNOWN;
+ done:
+	if (mem != NULL)
+		nvme_dmamem_free(sc, mem);
+	if (ccb != NULL)
+		nvme_ccb_put(sc, ccb);
+}
+#endif /* SMALL_KERNEL */

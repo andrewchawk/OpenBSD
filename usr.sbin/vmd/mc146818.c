@@ -1,4 +1,4 @@
-/* $OpenBSD: mc146818.c,v 1.29 2024/07/10 09:27:33 dv Exp $ */
+/* $OpenBSD: mc146818.c,v 1.32 2026/06/25 16:45:01 dv Exp $ */
 /*
  * Copyright (c) 2016 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -127,7 +127,7 @@ rtc_fire1(int fd, short type, void *arg)
 	if (rtc.now - old > 5) {
 		log_debug("%s: RTC clock drift (%llds), requesting guest "
 		    "resync", __func__, (rtc.now - old));
-		vmmci_ctl(VMMCI_SYNCRTC);
+		vmmci_ctl(&vmmci, VMMCI_SYNCRTC);
 	}
 	evtimer_add(&rtc.sec, &rtc.sec_tv);
 }
@@ -209,9 +209,13 @@ rtc_reschedule_per(void)
 {
 	uint16_t rate;
 	uint64_t us;
+	uint8_t period;
 
 	if (rtc.regs[MC_REGB] & MC_REGB_PIE) {
-		rate = 32768 >> ((rtc.regs[MC_REGA] & MC_RATE_MASK) - 1);
+		period = rtc.regs[MC_REGA] & MC_RATE_MASK;
+		if (period == 0)
+			return;
+		rate = 32768 >> (period - 1);
 		us = (1.0 / rate) * 1000000;
 		rtc.per_tv.tv_usec = us;
 		if (evtimer_pending(&rtc.per, NULL))
@@ -332,37 +336,6 @@ vcpu_exit_mc146818(struct vm_run_params *vrp)
 	}
 
 	return 0xFF;
-}
-
-int
-mc146818_dump(int fd)
-{
-	log_debug("%s: sending RTC", __func__);
-	if (atomicio(vwrite, fd, &rtc, sizeof(rtc)) != sizeof(rtc)) {
-		log_warnx("%s: error writing RTC to fd", __func__);
-		return (-1);
-	}
-	return (0);
-}
-
-int
-mc146818_restore(int fd, uint32_t vm_id)
-{
-	log_debug("%s: restoring RTC", __func__);
-	if (atomicio(read, fd, &rtc, sizeof(rtc)) != sizeof(rtc)) {
-		log_warnx("%s: error reading RTC from fd", __func__);
-		return (-1);
-	}
-	rtc.vm_id = vm_id;
-
-	memset(&rtc.sec, 0, sizeof(struct event));
-	memset(&rtc.per, 0, sizeof(struct event));
-	evtimer_set(&rtc.sec, rtc_fire1, NULL);
-	evtimer_set(&rtc.per, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
-
-	vm_pipe_init(&dev_pipe, mc146818_pipe_dispatch);
-
-	return (0);
 }
 
 void

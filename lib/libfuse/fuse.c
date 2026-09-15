@@ -1,4 +1,4 @@
-/* $OpenBSD: fuse.c,v 1.51 2019/06/28 13:32:42 deraadt Exp $ */
+/* $OpenBSD: fuse.c,v 1.61 2026/07/23 04:50:38 helg Exp $ */
 /*
  * Copyright (c) 2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -15,11 +15,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/wait.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-
-#include <miscfs/fuse/fusefs.h>
+#include <sys/uio.h>
 
 #include <errno.h>
 #include <signal.h>
@@ -28,7 +24,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "fuse_opt.h"
 #include "fuse_private.h"
 #include "debug.h"
 
@@ -87,6 +82,7 @@ static struct fuse_opt fuse_lib_opts[] = {
 	FUSE_OPT_KEY("fmask=%o",		KEY_STUB),
 	FUSE_LIB_OPT("umask=",			set_mode),
 	FUSE_LIB_OPT("umask=%o",		umask),
+	FUSE_OPT_KEY("max_write=",		FUSE_OPT_KEY_KEEP),
 	FUSE_OPT_END
 };
 
@@ -103,7 +99,6 @@ static struct fuse_opt fuse_mount_opts[] = {
 	FUSE_MOUNT_OPT("fsname=%s",		fsname),
 	FUSE_MOUNT_OPT("max_read=%u",		max_read),
 	FUSE_OPT_KEY("max_readahead",		KEY_STUB),
-	FUSE_OPT_KEY("max_write",		KEY_STUB),
 	FUSE_MOUNT_OPT("noatime",		noatime),
 	FUSE_MOUNT_OPT("nonempty",		nonempty),
 	FUSE_MOUNT_OPT("-r",			rdonly),
@@ -113,158 +108,12 @@ static struct fuse_opt fuse_mount_opts[] = {
 	FUSE_OPT_END
 };
 
-static void
-ifuse_try_unmount(struct fuse *f)
-{
-	pid_t child;
-
-	/* unmount in another thread so fuse_loop() doesn't deadlock */
-	child = fork();
-
-	if (child == -1) {
-		DPERROR(__func__);
-		return;
-	}
-
-	if (child == 0) {
-		fuse_remove_signal_handlers(fuse_get_session(f));
-		errno = 0;
-		fuse_unmount(f->fc->dir, f->fc);
-		_exit(errno);
-	}
-}
-
-static void
-ifuse_child_exit(const struct fuse *f)
-{
-	int status;
-
-	if (waitpid(WAIT_ANY, &status, WNOHANG) == -1)
-		fprintf(stderr, "fuse: %s\n", strerror(errno));
-
-	if (WIFEXITED(status) && (WEXITSTATUS(status) != 0))
-		fprintf(stderr, "fuse: %s: %s\n",
-			f->fc->dir, strerror(WEXITSTATUS(status)));
-
-	return;
-}
+extern struct fuse_lowlevel_ops llops;
 
 int
 fuse_loop(struct fuse *fuse)
 {
-	struct fusebuf fbuf;
-	struct fuse_context ctx;
-	struct fb_ioctl_xch ioexch;
-	struct kevent event[5];
-	struct kevent ev;
-	ssize_t n;
-	int ret;
-
-	if (fuse == NULL)
-		return (-1);
-
-	fuse->fc->kq = kqueue();
-	if (fuse->fc->kq == -1)
-		return (-1);
-
-	EV_SET(&event[0], fuse->fc->fd, EVFILT_READ, EV_ADD |
-	    EV_ENABLE, 0, 0, 0);
-
-	/* signal events */
-	EV_SET(&event[1], SIGCHLD, EVFILT_SIGNAL, EV_ADD |
-	    EV_ENABLE, 0, 0, 0);
-	EV_SET(&event[2], SIGHUP, EVFILT_SIGNAL, EV_ADD |
-	    EV_ENABLE, 0, 0, 0);
-	EV_SET(&event[3], SIGINT, EVFILT_SIGNAL, EV_ADD |
-	    EV_ENABLE, 0, 0, 0);
-	EV_SET(&event[4], SIGTERM, EVFILT_SIGNAL, EV_ADD |
-	    EV_ENABLE, 0, 0, 0);
-
-	while (!fuse->fc->dead) {
-		ret = kevent(fuse->fc->kq, &event[0], 5, &ev, 1, NULL);
-		if (ret == -1) {
-			if (errno != EINTR)
-				DPERROR(__func__);
-		} else if (ret > 0 && ev.filter == EVFILT_SIGNAL) {
-			int signum = ev.ident;
-			switch (signum) {
-			case SIGCHLD:
-				ifuse_child_exit(fuse);
-				break;
-			case SIGHUP:
-			case SIGINT:
-			case SIGTERM:
-				ifuse_try_unmount(fuse);
-				break;
-			default:
-				fprintf(stderr, "%s: %s\n", __func__,
-					strsignal(signum));
-			}
-		} else if (ret > 0) {
-			n = read(fuse->fc->fd, &fbuf, sizeof(fbuf));
-			if (n != sizeof(fbuf)) {
-				fprintf(stderr, "%s: bad fusebuf read\n",
-				    __func__);
-				return (-1);
-			}
-
-			/* check if there is data something present */
-			if (fbuf.fb_len) {
-				fbuf.fb_dat = malloc(fbuf.fb_len);
-				if (fbuf.fb_dat == NULL)
-					return (-1);
-				ioexch.fbxch_uuid = fbuf.fb_uuid;
-				ioexch.fbxch_len = fbuf.fb_len;
-				ioexch.fbxch_data = fbuf.fb_dat;
-
-				if (ioctl(fuse->fc->fd, FIOCGETFBDAT,
-				    &ioexch) == -1) {
-					free(fbuf.fb_dat);
-					return (-1);
-				}
-			}
-
-			ctx.fuse = fuse;
-			ctx.uid = fbuf.fb_uid;
-			ctx.gid = fbuf.fb_gid;
-			ctx.pid = fbuf.fb_tid;
-			ctx.umask = fbuf.fb_umask;
-			ctx.private_data = fuse->private_data;
-			ictx = &ctx;
-
-			ret = ifuse_exec_opcode(fuse, &fbuf);
-			if (ret) {
-				ictx = NULL;
-				return (-1);
-			}
-
-			n = write(fuse->fc->fd, &fbuf, sizeof(fbuf));
-			if (fbuf.fb_len) {
-				if (fbuf.fb_dat == NULL) {
-					fprintf(stderr, "%s: fb_dat is Null\n",
-					    __func__);
-					return (-1);
-				}
-				ioexch.fbxch_uuid = fbuf.fb_uuid;
-				ioexch.fbxch_len = fbuf.fb_len;
-				ioexch.fbxch_data = fbuf.fb_dat;
-
-				if (ioctl(fuse->fc->fd, FIOCSETFBDAT, &ioexch) == -1) {
-					free(fbuf.fb_dat);
-					return (-1);
-				}
-				free(fbuf.fb_dat);
-			}
-			ictx = NULL;
-
-			if (n != FUSEBUFSIZE) {
-				errno = EINVAL;
-				return (-1);
-			}
-		}
-	}
-
-	return (0);
+	return fuse_session_loop(fuse_get_session(fuse));
 }
 DEF(fuse_loop);
 
@@ -275,6 +124,7 @@ fuse_mount(const char *dir, struct fuse_args *args)
 	struct fuse_mount_opts opts;
 	struct fuse_chan *fc;
 	const char *errcause;
+	char *mnt_dir;
 	int mnt_flags;
 
 	if (dir == NULL)
@@ -284,12 +134,15 @@ fuse_mount(const char *dir, struct fuse_args *args)
 	if (fc == NULL)
 		return (NULL);
 
-	fc->dir = realpath(dir, NULL);
-	if (fc->dir == NULL)
+	mnt_dir = realpath(dir, NULL);
+	if (mnt_dir == NULL) {
+		fprintf(stderr, "fuse: realpath %s: %s\n", dir,
+		    strerror(errno));
 		goto bad;
+	}
 
-	if ((fc->fd = open("/dev/fuse0", O_RDWR)) == -1) {
-		perror(__func__);
+	if ((fc->fd = open("/dev/fuse0", O_RDWR|O_CLOEXEC)) == -1) {
+		perror("/dev/fuse0");
 		goto bad;
 	}
 
@@ -314,7 +167,7 @@ fuse_mount(const char *dir, struct fuse_args *args)
 	fargs.max_read = opts.max_read;
 	fargs.allow_other = opts.allow_other;
 
-	if (mount(MOUNT_FUSEFS, fc->dir, mnt_flags, &fargs)) {
+	if (mount(MOUNT_FUSEFS, mnt_dir, mnt_flags, &fargs)) {
 		switch (errno) {
 		case EMFILE:
 			errcause = "mount table full";
@@ -326,7 +179,7 @@ fuse_mount(const char *dir, struct fuse_args *args)
 			errcause = strerror(errno);
 			break;
 		}
-		fprintf(stderr, "%s on %s: %s\n", __func__, dir, errcause);
+		fprintf(stderr, "fuse: %s: %s\n", mnt_dir, errcause);
 		goto bad;
 	}
 
@@ -334,7 +187,7 @@ fuse_mount(const char *dir, struct fuse_args *args)
 bad:
 	if (fc->fd != -1)
 		close(fc->fd);
-	free(fc->dir);
+	free(mnt_dir);
 	free(fc);
 	return (NULL);
 }
@@ -343,11 +196,19 @@ DEF(fuse_mount);
 void
 fuse_unmount(const char *dir, struct fuse_chan *ch)
 {
-	if (ch == NULL || ch->dead)
+	if (ch == NULL)
 		return;
 
-	if (unmount(dir, MNT_UPDATE) == -1)
+	/*
+	 * Close the device before unmounting to prevent deadlocks with
+	 * FBT_DESTROY if fuse_loop() has already terminated.
+	 */
+	if (close(ch->fd) == -1)
 		DPERROR(__func__);
+
+	if (!ch->dead)
+		if (unmount(dir, MNT_FORCE) == -1)
+			DPERROR(__func__);
 }
 DEF(fuse_unmount);
 
@@ -356,20 +217,12 @@ fuse_is_lib_option(const char *opt)
 {
 	return (fuse_opt_match(fuse_lib_opts, opt));
 }
-
-int
-fuse_chan_fd(struct fuse_chan *ch)
-{
-	if (ch == NULL)
-		return (-1);
-
-	return (ch->fd);
-}
+DEF(fuse_is_lib_option);
 
 struct fuse_session *
 fuse_get_session(struct fuse *f)
 {
-	return (&f->se);
+	return (f->se);
 }
 DEF(fuse_get_session);
 
@@ -378,6 +231,7 @@ fuse_loop_mt(unused struct fuse *fuse)
 {
 	return (-1);
 }
+DEF(fuse_loop_mt);
 
 static int
 ifuse_lib_opt_proc(void *data, const char *arg, int key,
@@ -421,10 +275,15 @@ fuse_new(struct fuse_chan *fc, struct fuse_args *args,
 		return (NULL);
 	}
 
-	fuse->fc = fc;
 	fuse->max_ino = FUSE_ROOT_INO;
-	fuse->se.args = fuse;
 	fuse->private_data = userdata;
+	fuse->se = fuse_lowlevel_new(args, &llops, sizeof(llops), fuse);
+	if (fuse->se == NULL) {
+		free(fuse);
+		return (NULL);
+	}
+
+	fuse_session_add_chan(fuse->se, fc);
 
 	if ((root = alloc_vn(fuse, "/", FUSE_ROOT_INO, 0)) == NULL) {
 		free(fuse);
@@ -437,6 +296,20 @@ fuse_new(struct fuse_chan *fc, struct fuse_args *args,
 		free(fuse);
 		return (NULL);
 	}
+
+	/*
+	 * Prepare the context that is available to file system operations via
+	 * fuse_get_context(3). The pid, gid, uid and umask fields are set
+	 * on demand when this is called in a requeset handle.
+	 */
+	ictx = calloc(1, sizeof(*ictx));
+	if (ictx == NULL) {
+		free(fuse);
+		return (NULL);
+	}
+
+	ictx->fuse = fuse;
+	ictx->private_data = userdata;
 
 	return (fuse);
 }
@@ -453,22 +326,20 @@ fuse_daemonize(int foreground)
 DEF(fuse_daemonize);
 
 void
-fuse_destroy(struct fuse *f)
+fuse_destroy(struct fuse *fuse)
 {
-	if (f == NULL)
-		return;
-
-	/*
-  	 * Even though these were allocated in fuse_mount(), we can't free them
- 	 * in fuse_unmount() since fuse_loop() will not have terminated yet so
- 	 * we free them here.
- 	 */
-	close(f->fc->fd);
-	free(f->fc->dir);
-	free(f->fc);
-	free(f);
+	fuse_session_destroy(fuse_get_session(fuse));
+	free(fuse);
+	free(ictx);
+	ictx = NULL;
 }
 DEF(fuse_destroy);
+
+static void
+ifuse_sig_handler(int signum)
+{
+	/* empty handler to dinstinguish between SIG_IGN */
+}
 
 void
 fuse_remove_signal_handlers(unused struct fuse_session *se)
@@ -476,24 +347,20 @@ fuse_remove_signal_handlers(unused struct fuse_session *se)
 	struct sigaction old_sa;
 
 	if (sigaction(SIGHUP, NULL, &old_sa) == 0)
-		if (old_sa.sa_handler == SIG_IGN)
+		if (old_sa.sa_handler == ifuse_sig_handler)
 			signal(SIGHUP, SIG_DFL);
 
 	if (sigaction(SIGINT, NULL, &old_sa) == 0)
-		if (old_sa.sa_handler == SIG_IGN)
+		if (old_sa.sa_handler == ifuse_sig_handler)
 			signal(SIGINT, SIG_DFL);
 
 	if (sigaction(SIGTERM, NULL, &old_sa) == 0)
-		if (old_sa.sa_handler == SIG_IGN)
+		if (old_sa.sa_handler == ifuse_sig_handler)
 			signal(SIGTERM, SIG_DFL);
 
 	if (sigaction(SIGPIPE, NULL, &old_sa) == 0)
 		if (old_sa.sa_handler == SIG_IGN)
 			signal(SIGPIPE, SIG_DFL);
-
-	if (sigaction(SIGCHLD, NULL, &old_sa) == 0)
-		if (old_sa.sa_handler == SIG_IGN)
-			signal(SIGCHLD, SIG_DFL);
 }
 DEF(fuse_remove_signal_handlers);
 
@@ -505,30 +372,26 @@ fuse_set_signal_handlers(unused struct fuse_session *se)
 	if (sigaction(SIGHUP, NULL, &old_sa) == -1)
 		return (-1);
 	if (old_sa.sa_handler == SIG_DFL)
-		signal(SIGHUP, SIG_IGN);
+		signal(SIGHUP, ifuse_sig_handler);
 
 	if (sigaction(SIGINT, NULL, &old_sa) == -1)
 		return (-1);
 	if (old_sa.sa_handler == SIG_DFL)
-		signal(SIGINT, SIG_IGN);
+		signal(SIGINT, ifuse_sig_handler);
 
 	if (sigaction(SIGTERM, NULL, &old_sa) == -1)
 		return (-1);
 	if (old_sa.sa_handler == SIG_DFL)
-		signal(SIGTERM, SIG_IGN);
+		signal(SIGTERM, ifuse_sig_handler);
 
 	if (sigaction(SIGPIPE, NULL, &old_sa) == -1)
 		return (-1);
 	if (old_sa.sa_handler == SIG_DFL)
 		signal(SIGPIPE, SIG_IGN);
 
-	if (sigaction(SIGCHLD, NULL, &old_sa) == -1)
-		return (-1);
-	if (old_sa.sa_handler == SIG_DFL)
-		signal(SIGCHLD, SIG_IGN);
-
 	return (0);
 }
+DEF(fuse_set_signal_handlers);
 
 static void
 dump_help(void)
@@ -552,8 +415,6 @@ ifuse_process_opt(void *data, const char *arg, int key,
     unused struct fuse_args *args)
 {
 	struct fuse_core_opts *opt = data;
-	struct stat st;
-	int res;
 
 	switch (key) {
 	case KEY_STUB:
@@ -573,23 +434,10 @@ ifuse_process_opt(void *data, const char *arg, int key,
 		return (-1);
 	case FUSE_OPT_KEY_NONOPT:
 		if (opt->mp == NULL) {
-			opt->mp = realpath(arg, opt->mp);
+			opt->mp = strdup(arg);
 			if (opt->mp == NULL) {
-				fprintf(stderr, "fuse: realpath: "
-				    "%s : %s\n", arg, strerror(errno));
-				return (-1);
-			}
-
-			res = stat(opt->mp, &st);
-			if (res == -1) {
-				fprintf(stderr, "fuse: bad mount point "
-				    "%s : %s\n", arg, strerror(errno));
-				return (-1);
-			}
-
-			if (!S_ISDIR(st.st_mode)) {
-				fprintf(stderr, "fuse: bad mount point "
-				    "%s : %s\n", arg, strerror(ENOTDIR));
+				fprintf(stderr, "fuse: strdup: %s\n",
+				    strerror(errno));
 				return (-1);
 			}
 		}
@@ -614,11 +462,8 @@ fuse_parse_cmdline(struct fuse_args *args, char **mp, int *mt, int *fg)
 		return (-1);
 	}
 
-	if (mp != NULL) {
-		*mp = strdup(opt.mp);
-		if (*mp == NULL)
-			return (-1);
-	}
+	if (mp != NULL)
+		*mp = opt.mp;
 
 	if (mt != NULL)
 		*mt = 0;
@@ -633,6 +478,21 @@ DEF(fuse_parse_cmdline);
 struct fuse_context *
 fuse_get_context(void)
 {
+	const fuse_req_t req = ifuse_req();
+	const struct fuse_ctx *req_ctx = fuse_req_ctx(req);
+
+	if (req_ctx == NULL) {
+		ictx->uid = 0;
+		ictx->gid = 0;
+		ictx->pid = 0;
+		ictx->umask = 0;
+	} else {
+		ictx->uid = req_ctx->uid;
+		ictx->gid = req_ctx->gid;
+		ictx->pid = req_ctx->pid;
+		ictx->umask = req_ctx->umask;
+	}
+
 	return (ictx);
 }
 DEF(fuse_get_context);
@@ -642,6 +502,7 @@ fuse_version(void)
 {
 	return (FUSE_VERSION);
 }
+DEF(fuse_version);
 
 void
 fuse_teardown(struct fuse *fuse, char *mp)
@@ -649,16 +510,18 @@ fuse_teardown(struct fuse *fuse, char *mp)
 	if (fuse == NULL || mp == NULL)
 		return;
 
-	fuse_remove_signal_handlers(fuse_get_session(fuse));
-	fuse_unmount(mp, fuse->fc);
+	fuse_remove_signal_handlers(fuse->se);
+	fuse_unmount(mp, fuse->se->chan);
 	fuse_destroy(fuse);
 }
+DEF(fuse_teardown);
 
 int
 fuse_invalidate(unused struct fuse *f, unused const char *path)
 {
 	return (EINVAL);
 }
+DEF(fuse_invalidate);
 
 struct fuse *
 fuse_setup(int argc, char **argv, const struct fuse_operations *ops,
@@ -674,15 +537,13 @@ fuse_setup(int argc, char **argv, const struct fuse_operations *ops,
 	if (fuse_parse_cmdline(&args, &dir, mt, &fg))
 		goto err;
 
-	fuse_daemonize(fg);
-
 	if ((fc = fuse_mount(dir, &args)) == NULL)
 		goto err;
 
+	fuse_daemonize(fg);
+
 	if ((fuse = fuse_new(fc, &args, ops, size, data)) == NULL) {
 		fuse_unmount(dir, fc);
-		close(fc->fd);
-		free(fc->dir);
 		free(fc);
 		goto err;
 	}
@@ -713,10 +574,16 @@ int
 fuse_main(int argc, char **argv, const struct fuse_operations *ops, void *data)
 {
 	struct fuse *fuse;
+	char *mp;
+	int ret;
 
-	fuse = fuse_setup(argc, argv, ops, sizeof(*ops), NULL, NULL, data);
+	fuse = fuse_setup(argc, argv, ops, sizeof(*ops), &mp, NULL, data);
 	if (fuse == NULL)
 		return (-1);
 
-	return (fuse_loop(fuse));
+	ret = fuse_loop(fuse);
+	fuse_teardown(fuse, mp);
+
+	return (ret == -1 ? 1 : 0);
 }
+DEF(fuse_main);

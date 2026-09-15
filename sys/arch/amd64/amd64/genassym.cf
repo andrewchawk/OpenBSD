@@ -1,23 +1,17 @@
-#	$OpenBSD: genassym.cf,v 1.45 2024/02/12 01:18:17 guenther Exp $
+#	$OpenBSD: genassym.cf,v 1.51 2026/06/04 05:22:04 mlarkin Exp $
 #	Written by Artur Grabowski art@openbsd.org, Public Domain
 
 include <sys/param.h>
 include <sys/proc.h>
-include <sys/mutex.h>
-include <sys/resourcevar.h>
-include <sys/device.h>
-include <sys/user.h>
 
 include <uvm/uvm_extern.h>
 
-include <machine/trap.h>
+include <machine/pcb.h>
 include <machine/pmap.h>
 include <machine/pte.h>
 include <machine/vmparam.h>
 include <machine/intr.h>
-include <machine/pic.h>
 include <machine/tss.h>
-include <machine/i82093var.h>
 
 export	SONPROC
 
@@ -116,9 +110,6 @@ member	CPU_INFO_IDEPTH		ci_idepth
 member	CPU_INFO_ISOURCES	ci_isources
 member	CPU_INFO_IPENDING	ci_ipending
 member	CPU_INFO_IUNMASK	ci_iunmask
-ifdef DIAGNOSTIC
-member	CPU_INFO_MUTEX_LEVEL	ci_mutex_level
-endif
 member	CPU_INFO_GDT		ci_gdt
 member	CPU_INFO_TSS		ci_tss
 member	CPU_INFO_PFLAGS		ci_pflags
@@ -137,21 +128,13 @@ member	is_recurse
 member	is_resume
 member	is_handlers
 member	is_pic
-member	is_flags
 member	is_pin
-member	is_type
 member	is_maxlevel
 
 struct	intrhand
-member	ih_fun
-member	ih_arg
 member	ih_next
 member	ih_level
 member	IH_COUNT	ih_count.ec_count
-
-struct	ioapic_softc
-member	IOAPIC_SC_REG	sc_reg
-member	IOAPIC_SC_DATA	sc_data
 
 # pte fields
 export	PG_V
@@ -179,7 +162,9 @@ export	NDML2_ENTRIES
 export	NBPD_L2
 export	NPDPG
 
+export	DIRECT_MAP_START_MASK
 export	PDIR_SLOT_DIRECT
 export	PCID_PROC
 export	PCID_PROC_INTEL
+export	PCID_TEMP
 export	INVPCID_PCID

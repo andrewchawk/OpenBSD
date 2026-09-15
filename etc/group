@@ -20,6 +20,7 @@ _rusersd:*:32:
 _fingerd:*:33:
 _sshagnt:*:34:
 _x11:*:35:
+_fc-cache:*:36:
 utmp:*:45:
 _unwind:*:48:
 _traceroute:*:50:
@@ -83,5 +84,6 @@ _slaacd:*:115:
 _dhcp6leased:*:116:
 dialer:*:117:
 _shutdown:*:118:
+_lldpd:*:119:
 nogroup:*:32766:
 nobody:*:32767:

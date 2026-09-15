@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.h,v 1.24 2024/02/20 21:40:37 dv Exp $	*/
+/*	$OpenBSD: proc.h,v 1.32 2026/09/08 19:46:18 dv Exp $	*/
 
 /*
  * Copyright (c) 2010-2015 Reyk Floeter <reyk@openbsd.org>
@@ -18,7 +18,6 @@
 
 #include <sys/queue.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 
 #include <event.h>
 #include <imsg.h>
@@ -27,13 +26,11 @@
 #define _PROC_H
 
 enum {
-	IMSG_NONE,
+	IMSG_NONE = 0,
 	IMSG_CTL_OK,
 	IMSG_CTL_FAIL,
 	IMSG_CTL_VERBOSE,
-	IMSG_CTL_END,
 	IMSG_CTL_RESET,
-	IMSG_CTL_PROCFD,
 	IMSG_PROC_MAX
 };
 
@@ -46,12 +43,6 @@ struct imsgev {
 	void			*data;
 	short			 events;
 };
-
-#define IMSG_SIZE_CHECK(imsg, p) do {					\
-	if (IMSG_DATA_SIZE(imsg) < sizeof(*p))				\
-		fatalx("bad length imsg received (%s)",	#p);		\
-} while (0)
-#define IMSG_DATA_SIZE(imsg)	((imsg)->hdr.len - IMSG_HEADER_SIZE)
 
 /* control socket */
 struct control_sock {
@@ -91,15 +82,10 @@ extern enum privsep_procid privsep_process;
 #define CONFIG_SWITCHES		0x02
 #define CONFIG_ALL		0xff
 
-struct privsep_pipes {
-	int				*pp_pipes[PROC_MAX];
-};
-
 struct privsep {
-	struct privsep_pipes		*ps_pipes[PROC_MAX];
-	struct privsep_pipes		*ps_pp;
+	int				 ps_pipes[PROC_MAX];
 
-	struct imsgev			*ps_ievs[PROC_MAX];
+	struct imsgev			 ps_ievs[PROC_MAX];
 	const char			*ps_title[PROC_MAX];
 	uint8_t				 ps_what[PROC_MAX];
 
@@ -107,10 +93,6 @@ struct privsep {
 	int				 ps_noaction;
 
 	struct control_sock		 ps_csock;
-	struct control_socks		 ps_rcsocks;
-
-	unsigned int			 ps_instances[PROC_MAX];
-	unsigned int			 ps_instance;
 
 	/* Event and signal handlers */
 	struct event			 ps_evsigint;
@@ -136,11 +118,6 @@ struct privsep_proc {
 	struct privsep		*p_ps;
 };
 
-struct privsep_fd {
-	enum privsep_procid		 pf_procid;
-	unsigned int			 pf_instance;
-};
-
 #if DEBUG
 #define DPRINTF		log_debug
 #else
@@ -148,11 +125,10 @@ struct privsep_fd {
 #endif
 
 #define PROC_PARENT_SOCK_FILENO	3
-#define PROC_MAX_INSTANCES	32
 
 /* proc.c */
 void	 proc_init(struct privsep *, struct privsep_proc *, unsigned int, int,
-	    int, char **, enum privsep_procid);
+	    char *, int, char **, enum privsep_procid);
 void	 proc_kill(struct privsep *);
 void	 proc_connect(struct privsep *ps);
 void	 proc_dispatch(int, short event, void *);
@@ -161,29 +137,26 @@ void	 proc_run(struct privsep *, struct privsep_proc *,
 	    void (*)(struct privsep *, struct privsep_proc *, void *), void *);
 void	 imsg_event_add(struct imsgev *);
 void	 imsg_event_add2(struct imsgev *, struct event_base *);
-int	 imsg_compose_event(struct imsgev *, uint16_t, uint32_t,
-	    pid_t, int, void *, uint16_t);
-int	 imsg_compose_event2(struct imsgev *, uint16_t, uint32_t,
+int	 imsg_compose_event(struct imsgev *, uint32_t, uint32_t,
+	    pid_t, int, void *, size_t);
+int	 imsg_compose_event2(struct imsgev *, uint32_t, uint32_t,
     	    pid_t, int, void *, uint16_t, struct event_base *);
-int	 imsg_composev_event(struct imsgev *, uint16_t, uint32_t,
+int	 imsg_composev_event(struct imsgev *, uint32_t, uint32_t,
 	    pid_t, int, const struct iovec *, int);
-int	 proc_compose_imsg(struct privsep *, enum privsep_procid, int,
-	    uint16_t, uint32_t, int, void *, uint16_t);
+void	 imsg_forward_event(struct imsgev *, struct imsg *);
+int	 proc_compose_imsg(struct privsep *, enum privsep_procid,
+	    uint32_t, uint32_t, int, void *, size_t);
 int	 proc_compose(struct privsep *, enum privsep_procid,
-	    uint16_t, void *data, uint16_t);
-int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
-	    uint16_t, uint32_t, int, const struct iovec *, int);
+	    uint32_t, void *data, size_t);
+int	 proc_composev_imsg(struct privsep *, enum privsep_procid,
+	    uint32_t, uint32_t, int, const struct iovec *, int);
 int	 proc_composev(struct privsep *, enum privsep_procid,
-	    uint16_t, const struct iovec *, int);
+	    uint32_t, const struct iovec *, int);
 int	 proc_forward_imsg(struct privsep *, struct imsg *,
-	    enum privsep_procid, int);
-struct imsgbuf *
-	 proc_ibuf(struct privsep *, enum privsep_procid, int);
-struct imsgev *
-	 proc_iev(struct privsep *, enum privsep_procid, int);
+	    enum privsep_procid, uint32_t);
 enum privsep_procid
 	 proc_getid(struct privsep_proc *, unsigned int, const char *);
-int	 proc_flush_imsg(struct privsep *, enum privsep_procid, int);
+int	 proc_flush_imsg(struct privsep *, enum privsep_procid);
 
 /* control.c */
 void	 control(struct privsep *, struct privsep_proc *);
@@ -212,5 +185,10 @@ __dead void fatal(const char *, ...)
 	    __attribute__((__format__ (printf, 1, 2)));
 __dead void fatalx(const char *, ...)
 	    __attribute__((__format__ (printf, 1, 2)));
+
+/* imsg unmarshalling used in proc.c and elsewhere. */
+int 		 imsg_int_read(struct imsg *);
+unsigned int	 imsg_uint_read(struct imsg *);
+char		*imsg_string_read(struct imsg *, size_t max);
 
 #endif /* _PROC_H */

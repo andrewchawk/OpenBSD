@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip.c,v 1.33 2024/03/19 05:04:13 tb Exp $ */
+/*	$OpenBSD: ip.c,v 1.40 2026/05/09 01:42:30 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
+#include <assert.h>
 #include <err.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,17 +36,25 @@
  * Return zero on failure, non-zero on success.
  */
 int
-ip_addr_afi_parse(const char *fn, const ASN1_OCTET_STRING *p, enum afi *afi)
+ip_addr_afi_parse(const char *fn, const ASN1_OCTET_STRING *astr, enum afi *afi)
 {
+	const unsigned char *buf;
+	int len;
 	uint16_t v;
 
-	if (p->length == 0 || p->length > 3) {
-		warnx("%s: invalid field length, want 1--3, have %d",
-		    fn, p->length);
+	buf = ASN1_STRING_get0_data(astr);
+	len = ASN1_STRING_length(astr);
+
+	if (len == 3) {
+		warnx("%s: SAFI not allowed", fn);
+		return 0;
+	}
+	if (len != sizeof(v)) {
+		warnx("%s: invalid AFI length, want 2, have %d", fn, len);
 		return 0;
 	}
 
-	memcpy(&v, p->data, sizeof(v));
+	memcpy(&v, buf, sizeof(v));
 	v = ntohs(v);
 
 	/* Only accept IPv4 and IPv6 AFIs. */
@@ -53,13 +62,6 @@ ip_addr_afi_parse(const char *fn, const ASN1_OCTET_STRING *p, enum afi *afi)
 	if (v != AFI_IPV4 && v != AFI_IPV6) {
 		warnx("%s: only AFI for IPV4 (1) and IPV6 (2) allowed: "
 		    "have %hd", fn, v);
-		return 0;
-	}
-
-	/* Disallow the optional SAFI. */
-
-	if (p->length == 3) {
-		warnx("%s: SAFI not allowed", fn);
 		return 0;
 	}
 
@@ -78,11 +80,11 @@ ip_addr_afi_parse(const char *fn, const ASN1_OCTET_STRING *p, enum afi *afi)
 int
 ip_addr_check_covered(enum afi afi,
     const unsigned char *min, const unsigned char *max,
-    const struct cert_ip *ips, size_t ipsz)
+    const struct cert_ip *ips, size_t num_ips)
 {
 	size_t	 i, sz = AFI_IPV4 == afi ? 4 : 16;
 
-	for (i = 0; i < ipsz; i++) {
+	for (i = 0; i < num_ips; i++) {
 		if (ips[i].afi != afi)
 			continue;
 		if (ips[i].type == CERT_IP_INHERIT)
@@ -103,7 +105,7 @@ ip_addr_check_covered(enum afi afi,
  */
 int
 ip_addr_check_overlap(const struct cert_ip *ip, const char *fn,
-    const struct cert_ip *ips, size_t ipsz, int quiet)
+    const struct cert_ip *ips, size_t num_ips, int quiet)
 {
 	size_t	 i, sz = ip->afi == AFI_IPV4 ? 4 : 16;
 	int	 inherit_v4 = 0, inherit_v6 = 0;
@@ -114,7 +116,7 @@ ip_addr_check_overlap(const struct cert_ip *ip, const char *fn,
 	 * going to need to do a lot of scanning for big allocations.
 	 */
 
-	for (i = 0; i < ipsz; i++)
+	for (i = 0; i < num_ips; i++)
 		if (ips[i].type == CERT_IP_INHERIT) {
 			if (ips[i].afi == AFI_IPV4)
 				inherit_v4 = 1;
@@ -145,11 +147,11 @@ ip_addr_check_overlap(const struct cert_ip *ip, const char *fn,
 
 	/* Check our ranges. */
 
-	for (i = 0; i < ipsz; i++) {
+	for (i = 0; i < num_ips; i++) {
 		if (ips[i].afi != ip->afi)
 			continue;
-		if (memcmp(ips[i].max, ip->min, sz) <= 0 ||
-		    memcmp(ips[i].min, ip->max, sz) >= 0)
+		if (memcmp(ips[i].max, ip->min, sz) < 0 ||
+		    memcmp(ips[i].min, ip->max, sz) > 0)
 			continue;
 		if (!quiet) {
 			warnx("%s: RFC 3779 section 2.2.3.5: "
@@ -168,17 +170,21 @@ ip_addr_check_overlap(const struct cert_ip *ip, const char *fn,
  * Return zero on failure, non-zero on success.
  */
 int
-ip_addr_parse(const ASN1_BIT_STRING *p,
+ip_addr_parse(const ASN1_BIT_STRING *abs,
     enum afi afi, const char *fn, struct ip_addr *addr)
 {
-	long	 unused = 0;
+	const unsigned char *data;
+	size_t length;
+	int unused = 0;
 
-	/* Weird OpenSSL-ism to get unused bit count. */
+	data = ASN1_STRING_get0_data(abs);
 
-	if ((p->flags & ASN1_STRING_FLAG_BITS_LEFT))
-		unused = p->flags & 0x07;
+	if (!ASN1_BIT_STRING_get_length(abs, &length, &unused)) {
+		warnx("%s: invalid bit string in IP address", fn);
+		return 0;
+	}
 
-	if (p->length == 0 && unused != 0) {
+	if (length == 0 && unused != 0) {
 		warnx("%s: RFC 3779 section 2.2.3.8: "
 		    "unused bit count must be zero if length is zero", fn);
 		return 0;
@@ -190,8 +196,7 @@ ip_addr_parse(const ASN1_BIT_STRING *p,
 	 * of the [minimum] address ranges.
 	 */
 
-	if (p->length != 0 &&
-	    (p->data[p->length - 1] & ((1 << unused) - 1))) {
+	if (length != 0 && (data[length - 1] & ((1 << unused) - 1))) {
 		warnx("%s: RFC 3779 section 2.2.3.8: "
 		    "unused bits must be set to zero", fn);
 		return 0;
@@ -199,16 +204,16 @@ ip_addr_parse(const ASN1_BIT_STRING *p,
 
 	/* Limit possible sizes of addresses. */
 
-	if ((afi == AFI_IPV4 && p->length > 4) ||
-	    (afi == AFI_IPV6 && p->length > 16)) {
+	if ((afi == AFI_IPV4 && length > 4) ||
+	    (afi == AFI_IPV6 && length > 16)) {
 		warnx("%s: RFC 3779 section 2.2.3.8: "
 		    "IP address too long", fn);
 		return 0;
 	}
 
 	memset(addr, 0, sizeof(struct ip_addr));
-	addr->prefixlen = p->length * 8 - unused;
-	memcpy(addr->addr, p->data, p->length);
+	addr->prefixlen = length * 8 - unused;
+	memcpy(addr->addr, data, length);
 	return 1;
 }
 
@@ -362,4 +367,209 @@ ip_warn(const char *fn, const char *msg, const struct cert_ip *ip)
 		warnx("%s: corrupt cert", fn);
 		break;
 	}
+}
+
+/*
+ * Append an IP address structure to our list of results, ensuring there is
+ * at most one inheritance marker per AFI and no overlapping ranges.
+ */
+static int
+append_ip(const char *fn, struct cert_ip *ips, size_t *num_ips,
+    const struct cert_ip *ip)
+{
+	if (!ip_addr_check_overlap(ip, fn, ips, *num_ips, 0))
+		return 0;
+	ips[(*num_ips)++] = *ip;
+	return 1;
+}
+
+/*
+ * Construct a RFC 3779 2.2.3.8 range from its bit string.
+ * Returns zero on failure, non-zero on success.
+ */
+int
+sbgp_addr(const char *fn, struct cert_ip *ips, size_t *num_ips, enum afi afi,
+    const ASN1_BIT_STRING *bs)
+{
+	struct cert_ip ip;
+
+	memset(&ip, 0, sizeof(struct cert_ip));
+
+	ip.afi = afi;
+	ip.type = CERT_IP_ADDR;
+
+	if (!ip_addr_parse(bs, afi, fn, &ip.ip)) {
+		warnx("%s: RFC 3779 section 2.2.3.8: IPAddress: "
+		    "invalid IP address", fn);
+		return 0;
+	}
+
+	if (!ip_cert_compose_ranges(&ip)) {
+		warnx("%s: RFC 3779 section 2.2.3.8: IPAddress: "
+		    "IP address range reversed", fn);
+		return 0;
+	}
+
+	return append_ip(fn, ips, num_ips, &ip);
+}
+
+/*
+ * Parse RFC 3779 2.2.3.9 range of addresses.
+ * Returns zero on failure, non-zero on success.
+ */
+int
+sbgp_addr_range(const char *fn, struct cert_ip *ips, size_t *num_ips,
+    enum afi afi, const IPAddressRange *range)
+{
+	struct cert_ip ip;
+
+	memset(&ip, 0, sizeof(struct cert_ip));
+
+	ip.afi = afi;
+	ip.type = CERT_IP_RANGE;
+
+	if (!ip_addr_parse(range->min, afi, fn, &ip.range.min)) {
+		warnx("%s: RFC 3779 section 2.2.3.9: IPAddressRange: "
+		    "invalid IP address", fn);
+		return 0;
+	}
+
+	if (!ip_addr_parse(range->max, afi, fn, &ip.range.max)) {
+		warnx("%s: RFC 3779 section 2.2.3.9: IPAddressRange: "
+		    "invalid IP address", fn);
+		return 0;
+	}
+
+	if (!ip_cert_compose_ranges(&ip)) {
+		warnx("%s: RFC 3779 section 2.2.3.9: IPAddressRange: "
+		    "IP address range reversed", fn);
+		return 0;
+	}
+
+	return append_ip(fn, ips, num_ips, &ip);
+}
+
+static int
+sbgp_addr_inherit(const char *fn, struct cert_ip *ips, size_t *num_ips,
+    enum afi afi)
+{
+	struct cert_ip ip;
+
+	memset(&ip, 0, sizeof(struct cert_ip));
+
+	ip.afi = afi;
+	ip.type = CERT_IP_INHERIT;
+
+	return append_ip(fn, ips, num_ips, &ip);
+}
+
+int
+sbgp_parse_ipaddrblocks(const char *fn, const IPAddrBlocks *addrs,
+    struct cert_ip **out_ips, size_t *out_num_ips)
+{
+	const IPAddressFamily *af;
+	const IPAddressOrRanges *aors;
+	const IPAddressOrRange *aor;
+	enum afi afi;
+	struct cert_ip *ips = NULL;
+	size_t num_ips = 0, num;
+	int ipv4_seen = 0, ipv6_seen = 0;
+	int i, j, addrsz;
+
+	assert(*out_ips == NULL && *out_num_ips == 0);
+
+	addrsz = sk_IPAddressFamily_num(addrs);
+	if (addrsz != 1 && addrsz != 2) {
+		warnx("%s: RFC 6487 section 4.8.10: unexpected number of "
+		    "ipAddrBlocks (got %d, expected 1 or 2)", fn, addrsz);
+		goto out;
+	}
+
+	for (i = 0; i < addrsz; i++) {
+		af = sk_IPAddressFamily_value(addrs, i);
+
+		switch (af->ipAddressChoice->type) {
+		case IPAddressChoice_inherit:
+			aors = NULL;
+			num = num_ips + 1;
+			break;
+		case IPAddressChoice_addressesOrRanges:
+			aors = af->ipAddressChoice->u.addressesOrRanges;
+			num = num_ips + sk_IPAddressOrRange_num(aors);
+			break;
+		default:
+			warnx("%s: RFC 3779: IPAddressChoice: unknown type %d",
+			    fn, af->ipAddressChoice->type);
+			goto out;
+		}
+		if (num == num_ips) {
+			warnx("%s: RFC 6487 section 4.8.10: "
+			    "empty ipAddressesOrRanges", fn);
+			goto out;
+		}
+
+		if (num >= MAX_IP_SIZE)
+			goto out;
+		ips = recallocarray(ips, num_ips, num, sizeof(struct cert_ip));
+		if (ips == NULL)
+			err(1, NULL);
+
+		if (!ip_addr_afi_parse(fn, af->addressFamily, &afi)) {
+			warnx("%s: RFC 3779: invalid AFI", fn);
+			goto out;
+		}
+
+		switch (afi) {
+		case AFI_IPV4:
+			if (ipv4_seen++ > 0) {
+				warnx("%s: RFC 6487 section 4.8.10: "
+				    "IPv4 appears twice", fn);
+				goto out;
+			}
+			break;
+		case AFI_IPV6:
+			if (ipv6_seen++ > 0) {
+				warnx("%s: RFC 6487 section 4.8.10: "
+				    "IPv6 appears twice", fn);
+				goto out;
+			}
+			break;
+		}
+
+		if (aors == NULL) {
+			if (!sbgp_addr_inherit(fn, ips, &num_ips, afi))
+				goto out;
+			continue;
+		}
+
+		for (j = 0; j < sk_IPAddressOrRange_num(aors); j++) {
+			aor = sk_IPAddressOrRange_value(aors, j);
+			switch (aor->type) {
+			case IPAddressOrRange_addressPrefix:
+				if (!sbgp_addr(fn, ips, &num_ips, afi,
+				    aor->u.addressPrefix))
+					goto out;
+				break;
+			case IPAddressOrRange_addressRange:
+				if (!sbgp_addr_range(fn, ips, &num_ips, afi,
+				    aor->u.addressRange))
+					goto out;
+				break;
+			default:
+				warnx("%s: RFC 3779: IPAddressOrRange: "
+				    "unknown type %d", fn, aor->type);
+				goto out;
+			}
+		}
+	}
+
+	*out_ips = ips;
+	*out_num_ips = num_ips;
+
+	return 1;
+
+ out:
+	free(ips);
+
+	return 0;
 }

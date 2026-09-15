@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.124 2022/12/23 07:18:46 jmc Exp $	*/
+/*	$OpenBSD: main.c,v 1.126 2026/07/16 12:35:32 bluhm Exp $	*/
 /*	$NetBSD: main.c,v 1.9 1996/05/07 02:55:02 thorpej Exp $	*/
 
 /*
@@ -89,7 +89,6 @@ struct protox {
 
 struct protox ip6protox[] = {
 	{ ip6_stats,	"ip6", IPPROTO_IPV6 },
-	{ div6_stats,	"divert6", IPPROTO_DIVERT },
 	{ icmp6_stats,	"icmp6", 0 },
 	{ rip6_stats,	"rip6", 0 },
 	{ NULL,		NULL, 0 }
@@ -477,15 +476,17 @@ static void
 usage(void)
 {
 	(void)fprintf(stderr,
-	    "usage: netstat [-AaBln] [-M core] [-N system] [-p protocol] [-T rtable]\n"
+	    "usage: netstat [-AaBlnv] [-M core] [-N system] [-p protocol] "
+	    "[-T rtable]\n"
 	    "       netstat -W interface\n"
 	    "       netstat -m\n"
-	    "       netstat -I interface | -i [-bdehnq]\n"
-	    "       netstat -w wait [-bdehnq] [-c count] [-I interface]\n"
+	    "       netstat -I interface | -i [-bdeghnqv]\n"
+	    "       netstat -w wait [-bdeghnq] [-c count] [-I interface]\n"
 	    "       netstat -s [-gru] [-f address_family] [-p protocol]\n"
-	    "       netstat -g [-lnu] [-f address_family]\n"
+	    "       netstat -g [-nuv] [-f address_family]\n"
 	    "       netstat -R\n"
-	    "       netstat -r [-AFu] [-f address_family] [-M core] [-N system] [-T rtable]\n"
+	    "       netstat -r [-AFuv] [-f address_family] [-M core] "
+	    "[-N system] [-T rtable]\n"
 	    "       netstat -P pcbaddr [-v] [-M core] [-N system]\n");
 	exit(1);
 }

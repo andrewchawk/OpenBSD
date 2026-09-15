@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.12 2024/08/06 09:07:15 kettenis Exp $	*/
+/*	$OpenBSD: intr.c,v 1.17 2026/03/08 17:07:31 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2011 Dale Rahn <drahn@openbsd.org>
@@ -20,6 +20,8 @@
 #include <sys/systm.h>
 #include <sys/atomic.h>
 #include <sys/malloc.h>
+
+#include <uvm/uvm_extern.h>
 
 #include <machine/cpu.h>
 #include <machine/intr.h>
@@ -66,6 +68,7 @@ riscv_cpu_intr(void *frame)
 {
 	struct cpu_info	*ci = curcpu();
 
+	atomic_inc_int(&uvmexp.intrs);
 	ci->ci_idepth++;
 	(*riscv_intr_dispatch)(frame);
 	ci->ci_idepth--;
@@ -217,10 +220,10 @@ riscv_intr_prereg_disestablish_fdt(void *cookie)
 	struct intr_prereg *ip = cookie;
 	struct interrupt_controller *ic = ip->ip_ic;
 
-	if (ip->ip_ic != NULL && ip->ip_ih != NULL)
+	if (ic != NULL && ip->ip_ih != NULL)
 		ic->ic_disestablish(ip->ip_ih);
 
-	if (ip->ip_ic != NULL)
+	if (ic == NULL)
 		LIST_REMOVE(ip, ip_list);
 
 	free(ip, M_DEVBUF, sizeof(*ip));
@@ -489,6 +492,8 @@ riscv_intr_establish_fdt_msi_cpu(int node, uint64_t *addr, uint64_t *data,
 
 	val = ic->ic_establish_msi(ic->ic_cookie, addr, data,
 	    level, ci, func, cookie, name);
+	if (val == NULL)
+		return NULL;
 
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK);
 	ih->ih_ic = ic;
@@ -613,10 +618,9 @@ riscv_do_pending_intr(int pcpl)
 	}
 
 	do {
-		DO_SOFTINT(SIR_TTY, IPL_SOFTTTY);
-		DO_SOFTINT(SIR_NET, IPL_SOFTNET);
-		DO_SOFTINT(SIR_CLOCK, IPL_SOFTCLOCK);
-		DO_SOFTINT(SIR_SOFT, IPL_SOFT);
+		DO_SOFTINT(SOFTINTR_TTY, IPL_SOFTTTY);
+		DO_SOFTINT(SOFTINTR_NET, IPL_SOFTNET);
+		DO_SOFTINT(SOFTINTR_CLOCK, IPL_SOFTCLOCK);
 	} while (ci->ci_ipending & riscv_smask[pcpl]);
 
 	/* Don't use splx... we are here already! */
@@ -652,14 +656,12 @@ riscv_init_smask(void)
 
 	for (i = IPL_NONE; i <= IPL_HIGH; i++)  {
 		riscv_smask[i] = 0;
-		if (i < IPL_SOFT)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_SOFT);
 		if (i < IPL_SOFTCLOCK)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_CLOCK);
+			riscv_smask[i] |= SI_TO_IRQBIT(SOFTINTR_CLOCK);
 		if (i < IPL_SOFTNET)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_NET);
+			riscv_smask[i] |= SI_TO_IRQBIT(SOFTINTR_NET);
 		if (i < IPL_SOFTTTY)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_TTY);
+			riscv_smask[i] |= SI_TO_IRQBIT(SOFTINTR_TTY);
 	}
 }
 
@@ -692,6 +694,11 @@ splx(int ipl)
 	riscv_intr_func.x(ipl);
 }
 
+void
+softintr(int si)
+{
+	curcpu()->ci_ipending |= SI_TO_IRQBIT(si);
+}
 
 #ifdef DIAGNOSTIC
 void

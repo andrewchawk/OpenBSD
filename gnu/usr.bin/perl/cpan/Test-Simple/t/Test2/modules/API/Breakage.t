@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 
-if ($] lt "5.008") {
+if ("$]" < 5.008) {
     print "1..0 # SKIP Test cannot run on perls below 5.8.0 because local doesn't work on hash keys.\n";
     exit 0;
 }
@@ -61,7 +61,7 @@ for my $meth (qw/upgrade_suggested upgrade_required known_broken/) {
                 " * Module 'T2Test::UR1' is outdated and known to be broken, please update to 1.0 or higher.",
                 " * Module 'T2Test::KB1' is known to be broken in version 1.0 and below, newer versions have not been tested. You have: 0.9",
                 " * Module 'T2Test::KB2' is known to be broken in version 0.5 and below, newer versions have not been tested. You have: 0.9",
-                " * Module 'T2Test::UG1' is outdated, we recommed updating above 1.0. error was: 'T2Test::UG1 version 1.0 required--this is only version 0.9 at Breakage.pm line 75.'; INC is T2Test/UG1.pm",
+                " * Module 'T2Test::UG1' is outdated, we recommend updating above 1.0. error was: 'T2Test::UG1 version 1.0 required--this is only version 0.9 at Breakage.pm line 75.'; INC is T2Test/UG1.pm",
             ],
             "Got expected report items"
         );

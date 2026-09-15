@@ -1,4 +1,4 @@
-/*	$OpenBSD: lde.c,v 1.78 2024/04/23 13:34:51 jsg Exp $ */
+/*	$OpenBSD: lde.c,v 1.87 2026/08/17 09:00:19 claudio Exp $ */
 
 /*
  * Copyright (c) 2013, 2016 Renato Westphal <renato@openbsd.org>
@@ -128,7 +128,9 @@ lde(int debug, int verbose)
 	/* setup pipe and event handler to the parent process */
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = lde_dispatch_parent;
 	iev_main->events = EV_READ;
 	event_set(&iev_main->ev, iev_main->ibuf.fd, iev_main->events,
@@ -151,9 +153,9 @@ static __dead void
 lde_shutdown(void)
 {
 	/* close pipes */
-	msgbuf_clear(&iev_ldpe->ibuf.w);
+	imsgbuf_clear(&iev_ldpe->ibuf);
 	close(iev_ldpe->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	lde_gc_stop_timer();
@@ -194,25 +196,26 @@ lde_dispatch_imsg(int fd, short event, void *bula)
 	struct map		 map;
 	struct lde_addr		 lde_addr;
 	struct notify_msg	 nm;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("lde_dispatch_imsg: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("lde_dispatch_imsg: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -354,9 +357,11 @@ lde_dispatch_imsg(int fd, short event, void *bula)
 			    imsg.hdr.pid, NULL, 0);
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by ldpe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warn("wrong imsg len");
+			else
+				log_verbose(verbose);
 			break;
 		default:
 			log_debug("%s: unexpected imsg %d", __func__,
@@ -388,26 +393,27 @@ lde_dispatch_parent(int fd, short event, void *bula)
 	struct kroute		 kr;
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
-	ssize_t			 n;
-	int			 shut = 0;
+	int			 n, shut = 0;
 	struct fec		 fec;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("lde_dispatch_parent: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("lde_dispatch_parent: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -460,7 +466,8 @@ lde_dispatch_parent(int fd, short event, void *bula)
 
 			if ((iev_ldpe = malloc(sizeof(struct imsgev))) == NULL)
 				fatal(NULL);
-			imsg_init(&iev_ldpe->ibuf, fd);
+			if (imsgbuf_init(&iev_ldpe->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_ldpe->handler = lde_dispatch_imsg;
 			iev_ldpe->events = EV_READ;
 			event_set(&iev_ldpe->ev, iev_ldpe->ibuf.fd,

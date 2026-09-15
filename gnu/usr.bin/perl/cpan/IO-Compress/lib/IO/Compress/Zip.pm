@@ -4,41 +4,41 @@ use strict ;
 use warnings;
 use bytes;
 
-use IO::Compress::Base::Common  2.204 qw(:Status );
-use IO::Compress::RawDeflate 2.204 ();
-use IO::Compress::Adapter::Deflate 2.204 ;
-use IO::Compress::Adapter::Identity 2.204 ;
-use IO::Compress::Zlib::Extra 2.204 ;
-use IO::Compress::Zip::Constants 2.204 ;
+use IO::Compress::Base::Common  2.223 qw(:Status );
+use IO::Compress::RawDeflate 2.223 ();
+use IO::Compress::Adapter::Deflate 2.223 ;
+use IO::Compress::Adapter::Identity 2.223 ;
+use IO::Compress::Zlib::Extra 2.223 ;
+use IO::Compress::Zip::Constants 2.223 ;
 
 use File::Spec();
 use Config;
 
-use Compress::Raw::Zlib  2.204 ();
+use Compress::Raw::Zlib 2.222 ();
 
 BEGIN
 {
     eval { require IO::Compress::Adapter::Bzip2 ;
-           IO::Compress::Adapter::Bzip2->import( 2.201 );
+           IO::Compress::Adapter::Bzip2->VERSION( 2.218 );
            require IO::Compress::Bzip2 ;
-           IO::Compress::Bzip2->import( 2.201 );
+           IO::Compress::Bzip2->VERSION( 2.218 );
          } ;
 
     eval { require IO::Compress::Adapter::Lzma ;
-           IO::Compress::Adapter::Lzma->import( 2.201 );
+           IO::Compress::Adapter::Lzma->VERSION( 2.217 );
            require IO::Compress::Lzma ;
-           IO::Compress::Lzma->import( 2.201 );
+           IO::Compress::Lzma->VERSION( 2.217 );
          } ;
 
     eval { require IO::Compress::Adapter::Xz ;
-           IO::Compress::Adapter::Xz->import( 2.201 );
+           IO::Compress::Adapter::Xz->VERSION( 2.217 );
            require IO::Compress::Xz ;
-           IO::Compress::Xz->import( 2.201 );
+           IO::Compress::Xz->VERSION( 2.217 );
          } ;
     eval { require IO::Compress::Adapter::Zstd ;
-           IO::Compress::Adapter::Zstd->import( 2.201 );
+           IO::Compress::Adapter::Zstd->VERSION( 2.217 );
            require IO::Compress::Zstd ;
-           IO::Compress::Zstd->import( 2.201 );
+           IO::Compress::Zstd->VERSION( 2.217 );
          } ;
 }
 
@@ -47,17 +47,18 @@ require Exporter ;
 
 our ($VERSION, @ISA, @EXPORT_OK, %EXPORT_TAGS, %DEFLATE_CONSTANTS, $ZipError);
 
-$VERSION = '2.204';
+$VERSION = '2.223';
 $ZipError = '';
 
 @ISA = qw(IO::Compress::RawDeflate Exporter);
 @EXPORT_OK = qw( $ZipError zip ) ;
 %EXPORT_TAGS = %IO::Compress::RawDeflate::DEFLATE_CONSTANTS ;
 
-push @{ $EXPORT_TAGS{all} }, @EXPORT_OK ;
+my @zip_methods = qw( ZIP_CM_STORE ZIP_CM_DEFLATE ZIP_CM_BZIP2 ZIP_CM_LZMA ZIP_CM_XZ ZIP_CM_ZSTD ) ;
+$EXPORT_TAGS{all} = [ defined $EXPORT_TAGS{all} ? @{ $EXPORT_TAGS{all} } : (), @EXPORT_OK, @zip_methods ] ;
 
-$EXPORT_TAGS{zip_method} = [qw( ZIP_CM_STORE ZIP_CM_DEFLATE ZIP_CM_BZIP2 ZIP_CM_LZMA ZIP_CM_XZ ZIP_CM_ZSTD)];
-push @{ $EXPORT_TAGS{all} }, @{ $EXPORT_TAGS{zip_method} };
+$EXPORT_TAGS{zip_method} = [ @zip_methods ];
+push @{ $EXPORT_TAGS{constants} }, @zip_methods ;
 
 Exporter::export_ok_tags('all');
 
@@ -570,7 +571,7 @@ sub mkFinalTrailer
         $z64e .= U64::pack_V64 $entries   ; # entries in central dir
         $z64e .= U64::pack_V64 $cd_len    ; # size of central dir
         $z64e .= *$self->{ZipData}{Offset}->getPacked_V64() ; # offset to start central dir
-        $z64e .= *$self->{ZipData}{extrafieldzip64}  # otional extra field
+        $z64e .= *$self->{ZipData}{extrafieldzip64}  # optional extra field
             if defined *$self->{ZipData}{extrafieldzip64} ;
 
         $z64e  = pack("V", ZIP64_END_CENTRAL_REC_HDR_SIG) # signature
@@ -810,7 +811,7 @@ sub getFileInfo
         $params->setValue('mtime' => $mtime) ;
         $params->setValue('atime' => $atime) ;
         $params->setValue('ctime' => undef) ; # No Creation time
-        # TODO - see if can fillout creation time on non-Unix
+        # TODO - see if can fill out creation time on non-Unix
     }
 
     # NOTE - Unix specific code alert
@@ -1206,7 +1207,7 @@ Defaults to 0.
 
 =back
 
-=head2 Examples
+=head2 Oneshot Examples
 
 Here are a few example that show the capabilities of the module.
 
@@ -1317,7 +1318,10 @@ The format of the constructor for C<IO::Compress::Zip> is shown below
     my $z = IO::Compress::Zip->new( $output [,OPTS] )
         or die "IO::Compress::Zip failed: $ZipError\n";
 
-It returns an C<IO::Compress::Zip> object on success and undef on failure.
+The constructor takes one mandatory parameter, C<$output>, defined below and
+zero or more C<OPTS>, defined in L<Constructor Options>.
+
+It returns an C<IO::Compress::Zip> object on success and C<undef> on failure.
 The variable C<$ZipError> will contain an error message on failure.
 
 If you are running Perl 5.005 or better the object, C<$z>, returned from
@@ -1329,6 +1333,18 @@ these forms
 
     $z->print("hello world\n");
     print $z "hello world\n";
+
+Below is a simple exaple of using the OO interface to create an output file
+C<myfile.zip> and write some data to it.
+
+    my $filename = "myfile.zip";
+    my $z = IO::Compress::Zip->new($filename)
+        or die "IO::Compress::Zip failed: $ZipError\n";
+
+    $z->print("abcde");
+    $z->close();
+
+See the L</Examples> for more.
 
 The mandatory parameter C<$output> is used to control the destination
 of the compressed data. This parameter can take one of these forms.
@@ -1850,7 +1866,111 @@ This is a placeholder option.
 
 =head2 Examples
 
-TODO
+=head3 Streaming
+
+This very simple command line example demonstrates the streaming capabilities
+of the module. The code reads data from STDIN or all the files given on the
+commandline, compresses it, and writes the compressed data to STDOUT.
+
+    use strict ;
+    use warnings ;
+    use IO::Compress::Zip qw(zip $ZipError) ;
+
+    my $z = IO::Compress::Zip->new("-", Stream => 1)
+        or die "IO::Compress::Zip failed: $ZipError\n";
+
+    while (<>) {
+        $z->print("abcde");
+    }
+    $z->close();
+
+Note the use of C<"-"> to means C<STDOUT>. Alternatively you can use C<\*STDOUT>.
+
+One problem with creating a zip archive directly from STDIN can be demonstrated by looking at
+the contents of the zip file, output.zip, that we have just created
+(assumg you have redirected it to a file called C<output.zip>).
+
+    $ unzip -l output.zip
+    Archive:  output.zip
+    Length      Date    Time    Name
+    ---------  ---------- -----   ----
+        12  2019-08-16 22:21
+    ---------                     -------
+        12                     1 file
+
+The archive member (filename) used is the empty string.
+
+If that doesn't suit your needs, you can explicitly set the filename used
+in the zip archive by specifying the L<Name|"File Naming Options"> option, like so
+
+    my $z = IO::Compress::Zip->new("-", Name => "hello.txt", Stream => 1)
+
+Now the contents of the zip file looks like this
+
+    $ unzip -l output.zip
+    Archive:  output.zip
+    Length      Date    Time    Name
+    ---------  ---------- -----   ----
+        12  2019-08-16 22:22   hello.txt
+    ---------                     -------
+        12                     1 file
+
+=head3 Compressing a file from the filesystem
+
+To read the contents of the file C<file1.txt> and write the compressed
+data to the file C<file1.txt.zip> there are a few options
+
+Start by creating the compression object and opening the input file
+
+    use strict ;
+    use warnings ;
+    use IO::Compress::Zip qw(zip $ZipError) ;
+
+    my $input = "file1.txt";
+    my $z = IO::Compress::Zip->new("file1.txt.zip")
+        or die "IO::Compress::Zip failed: $ZipError\n";
+
+    # open the input file
+    open my $fh, "<", "file1.txt"
+        or die "Cannot open file1.txt: $!\n";
+
+    # loop through the input file & write to the compressed file
+    while (<$fh>) {
+        $z->print($_);
+    }
+
+    # not forgetting to close the compressed file
+    $z->close();
+
+=head3 Compressing multiple files
+
+To create a zip file, C<output.zip>, that contains the compressed contents
+of the files C<alpha.txt> and C<beta.txt>
+
+    use strict ;
+    use warnings ;
+    use IO::Compress::Zip qw(zip $ZipError) ;
+
+    my $z = IO::Compress::Zip->new("output.zip", Name => "alpha.txt")
+        or die "IO::Compress::Zip failed: $ZipError\n";
+
+    # open the input file
+    open my $fh, "<", "file1.txt"
+        or die "Cannot open file1.txt: $!\n";
+
+    # loop through the input file & write to the compressed file
+    while (<$fh>) {
+        $z->print($_);
+    }
+
+    # move to next file
+    $z->newStream(Name => "beta.txt")
+
+    while (<$fh>) {
+        $z->print($_);
+    }
+
+    $z->close();
 
 =head1 Methods
 
@@ -2166,7 +2286,7 @@ See the Changes file.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (c) 2005-2023 Paul Marquess. All rights reserved.
+Copyright (c) 2005-2026 Paul Marquess. All rights reserved.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.

@@ -1,4 +1,4 @@
-/*	$Id: netproc.c,v 1.35 2024/04/28 10:09:25 tb Exp $ */
+/*	$Id: netproc.c,v 1.49 2026/09/09 06:11:43 tb Exp $ */
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -19,6 +19,8 @@
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -78,7 +80,16 @@ buf_dump(const struct buf *buf)
 static char *
 url2host(const char *host, short *port, char **path)
 {
-	char	*url, *ep;
+	const char	*cp;
+	char		*url, *ep;
+
+	for (cp = host; *cp != '\0'; cp++) {
+		if (iscntrl((unsigned char)*cp) ||
+		    isspace((unsigned char)*cp)) {
+			warnx("invalid character in URL");
+			return NULL;
+		}
+	}
 
 	/* We only understand HTTP and HTTPS. */
 	if (strncmp(host, "https://", 8) == 0) {
@@ -87,14 +98,8 @@ url2host(const char *host, short *port, char **path)
 			warn("strdup");
 			return NULL;
 		}
-	} else if (strncmp(host, "http://", 7) == 0) {
-		*port = 80;
-		if ((url = strdup(host + 7)) == NULL) {
-			warn("strdup");
-			return NULL;
-		}
 	} else {
-		warnx("%s: unknown schema", host);
+		warnx("%s: RFC 8555 requires https for the API server", host);
 		return NULL;
 	}
 
@@ -109,6 +114,21 @@ url2host(const char *host, short *port, char **path)
 		warn("strdup");
 		free(url);
 		return NULL;
+	}
+
+	/* extract port */
+	if ((ep = strchr(url, ':')) != NULL) {
+		const char *errstr;
+
+		*ep = '\0';
+		*port = strtonum(ep + 1, 1, USHRT_MAX, &errstr);
+		if (errstr != NULL) {
+			warn("port is %s: %s", errstr, ep + 1);
+			free(*path);
+			*path = NULL;
+			free(url);
+			return NULL;
+		}
 	}
 
 	return url;
@@ -250,6 +270,7 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
 	struct httphead	*h;
 	ssize_t		 ssz;
 	long		 code;
+	int		 retry = 0;
 
 	if ((host = url2host(c->newnonce, &port, &path)) == NULL)
 		return -1;
@@ -278,6 +299,7 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
 	}
 	http_get_free(g);
 
+ again:
 	/*
 	 * Send the url, nonce and request payload to the acctproc.
 	 * This will create the proper JSON object we need.
@@ -336,6 +358,46 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
 	} else
 		memcpy(c->buf.buf, g->bodypart, c->buf.sz);
 
+	if (code == 400) {
+		struct jsmnn	*j;
+		char		*type;
+
+		j = json_parse(c->buf.buf, c->buf.sz);
+		if (j == NULL) {
+			code = -1;
+			goto out;
+		}
+
+		type = json_getstr(j, "type");
+		json_free(j);
+
+		if (type == NULL) {
+			code = -1;
+			goto out;
+		}
+
+		if (strcmp(type, "urn:ietf:params:acme:error:badNonce") != 0) {
+			free(type);
+			goto out;
+		}
+		free(type);
+
+		if (retry++ < RETRY_MAX) {
+			h = http_head_get("Replay-Nonce", g->head, g->headsz);
+			if (h == NULL) {
+				warnx("no replay nonce");
+				code = -1;
+				goto out;
+			} else if ((nonce = strdup(h->val)) == NULL) {
+				warn("strdup");
+				code = -1;
+				goto out;
+			}
+			http_get_free(g);
+			goto again;
+		}
+	}
+ out:
 	if (loc != NULL) {
 		free(*loc);
 		*loc = NULL;
@@ -355,14 +417,30 @@ sreq(struct conn *c, const char *addr, int kid, const char *req, char **loc)
  * Returns non-zero on success.
  */
 static int
-donewacc(struct conn *c, const struct capaths *p, const char *contact)
+donewacc(struct conn *c, const struct capaths *p, const char *contact,
+    int eab)
 {
 	struct jsmnn	*j = NULL;
 	int		 rc = 0;
-	char		*req, *detail, *error = NULL;
+	char		*req, *detail, *error = NULL, *accturi = NULL;
+	char		*eab_json = NULL;
 	long		 lc;
 
-	if ((req = json_fmt_newacc(contact)) == NULL)
+	if (eab) {
+		/* ask acct proc to produce eab json */
+		if (writeop(c->fd, COMM_ACCT, ACCT_EAB) <= 0) {
+			return -1;
+		} else if (writestr(c->fd, COMM_URL, p->newaccount) <= 0) {
+			return -1;
+		}
+
+		/* Now read back the signed payload. */
+		if ((eab_json = readstr(c->fd, COMM_REQ)) == NULL) {
+			return -1;
+		}
+	}
+
+	if ((req = json_fmt_newacc(contact, eab_json)) == NULL)
 		warnx("json_fmt_newacc");
 	else if ((lc = sreq(c, p->newaccount, 0, req, &c->kid)) < 0)
 		warnx("%s: bad comm", p->newaccount);
@@ -376,6 +454,7 @@ donewacc(struct conn *c, const struct capaths *p, const char *contact)
 				warnx("%s", error);
 				free(error);
 			}
+			free(detail);
 		}
 	} else if (lc != 200 && lc != 201)
 		warnx("%s: bad HTTP: %ld", p->newaccount, lc);
@@ -383,6 +462,12 @@ donewacc(struct conn *c, const struct capaths *p, const char *contact)
 		warnx("%s: empty response", p->newaccount);
 	else
 		rc = 1;
+
+	if (c->kid != NULL) {
+		if (stravis(&accturi, c->kid, VIS_SAFE) != -1)
+			printf("account key: %s\n", accturi);
+		free(accturi);
+	}
 
 	if (rc == 0 || verbose > 1)
 		buf_dump(&c->buf);
@@ -396,10 +481,11 @@ donewacc(struct conn *c, const struct capaths *p, const char *contact)
  * Returns non-zero on success.
  */
 static int
-dochkacc(struct conn *c, const struct capaths *p, const char *contact)
+dochkacc(struct conn *c, const struct capaths *p, const char *contact,
+    int eab)
 {
 	int		 rc = 0;
-	char		*req;
+	char		*req, *accturi = NULL;
 	long		 lc;
 
 	if ((req = json_fmt_chkacc()) == NULL)
@@ -411,12 +497,17 @@ dochkacc(struct conn *c, const struct capaths *p, const char *contact)
 	else if (c->buf.buf == NULL || c->buf.sz == 0)
 		warnx("%s: empty response", p->newaccount);
 	else if (lc == 400)
-		rc = donewacc(c, p, contact);
+		rc = donewacc(c, p, contact, eab);
 	else
 		rc = 1;
 
 	if (c->kid == NULL)
 		rc = 0;
+	else {
+		if (stravis(&accturi, c->kid, VIS_SAFE) != -1)
+			dodbg("account key: %s", accturi);
+		free(accturi);
+	}
 
 	if (rc == 0 || verbose > 1)
 		buf_dump(&c->buf);
@@ -428,15 +519,15 @@ dochkacc(struct conn *c, const struct capaths *p, const char *contact)
  * Submit a new order for a certificate.
  */
 static int
-doneworder(struct conn *c, const char *const *alts, size_t altsz,
-    struct order *order, const struct capaths *p)
+doneworder(struct conn *c, struct domain_c *domain, struct order *order,
+    const struct capaths *p)
 {
 	struct jsmnn	*j = NULL;
 	int		 rc = 0;
 	char		*req;
 	long		 lc;
 
-	if ((req = json_fmt_neworder(alts, altsz)) == NULL)
+	if ((req = json_fmt_neworder(domain)) == NULL)
 		warnx("json_fmt_neworder");
 	else if ((lc = sreq(c, p->neworder, 1, req, &order->uri)) < 0)
 		warnx("%s: bad comm", p->neworder);
@@ -659,9 +750,9 @@ dodirs(struct conn *c, const char *addr, struct capaths *paths)
 int
 netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
     int revocate, struct authority_c *authority,
-    const char *const *alts, size_t altsz)
+    struct domain_c *domain, int eab)
 {
-	int		 rc = 0;
+	int		 rc = 0, retries = 0;
 	size_t		 i;
 	char		*cert = NULL, *thumb = NULL, *error = NULL;
 	struct conn	 c;
@@ -683,7 +774,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 		goto out;
 	}
 
-	if (http_init() == -1) {
+	if (http_init(authority->insecure) == -1) {
 		warn("http_init");
 		goto out;
 	}
@@ -741,7 +832,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 	c.newnonce = paths.newnonce;
 
 	/* Check if our account already exists or create it. */
-	if (!dochkacc(&c, &paths, authority->contact))
+	if (!dochkacc(&c, &paths, authority->contact, eab))
 		goto out;
 
 	/*
@@ -750,7 +841,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 	 * Following that, submit the request to the CA then notify the
 	 * certproc, which will in turn notify the fileproc.
 	 * XXX currently we can only sign with the account key, the RFC
-	 * also mentions signing with the privat key of the cert itself.
+	 * also mentions signing with the private key of the cert itself.
 	 */
 	if (revocate) {
 		if ((cert = readstr(rfd, COMM_CSR)) == NULL)
@@ -764,7 +855,7 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 
 	memset(&order, 0, sizeof(order));
 
-	if (!doneworder(&c, alts, altsz, &order, &paths))
+	if (!doneworder(&c, domain, &order, &paths))
 		goto out;
 
 	chngs = calloc(order.authsz, sizeof(struct chng));
@@ -851,6 +942,9 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 			if (!docert(&c, order.finalize, cert))
 				goto out;
 			break;
+		case ORDER_PROCESSING:
+			/* we'll just retry */
+			break;
 		default:
 			warnx("unhandled status: %d", order.status);
 			goto out;
@@ -859,8 +953,19 @@ netproc(int kfd, int afd, int Cfd, int cfd, int dfd, int rfd,
 			goto out;
 
 		dodbg("order.status %d", order.status);
-		if (order.status == ORDER_PENDING)
+		switch (order.status) {
+		case ORDER_PENDING:
+		case ORDER_PROCESSING:
+			if (retries++ > RETRY_MAX) {
+				warnx("too many retries");
+				goto out;
+			}
 			sleep(RETRY_DELAY);
+			break;
+		default:
+			retries = 0; /* state changed, we made progress */
+			break;
+		}
 	}
 
 	if (order.status != ORDER_VALID) {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: radiusctl.c,v 1.12 2024/07/24 08:27:20 yasuoka Exp $	*/
+/*	$OpenBSD: radiusctl.c,v 1.18 2026/08/04 13:19:56 claudio Exp $	*/
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
  *
@@ -94,8 +94,7 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	int			 ch, sock, done = 0;
-	ssize_t			 n;
+	int			 n, ch, sock, done = 0;
 	struct parse_result	*res;
 	struct sockaddr_un	 sun;
 	struct imsgbuf		 ibuf;
@@ -147,7 +146,8 @@ main(int argc, char *argv[])
 		err(EX_OSERR, "socket");
 	if (connect(sock, (struct sockaddr *)&sun, sizeof(sun)) == -1)
 		err(EX_OSERR, "connect");
-	imsg_init(&ibuf, sock);
+	if (imsgbuf_init(&ibuf, sock) == -1)
+		err(EX_OSERR, "imsgbuf_init");
 
 	res = parse(argc, argv);
 	if (res == NULL)
@@ -170,6 +170,7 @@ main(int argc, char *argv[])
 		    IMSG_RADIUSD_MODULE_IPCP_MONITOR :
 		    IMSG_RADIUSD_MODULE_IPCP_DUMP, 0, 0, -1, iov, niov);
 		break;
+	case IPCP_DELETE:
 	case IPCP_DISCONNECT:
 		memset(module_name, 0, sizeof(module_name));
 		strlcpy(module_name, "ipcp",
@@ -178,19 +179,19 @@ main(int argc, char *argv[])
 		iov[niov++].iov_len = RADIUSD_MODULE_NAME_LEN;
 		iov[niov].iov_base = &res->session_seq;
 		iov[niov++].iov_len = sizeof(res->session_seq);
-		imsg_composev(&ibuf, IMSG_RADIUSD_MODULE_IPCP_DISCONNECT, 0, 0,
-		    -1, iov, niov);
+		imsg_composev(&ibuf,
+		    (res->action == IPCP_DELETE)
+		    ? IMSG_RADIUSD_MODULE_IPCP_DELETE
+		    : IMSG_RADIUSD_MODULE_IPCP_DISCONNECT, 0, 0, -1, iov, niov);
 		break;
 	}
-	while (ibuf.w.queued) {
-		if (msgbuf_write(&ibuf.w) <= 0 && errno != EAGAIN)
-			err(1, "ibuf_ctl: msgbuf_write error");
-	}
+	if (imsgbuf_flush(&ibuf) == -1)
+		err(1, "ibuf_ctl: imsgbuf_flush error");
 	while (!done) {
-		if (((n = imsg_read(&ibuf)) == -1 && errno != EAGAIN) || n == 0)
+		if (imsgbuf_read(&ibuf) != 1)
 			break;
 		for (;;) {
-			if ((n = imsg_get(&ibuf, &imsg)) <= 0) {
+			if ((n = imsgbuf_get(&ibuf, &imsg)) <= 0) {
 				if (n != 0)
 					done = 1;
 				break;
@@ -199,6 +200,7 @@ main(int argc, char *argv[])
 			case IPCP_SHOW:
 			case IPCP_DUMP:
 			case IPCP_MONITOR:
+			case IPCP_DELETE:
 			case IPCP_DISCONNECT:
 				done = ipcp_handle_imsg(res, &imsg, cnt++);
 				break;

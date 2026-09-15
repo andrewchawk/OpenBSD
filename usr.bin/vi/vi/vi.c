@@ -1,4 +1,4 @@
-/*	$OpenBSD: vi.c,v 1.23 2022/02/20 19:45:51 tb Exp $	*/
+/*	$OpenBSD: vi.c,v 1.24 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -55,7 +55,7 @@ static void	v_comlog(SCR *, VICMD *);
 
 /*
  * vi --
- * 	Main vi command loop.
+ *	Main vi command loop.
  *
  * PUBLIC: int vi(SCR **);
  */
@@ -764,7 +764,7 @@ v_motion(SCR *sp, VICMD *dm, VICMD *vp, int *mappedp)
 	 * this case, or if the command is a "line command", set the flags
 	 * appropriately.  If not a doubled command, run the function to get
 	 * the resulting mark.
- 	 */
+	 */
 	if (vp->key == motion.key) {
 		F_SET(vp, VM_LDOUBLE | VM_LMODE);
 

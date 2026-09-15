@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-swap-window.c,v 1.28 2021/08/21 10:22:39 nicm Exp $ */
+/* $OpenBSD: cmd-swap-window.c,v 1.30 2026/07/27 08:03:01 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -38,7 +38,7 @@ const struct cmd_entry cmd_swap_window_entry = {
 	.source = { 's', CMD_FIND_WINDOW, CMD_FIND_DEFAULT_MARKED },
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = 0,
+	.flags = CMD_AFTERHOOK,
 	.exec = cmd_swap_window_exec
 };
 
@@ -77,6 +77,8 @@ cmd_swap_window_exec(struct cmd *self, struct cmdq_item *item)
 	wl_src->window = w_dst;
 	TAILQ_INSERT_TAIL(&w_dst->winlinks, wl_src, wentry);
 
+	if (marked_pane.wl == wl_src)
+		marked_pane.wl = wl_dst;
 	if (args_has(args, 'd')) {
 		session_select(dst, wl_dst->idx);
 		if (src != dst)

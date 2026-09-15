@@ -7,6 +7,7 @@
 #include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/shmem_fs.h>
+#include <linux/vmalloc.h>
 
 #include "i915_drv.h"
 #include "gem/i915_gem_object.h"
@@ -41,7 +42,7 @@ struct file *shmem_create_from_object(struct drm_i915_gem_object *obj)
 
 	if (i915_gem_object_is_shmem(obj)) {
 		file = obj->base.filp;
-		atomic_long_inc(&file->f_count);
+		get_file(file);
 		return file;
 	}
 
@@ -109,7 +110,7 @@ static int __shmem_rw(struct file *file, loff_t off,
 		if (IS_ERR(page))
 			return PTR_ERR(page);
 
-		vaddr = kmap(page);
+		vaddr = kmap_local_page(page);
 		if (write) {
 			memcpy(vaddr + offset_in_page(off), ptr, this);
 			set_page_dirty(page);
@@ -117,7 +118,7 @@ static int __shmem_rw(struct file *file, loff_t off,
 			memcpy(ptr, vaddr + offset_in_page(off), this);
 		}
 		mark_page_accessed(page);
-		kunmap(page);
+		kunmap_local(vaddr);
 		put_page(page);
 
 		len -= this;
@@ -144,11 +145,11 @@ int shmem_read_to_iosys_map(struct file *file, loff_t off,
 		if (IS_ERR(page))
 			return PTR_ERR(page);
 
-		vaddr = kmap(page);
+		vaddr = kmap_local_page(page);
 		iosys_map_memcpy_to(map, map_off, vaddr + offset_in_page(off),
 				    this);
 		mark_page_accessed(page);
-		kunmap(page);
+		kunmap_local(vaddr);
 		put_page(page);
 
 		len -= this;
@@ -172,7 +173,7 @@ int shmem_write(struct file *file, loff_t off, void *src, size_t len)
 #endif /* __linux__ */
 
 struct uvm_object *
-uao_create_from_data(void *data, size_t len)
+uao_create_from_data(const char *name, void *data, size_t len)
 {
 	struct uvm_object *uao;
 	int err;
@@ -194,6 +195,7 @@ uao_create_from_data(void *data, size_t len)
 struct uvm_object *
 uao_create_from_object(struct drm_i915_gem_object *obj)
 {
+	enum i915_map_type map_type;
 	struct uvm_object *uao;
 	void *ptr;
 
@@ -202,12 +204,12 @@ uao_create_from_object(struct drm_i915_gem_object *obj)
 		return obj->base.uao;
 	}
 
-	ptr = i915_gem_object_pin_map_unlocked(obj, i915_gem_object_is_lmem(obj) ?
-						I915_MAP_WC : I915_MAP_WB);
+	map_type = i915_gem_object_is_lmem(obj) ? I915_MAP_WC : I915_MAP_WB;
+	ptr = i915_gem_object_pin_map_unlocked(obj, map_type);
 	if (IS_ERR(ptr))
 		return ERR_CAST(ptr);
 
-	uao = uao_create_from_data(ptr, obj->base.size);
+	uao = uao_create_from_data("", ptr, obj->base.size);
 	i915_gem_object_unpin_map(obj);
 
 	return uao;

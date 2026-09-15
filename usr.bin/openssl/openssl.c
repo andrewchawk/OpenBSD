@@ -1,4 +1,4 @@
-/* $OpenBSD: openssl.c,v 1.37 2024/07/08 05:59:10 tb Exp $ */
+/* $OpenBSD: openssl.c,v 1.43 2026/09/14 23:36:58 kenjiro Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -127,9 +127,6 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
-#include "progs.h"
-#include "s_apps.h"
-
 #define FUNC_TYPE_GENERAL       1
 #define FUNC_TYPE_MD            2
 #define FUNC_TYPE_CIPHER        3
@@ -234,12 +231,13 @@ FUNCTION functions[] = {
 #ifndef OPENSSL_NO_SHA512
 	{ FUNC_TYPE_MD, "sha512", dgst_main },
 #endif
+	{ FUNC_TYPE_MD, "sha3-224", dgst_main },
+	{ FUNC_TYPE_MD, "sha3-256", dgst_main },
+	{ FUNC_TYPE_MD, "sha3-384", dgst_main },
+	{ FUNC_TYPE_MD, "sha3-512", dgst_main },
 #ifndef OPENSSL_NO_SM3
 	{ FUNC_TYPE_MD, "sm3", dgst_main },
 	{ FUNC_TYPE_MD, "sm3WithRSAEncryption", dgst_main },
-#endif
-#ifndef OPENSSL_NO_WHIRLPOOL
-	{ FUNC_TYPE_MD, "whirlpool", dgst_main },
 #endif
 
 	/* Ciphers. */
@@ -349,7 +347,6 @@ openssl_startup(void)
 {
 	signal(SIGPIPE, SIG_IGN);
 
-	OpenSSL_add_all_algorithms();
 	SSL_library_init();
 	SSL_load_error_strings();
 
@@ -362,10 +359,6 @@ openssl_shutdown(void)
 	CONF_modules_unload(1);
 	destroy_ui();
 	OBJ_cleanup();
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
-	ERR_remove_thread_state(NULL);
-	ERR_free_strings();
 }
 
 int
@@ -463,6 +456,9 @@ main(int argc, char **argv)
 		BIO_free(bio_err);
 		bio_err = NULL;
 	}
+	ERR_remove_thread_state(NULL);
+	OPENSSL_cleanup();
+
 	return (ret);
 }
 

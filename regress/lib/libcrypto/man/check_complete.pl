@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# Copyright (c) 2021 Ingo Schwarze <schwarze@openbsd.org>
+# Copyright (c) 2021,2022,2023,2024,2025 Ingo Schwarze <schwarze@openbsd.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -25,17 +25,25 @@ my %internal = (
 	CHARTYPE_FIRST_ESC_2253 CHARTYPE_LAST_ESC_2253 CHARTYPE_PRINTABLESTRING
     )],
     bn => [qw(
-	BN_BITS BN_BITS4 BN_BYTES
-	BN_DEC_CONV BN_DEC_FMT1 BN_DEC_FMT2 BN_DEC_NUM BN_LLONG BN_LONG
-	BN_MASK2 BN_MASK2h BN_MASK2h1 BN_MASK2l
-	BN_TBIT BN_ULLONG
+	BN_BYTES BN_LLONG BN_ULLONG
+    )],
+    conf => [qw(
+	conf_st conf_method_st
     )],
     evp => [qw(
-        EVP_MD_CTRL_ALG_CTRL
-        EVP_MD_CTX_FLAG_CLEANED EVP_MD_CTX_FLAG_REUSE
-    )],
-    objects => [qw(
-	OBJ_bsearch_ OBJ_bsearch_ex_
+	ASN1_PKEY_CTRL_CMS_ENVELOPE ASN1_PKEY_CTRL_CMS_RI_TYPE
+	ASN1_PKEY_CTRL_CMS_SIGN
+	dh_st dsa_st ec_key_st
+	EVP_MD_CTRL_ALG_CTRL
+	EVP_MD_CTX_FLAG_CLEANED EVP_MD_CTX_FLAG_REUSE
+	EVP_PKEY_ALG_CTRL
+	EVP_PKEY_CTRL_CMS_DECRYPT EVP_PKEY_CTRL_CMS_ENCRYPT
+	EVP_PKEY_CTRL_CMS_SIGN
+	EVP_PKEY_CTRL_DIGESTINIT
+	EVP_PKEY_CTRL_PEER_KEY
+	EVP_PKEY_CTRL_PKCS7_DECRYPT EVP_PKEY_CTRL_PKCS7_ENCRYPT
+	EVP_PKEY_CTRL_PKCS7_SIGN
+	rsa_st
     )],
     x509_vfy => [qw(
 	X509_VERIFY_PARAM_ID
@@ -47,7 +55,6 @@ my %obsolete = (
 	ASN1_dup ASN1_d2i_bio ASN1_d2i_bio_of ASN1_d2i_fp ASN1_d2i_fp_of
 	ASN1_i2d_bio ASN1_i2d_bio_of ASN1_i2d_bio_of_const
 	ASN1_i2d_fp ASN1_i2d_fp_of ASN1_i2d_fp_of_const
-	ASN1_LONG_UNDEF
 	BIT_STRING_BITNAME
 	V_ASN1_PRIMATIVE_TAG
 	X509_algor_st
@@ -61,13 +68,21 @@ my %obsolete = (
 	BIO_set_filter_bio BIO_set_no_connect_return BIO_set_proxies
 	BIO_set_proxy_cb BIO_set_proxy_header BIO_set_url
     )],
-    bn => [qw(
-	BN_HEX_FMT1 BN_HEX_FMT2 BN_MASK
-    )],
     evp => [qw(
-        EVP_MD_CTRL_DIGALGID
-        EVP_MD_CTX_FLAG_NON_FIPS_ALLOW EVP_MD_CTX_FLAG_PAD_MASK
-        EVP_MD_CTX_FLAG_PAD_PKCS1 EVP_MD_CTX_FLAG_PAD_PSS
+	EVP_CIPH_FLAG_FIPS EVP_CIPH_FLAG_NON_FIPS_ALLOW
+	EVP_CTRL_AEAD_SET_MAC_KEY EVP_CTRL_AEAD_TLS1_AAD
+	EVP_CTRL_GET_RC5_ROUNDS EVP_CTRL_GOST_SET_SBOX
+	EVP_CTRL_PBE_PRF_NID EVP_CTRL_SET_RC5_ROUNDS
+	EVP_MD_CTRL_DIGALGID EVP_MD_CTRL_GOST_SET_SBOX EVP_MD_CTRL_SET_KEY
+	EVP_MD_CTX_FLAG_NON_FIPS_ALLOW EVP_MD_CTX_FLAG_PAD_MASK
+	EVP_MD_CTX_FLAG_PAD_PKCS1 EVP_MD_CTX_FLAG_PAD_PSS
+	EVP_MD_FLAG_DIGALGID_MASK
+	EVP_PBE_KEYGEN
+	EVP_PKEY_CTRL_SET_IV
+	EVP_PKEY_GOSTIMIT EVP_PKEY_GOSTR01
+	EVP_PKEY_GOSTR12_256 EVP_PKEY_GOSTR12_512
+	EVP_PKEY_MO_DECRYPT EVP_PKEY_MO_ENCRYPT
+	EVP_PKEY_MO_SIGN EVP_PKEY_MO_VERIFY
     )],
 );
 
@@ -97,7 +112,7 @@ my %postponed = (
 
 my $MANW = 'man -M /usr/share/man -w';
 my $srcdir = '/usr/src/lib/libcrypto/man';
-my $hfile = '/usr/include/openssl';
+my $hfile = '/usr/include';
 
 my $in_cplusplus = 0;
 my $in_comment = 0;
@@ -114,6 +129,7 @@ if (defined $ARGV[0] && $ARGV[0] eq '-v') {
 	shift @ARGV;
 }
 $#ARGV == 0 or die "usage: $0 [-v] headername";
+$hfile .= "/openssl" unless $ARGV[0] eq 'tls';
 $hfile .= "/$ARGV[0].h";
 open my $in_fh, '<', $hfile or die "$hfile: $!";
 
@@ -217,12 +233,15 @@ try_again:
 	# Uninteresting lines.
 
 	if (/^\s*$/ ||
+	    /^DECLARE_LHASH_OF\(\w+\);$/ ||
 	    /^DECLARE_STACK_OF\(\w+\)$/ ||
+	    /^DECLARE_PKCS12_STACK_OF\(\w+\)$/ ||
 	    /^TYPEDEF_D2I2D_OF\(\w+\);$/ ||
 	    /^#define __bounded__\(\w+, \w+, \w+\)$/ ||
 	    /^#define HEADER_\w+_H$/ ||
 	    /^#endif$/ ||
 	    /^#else$/ ||
+	    /^#error/ ||
 	    /^extern\s+const\s+ASN1_ITEM\s+\w+_it;$/ ||
 	    /^#\s*include\s/ ||
 	    /^#ifn?def\s/ ||
@@ -267,7 +286,7 @@ try_again:
 			print "D- $line\n" if $verbose;
 			next;
 		}
-		if ($id =~ /^(?:ASN1|BIO|BN|EVP|X509(?:V3)?)_[FR]_\w+$/) {
+		if ($id =~ /^(?:ASN1|BIO|BN|CONF|EVP|X509(?:V3)?)_[FR]_\w+$/) {
 			print "D- $line\n" if $verbose;
 			next;
 		}

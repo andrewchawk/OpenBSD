@@ -1,4 +1,4 @@
-.\" $OpenBSD: snmpd.conf.5,v 1.64 2024/02/06 12:39:13 martijn Exp $
+.\" $OpenBSD: snmpd.conf.5,v 1.67 2026/01/18 16:38:02 schwarze Exp $
 .\"
 .\" Copyright (c) 2007, 2008, 2012 Reyk Floeter <reyk@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: February 6 2024 $
+.Dd $Mdocdate: January 18 2026 $
 .Dt SNMPD.CONF 5
 .Os
 .Sh NAME
@@ -30,15 +30,15 @@ The
 .Nm
 file is divided into the following main sections:
 .Bl -tag -width xxxx
-.It Sy Macros
-User-defined variables may be defined and used later, simplifying the
+.It Sx Macros
+Definitions of variables that can be used later, simplifying the
 configuration file.
-.It Sy Global Configuration
+.It Sx Global configuration
 Global runtime settings for
 .Xr snmpd 8 .
-.It Sy User Configuration
+.It Sx User configuration
 USM user definitions.
-.It Sy OID Configuration
+.It Sx OID configuration
 Custom configuration of SNMP object identifiers and values.
 .El
 .Pp
@@ -50,7 +50,7 @@ and extend to the end of the current line.
 Care should be taken when commenting out multi-line text:
 the comment is effective until the end of the entire block.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Additional configuration files can be included with the
@@ -59,23 +59,28 @@ keyword, for example:
 .Bd -literal -offset indent
 include "/etc/snmpd.conf.local"
 .Ed
-.Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example,
+.Ss Macros
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic community ,
 .Ic system ,
 or
 .Ic oid ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
 ext_addr="192.168.0.1"
 listen on $ext_addr
 .Ed
-.Sh GLOBAL CONFIGURATION
+.Ss Global configuration
 The following options can be set globally:
 .Bl -tag -width Ds
 .It Ic blocklist Ar oid
@@ -372,7 +377,7 @@ option.
 The IPv4 or IPv6 source address of the traps can be enforced using
 .Ic source-address .
 .El
-.Sh USER CONFIGURATION
+.Ss User configuration
 Users for the SNMP User-based Security Model (USM, RFC 3414) must be
 defined in the configuration file:
 .Bl -tag -width xxxx
@@ -420,7 +425,7 @@ and defaults to
 Any user account that has encryption enabled requires authentication to
 be enabled too.
 .El
-.Sh OID CONFIGURATION
+.Ss OID configuration
 It is possible to specify user-defined OIDs in the configuration file:
 .Bl -tag -width Ds
 .It Xo

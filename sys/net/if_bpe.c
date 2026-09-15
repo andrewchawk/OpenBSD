@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_bpe.c,v 1.22 2023/12/23 10:52:54 bluhm Exp $ */
+/*	$OpenBSD: if_bpe.c,v 1.27 2025/11/21 04:44:26 dlg Exp $ */
 /*
  * Copyright (c) 2018 David Gwynne <dlg@openbsd.org>
  *
@@ -20,11 +20,9 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/kernel.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <sys/timeout.h>
 #include <sys/pool.h>
 #include <sys/tree.h>
 #include <sys/smr.h>
@@ -32,9 +30,7 @@
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_dl.h>
-#include <net/if_media.h>
 #include <net/if_types.h>
-#include <net/rtable.h>
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
@@ -269,7 +265,7 @@ bpe_start(struct ifnet *ifp)
 
 			smr_read_enter();
 			endpoint = etherbridge_resolve_ea(&sc->sc_eb,
-			    (struct ether_addr *)ceh->ether_dhost);
+			    0, (struct ether_addr *)ceh->ether_dhost);
 			if (endpoint == NULL) {
 				/* "flood" to unknown hosts */
 				endpoint = &sc->sc_group;
@@ -305,6 +301,7 @@ bpe_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	struct bpe_softc *sc = ifp->if_softc;
 	struct ifreq *ifr = (struct ifreq *)data;
 	struct ifbrparam *bparam = (struct ifbrparam *)data;
+	struct ifnet *ifp0;
 	int error = 0;
 
 	switch (cmd) {
@@ -317,6 +314,13 @@ bpe_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		} else {
 			if (ISSET(ifp->if_flags, IFF_RUNNING))
 				error = bpe_down(sc);
+		}
+		break;
+
+	case SIOCSIFXFLAGS:
+		if ((ifp0 = if_get(sc->sc_key.k_if)) != NULL) {
+			ifsetlro(ifp0, ISSET(ifr->ifr_flags, IFXF_LRO));
+			if_put(ifp0);
 		}
 		break;
 
@@ -706,13 +710,13 @@ bpe_add_addr(struct bpe_softc *sc, const struct ifbareq *ifba)
 	/* check endpoint for multicast or broadcast? */
 
 	return (etherbridge_add_addr(&sc->sc_eb, (void *)endpoint,
-	    &ifba->ifba_dst, type));
+	    0, 0, &ifba->ifba_dst, type));
 }
 
 static int
 bpe_del_addr(struct bpe_softc *sc, const struct ifbareq *ifba)
 {
-	return (etherbridge_del_addr(&sc->sc_eb, &ifba->ifba_dst));
+	return (etherbridge_del_addr(&sc->sc_eb, 0, &ifba->ifba_dst));
 }
 
 static inline struct bpe_softc *
@@ -729,7 +733,7 @@ bpe_find(struct ifnet *ifp0, uint32_t isid)
 }
 
 void
-bpe_input(struct ifnet *ifp0, struct mbuf *m)
+bpe_input(struct ifnet *ifp0, struct mbuf *m, struct netstack *ns)
 {
 	struct bpe_softc *sc;
 	struct ifnet *ifp;
@@ -766,7 +770,7 @@ bpe_input(struct ifnet *ifp0, struct mbuf *m)
 	ceh = (struct ether_header *)(itagp + 1);
 
 	etherbridge_map_ea(&sc->sc_eb, ceh->ether_shost,
-	    (struct ether_addr *)beh->ether_shost);
+	    0, 0, (struct ether_addr *)beh->ether_shost);
 
 	m_adj(m, sizeof(*beh) + sizeof(*itagp));
 
@@ -809,7 +813,7 @@ bpe_input(struct ifnet *ifp0, struct mbuf *m)
 	pf_pkt_addr_changed(m);
 #endif
 
-	if_vinput(ifp, m);
+	if_vinput(ifp, m, ns);
 	return;
 
 drop:

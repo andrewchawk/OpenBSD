@@ -1,7 +1,7 @@
-.\" $OpenBSD: mdoc.7,v 1.184 2024/06/17 15:35:33 schwarze Exp $
+.\" $OpenBSD: mdoc.7,v 1.196 2026/08/14 03:29:07 jsg Exp $
 .\"
+.\" Copyright (c) 2010-2021, 2024-2026 Ingo Schwarze <schwarze@openbsd.org>
 .\" Copyright (c) 2009, 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
-.\" Copyright (c) 2010, 2011, 2013-2020 Ingo Schwarze <schwarze@openbsd.org>
 .\"
 .\" Permission to use, copy, modify, and distribute this software for any
 .\" purpose with or without fee is hereby granted, provided that the above
@@ -15,7 +15,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 17 2024 $
+.Dd $Mdocdate: August 14 2026 $
 .Dt MDOC 7
 .Os
 .Sh NAME
@@ -192,15 +192,13 @@ See
 and
 .Ic \&Nd .
 .It Em LIBRARY
-The name of the library containing the documented material, which is
-assumed to be a function in a section 2, 3, or 9 manual.
-The syntax for this is as follows:
-.Bd -literal -offset indent
-\&.Lb libarm
-.Ed
-.Pp
-See
-.Ic \&Lb .
+The name of the library containing the documented functions.
+Using this section is no longer recommended.
+If any
+.Ic \&Lb
+macro is needed, put it at the beginning of the
+.Em SYNOPSIS
+section instead.
 .It Em SYNOPSIS
 Documents the utility invocation syntax, function call syntax, or device
 configuration.
@@ -222,11 +220,12 @@ Commands should be ordered alphabetically.
 .Pp
 For the second, function calls (sections 2, 3, 9):
 .Bd -literal -offset indent
+\&.Lb libname \e" unless the functions are in libc
 \&.In header.h
 \&.Vt extern const char *global;
-\&.Ft "char *"
+\&.Ft char *
 \&.Fn foo "const char *src"
-\&.Ft "char *"
+\&.Ft char *
 \&.Fn bar "const char *src"
 .Ed
 .Pp
@@ -359,7 +358,7 @@ This section documents the
 command exit status for section 1, 6, and 8 utilities.
 Historically, this information was described in
 .Em DIAGNOSTICS ,
-a practise that is now discouraged.
+a practice that is now discouraged.
 .Pp
 See
 .Ic \&Ex .
@@ -376,7 +375,7 @@ userland programs to the standard error output.
 .Pp
 Historically, this section was used in place of
 .Em EXIT STATUS
-for manuals in sections 1, 6, and 8; however, this practise is
+for manuals in sections 1, 6, and 8; however, this practice is
 discouraged.
 .Pp
 See
@@ -460,7 +459,8 @@ in the alphabetical
 .Op Fl compact
 .It Ic \&D1 Ta indented display (one line)
 .It Ic \&Dl Ta indented literal display (one line)
-.It Ic \&Ql Ta in-line literal display: Ql text
+.It Ic \&Ql Ta normal in-line literal display: Ql text
+.It Ic \&Li Ta unquoted in-line literal display: Li text
 .It Ic \&Bl , \&El Ta list block:
 .Fl Ar type
 .Op Fl width Ar val
@@ -491,7 +491,7 @@ in the alphabetical
 .El
 .Ss Semantic markup for function libraries
 .Bl -column "Brq, Bro, Brc" description
-.It Ic \&Lb Ta function library (one argument)
+.It Ic \&Lb Ta function library (>0 arguments)
 .It Ic \&In Ta include file (one argument)
 .It Ic \&Fd Ta other preprocessor directive (>0 arguments)
 .It Ic \&Ft Ta function type (>0 arguments)
@@ -799,9 +799,9 @@ justification than the one used by the surrounding text.
 They may contain both macro lines and text lines.
 By default, a display block is preceded by a vertical space.
 .Pp
-The
+The display
 .Ar type
-must be one of the following:
+is mandatory and must be specified first:
 .Bl -tag -width 13n -offset indent
 .It Fl centered
 Produce one output line from each input line, and center-justify each line.
@@ -827,46 +827,20 @@ but using the same font as for normal text, which is a variable width font
 if supported by the output device.
 .El
 .Pp
-The
-.Ar type
-must be provided first.
 Additional arguments may follow:
 .Bl -tag -width 13n -offset indent
 .It Fl offset Ar width
 Indent the display by the
-.Ar width ,
-which may be one of the following:
-.Bl -item
-.It
-One of the pre-defined strings
-.Cm indent ,
-the width of a standard indentation (six constant width characters);
-.Cm indent-two ,
-twice
-.Cm indent ;
-.Cm left ,
-which has no effect;
-.Cm right ,
-which justifies to the right margin; or
-.Cm center ,
-which aligns around an imagined center axis.
-.It
-A macro invocation, which selects a predefined width
-associated with that macro.
-The most popular is the imaginary macro
-.Ar \&Ds ,
-which resolves to
-.Sy 6n .
-.It
-A scaling width as described in
-.Xr roff 7 .
-.It
-An arbitrary string, which indents by the length of this string.
-.El
-.Pp
-When the argument is missing,
-.Fl offset
-is ignored.
+.Ar width .
+The default is
+.Cm 0n ,
+i.e. no indentation.
+If an indentation is desired, the form
+.Fl offset Cm indent
+is recommended for most use cases.
+For details, see
+.Sx WIDTH SPECIFICATIONS
+below.
 .It Fl compact
 Do not assert vertical space before the display.
 .El
@@ -944,35 +918,12 @@ Doing so will clobber the right margin.
 Begin a list.
 Lists consist of items specified using the
 .Ic \&It
-macro, containing a head or a body or both.
+macro, each containing a head or a body or both.
 .Pp
 The list
 .Ar type
 is mandatory and must be specified first.
-The
-.Fl width
-and
-.Fl offset
-arguments accept macro names as described for
-.Ic \&Bd
-.Fl offset ,
-scaling widths as described in
-.Xr roff 7 ,
-or use the length of the given string.
-The
-.Fl offset
-is a global indentation for the whole list, affecting both item heads
-and bodies.
-For those list types supporting it, the
-.Fl width
-argument requests an additional indentation of item bodies,
-to be added to the
-.Fl offset .
-Unless the
-.Fl compact
-argument is specified, list entries are separated by vertical space.
-.Pp
-A list must specify one of the following list types:
+The following list types are commonly used:
 .Bl -tag -width 12n -offset indent
 .It Fl bullet
 No item heads can be specified, but a bullet will be printed at the head
@@ -980,14 +931,22 @@ of each item.
 Item bodies start on the same output line as the bullet
 and are indented according to the
 .Fl width
-argument.
+argument, which defaults to
+.Cm 2n .
 .It Fl column
 A columnated list.
 The
 .Fl width
 argument has no effect; instead, the string length of each argument
 specifies the width of one column.
-If the first line of the body of a
+The width specification for the last column does not affect formatting.
+.Pp
+For two-column lists, using
+.Fl tag
+often results in simpler code, identical terminal output, and better HTML
+output, especially when the first column contains short identifiers.
+.Pp
+For compatibility with legacy documents, if the first line of the body of a
 .Fl column
 list is not an
 .Ic \&It
@@ -1009,7 +968,7 @@ Like
 except that item heads are not parsed for macro invocations.
 Most often used in the
 .Em DIAGNOSTICS
-section with error constants in the item heads.
+section with error messages in the item heads.
 .It Fl enum
 A numbered list.
 No item heads can be specified.
@@ -1017,6 +976,24 @@ Formatted like
 .Fl bullet ,
 except that ordinal numbers are used in place of bullets,
 starting at 1.
+.It Fl tag
+Item bodies are indented according to the
+.Fl width
+argument, which defaults to
+.Cm 6n .
+When an item head fits inside the indentation, the item body follows
+this head on the same output line.
+Otherwise, the body starts on the output line following the head.
+By convention and to achieve a consistent layout, using
+.Fl tag Fl width Cm \&Ds
+is recommended unless there are specific reasons to use a different width.
+In ERRORS sections,
+.Fl tag Fl width Cm \&Er
+is conventionally used.
+.El
+.Pp
+The following list types are rarely useful:
+.Bl -tag -width 12n -offset indent
 .It Fl hang
 Like
 .Fl tag ,
@@ -1043,13 +1020,34 @@ Item bodies start on the line following item heads and are not indented.
 The
 .Fl width
 argument is ignored.
-.It Fl tag
-Item bodies are indented according to the
-.Fl width
-argument.
-When an item head fits inside the indentation, the item body follows
-this head on the same output line.
-Otherwise, the body starts on the output line following the head.
+.El
+.Pp
+Additional arguments may follow:
+.Bl -tag -width 12n -offset indent
+.It Fl offset Ar val
+A global indentation for the whole list, affecting both item heads and bodies.
+The default is
+.Cm 0n ,
+i.e. no indentation.
+For most cases where a global indentation is desired,
+.Fl offset Cm indent
+is recommended.
+For details, see
+.Sx WIDTH SPECIFICATIONS
+below.
+.It Fl width Ar val
+An additional indentation of item bodies,
+to be added to the
+.Fl offset .
+The default value depends on the list
+.Ar type ,
+and some types ignore this argument.
+For details, see
+.Sx WIDTH SPECIFICATIONS
+below.
+.It Fl compact
+Unless this argument is specified,
+list entries are preceded by vertical space.
 .El
 .Pp
 Lists may be nested within lists and displays.
@@ -1176,7 +1174,7 @@ this macro is commonly abused by using quoted literals to retain
 whitespace and align consecutive
 .Ic \&Cd
 declarations.
-This practise is discouraged.
+This practice is discouraged.
 .Tg Cm
 .It Ic \&Cm Ar keyword ...
 Command modifiers.
@@ -1270,9 +1268,9 @@ and
 .Ic \&Os .
 .Tg Dl
 .It Ic \&Dl Ar line
-One-line indented display.
-This is formatted as literal text and is useful for commands and
-invocations.
+One-line indented literal display.
+This is formatted using a constant-width font
+and is useful for commands and invocations.
 It is followed by a newline.
 .Pp
 Examples:
@@ -1873,34 +1871,45 @@ but not the whitespace before the semicolon.
 See also
 .Ic \&Bl .
 .Tg Lb
-.It Ic \&Lb Cm lib Ns Ar name
-Specify a library.
-.Pp
-The
-.Ar name
-parameter may be a system library, such as
-.Cm z
-or
-.Cm pam ,
-in which case a small library description is printed next to the linker
-invocation; or a custom library, in which case the library name is
-printed in quotes.
-This is most commonly used in the
+.It Ic \&Lb Cm lib Ns Ar name Op Cm lib Ns Ar name ...
+Specify one or more libraries to link against.
+Putting this macro at the beginning of the
 .Em SYNOPSIS
-section as described in
-.Sx MANUAL STRUCTURE .
+section is recommended, in which case it prints this comment:
+.D1 /* Fl l Ns Ar name Oo Fl l Ns Ar name ... Oc */
 .Pp
-Examples:
-.Dl \&.Lb libz
-.Dl \&.Lb libmandoc
+If used outside the
+.Em SYNOPSIS ,
+this macro prints
+.D1 library Dq Cm lib Ns Ar name
+instead.
+For system libraries, some operating systems
+print a short library description.
+.Pp
+Example:
+.Bd -literal -offset indent -compact
+\&.Sh SYNOPSIS
+\&.Lb libtls libssl libcrypto
+\&.In tls.h
+\&.Ft int
+\&.Fn tls_init void
+.Ed
 .Tg Li
 .It Ic \&Li Ar word ...
-Request a typewriter (literal) font.
-Deprecated because on terminal output devices, this is usually
-indistinguishable from normal text.
-For literal displays, use
-.Ic \&Ql Pq in-line ,
-.Ic \&Dl Pq single line ,
+Unquoted in-line literal display, always set in a constant-width font.
+In most cases, use
+.Ic \&Ql
+instead because on terminal output devices,
+.Ic \&Li
+is usually indistinguishable from normal text.
+This macro is only useful when enclosing the argument in quotes
+is explicitly not desired, for example because it already stands out
+due to being wrapped in another macro, e.g. in an
+.Ic \&It
+head.
+.Pp
+For longer literal displays, use
+.Ic \&Dl Pq single line
 or
 .Ic \&Bd Fl literal Pq multi-line
 instead.
@@ -2213,15 +2222,17 @@ Close quoted context opened by
 .Ic \&Qo .
 .Tg Ql
 .It Ic \&Ql Ar line
-In-line literal display.
+Normal in-line literal display, always set in constant-width font and
+additionally enclosed in quotes by many formatters in many cases.
 This can be used for complete command invocations and for multi-word
 code examples when an indented display is not desired.
 .Pp
 See also
-.Ic \&Dl
-and
+.Ic \&Dl ,
 .Ic \&Bd
-.Fl literal .
+.Fl literal ,
+and
+.Ic \&Li .
 .It Ic \&Qo Ar block
 Multi-line version of
 .Ic \&Qq .
@@ -2310,13 +2321,14 @@ Close single-quoted context opened by
 Begin a new section.
 For a list of conventional manual sections, see
 .Sx MANUAL STRUCTURE .
-These sections should be used unless it's absolutely necessary that
-custom sections be used.
+Use the conventional sections where applicable.
+For unusually long and complicated manual pages,
+adding custom sections is occasionally useful.
 .Pp
-Section names should be unique so that they may be keyed by
-.Ic \&Sx .
-Although this macro is parsed, it should not consist of child node or it
-may not be linked with
+Avoid using macros inside the
+.Ar TITLE LINE
+and keep that line unique within the manual page,
+such that it can be pointed to with
 .Ic \&Sx .
 .Pp
 See also
@@ -2366,10 +2378,10 @@ the conventional sections described in
 .Sx MANUAL STRUCTURE
 rarely have subsections.
 .Pp
-Sub-section names should be unique so that they may be keyed by
-.Ic \&Sx .
-Although this macro is parsed, it should not consist of child node or it
-may not be linked with
+Avoid using macros inside the
+.Ar Title line
+and keep that line unique within the manual page,
+such that it can be pointed to with
 .Ic \&Sx .
 .Pp
 See also
@@ -2411,14 +2423,19 @@ The original C standard.
 .It \-isoC-99
 .St -isoC-99
 .br
-The second major version of the C language standard.
+Edition 2 of the C language standard.
 .Pp
 .It \-isoC-2011
 .St -isoC-2011
 .br
-The third major version of the C language standard.
+Edition 3 of the C language standard.
+.Pp
+.It \-isoC-2023
+.St -isoC-2023
+.br
+Edition 5 of the C language standard.
 .El
-.It POSIX.1 before the Single UNIX Specification
+.It POSIX.1 before XPG4.2
 .Pp
 .Bl -tag -width "-p1003.1g-2000" -compact
 .It \-p1003.1-88
@@ -2459,7 +2476,7 @@ Technical Corrigendum.
 .br
 Includes POSIX.1-1990, 1b, 1c, and 1i.
 .El
-.It X/Open Portability Guide version 4 and related standards
+.It X/Open Portability Guide before XPG4.2
 .Pp
 .Bl -tag -width "-p1003.1g-2000" -compact
 .It \-xpg3
@@ -2486,7 +2503,7 @@ Updates to POSIX.2.
 .br
 Based on POSIX.1 and POSIX.2, published in 1992.
 .El
-.It Single UNIX Specification version 1 and related standards
+.It X/Open Portability Guide Issue 4 Version 2 and related standards
 .Pp
 .Bl -tag -width "-p1003.1g-2000" -compact
 .It \-susv1
@@ -2511,13 +2528,14 @@ Networking APIs, including sockets.
 .br
 Published in 1995.
 .El
-.It Single UNIX Specification version 2 and related standards
+.It X/Open Portability Guide Issue 5 and related standards
 .Pp
 .Bl -tag -width "-p1003.1g-2000" -compact
 .It \-susv2
 .St -susv2
+.br
 This Standard was published in 1997
-and is also called X/Open Portability Guide version 5.
+and is also called X/Open Portability Guide Issue 5.
 It was used as the basis for UNIX 98 certification.
 The following refer to parts of it.
 .Pp
@@ -2535,7 +2553,7 @@ The following refer to parts of it.
 .It \-xns5.2
 .St -xns5.2
 .El
-.It Single UNIX Specification version 3
+.It POSIX Issue 6
 .Pp
 .Bl -tag -width "-p1003.1-2001" -compact
 .It \-p1003.1-2001
@@ -2544,7 +2562,7 @@ The following refer to parts of it.
 .St -susv3
 .br
 This standard is based on C99, SUSv2, POSIX.1-1996, 1d, and 1j.
-It is also called X/Open Portability Guide version 6.
+It is also called X/Open Portability Guide Issue 6.
 It is used as the basis for UNIX 03 certification.
 .Pp
 .It \-p1003.1-2004
@@ -2552,7 +2570,7 @@ It is used as the basis for UNIX 03 certification.
 .br
 The second and last Technical Corrigendum.
 .El
-.It POSIX issues 7 and 8
+.It POSIX Issues 7 and 8
 .Pp
 .Bl -tag -width "-p1003.1g-2000" -compact
 .It \-p1003.1-2008
@@ -2772,6 +2790,68 @@ Examples:
 .Dl \&.Xr mandoc 1
 .Dl \&.Xr mandoc 1 \&;
 .Dl \&.Xr mandoc 1 \&Ns s behaviour
+.El
+.Sh WIDTH SPECIFICATIONS
+On
+.Ic \&Bd
+and
+.Ic \&Bl
+macro lines,
+.Fl offset
+and
+.Fl width
+accept arguments of the following forms:
+.Bl -bullet
+.It
+The string
+.Cm \&Ds ,
+which has the same effect as
+.Cm 6n .
+.It
+The name of any
+.Nm
+macro, which selects a default width associated with that macro.
+Using this form is not recommended outside the ERRORS section.
+.It
+A scaling width as documented in the
+.Xr roff 7
+manual.
+Use this sparingly; relying on the default widths usually results in
+a more uniform appearance of the document, but occasionally, reducing
+widths can make sense, for example in nested lists and in lists
+with very long item bodies.
+.El
+.Pp
+In addition,
+.Fl offset
+supports the following forms:
+.Bl -bullet
+.It
+The string
+.Cm left ,
+which has the same effect as
+.Cm 0n .
+This is the default.
+.It
+The string
+.Cm indent ,
+which has the same effect as
+.Cm 6n ,
+or if the
+.Xr mandoc 1
+.Fl O Cm indent
+command line option is used, the argument of that option plus one.
+Using
+.Fl offset Cm indent
+is recommended for most cases where global indentation is desired.
+.It
+The string
+.Cm indent-two ,
+which produces two times the indentation of
+.Cm indent .
+Using this form is not recommended because it usually wastes too much space.
+.It
+For any other string, the string length of that string is used.
 .El
 .Sh MACRO SYNTAX
 The syntax of a macro depends on its classification.
@@ -3029,8 +3109,8 @@ then the macro accepts an arbitrary number of arguments.
 .It Ic \&Fx  Ta    Yes      Ta    Yes      Ta    n
 .It Ic \&Hf  Ta    \&No     Ta    \&No     Ta    n
 .It Ic \&Ic  Ta    Yes      Ta    Yes      Ta    >0
-.It Ic \&In  Ta    \&No     Ta    \&No     Ta    1
-.It Ic \&Lb  Ta    \&No     Ta    \&No     Ta    1
+.It Ic \&In  Ta    Yes      Ta    Yes      Ta    1
+.It Ic \&Lb  Ta    \&No     Ta    \&No     Ta    >0
 .It Ic \&Li  Ta    Yes      Ta    Yes      Ta    >0
 .It Ic \&Lk  Ta    Yes      Ta    Yes      Ta    >0
 .It Ic \&Lp  Ta    \&No     Ta    \&No     Ta    0
@@ -3191,8 +3271,7 @@ can only be called by other macros, but not at the beginning of a line.
 and
 .Sq \eF
 .Pq font family face
-.Sx Text Decoration
-escapes behave irregularly when specified within line-macro scopes.
+escape sequences behave irregularly when specified within line-macro scopes.
 .It
 Negative scaling units return to prior lines.
 Instead, mandoc truncates them to zero.

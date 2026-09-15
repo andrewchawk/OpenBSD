@@ -1,4 +1,4 @@
-/*	$OpenBSD: ldpd.c,v 1.69 2023/03/08 04:43:13 guenther Exp $ */
+/*	$OpenBSD: ldpd.c,v 1.83 2026/09/06 18:56:27 deraadt Exp $ */
 
 /*
  * Copyright (c) 2013, 2016 Renato Westphal <renato@openbsd.org>
@@ -27,6 +27,7 @@
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -108,10 +109,9 @@ int
 main(int argc, char *argv[])
 {
 	struct event		 ev_sigint, ev_sigterm, ev_sighup;
-	char			*saved_argv0;
 	int			 ch;
 	int			 debug = 0, lflag = 0, eflag = 0;
-	char			*sockname;
+	char			*sockname, execpath[PATH_MAX];
 	int			 pipe_parent2ldpe[2];
 	int			 pipe_parent2lde[2];
 
@@ -122,10 +122,6 @@ main(int argc, char *argv[])
 
 	log_init(1);	/* log to stderr until daemonized */
 	log_verbose(1);
-
-	saved_argv0 = argv[0];
-	if (saved_argv0 == NULL)
-		saved_argv0 = "ldpd";
 
 	while ((ch = getopt(argc, argv, "dD:f:ns:vLE")) != -1) {
 		switch (ch) {
@@ -167,6 +163,9 @@ main(int argc, char *argv[])
 	argv += optind;
 	if (argc > 0 || (lflag && eflag))
 		usage();
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	if (lflag)
 		lde(debug, global.cmd_opts & LDPD_OPT_VERBOSE);
@@ -215,10 +214,10 @@ main(int argc, char *argv[])
 		fatal("socketpair");
 
 	/* start children */
-	lde_pid = start_child(PROC_LDE_ENGINE, saved_argv0,
+	lde_pid = start_child(PROC_LDE_ENGINE, execpath,
 	    pipe_parent2lde[1], debug, global.cmd_opts & LDPD_OPT_VERBOSE,
 	    NULL);
-	ldpe_pid = start_child(PROC_LDP_ENGINE, saved_argv0,
+	ldpe_pid = start_child(PROC_LDP_ENGINE, execpath,
 	    pipe_parent2ldpe[1], debug, global.cmd_opts & LDPD_OPT_VERBOSE,
 	    sockname);
 
@@ -242,9 +241,13 @@ main(int argc, char *argv[])
 	if ((iev_ldpe = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_lde = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_ldpe->ibuf, pipe_parent2ldpe[0]);
+	if (imsgbuf_init(&iev_ldpe->ibuf, pipe_parent2ldpe[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_ldpe->ibuf);
 	iev_ldpe->handler = main_dispatch_ldpe;
-	imsg_init(&iev_lde->ibuf, pipe_parent2lde[0]);
+	if (imsgbuf_init(&iev_lde->ibuf, pipe_parent2lde[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_lde->ibuf);
 	iev_lde->handler = main_dispatch_lde;
 
 	/* setup event handler */
@@ -291,9 +294,9 @@ ldpd_shutdown(void)
 	int		 status;
 
 	/* close pipes */
-	msgbuf_clear(&iev_ldpe->ibuf.w);
+	imsgbuf_clear(&iev_ldpe->ibuf);
 	close(iev_ldpe->ibuf.fd);
-	msgbuf_clear(&iev_lde->ibuf.w);
+	imsgbuf_clear(&iev_lde->ibuf);
 	close(iev_lde->ibuf.fd);
 
 	kr_shutdown();
@@ -319,7 +322,7 @@ ldpd_shutdown(void)
 }
 
 static pid_t
-start_child(enum ldpd_process p, char *argv0, int fd, int debug, int verbose,
+start_child(enum ldpd_process p, char *execpath, int fd, int debug, int verbose,
     char *sockname)
 {
 	char	*argv[7];
@@ -342,7 +345,7 @@ start_child(enum ldpd_process p, char *argv0, int fd, int debug, int verbose,
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	switch (p) {
 	case PROC_MAIN:
 		fatalx("Can not start main process");
@@ -363,8 +366,8 @@ start_child(enum ldpd_process p, char *argv0, int fd, int debug, int verbose,
 	}
 	argv[argc++] = NULL;
 
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 /* imsg handling */
@@ -375,26 +378,26 @@ main_dispatch_ldpe(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
 	int			 af;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -428,9 +431,11 @@ main_dispatch_ldpe(int fd, short event, void *bula)
 				log_warnx("IFINFO request with wrong len");
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by ldpe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warn("wrong imsg len");
+			else
+				log_verbose(verbose);
 			break;
 		default:
 			log_debug("%s: error handling imsg %d", __func__,
@@ -454,26 +459,26 @@ main_dispatch_lde(int fd, short event, void *bula)
 	struct imsgev	*iev = bula;
 	struct imsgbuf	*ibuf = &iev->ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 shut = 0;
+	int		 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -552,7 +557,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -575,14 +580,14 @@ imsg_compose_event(struct imsgev *iev, uint16_t type, uint32_t peerid,
 void
 evbuf_enqueue(struct evbuf *eb, struct ibuf *buf)
 {
-	ibuf_close(&eb->wbuf, buf);
+	ibuf_close(eb->wbuf, buf);
 	evbuf_event_add(eb);
 }
 
 void
 evbuf_event_add(struct evbuf *eb)
 {
-	if (eb->wbuf.queued)
+	if (msgbuf_queuelen(eb->wbuf) > 0)
 		event_add(&eb->ev, NULL);
 }
 
@@ -590,17 +595,19 @@ void
 evbuf_init(struct evbuf *eb, int fd, void (*handler)(int, short, void *),
     void *arg)
 {
-	msgbuf_init(&eb->wbuf);
-	eb->wbuf.fd = fd;
-	event_set(&eb->ev, eb->wbuf.fd, EV_WRITE, handler, arg);
+	if (eb->wbuf != NULL)
+		fatalx("evbuf_init: msgbuf already set");
+	if ((eb->wbuf = msgbuf_new()) == NULL)
+		fatal(__func__);
+	event_set(&eb->ev, fd, EV_WRITE, handler, arg);
 }
 
 void
 evbuf_clear(struct evbuf *eb)
 {
 	event_del(&eb->ev);
-	msgbuf_clear(&eb->wbuf);
-	eb->wbuf.fd = -1;
+	msgbuf_free(eb->wbuf);
+	eb->wbuf = NULL;
 }
 
 static int

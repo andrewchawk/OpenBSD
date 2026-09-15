@@ -1,4 +1,4 @@
-/*	$OpenBSD: ca.c,v 1.47 2023/07/11 16:40:22 op Exp $	*/
+/*	$OpenBSD: ca.c,v 1.51 2026/08/03 06:58:55 claudio Exp $	*/
 
 /*
  * Copyright (c) 2014 Reyk Floeter <reyk@openbsd.org>
@@ -125,49 +125,6 @@ ca_init(void)
 			dict_xset(&pkeys, hash, pkey);
 		free(hash);
 	}
-}
-
-int
-ca_X509_verify(void *certificate, void *chain, const char *CAfile,
-    const char *CRLfile, const char **errstr)
-{
-	X509_STORE     *store = NULL;
-	X509_STORE_CTX *xsc = NULL;
-	int		ret = 0;
-	long		error = 0;
-
-	if ((store = X509_STORE_new()) == NULL)
-		goto end;
-
-	if (!X509_STORE_load_locations(store, CAfile, NULL)) {
-		log_warn("warn: unable to load CA file %s", CAfile);
-		goto end;
-	}
-	X509_STORE_set_default_paths(store);
-
-	if ((xsc = X509_STORE_CTX_new()) == NULL)
-		goto end;
-
-	if (X509_STORE_CTX_init(xsc, store, certificate, chain) != 1)
-		goto end;
-
-	ret = X509_verify_cert(xsc);
-
-end:
-	*errstr = NULL;
-	if (ret != 1) {
-		if (xsc) {
-			error = X509_STORE_CTX_get_error(xsc);
-			*errstr = X509_verify_cert_error_string(error);
-		}
-		else if (ERR_peek_last_error())
-			*errstr = ERR_error_string(ERR_peek_last_error(), NULL);
-	}
-
-	X509_STORE_CTX_free(xsc);
-	X509_STORE_free(store);
-
-	return ret > 0 ? 1 : 0;
 }
 
 void
@@ -323,14 +280,14 @@ rsae_send_imsg(int flen, const unsigned char *from, unsigned char *to,
 	ibuf = &p_ca->imsgbuf;
 
 	while (!done) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatalx("imsg_read");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatalx("imsgbuf_read");
 		if (n == 0)
 			fatalx("pipe closed");
 
 		while (!done) {
-			if ((n = imsg_get(ibuf, &imsg)) == -1)
-				fatalx("imsg_get error");
+			if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+				fatalx("imsgbuf_get error");
 			if (n == 0)
 				break;
 
@@ -431,13 +388,13 @@ ecdsae_send_enc_imsg(const unsigned char *dgst, int dgst_len,
 	ibuf = &p_ca->imsgbuf;
 
 	while (!done) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatalx("imsg_read");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatalx("imsgbuf_read");
 		if (n == 0)
 			fatalx("pipe closed");
 		while (!done) {
-			if ((n = imsg_get(ibuf, &imsg)) == -1)
-				fatalx("imsg_get error");
+			if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+				fatalx("imsgbuf_get error");
 			if (n == 0)
 				break;
 

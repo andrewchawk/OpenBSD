@@ -1,4 +1,4 @@
-/* $OpenBSD: ike_phase_1.c,v 1.78 2018/09/20 11:49:55 jsg Exp $	 */
+/* $OpenBSD: ike_phase_1.c,v 1.81 2026/06/24 09:57:32 hshoexer Exp $	 */
 /* $EOM: ike_phase_1.c,v 1.31 2000/12/11 23:47:56 niklas Exp $	 */
 
 /*
@@ -738,7 +738,7 @@ ike_phase_1_post_exchange_KE_NONCE(struct message *msg)
 		exchange->keystate = crypto_init(exchange->crypto, key,
 		    exchange->key_length, &err);
 
-		free(key);
+		freezero(key, keylen);
 	} else
 		/* Setup our keystate using the raw skeyid_e.  */
 		exchange->keystate = crypto_init(exchange->crypto,
@@ -1070,7 +1070,9 @@ ike_phase_1_recv_ID(struct message *msg)
 		}
 
 		/* Compare expected/desired and received remote ID */
-		if (memcmp(rid, payload->p + ISAKMP_ID_DATA_OFF, sz) != 0) {
+		if ((size_t)sz != GET_ISAKMP_GEN_LENGTH(payload->p) -
+		    ISAKMP_ID_DATA_OFF ||
+		    memcmp(rid, payload->p + ISAKMP_ID_DATA_OFF, sz) != 0) {
 			free(rid);
 			log_print("ike_phase_1_recv_ID: "
 			    "received remote ID other than expected %s", p);
@@ -1268,6 +1270,12 @@ attribute_unacceptable(u_int16_t type, u_int8_t *value, u_int16_t len,
 	struct constant_map *map;
 	struct attr_node *node;
 	int             rv, dur = 0;
+
+	if (len < sizeof(u_int16_t)) {
+		log_print("attribute_unacceptable: too short attribute "
+		    "(type %u, len %u)", type, len);
+		return 1;
+	}
 
 	if (!tag) {
 		log_print("attribute_unacceptable: "

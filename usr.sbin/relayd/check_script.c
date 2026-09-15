@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_script.c,v 1.22 2021/02/22 01:24:59 jmatthew Exp $	*/
+/*	$OpenBSD: check_script.c,v 1.25 2026/08/07 10:21:39 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -27,6 +27,7 @@
 #include <pwd.h>
 
 #include "relayd.h"
+#include "log.h"
 
 void	 script_sig_alarm(int);
 
@@ -48,10 +49,10 @@ check_script(struct relayd *env, struct host *host)
 	host->flags &= ~(F_CHECK_SENT|F_CHECK_DONE);
 
 	scr.host = host->conf.id;
-	if ((strlcpy(scr.name, host->conf.name,sizeof(scr.name)) >=
+	if ((strlcpy(scr.name, host->conf.name, sizeof(scr.name)) >=
 	    sizeof(scr.name)) ||
 	    (strlcpy(scr.path, table->conf.path, sizeof(scr.path)) >=
-	    sizeof(scr.path)))
+	     sizeof(scr.path)))
 		fatalx("invalid script path");
 	memcpy(&scr.timeout, &table->conf.timeout, sizeof(scr.timeout));
 
@@ -105,7 +106,7 @@ script_exec(struct relayd *env, struct ctl_script *scr)
 		return (-1);
 	}
 
-	DPRINTF("%s: running script %s, host %s",
+	log_debug("%s: running script %s, host %s",
 	    __func__, scr->path, scr->name);
 
 	arg = scr->name;

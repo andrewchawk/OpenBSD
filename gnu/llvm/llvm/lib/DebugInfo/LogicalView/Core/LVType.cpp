@@ -253,16 +253,10 @@ void LVType::getParameters(const LVTypes *Types, LVTypes *TypesParam,
     if (!Type->getIsTemplateParam())
       continue;
     if (options().getAttributeArgument()) {
-      LVScope *Scope = nullptr;
       if (Type->getIsKindType())
-        Type = Type->getTypeAsType();
-      else {
-        if (Type->getIsKindScope()) {
-          Scope = Type->getTypeAsScope();
-          Type = nullptr;
-        }
-      }
-      Type ? TypesParam->push_back(Type) : ScopesParam->push_back(Scope);
+        TypesParam->push_back(Type->getTypeAsType());
+      else if (Type->getIsKindScope())
+        ScopesParam->push_back(Type->getTypeAsScope());
     } else
       TypesParam->push_back(Type);
   }
@@ -298,7 +292,11 @@ void LVType::print(raw_ostream &OS, bool Full) const {
 }
 
 void LVType::printExtra(raw_ostream &OS, bool Full) const {
-  OS << formattedKind(kind()) << " " << formattedName(getName()) << "\n";
+  OS << formattedKind(kind()) << " " << formattedName(getName());
+  if (options().getAttributeSize())
+    if (uint32_t Size = getStorageSizeInBytes())
+      OS << " [Size = " << Size << "]";
+  OS << "\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -330,6 +328,13 @@ LVElement *LVTypeDefinition::getUnderlyingType() {
 }
 
 void LVTypeDefinition::resolveExtra() {
+  // In the case of CodeView, the MSVC toolset generates a series of typedefs
+  // that refer to internal runtime structures, that we do not process. Those
+  // typedefs are marked as 'system'. They have an associated logical type,
+  // but the underlying type always is null.
+  if (getIsSystem())
+    return;
+
   // Set the reference to the typedef type.
   if (options().getAttributeUnderlying()) {
     setUnderlyingType(getUnderlyingType());

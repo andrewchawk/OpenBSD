@@ -1,6 +1,6 @@
 #!/bin/ksh
 #
-# $OpenBSD: rcctl.sh,v 1.119 2024/07/08 14:47:42 ajacoutot Exp $
+# $OpenBSD: rcctl.sh,v 1.122 2025/08/16 10:21:57 ajacoutot Exp $
 #
 # Copyright (c) 2014, 2015-2022 Antoine Jacoutot <ajacoutot@openbsd.org>
 # Copyright (c) 2014 Ingo Schwarze <schwarze@openbsd.org>
@@ -29,11 +29,11 @@ _rc_parse_conf
 usage()
 {
 	local _a _i
-	for _i in ${_rc_actions}; do _a="$(echo -n ${_i}${_a:+|${_a}})"; done
+	for _i in ${_rc_actions}; do _a=${_a:+${_a}|}$_i; done
 
 	_rc_err \
-	"usage:	rcctl get|getdef|set service | daemon [variable [argument ...]]
-	rcctl [-df] ${_a} daemon ...
+	"usage:	rcctl get|getdef|set daemon|service [variable [argument ...]]
+	rcctl [-d | -q] [-f] ${_a} daemon ...
 	rcctl disable|enable|order [daemon ...]
 	rcctl ls all|failed|off|on|rogue|started|stopped"
 }
@@ -68,7 +68,7 @@ pkg_scripts_append()
 	if [ -z "${pkg_scripts}" ]; then
 		echo pkg_scripts="${_svc}" >>${_TMP_RCCONF}
 	elif ! echo ${pkg_scripts} | grep -qw -- ${_svc}; then
-		grep -v "^pkg_scripts.*=" /etc/rc.conf.local >${_TMP_RCCONF}
+		grep -v "^pkg_scripts *=" /etc/rc.conf.local >${_TMP_RCCONF}
 		echo pkg_scripts="${pkg_scripts} ${_svc}" >>${_TMP_RCCONF}
 	fi
 	rcconf_edit_end
@@ -91,7 +91,7 @@ pkg_scripts_order()
 	_pkg_scripts=$(echo "${_svcs} ${pkg_scripts}" | tr "[:blank:]" "\n" | \
 		     awk -v ORS=' ' '!x[$0]++')
 	rcconf_edit_begin
-	grep -v "^pkg_scripts.*=" /etc/rc.conf.local >${_TMP_RCCONF}
+	grep -v "^pkg_scripts *=" /etc/rc.conf.local >${_TMP_RCCONF}
 	echo pkg_scripts=${_pkg_scripts} >>${_TMP_RCCONF}
 	rcconf_edit_end
 }
@@ -409,7 +409,7 @@ svc_rm()
 
 	rcconf_edit_begin
 	if svc_is_special ${_svc}; then
-		grep -v "^${_svc}.*=" /etc/rc.conf.local >${_TMP_RCCONF}
+		grep -v "^${_svc} *=" /etc/rc.conf.local >${_TMP_RCCONF}
 		( svc_getdef ${_svc} status ) && \
 			echo "${_svc}=NO" >>${_TMP_RCCONF}
 	else
@@ -458,7 +458,7 @@ svc_set()
 	if svc_is_special ${_svc}; then
 		[ "${_var}" = "flags" ] || return
 		rcconf_edit_begin
-		grep -v "^${_svc}.*=" /etc/rc.conf.local >${_TMP_RCCONF}
+		grep -v "^${_svc} *=" /etc/rc.conf.local >${_TMP_RCCONF}
 		( svc_getdef ${_svc} status ) || \
 			echo "${_svc}=YES" >>${_TMP_RCCONF}
 		rcconf_edit_end
@@ -498,7 +498,7 @@ svc_set()
 	unset ${_svc}_${_var}
 
 	rcconf_edit_begin
-	grep -v "^${_svc}_${_var}.*=" /etc/rc.conf.local >${_TMP_RCCONF}
+	grep -v "^${_svc}_${_var} *=" /etc/rc.conf.local >${_TMP_RCCONF}
 	if [ -n "${_args}" ] || \
 	   ( svc_is_base ${_svc} && ! svc_getdef ${_svc} status && [ "${_var}" == "flags" ] ); then
 		echo "${_svc}_${_var}=${_args}" >>${_TMP_RCCONF}
@@ -506,16 +506,18 @@ svc_set()
 	rcconf_edit_end
 }
 
-unset _RC_DEBUG _RC_FORCE
-while getopts "df" c; do
+unset _RC_DEBUG _RC_FORCE _RC_QUIET
+while getopts "dfq" c; do
 	case "$c" in
 		d) _RC_DEBUG=-d;;
 		f) _RC_FORCE=-f;;
+		q) _RC_QUIET=-q;;
 		*) usage;;
 	esac
 done
 shift $((OPTIND-1))
 [ $# -gt 0 ] || usage
+[[ -n ${_RC_DEBUG} && -n ${_RC_QUIET} ]] && usage
 
 action=$1
 ret=0
@@ -647,7 +649,7 @@ case ${action} in
 			if svc_is_special ${svc}; then
 				rcctl_err "\"${svc}\" is a special variable, no rc.d(8) script"
 			fi
-			/etc/rc.d/${svc} ${_RC_DEBUG} ${_RC_FORCE} ${action} || ret=$?;
+			/etc/rc.d/${svc} ${_RC_DEBUG} ${_RC_FORCE} ${_RC_QUIET} ${action} || ret=$?;
 		done
 		exit ${ret}
 		;;

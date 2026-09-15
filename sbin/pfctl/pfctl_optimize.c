@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_optimize.c,v 1.50 2024/07/14 19:51:08 sashan Exp $ */
+/*	$OpenBSD: pfctl_optimize.c,v 1.52 2026/05/17 14:11:57 sashan Exp $ */
 
 /*
  * Copyright (c) 2004 Mike Frantzen <frantzen@openbsd.org>
@@ -392,7 +392,7 @@ optimize_superblock(struct pfctl *pf, struct superblock *block)
 	printf("--- Superblock ---\n");
 	TAILQ_FOREACH(por, &block->sb_rules, por_entry) {
 		printf("  ");
-		print_rule(&por->por_rule, por->por_rule.anchor ?
+		print_rule(pf, &por->por_rule, por->por_rule.anchor ?
 		    por->por_rule.anchor->name : "", PF_OPT_DEBUG);
 	}
 #endif /* OPT_DEBUG */
@@ -691,6 +691,7 @@ reorder_rules(struct pfctl *pf, struct superblock *block, int depth)
 
 	while (!TAILQ_EMPTY(&head)) {
 		largest = 1;
+		largest_list = 0;
 
 		/*
 		 * Find the most useful skip steps remaining

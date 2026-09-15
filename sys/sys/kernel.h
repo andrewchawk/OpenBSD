@@ -1,4 +1,4 @@
-/*	$OpenBSD: kernel.h,v 1.26 2023/03/03 20:16:44 cheloha Exp $	*/
+/*	$OpenBSD: kernel.h,v 1.28 2025/09/25 08:46:50 mvs Exp $	*/
 /*	$NetBSD: kernel.h,v 1.11 1995/03/03 01:24:16 cgd Exp $	*/
 
 /*-
@@ -40,7 +40,7 @@
 /* Global variables for the kernel. */
 
 /* 1.1 */
-extern long hostid;
+extern int hostid;
 extern char hostname[MAXHOSTNAMELEN];
 extern int hostnamelen;
 extern char domainname[MAXHOSTNAMELEN];
@@ -55,7 +55,6 @@ extern int ticks;		/* # of hardclock ticks */
 extern int hz;			/* system clock's frequency */
 extern int stathz;		/* statistics clock's frequency */
 extern int profhz;		/* profiling clock's frequency */
-extern int lbolt;		/* once a second sleep address */
 
 #ifndef HZ
 #define HZ 100

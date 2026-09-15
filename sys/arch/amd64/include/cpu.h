@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.175 2024/07/21 19:41:31 bluhm Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.186 2026/09/08 21:01:59 daniel Exp $	*/
 /*	$NetBSD: cpu.h,v 1.1 2003/04/26 18:39:39 fvdl Exp $	*/
 
 /*-
@@ -53,6 +53,7 @@
 #include <sys/sched.h>
 #include <sys/sensors.h>
 #include <sys/srp.h>
+#include <sys/xcall.h>
 #include <uvm/uvm_percpu.h>
 
 #ifdef _KERNEL
@@ -73,8 +74,8 @@ struct vmx {
 	uint32_t	vmx_vmxon_revision;
 	uint32_t	vmx_msr_table_size;
 	uint32_t	vmx_cr3_tgt_count;
-	uint64_t	vmx_vm_func;
 	uint8_t		vmx_has_l1_flush_msr;
+	uint64_t	vmx_invept_mode;
 };
 
 /*
@@ -169,6 +170,7 @@ struct cpu_info {
 	u_int32_t	ci_feature_sefflags_ebx;/* [I] */
 	u_int32_t	ci_feature_sefflags_ecx;/* [I] */
 	u_int32_t	ci_feature_sefflags_edx;/* [I] */
+	u_int32_t	ci_feature_sefflags_2_edx;/* [I] */
 	u_int32_t	ci_feature_amdspec_ebx;	/* [I] */
 	u_int32_t	ci_feature_amdsev_eax;	/* [I] */
 	u_int32_t	ci_feature_amdsev_ebx;	/* [I] */
@@ -187,6 +189,7 @@ struct cpu_info {
 	int		ci_inatomic;		/* [o] */
 
 #define __HAVE_CPU_TOPOLOGY
+	u_int32_t	ci_cputype;		/* [I] */
 	u_int32_t	ci_smt_id;		/* [I] */
 	u_int32_t	ci_core_id;		/* [I] */
 	u_int32_t	ci_pkg_id;		/* [I] */
@@ -215,6 +218,7 @@ struct cpu_info {
 
 #ifdef MULTIPROCESSOR
 	struct srp_hazard	ci_srp_hazards[SRP_HAZARD_NUM];
+	struct xcall_cpu	ci_xcall;
 #define __HAVE_UVM_PERCPU
 	struct uvm_pmr_cache	ci_uvm;		/* [o] page cache */
 #endif
@@ -237,12 +241,12 @@ struct cpu_info {
 	union		vmm_cpu_cap ci_vmm_cap;
 	paddr_t		ci_vmxon_region_pa;
 	struct vmxon_region *ci_vmxon_region;
-	struct vcpu	*ci_guest_vcpu;		/* [o] last vcpu resumed */
-
-	char		ci_panicbuf[512];
-
 	paddr_t		ci_vmcs_pa;
 	struct rwlock	ci_vmcs_lock;
+	struct pmap		*ci_ept_pmap;	/* [o] last used EPT pmap */
+	struct vcpu		*ci_guest_vcpu;	/* [o] last vcpu resumed */
+
+	char		ci_panicbuf[512];
 
 	struct clockqueue ci_queue;
 };
@@ -289,7 +293,7 @@ extern void need_resched(struct cpu_info *);
 
 #if defined(MULTIPROCESSOR)
 
-#define MAXCPUS		64	/* bitmask */
+#define MAXCPUS		255
 
 #define CPU_STARTUP(_ci)	((_ci)->ci_func->start(_ci))
 #define CPU_STOP(_ci)		((_ci)->ci_func->stop(_ci))
@@ -415,13 +419,14 @@ void	x86_print_cacheinfo(struct cpu_info *);
 void	identifycpu(struct cpu_info *);
 int	cpu_amd64speed(int *);
 extern int cpuspeed;
+extern int amd64_pos_cbit;
+extern int amd64_min_noes_asid;
 
 /* machdep.c */
 void	dumpconf(void);
 void	cpu_set_vendor(struct cpu_info *, int _level, const char *_vendor);
 void	cpu_reset(void);
 void	x86_64_proc0_tss_ldt_init(void);
-void	cpu_proc_fork(struct proc *, struct proc *);
 int	amd64_pa_used(paddr_t);
 #define	cpu_idle_enter()	do { /* nothing */ } while (0)
 extern void (*cpu_idle_cycle_fcn)(void);
@@ -430,6 +435,7 @@ extern void (*cpu_suspend_cycle_fcn)(void);
 #define	cpu_idle_leave()	do { /* nothing */ } while (0)
 extern void (*initclock_func)(void);
 extern void (*startclock_func)(void);
+extern int hibernate_delay;
 
 struct region_descriptor;
 void	lgdt(struct region_descriptor *);
@@ -443,6 +449,9 @@ void	startclocks(void);
 void	rtcinit(void);
 void	rtcstart(void);
 void	rtcstop(void);
+int	rtcalarm_suspend(struct timeval *tv);
+void	rtcalarm_resume(void);
+int	rtcalarm_fired(void);
 void	i8254_delay(int);
 void	i8254_initclocks(void);
 void	i8254_startclock(void);
@@ -495,13 +504,15 @@ void mp_setperf_init(void);
 #define CPU_CPUFEATURE		8	/* cpuid features */
 #define CPU_KBDRESET		10	/* keyboard reset under pcvt */
 #define CPU_XCRYPT		12	/* supports VIA xcrypt in userland */
+#define CPU_HIBERNATEDELAY	13	/* hibernate delay after suspend */
 #define CPU_LIDACTION		14	/* action caused by lid close */
 #define CPU_FORCEUKBD		15	/* Force ukbd(4) as console keyboard */
 #define CPU_TSCFREQ		16	/* TSC frequency */
 #define CPU_INVARIANTTSC	17	/* has invariant TSC */
 #define CPU_PWRACTION		18	/* action caused by power button */
 #define CPU_RETPOLINE		19	/* cpu requires retpoline pattern */
-#define CPU_MAXID		20	/* number of valid machdep ids */
+#define CPU_VMMODE		20	/* virtualization mode */
+#define CPU_MAXID		21	/* number of valid machdep ids */
 
 #define	CTL_MACHDEP_NAMES { \
 	{ 0, 0 }, \
@@ -517,13 +528,14 @@ void mp_setperf_init(void);
 	{ "kbdreset", CTLTYPE_INT }, \
 	{ 0, 0 }, \
 	{ "xcrypt", CTLTYPE_INT }, \
-	{ 0, 0 }, \
+	{ "hibernatedelay", CTLTYPE_INT }, \
 	{ "lidaction", CTLTYPE_INT }, \
 	{ "forceukbd", CTLTYPE_INT }, \
 	{ "tscfreq", CTLTYPE_QUAD }, \
 	{ "invarianttsc", CTLTYPE_INT }, \
 	{ "pwraction", CTLTYPE_INT }, \
 	{ "retpoline", CTLTYPE_INT }, \
+	{ "vmmode", CTLTYPE_STRING }, \
 }
 
 #endif /* !_MACHINE_CPU_H_ */

@@ -1,7 +1,8 @@
-/*	$OpenBSD: fclose.c,v 1.10 2015/08/31 02:53:57 guenther Exp $ */
+/*	$OpenBSD: fclose.c,v 1.15 2025/08/04 01:44:33 dlg Exp $ */
 /*-
- * Copyright (c) 1990, 1993
- *	The Regents of the University of California.  All rights reserved.
+ * Copyright (c) 1990, 1993 The Regents of the University of California.
+ * Copyright (c) 2013 Mariusz Zaborski <oshogbo@FreeBSD.org>
+ * All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
  * Chris Torek.
@@ -37,6 +38,30 @@
 #include "local.h"
 
 int
+__cleanfile(FILE *fp, int doclose)
+{
+	int r;
+
+	r = __sflush(fp);
+	if (doclose && fp->_close != NULL && (*fp->_close)(fp->_cookie) < 0)
+		r = EOF;
+	if (fp->_flags & __SMBF)
+		free(fp->_bf._base);
+	if (HASUB(fp))
+		FREEUB(fp);
+	if (HASLB(fp))
+		FREELB(fp);
+	fp->_r = fp->_w = 0;	/* Mess up if reaccessed. */
+	return r;
+}
+
+void
+__relefile(FILE *fp)
+{
+	fp->_flags = 0;		/* Release this FILE for reuse. */
+}
+
+int
 fclose(FILE *fp)
 {
 	int r;
@@ -46,19 +71,9 @@ fclose(FILE *fp)
 		return (EOF);
 	}
 	FLOCKFILE(fp);
-	WCIO_FREE(fp);
-	r = fp->_flags & __SWR ? __sflush(fp) : 0;
-	if (fp->_close != NULL && (*fp->_close)(fp->_cookie) < 0)
-		r = EOF;
-	if (fp->_flags & __SMBF)
-		free((char *)fp->_bf._base);
-	if (HASUB(fp))
-		FREEUB(fp);
-	if (HASLB(fp))
-		FREELB(fp);
-	fp->_r = fp->_w = 0;	/* Mess up if reaccessed. */
-	fp->_flags = 0;		/* Release this FILE for reuse. */
+	r = __cleanfile(fp, 1);
 	FUNLOCKFILE(fp);
+	__relefile(fp);
 	return (r);
 }
 DEF_STRONG(fclose);

@@ -1,4 +1,4 @@
-.\"	$OpenBSD: openprom.4,v 1.2 2022/09/11 06:38:11 jmc Exp $
+.\"	$OpenBSD: openprom.4,v 1.4 2026/09/10 01:17:22 jsg Exp $
 .\" Copyright (c) 1992, 1993
 .\"	The Regents of the University of California.  All rights reserved.
 .\"
@@ -32,7 +32,7 @@
 .\"
 .\"     from: @(#)openprom.4	8.1 (Berkeley) 6/5/93
 .\"
-.Dd $Mdocdate: September 11 2022 $
+.Dd $Mdocdate: September 10 2026 $
 .Dt OPENPROM 4
 .Os
 .Sh NAME
@@ -108,7 +108,7 @@ the value length is set to 0.
 Writes the given value under the given name.
 The OPENPROM may refuse this operation,
 in this case
-.Dv EINVAL
+.Er EINVAL
 is returned.
 .It Dv OPIOCNEXTPROP
 Finds the property whose name follows the given name
@@ -157,8 +157,12 @@ on octeon since
 .Ox 6.0 ,
 on armv7 since
 .Ox 6.0 ,
-and on arm64 since
-.Ox 6.1 .
+on arm64 since
+.Ox 6.1 ,
+on powerpc64 since
+.Ox 6.8 ,
+and on riscv64 since
+.Ox 7.0 .
 .Sh BUGS
 Due to limitations within the OPENPROM itself,
 these functions run at elevated priority

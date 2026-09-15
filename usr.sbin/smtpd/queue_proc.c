@@ -1,4 +1,4 @@
-/*	$OpenBSD: queue_proc.c,v 1.11 2024/05/07 12:10:06 op Exp $	*/
+/*	$OpenBSD: queue_proc.c,v 1.15 2026/08/03 06:58:55 claudio Exp $	*/
 
 /*
  * Copyright (c) 2013 Eric Faurot <eric@openbsd.org>
@@ -31,16 +31,16 @@ static char		*rdata;
 static void
 queue_proc_call(void)
 {
-	ssize_t	n;
+	int	n;
 
-	if (imsg_flush(&ibuf) == -1) {
-		log_warn("warn: queue-proc: imsg_flush");
+	if (imsgbuf_flush(&ibuf) == -1) {
+		log_warn("warn: queue-proc: imsgbuf_flush");
 		fatalx("queue-proc: exiting");
 	}
 
 	while (1) {
-		if ((n = imsg_get(&ibuf, &imsg)) == -1) {
-			log_warn("warn: queue-proc: imsg_get");
+		if ((n = imsgbuf_get(&ibuf, &imsg)) == -1) {
+			log_warn("warn: queue-proc: imsgbuf_get");
 			break;
 		}
 		if (n) {
@@ -54,8 +54,8 @@ queue_proc_call(void)
 			return;
 		}
 
-		if ((n = imsg_read(&ibuf)) == -1 && errno != EAGAIN) {
-			log_warn("warn: queue-proc: imsg_read");
+		if ((n = imsgbuf_read(&ibuf)) == -1) {
+			log_warn("warn: queue-proc: imsgbuf_read");
 			break;
 		}
 
@@ -291,7 +291,9 @@ queue_proc_init(struct passwd *pw, int server, const char *conf)
 	if (fd == -1)
 		fatalx("queue-proc: exiting");
 
-	imsg_init(&ibuf, fd);
+	if (imsgbuf_init(&ibuf, fd) == -1)
+		fatal("queue-proc: exiting");
+	imsgbuf_allow_fdpass(&ibuf);
 
 	version = PROC_QUEUE_API_VERSION;
 	imsg_compose(&ibuf, PROC_QUEUE_INIT, 0, 0, -1,

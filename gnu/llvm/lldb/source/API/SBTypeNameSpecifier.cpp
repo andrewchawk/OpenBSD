@@ -38,8 +38,8 @@ SBTypeNameSpecifier::SBTypeNameSpecifier(SBType type) {
   LLDB_INSTRUMENT_VA(this, type);
 
   if (type.IsValid())
-    m_opaque_sp = TypeNameSpecifierImplSP(
-        new TypeNameSpecifierImpl(type.m_opaque_sp->GetCompilerType(true)));
+    m_opaque_sp = std::make_shared<TypeNameSpecifierImpl>(
+        type.m_opaque_sp->GetCompilerType(true));
 }
 
 SBTypeNameSpecifier::SBTypeNameSpecifier(const lldb::SBTypeNameSpecifier &rhs)
@@ -65,7 +65,7 @@ const char *SBTypeNameSpecifier::GetName() {
   if (!IsValid())
     return nullptr;
 
-  return m_opaque_sp->GetName();
+  return ConstString(m_opaque_sp->GetName()).GetCString();
 }
 
 SBType SBTypeNameSpecifier::GetType() {

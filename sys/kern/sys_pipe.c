@@ -1,4 +1,4 @@
-/*	$OpenBSD: sys_pipe.c,v 1.146 2023/05/09 14:22:17 visa Exp $	*/
+/*	$OpenBSD: sys_pipe.c,v 1.149 2025/08/04 04:59:31 guenther Exp $	*/
 
 /*
  * Copyright (c) 1996 John S. Dyson
@@ -162,7 +162,7 @@ sys_pipe2(struct proc *p, void *v, register_t *retval)
 		syscallarg(int) flags;
 	} */ *uap = v;
 
-	if (SCARG(uap, flags) & ~(O_CLOEXEC | FNONBLOCK))
+	if (SCARG(uap, flags) & ~(O_CLOEXEC | O_CLOFORK | FNONBLOCK))
 		return (EINVAL);
 
 	return (dopipe(p, SCARG(uap, fdp), SCARG(uap, flags)));
@@ -175,9 +175,10 @@ dopipe(struct proc *p, int *ufds, int flags)
 	struct file *rf, *wf;
 	struct pipe_pair *pp;
 	struct pipe *rpipe, *wpipe = NULL;
-	int fds[2], cloexec, error;
+	int fds[2], fdflags, error;
 
-	cloexec = (flags & O_CLOEXEC) ? UF_EXCLOSE : 0;
+	fdflags = ((flags & O_CLOEXEC) ? UF_EXCLOSE : 0)
+	    | ((flags & O_CLOFORK) ? UF_FORKCLOSE : 0);
 
 	pp = pipe_pair_create();
 	if (pp == NULL)
@@ -203,8 +204,8 @@ dopipe(struct proc *p, int *ufds, int flags)
 	wf->f_data = wpipe;
 	wf->f_ops = &pipeops;
 
-	fdinsert(fdp, fds[0], cloexec, rf);
-	fdinsert(fdp, fds[1], cloexec, wf);
+	fdinsert(fdp, fds[0], fdflags, rf);
+	fdinsert(fdp, fds[1], fdflags, wf);
 
 	error = copyout(fds, ufds, sizeof(fds));
 	if (error == 0) {
@@ -253,9 +254,7 @@ pipe_buffer_realloc(struct pipe *cpipe, u_int size)
 	/* buffer should be empty */
 	KASSERT(cpipe->pipe_buffer.cnt == 0);
 
-	KERNEL_LOCK();
 	buffer = km_alloc(size, &kv_any, &kp_pageable, &kd_waitok);
-	KERNEL_UNLOCK();
 	if (buffer == NULL)
 		return (ENOMEM);
 
@@ -676,9 +675,6 @@ pipe_ioctl(struct file *fp, u_long cmd, caddr_t data, struct proc *p)
 
 	switch (cmd) {
 
-	case FIONBIO:
-		break;
-
 	case FIOASYNC:
 		rw_enter_write(mpipe->pipe_lock);
 		if (*(int *)data) {
@@ -767,9 +763,7 @@ pipe_buffer_free(struct pipe *cpipe)
 
 	size = cpipe->pipe_buffer.size;
 
-	KERNEL_LOCK();
 	km_free(cpipe->pipe_buffer.buffer, size, &kv_any, &kp_pageable);
-	KERNEL_UNLOCK();
 
 	cpipe->pipe_buffer.buffer = NULL;
 

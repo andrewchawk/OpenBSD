@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpipci.c,v 1.8 2024/05/13 01:15:50 jsg Exp $	*/
+/*	$OpenBSD: acpipci.c,v 1.13 2026/08/10 15:14:57 hshoexer Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis
  *
@@ -66,6 +66,7 @@ struct acpipci_softc {
 	char		sc_memex_name[32];
 	int		sc_bus;
 	uint32_t	sc_seg;
+	int		sc_domain;
 };
 
 int	acpipci_match(struct device *, void *, void *);
@@ -76,7 +77,7 @@ const struct cfattach acpipci_ca = {
 };
 
 struct cfdriver acpipci_cd = {
-	NULL, "acpipci", DV_DULL
+	NULL, "acpipci", DV_DULL, CD_COCOVM
 };
 
 const char *acpipci_hids[] = {
@@ -88,6 +89,27 @@ const char *acpipci_hids[] = {
 int	acpipci_print(void *, const char *);
 int	acpipci_parse_resources(int, union acpi_resource *, void *);
 void	acpipci_osc(struct acpipci_softc *);
+
+/*
+ * Translate the OpenBSD PCI domain enumeration index back to the ACPI
+ * segment number (_SEG).
+ */
+int
+acpipci_domain_to_seg(int domain)
+{
+	struct acpipci_softc *sc;
+	int i;
+
+	for (i = 0; i < acpipci_cd.cd_ndevs; i++) {
+		sc = (struct acpipci_softc *)acpipci_cd.cd_devs[i];
+		if (sc == NULL)
+			continue;
+		if (sc->sc_domain == domain)
+			return sc->sc_seg;
+	}
+
+	return -1;
+}
 
 int
 acpipci_match(struct device *parent, void *match, void *aux)
@@ -125,6 +147,9 @@ acpipci_attach(struct device *parent, struct device *self, void *aux)
 	aml_evalinteger(sc->sc_acpi, sc->sc_node, "_SEG", 0, NULL, &seg);
 	sc->sc_seg = seg;
 
+	/* Assigned when the PCI bus attaches. */
+	sc->sc_domain = -1;
+
 	if (aml_evalname(sc->sc_acpi, sc->sc_node, "_CRS", 0, NULL, &res)) {
 		printf(": can't find resources\n");
 
@@ -152,7 +177,7 @@ acpipci_attach(struct device *parent, struct device *self, void *aux)
 
 	aml_parse_resource(&res, acpipci_parse_resources, sc);
 
-	if (sc->sc_acpi->sc_major < 5) {
+	if (sc->sc_acpi->sc_major < 5 && (cpu_ecxfeature & CPUIDECX_HV) == 0) {
 		extent_destroy(sc->sc_ioex);
 		extent_destroy(sc->sc_memex);
 
@@ -188,10 +213,18 @@ acpipci_attach_bus(struct device *parent, struct acpipci_softc *sc)
 	pba.pba_pmemex = sc->sc_memex;
 	pba.pba_domain = pci_ndomains++;
 	pba.pba_bus = sc->sc_bus;
+	sc->sc_domain = pba.pba_domain;
 
 	/* Enable MSI in ACPI 2.0 and above, unless we're told not to. */
 	if (sc->sc_acpi->sc_fadt->hdr.revision >= 2 &&
 	    (sc->sc_acpi->sc_fadt->iapc_boot_arch & FADT_NO_MSI) == 0)
+		pba.pba_flags |= PCI_FLAGS_MSI_ENABLED;
+
+	/* Enable MSI for QEMU claiming ACPI 1.0 */
+	tag = pci_make_tag(pba.pba_pc, sc->sc_bus, 0, 0);
+	id = pci_conf_read(pba.pba_pc, tag, PCI_SUBSYS_ID_REG);
+	if (sc->sc_acpi->sc_fadt->hdr.revision == 1 &&
+	    PCI_VENDOR(id) == PCI_VENDOR_QUMRANET)
 		pba.pba_flags |= PCI_FLAGS_MSI_ENABLED;
 
 	/*
@@ -199,7 +232,6 @@ acpipci_attach_bus(struct device *parent, struct acpipci_softc *sc)
 	 * like VIA and SiS.  We do this by looking at the host
 	 * bridge, which should be device 0 function 0.
 	 */
-	tag = pci_make_tag(pba.pba_pc, sc->sc_bus, 0, 0);
 	id = pci_conf_read(pba.pba_pc, tag, PCI_ID_REG);
 	class = pci_conf_read(pba.pba_pc, tag, PCI_CLASS_REG);
 	if (PCI_CLASS(class) == PCI_CLASS_BRIDGE &&

@@ -1,4 +1,4 @@
-/*	$OpenBSD: vioscsi.c,v 1.24 2023/09/06 19:26:39 dv Exp $  */
+/*	$OpenBSD: vioscsi.c,v 1.33 2026/08/04 19:12:14 claudio Exp $  */
 
 /*
  * Copyright (c) 2017 Carlos Cardenas <ccardenas@openbsd.org>
@@ -26,15 +26,178 @@
 #include <scsi/cd.h>
 
 #include <errno.h>
+#include <event.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include "atomicio.h"
 #include "vmd.h"
 #include "vioscsi.h"
 #include "virtio.h"
 
-extern char *__progname;
+#define VIOSCSI_DEBUG	0
+#ifdef DPRINTF
+#undef DPRINTF
+#endif
+#if VIOSCSI_DEBUG
+#define DPRINTF		log_debug
+#else
+#define DPRINTF(x...)	do {} while(0)
+#endif	/* VIOSCSI_DEBUG */
+
+extern struct vmd_vm *current_vm;
+
+static void dev_dispatch_vm(int, short, void *);
+static void handle_sync_io(int, short, void *);
+static uint32_t vioscsi_io_cfg(struct virtio_dev *, int, uint8_t, uint32_t,
+    uint8_t);
+static int vioscsi_notifyq(struct virtio_dev *, uint16_t);
+static uint32_t vioscsi_read(struct virtio_dev *, struct viodev_msg *, int *);
+static int vioscsi_write(struct virtio_dev *, struct viodev_msg *);
+
+__dead void
+vioscsi_main(int fd, int fd_vmm)
+{
+	struct virtio_dev	 dev;
+	struct vioscsi_dev	*vioscsi = NULL;
+	struct viodev_msg 	 msg;
+	struct vmd_vm		 vm;
+	ssize_t			 sz;
+	int			 ret;
+
+	/*
+	 * stdio - needed for read/write to disk fds and channels to the vm.
+	 * vmm + proc - needed to create shared vm mappings.
+	 */
+	if (pledge("stdio vmm proc", NULL) == -1)
+		fatal("pledge");
+
+	/* Receive our virtio_dev, mostly preconfigured. */
+	memset(&dev, 0, sizeof(dev));
+	sz = atomicio(read, fd, &dev, sizeof(dev));
+	if (sz != sizeof(dev)) {
+		ret = errno;
+		log_warn("failed to receive vioscsi");
+		goto fail;
+	}
+	if (dev.dev_type != VMD_DEVTYPE_SCSI) {
+		ret = EINVAL;
+		log_warn("received invalid device type");
+		goto fail;
+	}
+	dev.sync_fd = fd;
+	vioscsi = &dev.vioscsi;
+
+	log_debug("%s: got vioscsi dev. cdrom fd = %d, syncfd = %d, "
+	    "asyncfd = %d, vmm fd = %d", __func__, vioscsi->cdrom_fd,
+	    dev.sync_fd, dev.async_fd, fd_vmm);
+
+	/* Receive our vm information from the vm process. */
+	memset(&vm, 0, sizeof(vm));
+	sz = atomicio(read, dev.sync_fd, &vm, sizeof(vm));
+	if (sz != sizeof(vm)) {
+		ret = EIO;
+		log_warnx("failed to receive vm details");
+		goto fail;
+	}
+	current_vm = &vm;
+
+	setproctitle("%s/vioscsi", vm.vm_params.vmc_name);
+	log_procinit("vm/%s/vioscsi", vm.vm_params.vmc_name);
+
+	/* Now that we have our vm information, we can remap memory. */
+	ret = remap_guest_mem(&vm, fd_vmm);
+	if (ret) {
+		log_warnx("failed to remap guest memory");
+		goto fail;
+	}
+
+	/*
+	 * We no longer need /dev/vmm access.
+	 */
+	close_fd(fd_vmm);
+	if (pledge("stdio", NULL) == -1)
+		fatal("pledge2");
+
+	/* Initialize the vioscsi backing file. */
+	ret = virtio_raw_init(&vioscsi->file, &vioscsi->sz,
+	    &vioscsi->cdrom_fd, 1);
+	if (ret == -1) {
+		log_warnx("%s: unable to determine iso format", __func__);
+		goto fail;
+	}
+	vioscsi->n_blocks = vioscsi->sz / VIOSCSI_BLOCK_SIZE_CDROM;
+
+	/* Initialize libevent so we can start wiring event handlers. */
+	event_init();
+
+	/* Wire up an async imsg channel. */
+	log_debug("%s: wiring in async vm event handler (fd=%d)", __func__,
+		dev.async_fd);
+	if (vm_device_pipe(&dev, dev_dispatch_vm, NULL)) {
+		ret = EIO;
+		log_warnx("vm_device_pipe");
+		goto fail;
+	}
+
+	/* Configure our sync channel event handler. */
+	log_debug("%s: wiring in sync channel handler (fd=%d)", __func__,
+		dev.sync_fd);
+	if (imsgbuf_init(&dev.sync_iev.ibuf, dev.sync_fd) == -1) {
+		log_warn("imsgbuf_init");
+		goto fail;
+	}
+	dev.sync_iev.handler = handle_sync_io;
+	dev.sync_iev.data = &dev;
+	dev.sync_iev.events = EV_READ;
+	imsg_event_add(&dev.sync_iev);
+
+	/* Send a ready message over the sync channel. */
+	log_debug("%s: telling vm %s device is ready", __func__,
+	    vm.vm_params.vmc_name);
+	memset(&msg, 0, sizeof(msg));
+	msg.type = VIODEV_MSG_READY;
+	imsg_compose_event(&dev.sync_iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
+	    sizeof(msg));
+
+	/* Send a ready message over the async channel. */
+	log_debug("%s: sending heartbeat", __func__);
+	ret = imsg_compose_event(&dev.async_iev, IMSG_DEVOP_MSG, 0, 0, -1,
+	    &msg, sizeof(msg));
+	if (ret == -1) {
+		log_warnx("%s: failed to send async ready message!", __func__);
+		goto fail;
+	}
+
+	/* Engage the event loop! */
+	ret = event_dispatch();
+
+	if (ret == 0) {
+		/* Clean shutdown. */
+		close_fd(dev.sync_fd);
+		close_fd(dev.async_fd);
+		close_fd(vioscsi->cdrom_fd);
+		_exit(0);
+		/* NOTREACHED */
+	}
+
+fail:
+	/* Try letting the vm know we've failed something. */
+	memset(&msg, 0, sizeof(msg));
+	msg.type = VIODEV_MSG_ERROR;
+	msg.data = ret;
+	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
+	    sizeof(msg));
+	imsgbuf_flush(&dev.sync_iev.ibuf);
+
+	close_fd(dev.sync_fd);
+	close_fd(dev.async_fd);
+	if (vioscsi != NULL)
+		close_fd(vioscsi->cdrom_fd);
+	_exit(ret);
+	/* NOTREACHED */
+}
 
 static void
 vioscsi_prepare_resp(struct virtio_scsi_res_hdr *resp, uint8_t vio_status,
@@ -68,24 +231,24 @@ vioscsi_prepare_resp(struct virtio_scsi_res_hdr *resp, uint8_t vio_status,
 }
 
 static struct vring_desc*
-vioscsi_next_ring_desc(struct vring_desc* desc, struct vring_desc* cur,
-    uint16_t *idx)
+vioscsi_next_ring_desc(struct virtio_vq_info *vq_info, struct vring_desc* desc,
+    struct vring_desc* cur, uint16_t *idx)
 {
-	*idx = cur->next & VIOSCSI_QUEUE_MASK;
+	*idx = cur->next & vq_info->mask;
 	return &desc[*idx];
 }
 
 static void
-vioscsi_next_ring_item(struct vioscsi_dev *dev, struct vring_avail *avail,
-    struct vring_used *used, struct vring_desc *desc, uint16_t idx)
+vioscsi_next_ring_item(struct virtio_vq_info *vq_info,
+    struct vring_avail *avail, struct vring_used *used, struct vring_desc *desc,
+    uint16_t idx)
 {
-	used->ring[used->idx & VIOSCSI_QUEUE_MASK].id = idx;
-	used->ring[used->idx & VIOSCSI_QUEUE_MASK].len = desc->len;
+	used->ring[used->idx & vq_info->mask].id = idx;
+	used->ring[used->idx & vq_info->mask].len = desc->len;
 	__sync_synchronize();
 	used->idx++;
 
-	dev->vq[dev->cfg.queue_notify].last_avail =
-	    avail->idx & VIOSCSI_QUEUE_MASK;
+	vq_info->last_avail = avail->idx & vq_info->mask;
 }
 
 static const char *
@@ -152,31 +315,25 @@ vioscsi_op_names(uint8_t type)
 	}
 }
 
+#if VIOSCSI_DEBUG
 static const char *
 vioscsi_reg_name(uint8_t reg)
 {
 	switch (reg) {
-	case VIRTIO_CONFIG_DEVICE_FEATURES: return "device feature";
-	case VIRTIO_CONFIG_GUEST_FEATURES: return "guest feature";
-	case VIRTIO_CONFIG_QUEUE_PFN: return "queue pfn";
-	case VIRTIO_CONFIG_QUEUE_SIZE: return "queue size";
-	case VIRTIO_CONFIG_QUEUE_SELECT: return "queue select";
-	case VIRTIO_CONFIG_QUEUE_NOTIFY: return "queue notify";
-	case VIRTIO_CONFIG_DEVICE_STATUS: return "device status";
-	case VIRTIO_CONFIG_ISR_STATUS: return "isr status";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI: return "num_queues";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 4: return "seg_max";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 8: return "max_sectors";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 12: return "cmd_per_lun";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 16: return "event_info_size";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 20: return "sense_size";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 24: return "cdb_size";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 28: return "max_channel";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 30: return "max_target";
-	case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 32: return "max_lun";
+	case VIRTIO_SCSI_CONFIG_NUM_QUEUES: return "NUM_QUEUES";
+	case VIRTIO_SCSI_CONFIG_SEG_MAX: return "SEG_MAX";
+	case VIRTIO_SCSI_CONFIG_MAX_SECTORS: return "MAX_SECTORS";
+	case VIRTIO_SCSI_CONFIG_CMD_PER_LUN: return "CMD_PER_LUN";
+	case VIRTIO_SCSI_CONFIG_EVENT_INFO_SIZE: return "EVENT_INFO_SIZE";
+	case VIRTIO_SCSI_CONFIG_SENSE_SIZE: return "SENSE_SIZE";
+	case VIRTIO_SCSI_CONFIG_CDB_SIZE: return "CDB_SIZE";
+	case VIRTIO_SCSI_CONFIG_MAX_CHANNEL: return "MAX_CHANNEL";
+	case VIRTIO_SCSI_CONFIG_MAX_TARGET: return "MAX_TARGET";
+	case VIRTIO_SCSI_CONFIG_MAX_LUN: return "MAX_LUN";
 	default: return "unknown";
 	}
 }
+#endif	/* VIOSCSI_DEBUG */
 
 static void
 vioscsi_free_info(struct ioinfo *info)
@@ -188,7 +345,7 @@ vioscsi_free_info(struct ioinfo *info)
 }
 
 static struct ioinfo *
-vioscsi_start_read(struct vioscsi_dev *dev, off_t block, size_t n_blocks)
+vioscsi_start_read(struct virtio_dev *dev, off_t block, size_t n_blocks)
 {
 	struct ioinfo *info;
 
@@ -216,10 +373,16 @@ nomem:
 }
 
 static const uint8_t *
-vioscsi_finish_read(struct vioscsi_dev *dev, struct ioinfo *info)
+vioscsi_finish_read(struct virtio_dev *dev, struct ioinfo *info)
 {
-	struct virtio_backing *f = &dev->file;
+	struct virtio_backing *f = NULL;
+	struct vioscsi_dev *vioscsi = NULL;
 
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
+
+	f = &vioscsi->file;
 	if (f->pread(f->p, info->buf, info->len, info->offset) != info->len) {
 		log_warn("vioscsi read error");
 		return NULL;
@@ -229,16 +392,16 @@ vioscsi_finish_read(struct vioscsi_dev *dev, struct ioinfo *info)
 }
 
 static int
-vioscsi_handle_tur(struct vioscsi_dev *dev, struct virtio_scsi_req_hdr *req,
-    struct virtio_vq_acct *acct)
+vioscsi_handle_tur(struct virtio_dev *dev, struct virtio_vq_info *vq_info,
+    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
 
 	memset(&resp, 0, sizeof(resp));
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	vioscsi_prepare_resp(&resp, VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
@@ -247,17 +410,212 @@ vioscsi_handle_tur(struct vioscsi_dev *dev, struct virtio_scsi_req_hdr *req,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
 	return (ret);
 }
 
+static void
+dev_dispatch_vm(int fd, short event, void *arg)
+{
+	struct virtio_dev	*dev = (struct virtio_dev *)arg;
+	struct imsgev		*iev = &dev->async_iev;
+	struct imsgbuf		*ibuf = &iev->ibuf;
+	struct imsg		 imsg;
+	int			 n, verbose;
+	uint32_t		 type;
+
+	if (event & EV_READ) {
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
+		if (n == 0) {
+			/* this pipe is dead, so remove the event handler */
+			log_debug("%s: vioscsi pipe dead (EV_READ)", __func__);
+			event_del(&iev->ev);
+			event_loopexit(NULL);
+			return;
+		}
+	}
+
+	if (event & EV_WRITE) {
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
+		}
+	}
+
+	for (;;) {
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
+		if (n == 0)
+			break;
+
+		type = imsg_get_type(&imsg);
+		switch (type) {
+		case IMSG_VMDOP_PAUSE_VM:
+			log_debug("%s: pausing", __func__);
+			break;
+		case IMSG_VMDOP_UNPAUSE_VM:
+			log_debug("%s: unpausing", __func__);
+			break;
+		case IMSG_CTL_VERBOSE:
+			verbose = imsg_int_read(&imsg);
+			log_setverbose(verbose);
+			break;
+		default:
+			log_warnx("%s: unhandled imsg type %d", __func__, type);
+			break;
+		}
+		imsg_free(&imsg);
+	}
+	imsg_event_add(iev);
+}
+
+/*
+ * Synchronous IO handler.
+ */
+static void
+handle_sync_io(int fd, short event, void *arg)
+{
+	struct virtio_dev *dev = (struct virtio_dev *)arg;
+	struct imsgev *iev = &dev->sync_iev;
+	struct imsgbuf *ibuf = &iev->ibuf;
+	struct viodev_msg msg;
+	struct imsg imsg;
+	int n, deassert = 0;
+
+	if (event & EV_READ) {
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
+		if (n == 0) {
+			/* this pipe is dead, so remove the event handler */
+			log_debug("%s: vioscsi pipe dead (EV_READ)", __func__);
+			event_del(&iev->ev);
+			event_loopexit(NULL);
+			return;
+		}
+	}
+
+	if (event & EV_WRITE) {
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
+		}
+	}
+
+	for (;;) {
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get", __func__);
+		if (n == 0)
+			break;
+
+		/* Unpack our message. They ALL should be dev messages! */
+		viodev_msg_read(&imsg, &msg);
+		imsg_free(&imsg);
+
+		switch (msg.type) {
+		case VIODEV_MSG_IO_READ:
+			/* Read IO: make sure to send a reply */
+			msg.data = vioscsi_read(dev, &msg, &deassert);
+			msg.data_valid = 1;
+			if (deassert) {
+				/* Inline any interrupt deassertions. */
+				msg.state = INTR_STATE_DEASSERT;
+			}
+			imsg_compose_event(iev, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
+			    sizeof(msg));
+			break;
+		case VIODEV_MSG_IO_WRITE:
+			/* Write IO: no reply needed, but maybe an irq assert */
+			if (vioscsi_write(dev, &msg))
+				virtio_assert_irq(dev, 0);
+			break;
+		case VIODEV_MSG_SHUTDOWN:
+			event_del(&dev->sync_iev.ev);
+			event_loopbreak();
+			return;
+		default:
+			fatalx("%s: invalid msg type %d", __func__, msg.type);
+		}
+	}
+	imsg_event_add(iev);
+}
+
 static int
-vioscsi_handle_inquiry(struct vioscsi_dev *dev,
+vioscsi_write(struct virtio_dev *dev, struct viodev_msg *msg)
+{
+	uint32_t data = msg->data;
+	uint16_t reg = msg->reg;
+	uint8_t sz = msg->io_sz;
+	int notify = 0;
+
+	switch (reg & 0xFF00) {
+	case VIO1_CFG_BAR_OFFSET:
+		(void)virtio_io_cfg(dev, VEI_DIR_OUT, (reg & 0xFF), data, sz);
+		break;
+	case VIO1_DEV_BAR_OFFSET:
+		(void)vioscsi_io_cfg(dev, VEI_DIR_OUT, (reg & 0xFF), data, sz);
+		break;
+	case VIO1_NOTIFY_BAR_OFFSET:
+		notify = vioscsi_notifyq(dev, (uint16_t)(msg->data));
+		break;
+	case VIO1_ISR_BAR_OFFSET:
+		/* Ignore writes to ISR. */
+		break;
+	default:
+		log_debug("%s: no handler for reg 0x%04x", __func__, reg);
+	}
+
+	return (notify);
+}
+
+static uint32_t
+vioscsi_read(struct virtio_dev *dev, struct viodev_msg *msg, int *deassert)
+{
+	uint32_t data = 0;
+	uint16_t reg = msg->reg;
+	uint8_t sz = msg->io_sz;
+
+	switch (reg & 0xFF00) {
+	case VIO1_CFG_BAR_OFFSET:
+		data = virtio_io_cfg(dev, VEI_DIR_IN, (reg & 0xFF), 0, sz);
+		break;
+	case VIO1_DEV_BAR_OFFSET:
+		data = vioscsi_io_cfg(dev, VEI_DIR_IN, (reg & 0xFF), 0, sz);
+		break;
+	case VIO1_NOTIFY_BAR_OFFSET:
+		/* Reads of notify register return all 1's. */
+		break;
+	case VIO1_ISR_BAR_OFFSET:
+		data = dev->isr;
+		dev->isr = 0;
+		*deassert = 1;
+		break;
+	default:
+		log_debug("%s: no handler for reg 0x%04x", __func__, reg);
+	}
+
+	return (data);
+}
+
+static int
+vioscsi_handle_inquiry(struct virtio_dev *dev, struct virtio_vq_info *vq_info,
     struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
 {
 	int ret = 0;
@@ -291,8 +649,8 @@ vioscsi_handle_inquiry(struct vioscsi_dev *dev,
 	memcpy(inq_data->revision, INQUIRY_REVISION, INQUIRY_REVISION_LEN);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d", __func__, acct->resp_desc->addr,
@@ -305,8 +663,8 @@ vioscsi_handle_inquiry(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for inquiry_data */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing inq_data to 0x%llx size %d at "
 	    "local idx %d req_idx %d global_idx %d",
@@ -320,9 +678,9 @@ vioscsi_handle_inquiry(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -333,8 +691,9 @@ inq_out:
 }
 
 static int
-vioscsi_handle_mode_sense(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_mode_sense(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -402,7 +761,7 @@ vioscsi_handle_mode_sense(struct vioscsi_dev *dev,
 		}
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		DPRINTF("%s: writing resp to 0x%llx size %d "
@@ -419,7 +778,7 @@ vioscsi_handle_mode_sense(struct vioscsi_dev *dev,
 		}
 
 		/* Move index for mode_reply */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->resp_desc, &(acct->resp_idx));
 
 		DPRINTF("%s: writing mode_reply to 0x%llx "
@@ -439,9 +798,9 @@ vioscsi_handle_mode_sense(struct vioscsi_dev *dev,
 		free(mode_reply);
 
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	} else {
 mode_sense_error:
@@ -451,7 +810,7 @@ mode_sense_error:
 		    SENSE_ILLEGAL_CDB_FIELD, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -461,9 +820,9 @@ mode_sense_error:
 		}
 
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 mode_sense_out:
@@ -471,8 +830,9 @@ mode_sense_out:
 }
 
 static int
-vioscsi_handle_mode_sense_big(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_mode_sense_big(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -540,7 +900,7 @@ vioscsi_handle_mode_sense_big(struct vioscsi_dev *dev,
 		}
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		DPRINTF("%s: writing resp to 0x%llx size %d "
@@ -557,7 +917,7 @@ vioscsi_handle_mode_sense_big(struct vioscsi_dev *dev,
 		}
 
 		/* Move index for mode_reply */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->resp_desc, &(acct->resp_idx));
 
 		DPRINTF("%s: writing mode_reply to 0x%llx "
@@ -577,9 +937,9 @@ vioscsi_handle_mode_sense_big(struct vioscsi_dev *dev,
 		free(mode_reply);
 
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	} else {
 mode_sense_big_error:
@@ -589,7 +949,7 @@ mode_sense_big_error:
 		    SENSE_ILLEGAL_CDB_FIELD, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -599,9 +959,9 @@ mode_sense_big_error:
 		}
 
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 mode_sense_big_out:
@@ -609,12 +969,18 @@ mode_sense_big_out:
 }
 
 static int
-vioscsi_handle_read_capacity(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_read_capacity(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info,struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
 	struct scsi_read_cap_data *r_cap_data;
+	struct vioscsi_dev *vioscsi = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 #if DEBUG
 	struct scsi_read_capacity *r_cap =
@@ -635,7 +1001,7 @@ vioscsi_handle_read_capacity(struct vioscsi_dev *dev,
 	}
 
 	DPRINTF("%s: ISO has %lld bytes and %lld blocks",
-	    __func__, dev->sz, dev->n_blocks);
+	    __func__, vioscsi->sz, vioscsi->n_blocks);
 
 	/*
 	 * determine if num blocks of iso image > UINT32_MAX
@@ -643,20 +1009,20 @@ vioscsi_handle_read_capacity(struct vioscsi_dev *dev,
 	 * indicating to hosts that READ_CAPACITY_16 should
 	 * be called to retrieve the full size
 	 */
-	if (dev->n_blocks >= UINT32_MAX) {
+	if (vioscsi->n_blocks >= UINT32_MAX) {
 		_lto4b(UINT32_MAX, r_cap_data->addr);
 		_lto4b(VIOSCSI_BLOCK_SIZE_CDROM, r_cap_data->length);
 		log_warnx("%s: ISO sz %lld is bigger than "
 		    "UINT32_MAX %u, all data may not be read",
-		    __func__, dev->sz, UINT32_MAX);
+		    __func__, vioscsi->sz, UINT32_MAX);
 	} else {
-		_lto4b(dev->n_blocks - 1, r_cap_data->addr);
+		_lto4b(vioscsi->n_blocks - 1, r_cap_data->addr);
 		_lto4b(VIOSCSI_BLOCK_SIZE_CDROM, r_cap_data->length);
 	}
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d",
@@ -670,8 +1036,8 @@ vioscsi_handle_read_capacity(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for r_cap_data */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing r_cap_data to 0x%llx size %d at "
 	    "local idx %d req_idx %d global_idx %d",
@@ -685,9 +1051,9 @@ vioscsi_handle_read_capacity(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -698,12 +1064,18 @@ read_capacity_out:
 }
 
 static int
-vioscsi_handle_read_capacity_16(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_read_capacity_16(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
 	struct scsi_read_cap_data_16 *r_cap_data_16;
+	struct vioscsi_dev *vioscsi = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 #if DEBUG
 	struct scsi_read_capacity_16 *r_cap_16 =
@@ -724,14 +1096,14 @@ vioscsi_handle_read_capacity_16(struct vioscsi_dev *dev,
 	}
 
 	DPRINTF("%s: ISO has %lld bytes and %lld blocks", __func__,
-	    dev->sz, dev->n_blocks);
+	    dev->vioscsi.sz, dev->vioscsi.n_blocks);
 
-	_lto8b(dev->n_blocks - 1, r_cap_data_16->addr);
+	_lto8b(vioscsi->n_blocks - 1, r_cap_data_16->addr);
 	_lto4b(VIOSCSI_BLOCK_SIZE_CDROM, r_cap_data_16->length);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d",
@@ -745,8 +1117,8 @@ vioscsi_handle_read_capacity_16(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for r_cap_data_16 */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing r_cap_data_16 to 0x%llx size %d "
 	    "at local idx %d req_idx %d global_idx %d",
@@ -760,9 +1132,9 @@ vioscsi_handle_read_capacity_16(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -773,8 +1145,9 @@ read_capacity_16_out:
 }
 
 static int
-vioscsi_handle_report_luns(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_report_luns(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -798,7 +1171,7 @@ vioscsi_handle_report_luns(struct vioscsi_dev *dev,
 		    SENSE_ILLEGAL_CDB_FIELD, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -807,9 +1180,9 @@ vioscsi_handle_report_luns(struct vioscsi_dev *dev,
 			    acct->resp_desc->addr);
 		} else {
 			ret = 1;
-			dev->cfg.isr_status = 1;
+			dev->isr = 1;
 			/* Move ring indexes */
-			vioscsi_next_ring_item(dev, acct->avail, acct->used,
+			vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 			    acct->req_desc, acct->req_idx);
 		}
 		goto rpl_out;
@@ -830,8 +1203,8 @@ vioscsi_handle_report_luns(struct vioscsi_dev *dev,
 	    VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d", __func__, acct->resp_desc->addr,
@@ -844,8 +1217,8 @@ vioscsi_handle_report_luns(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for reply_rpl */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing reply_rpl to 0x%llx size %d at "
 	    "local idx %d req_idx %d global_idx %d",
@@ -859,9 +1232,9 @@ vioscsi_handle_report_luns(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -872,8 +1245,9 @@ rpl_out:
 }
 
 static int
-vioscsi_handle_read_6(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_read_6(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -881,6 +1255,11 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 	uint32_t read_lba;
 	struct ioinfo *info;
 	struct scsi_rw *read_6;
+	struct vioscsi_dev *vioscsi = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 	memset(&resp, 0, sizeof(resp));
 	read_6 = (struct scsi_rw *)(req->cdb);
@@ -888,19 +1267,20 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 	    (read_6->addr[1] << 8) | read_6->addr[2];
 
 	DPRINTF("%s: READ Addr 0x%08x Len %d (%d)",
-	    __func__, read_lba, read_6->length, read_6->length * dev->max_xfer);
+	    __func__, read_lba, read_6->length,
+	    read_6->length * dev->vioscsi.max_xfer);
 
 	/* check if lba is in range */
-	if (read_lba > dev->n_blocks - 1) {
+	if (read_lba > vioscsi->n_blocks - 1) {
 		DPRINTF("%s: requested block out of range req: %ud max: %lld",
-		    __func__, read_lba, dev->n_blocks);
+		    __func__, read_lba, vioscsi->n_blocks);
 
 		vioscsi_prepare_resp(&resp,
 		    VIRTIO_SCSI_S_OK, SCSI_CHECK, SKEY_ILLEGAL_REQUEST,
 		    SENSE_LBA_OUT_OF_RANGE, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -909,9 +1289,9 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 			    acct->resp_desc->addr);
 		} else {
 			ret = 1;
-			dev->cfg.isr_status = 1;
+			dev->isr = 1;
 			/* Move ring indexes */
-			vioscsi_next_ring_item(dev, acct->avail, acct->used,
+			vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 			    acct->req_desc, acct->req_idx);
 		}
 		goto read_6_out;
@@ -935,7 +1315,7 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 		    SENSE_MEDIUM_NOT_PRESENT, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -944,9 +1324,9 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 			    acct->resp_desc->addr);
 		} else {
 			ret = 1;
-			dev->cfg.isr_status = 1;
+			dev->isr = 1;
 			/* Move ring indexes */
-			vioscsi_next_ring_item(dev, acct->avail, acct->used,
+			vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 			    acct->req_desc, acct->req_idx);
 		}
 
@@ -956,8 +1336,8 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 	vioscsi_prepare_resp(&resp, VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d",
@@ -971,8 +1351,8 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for read_buf */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing read_buf to 0x%llx size %d at "
 	    "local idx %d req_idx %d global_idx %d",
@@ -984,9 +1364,9 @@ vioscsi_handle_read_6(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -997,8 +1377,9 @@ read_6_out:
 }
 
 static int
-vioscsi_handle_read_10(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_read_10(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -1009,6 +1390,11 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 	struct ioinfo *info;
 	struct scsi_rw_10 *read_10;
 	size_t chunk_len = 0;
+	struct vioscsi_dev *vioscsi = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 	memset(&resp, 0, sizeof(resp));
 	read_10 = (struct scsi_rw_10 *)(req->cdb);
@@ -1017,19 +1403,19 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 	chunk_offset = 0;
 
 	DPRINTF("%s: READ_10 Addr 0x%08x Len %d (%d)",
-	    __func__, read_lba, read_10_len, read_10_len * dev->max_xfer);
+	    __func__, read_lba, read_10_len, read_10_len * vioscsi->max_xfer);
 
 	/* check if lba is in range */
-	if (read_lba > dev->n_blocks - 1) {
+	if (read_lba > vioscsi->n_blocks - 1) {
 		DPRINTF("%s: requested block out of range req: %ud max: %lld",
-		    __func__, read_lba, dev->n_blocks);
+		    __func__, read_lba, vioscsi->n_blocks);
 
 		vioscsi_prepare_resp(&resp,
 		    VIRTIO_SCSI_S_OK, SCSI_CHECK, SKEY_ILLEGAL_REQUEST,
 		    SENSE_LBA_OUT_OF_RANGE, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -1037,9 +1423,9 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 			    __func__, acct->resp_desc->addr);
 		} else {
 			ret = 1;
-			dev->cfg.isr_status = 1;
+			dev->isr = 1;
 			/* Move ring indexes */
-			vioscsi_next_ring_item(dev, acct->avail, acct->used,
+			vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 			    acct->req_desc, acct->req_idx);
 		}
 
@@ -1063,7 +1449,7 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 		    SENSE_MEDIUM_NOT_PRESENT, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -1071,9 +1457,9 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 			    __func__, acct->resp_desc->addr);
 		} else {
 			ret = 1;
-			dev->cfg.isr_status = 1;
+			dev->isr = 1;
 			/* Move ring indexes */
-			vioscsi_next_ring_item(dev, acct->avail, acct->used,
+			vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 			    acct->req_desc, acct->req_idx);
 		}
 
@@ -1083,8 +1469,8 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 	vioscsi_prepare_resp(&resp, VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d",
@@ -1105,13 +1491,18 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 	 */
 	do {
 		/* Move index for read_buf */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->resp_desc, &(acct->resp_idx));
 
 		DPRINTF("%s: writing read_buf to 0x%llx size "
 		    "%d at local idx %d req_idx %d global_idx %d",
 		    __func__, acct->resp_desc->addr, acct->resp_desc->len,
 		    acct->resp_idx, acct->req_idx, acct->idx);
+
+		if (acct->resp_desc->len == 0) {
+			log_warnx("%s: zero-length read_buf descriptor", __func__);
+			goto free_read_10;
+		}
 
 		/* Check we don't read beyond read_buf boundaries. */
 		if (acct->resp_desc->len > info->len - chunk_offset) {
@@ -1121,6 +1512,11 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 		} else
 			chunk_len = acct->resp_desc->len;
 
+		if (chunk_len == 0 && chunk_offset < info->len) {
+			log_warnx("%s: zero-length read_buf descriptor", __func__);
+			goto free_read_10;
+		}
+
 		if (write_mem(acct->resp_desc->addr, read_buf + chunk_offset,
 			chunk_len)) {
 			log_warnx("%s: unable to write read_buf"
@@ -1128,13 +1524,13 @@ vioscsi_handle_read_10(struct vioscsi_dev *dev,
 			    acct->resp_desc->addr);
 			goto free_read_10;
 		}
-		chunk_offset += acct->resp_desc->len;
+		chunk_offset += chunk_len;
 	} while (chunk_offset < info->len);
 
 	ret = 1;
-	dev->cfg.isr_status = 1;
+	dev->isr = 1;
 	/* Move ring indexes */
-	vioscsi_next_ring_item(dev, acct->avail, acct->used, acct->req_desc,
+	vioscsi_next_ring_item(vq_info, acct->avail, acct->used, acct->req_desc,
 	    acct->req_idx);
 
 free_read_10:
@@ -1144,35 +1540,41 @@ read_10_out:
 }
 
 static int
-vioscsi_handle_prevent_allow(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_prevent_allow(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
+	struct vioscsi_dev *vioscsi = NULL;
 	struct virtio_scsi_res_hdr resp;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 	memset(&resp, 0, sizeof(resp));
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	vioscsi_prepare_resp(&resp, VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
-	if (dev->locked) {
+	if (vioscsi->locked) {
 		DPRINTF("%s: unlocking medium", __func__);
 	} else {
 		DPRINTF("%s: locking medium", __func__);
 	}
 
-	dev->locked = dev->locked ? 0 : 1;
+	vioscsi->locked = vioscsi->locked ? 0 : 1;
 
 	if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
 		log_warnx("%s: unable to write OK resp status data @ 0x%llx",
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -1180,8 +1582,9 @@ vioscsi_handle_prevent_allow(struct vioscsi_dev *dev,
 }
 
 static int
-vioscsi_handle_mechanism_status(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_mechanism_status(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -1202,7 +1605,7 @@ vioscsi_handle_mechanism_status(struct vioscsi_dev *dev,
 	    VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 	    acct->req_desc, &(acct->resp_idx));
 
 	if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -1212,8 +1615,8 @@ vioscsi_handle_mechanism_status(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for mech_status_header */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	if (write_mem(acct->resp_desc->addr, mech_status_header,
 		sizeof(struct scsi_mechanism_status_header))) {
@@ -1223,9 +1626,9 @@ vioscsi_handle_mechanism_status(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -1236,8 +1639,9 @@ mech_out:
 }
 
 static int
-vioscsi_handle_read_toc(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_read_toc(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -1245,6 +1649,11 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 	uint8_t toc_data[TOC_DATA_SIZE];
 	uint8_t *toc_data_p;
 	struct scsi_read_toc *toc = (struct scsi_read_toc *)(req->cdb);
+	struct vioscsi_dev *vioscsi = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 	DPRINTF("%s: %s - MSF %d Track 0x%02x Addr 0x%04x",
 	    __func__, vioscsi_op_names(toc->opcode), ((toc->byte2 >> 1) & 1),
@@ -1263,7 +1672,7 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 		    SENSE_ILLEGAL_CDB_FIELD, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -1273,9 +1682,9 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 		}
 
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 
 		goto read_toc_out;
@@ -1324,7 +1733,7 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 	*toc_data_p++ = READ_TOC_LEAD_OUT_TRACK;
 	*toc_data_p++ = 0x0;
 
-	_lto4b((uint32_t)dev->n_blocks, toc_data_p);
+	_lto4b((uint32_t)vioscsi->n_blocks, toc_data_p);
 	toc_data_p += 4;
 
 	toc_data_len = toc_data_p - toc_data;
@@ -1334,8 +1743,8 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 	vioscsi_prepare_resp(&resp, VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d",
@@ -1349,8 +1758,8 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for toc descriptor */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing toc_data to 0x%llx size %d at "
 	    "local idx %d req_idx %d global_idx %d",
@@ -1362,9 +1771,9 @@ vioscsi_handle_read_toc(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -1373,8 +1782,9 @@ read_toc_out:
 }
 
 static int
-vioscsi_handle_read_disc_info(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_read_disc_info(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -1389,7 +1799,7 @@ vioscsi_handle_read_disc_info(struct vioscsi_dev *dev,
 	    SENSE_ILLEGAL_CDB_FIELD, SENSE_DEFAULT_ASCQ);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 	    acct->req_desc, &(acct->resp_idx));
 
 	if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -1397,9 +1807,9 @@ vioscsi_handle_read_disc_info(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -1407,8 +1817,9 @@ vioscsi_handle_read_disc_info(struct vioscsi_dev *dev,
 }
 
 static int
-vioscsi_handle_gesn(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_gesn(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -1416,6 +1827,11 @@ vioscsi_handle_gesn(struct vioscsi_dev *dev,
 	struct scsi_gesn *gesn;
 	struct scsi_gesn_event_header *gesn_event_header;
 	struct scsi_gesn_power_event *gesn_power_event;
+	struct vioscsi_dev *vioscsi = NULL;
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 	memset(&resp, 0, sizeof(resp));
 	gesn = (struct scsi_gesn *)(req->cdb);
@@ -1429,7 +1845,7 @@ vioscsi_handle_gesn(struct vioscsi_dev *dev,
 		    SENSE_ILLEGAL_CDB_FIELD, SENSE_DEFAULT_ASCQ);
 
 		/* Move index for response */
-		acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+		acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 		    acct->req_desc, &(acct->resp_idx));
 
 		if (write_mem(acct->resp_desc->addr, &resp, sizeof(resp))) {
@@ -1439,9 +1855,9 @@ vioscsi_handle_gesn(struct vioscsi_dev *dev,
 		}
 
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 
 		goto gesn_out;
@@ -1456,14 +1872,14 @@ vioscsi_handle_gesn(struct vioscsi_dev *dev,
 
 	/* set event descriptor */
 	gesn_power_event->event_code = GESN_CODE_NOCHG;
-	if (dev->locked)
+	if (vioscsi->locked)
 		gesn_power_event->status = GESN_STATUS_ACTIVE;
 	else
 		gesn_power_event->status = GESN_STATUS_IDLE;
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->req_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
 	    "idx %d req_idx %d global_idx %d",
@@ -1477,8 +1893,8 @@ vioscsi_handle_gesn(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for gesn_reply */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing gesn_reply to 0x%llx size %d at "
 	    "local idx %d req_idx %d global_idx %d",
@@ -1491,9 +1907,9 @@ vioscsi_handle_gesn(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -1502,8 +1918,9 @@ gesn_out:
 }
 
 static int
-vioscsi_handle_get_config(struct vioscsi_dev *dev,
-    struct virtio_scsi_req_hdr *req, struct virtio_vq_acct *acct)
+vioscsi_handle_get_config(struct virtio_dev *dev,
+    struct virtio_vq_info *vq_info, struct virtio_scsi_req_hdr *req,
+    struct virtio_vq_acct *acct)
 {
 	int ret = 0;
 	struct virtio_scsi_res_hdr resp;
@@ -1515,6 +1932,7 @@ vioscsi_handle_get_config(struct vioscsi_dev *dev,
 	struct scsi_config_morphing_descriptor *config_morphing_desc;
 	struct scsi_config_remove_media_descriptor *config_remove_media_desc;
 	struct scsi_config_random_read_descriptor *config_random_read_desc;
+	struct vioscsi_dev *vioscsi = NULL;
 
 #if DEBUG
 	struct scsi_get_configuration *get_configuration =
@@ -1523,6 +1941,10 @@ vioscsi_handle_get_config(struct vioscsi_dev *dev,
 	    get_configuration->byte2, _2btol(get_configuration->feature),
 	    _2btol(get_configuration->length));
 #endif /* DEBUG */
+
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
 	get_conf_reply = (uint8_t*)calloc(G_CONFIG_REPLY_SIZE, sizeof(uint8_t));
 
@@ -1594,10 +2016,11 @@ vioscsi_handle_get_config(struct vioscsi_dev *dev,
 	    config_random_read_desc->feature_code);
 	config_random_read_desc->byte3 = CONFIG_RANDOM_READ_BYTE3;
 	config_random_read_desc->length = CONFIG_RANDOM_READ_LENGTH;
-	if (dev->n_blocks >= UINT32_MAX)
+	if (vioscsi->n_blocks >= UINT32_MAX)
 		_lto4b(UINT32_MAX, config_random_read_desc->block_size);
 	else
-		_lto4b(dev->n_blocks - 1, config_random_read_desc->block_size);
+		_lto4b(vioscsi->n_blocks - 1,
+		    config_random_read_desc->block_size);
 	_lto2b(CONFIG_RANDOM_READ_BLOCKING_TYPE,
 	    config_random_read_desc->blocking_type);
 
@@ -1605,7 +2028,7 @@ vioscsi_handle_get_config(struct vioscsi_dev *dev,
 	vioscsi_prepare_resp(&resp, VIRTIO_SCSI_S_OK, SCSI_OK, 0, 0, 0);
 
 	/* Move index for response */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc,
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
 	    acct->req_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing resp to 0x%llx size %d at local "
@@ -1620,8 +2043,8 @@ vioscsi_handle_get_config(struct vioscsi_dev *dev,
 	}
 
 	/* Move index for get_conf_reply */
-	acct->resp_desc = vioscsi_next_ring_desc(acct->desc, acct->resp_desc,
-	    &(acct->resp_idx));
+	acct->resp_desc = vioscsi_next_ring_desc(vq_info, acct->desc,
+	    acct->resp_desc, &(acct->resp_idx));
 
 	DPRINTF("%s: writing get_conf_reply to 0x%llx size %d "
 	    "at local idx %d req_idx %d global_idx %d",
@@ -1635,9 +2058,9 @@ vioscsi_handle_get_config(struct vioscsi_dev *dev,
 		    __func__, acct->resp_desc->addr);
 	} else {
 		ret = 1;
-		dev->cfg.isr_status = 1;
+		dev->isr = 1;
 		/* Move ring indexes */
-		vioscsi_next_ring_item(dev, acct->avail, acct->used,
+		vioscsi_next_ring_item(vq_info, acct->avail, acct->used,
 		    acct->req_desc, acct->req_idx);
 	}
 
@@ -1647,423 +2070,110 @@ get_config_out:
 	return (ret);
 }
 
-int
-vioscsi_io(int dir, uint16_t reg, uint32_t *data, uint8_t *intr,
-    void *cookie, uint8_t sz)
+static uint32_t
+vioscsi_io_cfg(struct virtio_dev *dev, int dir, uint8_t reg, uint32_t data,
+    uint8_t sz)
 {
-	struct vioscsi_dev *dev = (struct vioscsi_dev *)cookie;
+	struct vioscsi_dev *vioscsi = NULL;
+	uint32_t res = 0;
 
-	*intr = 0xFF;
+	if (dev->device_id != PCI_PRODUCT_VIRTIO_SCSI)
+		fatalx("%s: virtio device is not a scsi device", __func__);
+	vioscsi = &dev->vioscsi;
 
-	DPRINTF("%s: request %s reg %u, %s sz %u", __func__,
-	    dir ? "READ" : "WRITE", reg, vioscsi_reg_name(reg), sz);
+	DPRINTF("%s: request %s reg %s sz %u", __func__,
+	    dir ? "READ" : "WRITE", vioscsi_reg_name(reg), sz);
 
-	if (dir == 0) {
+	if (dir == VEI_DIR_OUT) {
 		switch (reg) {
-		case VIRTIO_CONFIG_DEVICE_FEATURES:
-		case VIRTIO_CONFIG_QUEUE_SIZE:
-		case VIRTIO_CONFIG_ISR_STATUS:
-			log_warnx("%s: illegal write %x to %s",
-			    __progname, *data, vioscsi_reg_name(reg));
+		case VIRTIO_SCSI_CONFIG_SENSE_SIZE:
+			/* Support writing to sense size register. */
+			if (data != VIOSCSI_SENSE_LEN)
+				log_warnx("%s: guest write to sense size "
+				    "register ignored", __func__);
 			break;
-		case VIRTIO_CONFIG_GUEST_FEATURES:
-			dev->cfg.guest_feature = *data;
-			DPRINTF("%s: guest feature set to %u",
-			    __func__, dev->cfg.guest_feature);
-			break;
-		case VIRTIO_CONFIG_QUEUE_PFN:
-			dev->cfg.queue_pfn = *data;
-			vioscsi_update_qa(dev);
-			break;
-		case VIRTIO_CONFIG_QUEUE_SELECT:
-			dev->cfg.queue_select = *data;
-			vioscsi_update_qs(dev);
-			break;
-		case VIRTIO_CONFIG_QUEUE_NOTIFY:
-			dev->cfg.queue_notify = *data;
-			if (vioscsi_notifyq(dev))
-				*intr = 1;
-			break;
-		case VIRTIO_CONFIG_DEVICE_STATUS:
-			dev->cfg.device_status = *data;
-			DPRINTF("%s: device status set to %u",
-			    __func__, dev->cfg.device_status);
-			if (dev->cfg.device_status == 0) {
-				log_debug("%s: device reset", __func__);
-				dev->cfg.guest_feature = 0;
-				dev->cfg.queue_pfn = 0;
-				vioscsi_update_qa(dev);
-				dev->cfg.queue_size = 0;
-				vioscsi_update_qs(dev);
-				dev->cfg.queue_select = 0;
-				dev->cfg.queue_notify = 0;
-				dev->cfg.isr_status = 0;
-				dev->vq[0].last_avail = 0;
-				dev->vq[1].last_avail = 0;
-				dev->vq[2].last_avail = 0;
-			}
+		case VIRTIO_SCSI_CONFIG_CDB_SIZE:
+			/* Support writing CDB size. */
+			if (data != VIOSCSI_CDB_LEN)
+				log_warnx("%s: guest write to cdb size "
+				    "register ignored", __func__);
 			break;
 		default:
+			log_warnx("%s: invalid register 0x%04x", __func__, reg);
 			break;
 		}
 	} else {
 		switch (reg) {
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI:
-			/* VIRTIO_SCSI_CONFIG_NUM_QUEUES, 32bit */
+		case VIRTIO_SCSI_CONFIG_NUM_QUEUES:
+			/* Number of request queues, not number of all queues. */
 			if (sz == 4)
-				*data = (uint32_t)VIOSCSI_NUM_QUEUES;
-			else if (sz == 1) {
-				/* read first byte of num_queues */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_NUM_QUEUES) & 0xFF;
-			}
+				res = (uint32_t)(VIOSCSI_NUM_REQ_QUEUES);
+			else
+				log_warnx("%s: unaligned read of num queues "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 1:
-			if (sz == 1) {
-				/* read second byte of num_queues */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_NUM_QUEUES >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 2:
-			if (sz == 1) {
-				/* read third byte of num_queues */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_NUM_QUEUES >> 16) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 3:
-			if (sz == 1) {
-				/* read fourth byte of num_queues */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_NUM_QUEUES >> 24) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 4:
-			/* VIRTIO_SCSI_CONFIG_SEG_MAX, 32bit */
+		case VIRTIO_SCSI_CONFIG_SEG_MAX:
 			if (sz == 4)
-				*data = (uint32_t)(VIOSCSI_SEG_MAX);
-			else if (sz == 1) {
-				/* read first byte of seg_max */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_SEG_MAX) & 0xFF;
-			}
+				res = (uint32_t)(VIOSCSI_SEG_MAX);
+			else
+				log_warnx("%s: unaligned read of seg max "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 5:
-			if (sz == 1) {
-				/* read second byte of seg_max */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_SEG_MAX >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 6:
-			if (sz == 1) {
-				/* read third byte of seg_max */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_SEG_MAX >> 16) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 7:
-			if (sz == 1) {
-				/* read fourth byte of seg_max */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_SEG_MAX >> 24) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 8:
-			/* VIRTIO_SCSI_CONFIG_MAX_SECTORS, 32bit */
+		case VIRTIO_SCSI_CONFIG_MAX_SECTORS:
 			if (sz == 4)
-				*data = (uint32_t)(dev->max_xfer);
-			else if (sz == 1) {
-				/* read first byte of max_xfer */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(dev->max_xfer) & 0xFF;
-			}
+				res = (uint32_t)(vioscsi->max_xfer);
+			else
+				log_warnx("%s: unaligned read of max sectors "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 9:
-			if (sz == 1) {
-				/* read second byte of max_xfer */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(dev->max_xfer >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 10:
-			if (sz == 1) {
-				/* read third byte of max_xfer */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(dev->max_xfer >> 16) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 11:
-			if (sz == 1) {
-				/* read fourth byte of max_xfer */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(dev->max_xfer >> 24) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 12:
-			/* VIRTIO_SCSI_CONFIG_CMD_PER_LUN, 32bit */
+		case VIRTIO_SCSI_CONFIG_CMD_PER_LUN:
 			if (sz == 4)
-				*data = (uint32_t)(VIOSCSI_CMD_PER_LUN);
-			else if (sz == 1) {
-				/* read first byte of cmd_per_lun */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_CMD_PER_LUN) & 0xFF;
-			}
+				res = (uint32_t)(VIOSCSI_CMD_PER_LUN);
+			else
+				log_warnx("%s: unaligned read of cmd per lun "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 13:
-			if (sz == 1) {
-				/* read second byte of cmd_per_lun */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_CMD_PER_LUN >> 8) & 0xFF;
-			}
+		case VIRTIO_SCSI_CONFIG_EVENT_INFO_SIZE:
+			res = 0;
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 14:
-			if (sz == 1) {
-				/* read third byte of cmd_per_lun */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_CMD_PER_LUN >> 16)
-				    & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 15:
-			if (sz == 1) {
-				/* read fourth byte of cmd_per_lun */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_CMD_PER_LUN >> 24)
-				    & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 16:
-			/* VIRTIO_SCSI_CONFIG_EVENT_INFO_SIZE, 32bit */
-			*data = 0x00;
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 20:
-			/* VIRTIO_SCSI_CONFIG_SENSE_SIZE, 32bit */
+		case VIRTIO_SCSI_CONFIG_SENSE_SIZE:
 			if (sz == 4)
-				*data = (uint32_t)(VIOSCSI_SENSE_LEN);
-			else if (sz == 1) {
-				/* read first byte of sense_size */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_SENSE_LEN) & 0xFF;
-			}
+				res = (uint32_t)(VIOSCSI_SENSE_LEN);
+			else
+				log_warnx("%s: unaligned read of sense size "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 21:
-			if (sz == 1) {
-				/* read second byte of sense_size */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_SENSE_LEN >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 22:
-			if (sz == 1) {
-				/* read third byte of sense_size */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_SENSE_LEN >> 16) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 23:
-			if (sz == 1) {
-				/* read fourth byte of sense_size */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_SENSE_LEN >> 24) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 24:
-			/* VIRTIO_SCSI_CONFIG_CDB_SIZE, 32bit */
+		case VIRTIO_SCSI_CONFIG_CDB_SIZE:
 			if (sz == 4)
-				*data = (uint32_t)(VIOSCSI_CDB_LEN);
-			else if (sz == 1) {
-				/* read first byte of cdb_len */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_CDB_LEN) & 0xFF;
-			}
+				res = (uint32_t)(VIOSCSI_CDB_LEN);
+			else
+				log_warnx("%s: unaligned read of cdb size "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 25:
-			if (sz == 1) {
-				/* read second byte of cdb_len */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_CDB_LEN >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 26:
-			if (sz == 1) {
-				/* read third byte of cdb_len */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_CDB_LEN >> 16) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 27:
-			if (sz == 1) {
-				/* read fourth byte of cdb_len */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_CDB_LEN >> 24) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 28:
-			/* VIRTIO_SCSI_CONFIG_MAX_CHANNEL, 16bit */
-
+		case VIRTIO_SCSI_CONFIG_MAX_CHANNEL:
 			/* defined by standard to be zero */
-			*data &= 0xFFFF0000;
+			res = 0;
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 29:
-			/* defined by standard to be zero */
-			*data &= 0xFFFF0000;
+		case VIRTIO_SCSI_CONFIG_MAX_TARGET:
+			if (sz == 2)
+				res = (uint32_t)(VIOSCSI_MAX_TARGET);
+			else
+				log_warnx("%s: unaligned read of max target "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 30:
-			/* VIRTIO_SCSI_CONFIG_MAX_TARGET, 16bit */
-			if (sz == 2) {
-				*data &= 0xFFFF0000;
-				*data |=
-				    (uint32_t)(VIOSCSI_MAX_TARGET) & 0xFFFF;
-			} else if (sz == 1) {
-				/* read first byte of max_target */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_MAX_TARGET) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 31:
-			if (sz == 1) {
-				/* read second byte of max_target */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_MAX_TARGET >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 32:
-			/* VIRTIO_SCSI_CONFIG_MAX_LUN, 32bit */
+		case VIRTIO_SCSI_CONFIG_MAX_LUN:
 			if (sz == 4)
-				*data = (uint32_t)(VIOSCSI_MAX_LUN);
-			else if (sz == 1) {
-				/* read first byte of max_lun */
-				*data &= 0xFFFFFF00;
-				*data |= (uint32_t)(VIOSCSI_MAX_LUN) & 0xFF;
-			}
+				res = (uint32_t)(VIOSCSI_MAX_LUN);
+			else
+				log_warnx("%s: unaligned read of max lun "
+				    "register", __func__);
 			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 33:
-			if (sz == 1) {
-				/* read second byte of max_lun */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_MAX_LUN >> 8) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 34:
-			if (sz == 1) {
-				/* read third byte of max_lun */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_MAX_LUN >> 16) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_CONFIG_NOMSI + 35:
-			if (sz == 1) {
-				/* read fourth byte of max_lun */
-				*data &= 0xFFFFFF00;
-				*data |=
-				    (uint32_t)(VIOSCSI_MAX_LUN >> 24) & 0xFF;
-			}
-			break;
-		case VIRTIO_CONFIG_DEVICE_FEATURES:
-			*data = dev->cfg.device_feature;
-			break;
-		case VIRTIO_CONFIG_GUEST_FEATURES:
-			*data = dev->cfg.guest_feature;
-			break;
-		case VIRTIO_CONFIG_QUEUE_PFN:
-			*data = dev->cfg.queue_pfn;
-			break;
-		case VIRTIO_CONFIG_QUEUE_SIZE:
-			if (sz == 4)
-				*data = dev->cfg.queue_size;
-			else if (sz == 2) {
-				*data &= 0xFFFF0000;
-				*data |= (uint16_t)dev->cfg.queue_size;
-			} else if (sz == 1) {
-				*data &= 0xFFFFFF00;
-				*data |= (uint8_t)dev->cfg.queue_size;
-			}
-			break;
-		case VIRTIO_CONFIG_QUEUE_SELECT:
-			*data = dev->cfg.queue_select;
-			break;
-		case VIRTIO_CONFIG_QUEUE_NOTIFY:
-			*data = dev->cfg.queue_notify;
-			break;
-		case VIRTIO_CONFIG_DEVICE_STATUS:
-			if (sz == 4)
-				*data = dev->cfg.device_status;
-			else if (sz == 2) {
-				*data &= 0xFFFF0000;
-				*data |= (uint16_t)dev->cfg.device_status;
-			} else if (sz == 1) {
-				*data &= 0xFFFFFF00;
-				*data |= (uint8_t)dev->cfg.device_status;
-			}
-			break;
-		case VIRTIO_CONFIG_ISR_STATUS:
-			*data = dev->cfg.isr_status;
-			dev->cfg.isr_status = 0;
-			break;
+		default:
+			log_warnx("%s: invalid register 0x%04x", __func__, reg);
 		}
 	}
 
-
-	return (0);
-}
-
-void
-vioscsi_update_qs(struct vioscsi_dev *dev)
-{
-	struct virtio_vq_info *vq_info;
-
-	/* Invalid queue? */
-	if (dev->cfg.queue_select >= VIRTIO_MAX_QUEUES) {
-		dev->cfg.queue_size = 0;
-		return;
-	}
-
-	vq_info = &dev->vq[dev->cfg.queue_select];
-
-	/* Update queue pfn/size based on queue select */
-	dev->cfg.queue_pfn = vq_info->q_gpa >> 12;
-	dev->cfg.queue_size = vq_info->qs;
-}
-
-void
-vioscsi_update_qa(struct vioscsi_dev *dev)
-{
-	struct virtio_vq_info *vq_info;
-	void *hva = NULL;
-
-	/* Invalid queue? */
-	if (dev->cfg.queue_select >= VIRTIO_MAX_QUEUES)
-		return;
-
-	vq_info = &dev->vq[dev->cfg.queue_select];
-	vq_info->q_gpa = (uint64_t)dev->cfg.queue_pfn * VIRTIO_PAGE_SIZE;
-
-	hva = hvaddr_mem(vq_info->q_gpa, vring_size(VIOSCSI_QUEUE_SIZE));
-	if (hva == NULL)
-		fatal("vioscsi_update_qa");
-	vq_info->q_hva = hva;
+	return (res);
 }
 
 /*
@@ -2076,23 +2186,28 @@ vioscsi_update_qa(struct vioscsi_dev *dev)
  * Return 1 if an interrupt should be generated (response written)
  *        0 otherwise
  */
-int
-vioscsi_notifyq(struct vioscsi_dev *dev)
+static int
+vioscsi_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 {
-	int cnt, ret = 0;
+	size_t cnt;
+	int ret = 0;
 	char *vr;
 	struct virtio_scsi_req_hdr req;
 	struct virtio_scsi_res_hdr resp;
 	struct virtio_vq_acct acct;
 	struct virtio_vq_info *vq_info;
 
-	ret = 0;
+	if (vq_idx >= dev->num_queues) {
+		log_warnx("%s: invalid virtqueue index %u", __func__, vq_idx);
+		return (0);
+	}
 
-	/* Invalid queue? */
-	if (dev->cfg.queue_notify >= VIRTIO_MAX_QUEUES)
-		return (ret);
+	vq_info = &dev->vq[vq_idx];
+	if (!vq_info->vq_enabled) {
+		log_warnx("%s: virtqueue not enabled", __func__);
+		return (0);
+	}
 
-	vq_info = &dev->vq[dev->cfg.queue_notify];
 	vr = vq_info->q_hva;
 	if (vr == NULL)
 		fatalx("%s: null vring", __func__);
@@ -2102,23 +2217,23 @@ vioscsi_notifyq(struct vioscsi_dev *dev)
 	acct.avail = (struct vring_avail *)(vr + vq_info->vq_availoffset);
 	acct.used = (struct vring_used *)(vr + vq_info->vq_usedoffset);
 
-	acct.idx = vq_info->last_avail & VIOSCSI_QUEUE_MASK;
+	acct.idx = vq_info->last_avail & vq_info->mask;
 
-	if ((acct.avail->idx & VIOSCSI_QUEUE_MASK) == acct.idx) {
+	if ((acct.avail->idx & vq_info->mask) == acct.idx) {
 		log_debug("%s - nothing to do?", __func__);
 		return (0);
 	}
 
 	cnt = 0;
-	while (acct.idx != (acct.avail->idx & VIOSCSI_QUEUE_MASK)) {
+	while (acct.idx != (acct.avail->idx & vq_info->mask)) {
 
 		/* Guard against infinite descriptor chains */
-		if (++cnt >= VIOSCSI_QUEUE_SIZE) {
+		if (++cnt >= vq_info->qs) {
 			log_warnx("%s: invalid descriptor table", __func__);
 			goto out;
 		}
 
-		acct.req_idx = acct.avail->ring[acct.idx] & VIOSCSI_QUEUE_MASK;
+		acct.req_idx = acct.avail->ring[acct.idx] & vq_info->mask;
 		acct.req_desc = &(acct.desc[acct.req_idx]);
 
 		/* Clear resp for next message */
@@ -2157,8 +2272,8 @@ vioscsi_notifyq(struct vioscsi_dev *dev)
 			    __func__, req.cdb[0], vioscsi_op_names(req.cdb[0]),
 			    req.lun[0], req.lun[1], req.lun[2], req.lun[3]);
 			/* Move index for response */
-			acct.resp_desc = vioscsi_next_ring_desc(acct.desc,
-			    acct.req_desc, &(acct.resp_idx));
+			acct.resp_desc = vioscsi_next_ring_desc(vq_info,
+			    acct.desc, acct.req_desc, &(acct.resp_idx));
 
 			vioscsi_prepare_resp(&resp,
 			    VIRTIO_SCSI_S_BAD_TARGET, SCSI_OK, 0, 0, 0);
@@ -2177,79 +2292,89 @@ vioscsi_notifyq(struct vioscsi_dev *dev)
 			}
 
 			ret = 1;
-			dev->cfg.isr_status = 1;
+			dev->isr = 1;
 
 			/* Move ring indexes (updates the used ring index) */
-			vioscsi_next_ring_item(dev, acct.avail, acct.used,
+			vioscsi_next_ring_item(vq_info, acct.avail, acct.used,
 			    acct.req_desc, acct.req_idx);
 			goto next_msg;
 		}
 
 		DPRINTF("%s: Queue %d id 0x%llx lun %u:%u:%u:%u"
 		    " cdb OP 0x%02x,%s",
-		    __func__, dev->cfg.queue_notify, req.id,
-		    req.lun[0], req.lun[1], req.lun[2], req.lun[3],
-		    req.cdb[0], vioscsi_op_names(req.cdb[0]));
+		    __func__, vq_idx, req.id, req.lun[0], req.lun[1],
+		    req.lun[2], req.lun[3],req.cdb[0],
+		    vioscsi_op_names(req.cdb[0]));
 
 		/* opcode is first byte */
 		switch (req.cdb[0]) {
 		case TEST_UNIT_READY:
 		case START_STOP:
-			ret = vioscsi_handle_tur(dev, &req, &acct);
+			ret = vioscsi_handle_tur(dev, vq_info, &req, &acct);
 			break;
 		case PREVENT_ALLOW:
-			ret = vioscsi_handle_prevent_allow(dev, &req, &acct);
+			ret = vioscsi_handle_prevent_allow(dev, vq_info, &req,
+			    &acct);
 			break;
 		case READ_TOC:
-			ret = vioscsi_handle_read_toc(dev, &req, &acct);
+			ret = vioscsi_handle_read_toc(dev, vq_info, &req,
+			    &acct);
 			break;
 		case READ_CAPACITY:
-			ret = vioscsi_handle_read_capacity(dev, &req, &acct);
+			ret = vioscsi_handle_read_capacity(dev, vq_info, &req,
+			    &acct);
 			break;
 		case READ_CAPACITY_16:
-			ret = vioscsi_handle_read_capacity_16(dev, &req, &acct);
+			ret = vioscsi_handle_read_capacity_16(dev, vq_info,
+			    &req, &acct);
 			break;
 		case READ_COMMAND:
-			ret = vioscsi_handle_read_6(dev, &req, &acct);
+			ret = vioscsi_handle_read_6(dev, vq_info, &req, &acct);
 			break;
 		case READ_10:
-			ret = vioscsi_handle_read_10(dev, &req, &acct);
+			ret = vioscsi_handle_read_10(dev, vq_info, &req, &acct);
 			break;
 		case INQUIRY:
-			ret = vioscsi_handle_inquiry(dev, &req, &acct);
+			ret = vioscsi_handle_inquiry(dev, vq_info, &req, &acct);
 			break;
 		case MODE_SENSE:
-			ret = vioscsi_handle_mode_sense(dev, &req, &acct);
+			ret = vioscsi_handle_mode_sense(dev, vq_info, &req,
+			    &acct);
 			break;
 		case MODE_SENSE_BIG:
-			ret = vioscsi_handle_mode_sense_big(dev, &req, &acct);
+			ret = vioscsi_handle_mode_sense_big(dev, vq_info, &req,
+			    &acct);
 			break;
 		case GET_EVENT_STATUS_NOTIFICATION:
-			ret = vioscsi_handle_gesn(dev, &req, &acct);
+			ret = vioscsi_handle_gesn(dev, vq_info, &req, &acct);
 			break;
 		case READ_DISC_INFORMATION:
-			ret = vioscsi_handle_read_disc_info(dev, &req, &acct);
+			ret = vioscsi_handle_read_disc_info(dev, vq_info, &req,
+			    &acct);
 			break;
 		case GET_CONFIGURATION:
-			ret = vioscsi_handle_get_config(dev, &req, &acct);
+			ret = vioscsi_handle_get_config(dev, vq_info, &req,
+			    &acct);
 			break;
 		case MECHANISM_STATUS:
-			ret = vioscsi_handle_mechanism_status(dev, &req, &acct);
+			ret = vioscsi_handle_mechanism_status(dev, vq_info,
+			    &req, &acct);
 			break;
 		case REPORT_LUNS:
-			ret = vioscsi_handle_report_luns(dev, &req, &acct);
+			ret = vioscsi_handle_report_luns(dev, vq_info, &req,
+			    &acct);
 			break;
 		default:
 			log_warnx("%s: unsupported opcode 0x%02x,%s",
 			    __func__, req.cdb[0], vioscsi_op_names(req.cdb[0]));
 			/* Move ring indexes */
-			vioscsi_next_ring_item(dev, acct.avail, acct.used,
+			vioscsi_next_ring_item(vq_info, acct.avail, acct.used,
 			    acct.req_desc, acct.req_idx);
 			break;
 		}
 next_msg:
 		/* Increment to the next queue slot */
-		acct.idx = (acct.idx + 1) & VIOSCSI_QUEUE_MASK;
+		acct.idx = (acct.idx + 1) & vq_info->mask;
 	}
 out:
 	return (ret);

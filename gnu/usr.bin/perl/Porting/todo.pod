@@ -38,6 +38,16 @@ Perl that s/he knows well enough to try to fix.  This task involves
 going through these bugs and assigning one or more labels, and removing the
 "Needs Triage" label if present.
 
+=head2 Transfer test failure cases to F<t/run/todo.t>
+
+We have more open bug reports than anyone can really grasp.  Most of
+those came with code to reproduce the failure.  We also have a test file,
+F<t/run/todo.t>, whose purpose is to hold these test failures.  This
+task is to add failing code to this test file, following the paradigm of
+those already in it.  It is likely that some of those bugs have already
+been fixed and nobody has realized it!  This is a gentle way to become
+familiar with perl's internals.
+
 =head2 Ongoing: investigate new bug reports
 
 When a bug report is filed, it would be very helpful to have someone do
@@ -278,7 +288,7 @@ to do this manually are roughly
 =item *
 
 do a normal C<Configure>, but include Devel::Cover as a module to install
-(see L<INSTALL> for how to do this)
+(see F<INSTALL> for how to do this)
 
 =item *
 
@@ -1183,7 +1193,7 @@ L<http://www.xray.mpe.mpg.de/mailing-lists/perl5-porters/2013-01/msg00339.html>
 =head1 Big projects
 
 Tasks that will get your name mentioned in the description of the "Highlights
-of 5.40.0"
+of 5.42.3"
 
 =head2 make ithreads more robust
 
@@ -1196,18 +1206,3 @@ One bit would be to determine how to clone directory handles on systems
 without a C<fchdir> function (in sv.c:Perl_dirp_dup).
 
 Fix Perl_sv_dup, et al so that threads can return objects.
-
-=head1 Tasks for microperl
-
-
-[ Each and every one of these may be obsolete, but they were listed
-  in the old Todo.micro file]
-
-=head2 do away with fork/exec/wait?
-
-(system, popen should be enough?)
-
-=head2 some of the uconfig.sh really needs to be probed (using cc) in buildtime:
-
-(uConfigure? :-) native datatype widths and endianness come to mind
-

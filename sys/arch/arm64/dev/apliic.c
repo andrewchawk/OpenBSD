@@ -1,4 +1,4 @@
-/*	$OpenBSD: apliic.c,v 1.5 2022/12/10 18:43:48 kettenis Exp $	*/
+/*	$OpenBSD: apliic.c,v 1.7 2026/01/05 20:06:15 patrick Exp $	*/
 /*
  * Copyright (c) 2021 Patrick Wildt <patrick@blueri.se>
  *
@@ -96,7 +96,8 @@ apliic_match(struct device *parent, void *match, void *aux)
 {
 	struct fdt_attach_args *faa = aux;
 
-	return OF_is_compatible(faa->fa_node, "apple,i2c");
+	return OF_is_compatible(faa->fa_node, "apple,i2c") ||
+	    OF_is_compatible(faa->fa_node, "apple,t8103-i2c");
 }
 
 void
@@ -244,16 +245,13 @@ apliic_bus_scan(struct device *self, struct i2cbus_attach_args *iba, void *arg)
 {
 	int iba_node = *(int *)arg;
 	struct i2c_attach_args ia;
-	char status[32];
 	char *compat;
 	uint32_t reg[1];
 	int node;
 	int len;
 
 	for (node = OF_child(iba_node); node; node = OF_peer(node)) {
-		memset(status, 0, sizeof(status));
-		if (OF_getprop(node, "status", status, sizeof(status)) > 0 &&
-		    strcmp(status, "disabled") == 0)
+		if (!OF_is_enabled(node))
 			continue;
 
 		memset(reg, 0, sizeof(reg));

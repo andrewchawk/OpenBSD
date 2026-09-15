@@ -1,4 +1,4 @@
-/*	$OpenBSD: ntpd.c,v 1.133 2024/05/21 05:00:48 jsg Exp $ */
+/*	$OpenBSD: ntpd.c,v 1.148 2026/09/10 15:06:22 deraadt Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -45,7 +45,7 @@ __dead void	usage(void);
 int		auto_preconditions(const struct ntpd_conf *);
 int		main(int, char *[]);
 void		check_child(void);
-int		dispatch_imsg(struct ntpd_conf *, int, char **);
+int		dispatch_imsg(struct ntpd_conf *, char *, int, char **);
 void		reset_adjtime(void);
 int		ntpd_adjtime(double);
 void		ntpd_adjfreq(double, int);
@@ -136,9 +136,9 @@ main(int argc, char *argv[])
 	struct passwd		*pw;
 	void			*newp;
 	int			argc0 = argc, logdest;
-	char			**argv0 = argv;
+	char			**argv0 = argv, execpath[PATH_MAX];
 	char			*pname = NULL;
-	time_t			 settime_deadline;
+	time_t			 settime_deadline = 0;
 	int			 sopt = 0;
 
 	if (strcmp(__progname, "ntpctl") == 0) {
@@ -195,6 +195,9 @@ main(int argc, char *argv[])
 	argv += optind;
 	if (argc > 0)
 		usage();
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	if (parse_config(conffile, &lconf))
 		exit(1);
@@ -261,7 +264,7 @@ main(int argc, char *argv[])
 	signal(SIGCHLD, sighdlr);
 
 	/* fork child process */
-	start_child(NTP_PROC_NAME, pipe_chld[1], argc0, argv0);
+	start_child(NTP_PROC_NAME, pipe_chld[1], execpath, argc0, argv0);
 
 	log_procinit("[priv]");
 	readfreq();
@@ -274,7 +277,8 @@ main(int argc, char *argv[])
 
 	if ((ibuf = malloc(sizeof(struct imsgbuf))) == NULL)
 		fatal(NULL);
-	imsg_init(ibuf, pipe_chld[0]);
+	if (imsgbuf_init(ibuf, pipe_chld[0]) == -1)
+		fatal(NULL);
 
 	constraint_cnt = 0;
 
@@ -282,8 +286,8 @@ main(int argc, char *argv[])
 	 * Constraint processes are forked with certificates in memory,
 	 * then privdrop into chroot before speaking to the outside world.
 	 */
-	if (unveil("/usr/sbin/ntpd", "x") == -1)
-		err(1, "unveil /usr/sbin/ntpd");
+	if (unveil(execpath, "x") == -1)
+		err(1, "unveil %s", execpath);
 	if (pledge("stdio settime proc exec", NULL) == -1)
 		err(1, "pledge");
 
@@ -304,7 +308,7 @@ main(int argc, char *argv[])
 		memset(pfd, 0, sizeof(*pfd) * pfd_elms);
 		pfd[PFD_PIPE].fd = ibuf->fd;
 		pfd[PFD_PIPE].events = POLLIN;
-		if (ibuf->w.queued)
+		if (imsgbuf_queuelen(ibuf) > 0)
 			pfd[PFD_PIPE].events |= POLLOUT;
 
 		i = PFD_MAX;
@@ -333,14 +337,14 @@ main(int argc, char *argv[])
 		}
 
 		if (nfds > 0 && (pfd[PFD_PIPE].revents & POLLOUT))
-			if (msgbuf_write(&ibuf->w) <= 0 && errno != EAGAIN) {
+			if (imsgbuf_write(ibuf) == -1) {
 				log_warn("pipe write error (to child)");
 				quit = 1;
 			}
 
 		if (nfds > 0 && pfd[PFD_PIPE].revents & POLLIN) {
 			nfds--;
-			if (dispatch_imsg(&lconf, argc0, argv0) == -1)
+			if (dispatch_imsg(&lconf, execpath, argc0, argv0) == -1)
 				quit = 1;
 		}
 
@@ -365,7 +369,7 @@ main(int argc, char *argv[])
 			fatal("wait");
 	} while (pid != -1 || (pid == -1 && errno == EINTR));
 
-	msgbuf_clear(&ibuf->w);
+	imsgbuf_clear(ibuf);
 	free(ibuf);
 	log_info("Terminating");
 	return (0);
@@ -387,19 +391,18 @@ check_child(void)
 }
 
 int
-dispatch_imsg(struct ntpd_conf *lconf, int argc, char **argv)
+dispatch_imsg(struct ntpd_conf *lconf, char *execpath, int argc, char **argv)
 {
 	struct imsg		 imsg;
-	int			 n;
+	int			 n, synced;
 	double			 d;
 
-	if (((n = imsg_read(ibuf)) == -1 && errno != EAGAIN) || n == 0)
+	if (imsgbuf_read(ibuf) != 1)
 		return (-1);
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
 			return (-1);
-
 		if (n == 0)
 			break;
 
@@ -408,9 +411,11 @@ dispatch_imsg(struct ntpd_conf *lconf, int argc, char **argv)
 			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(d))
 				fatalx("invalid IMSG_ADJTIME received");
 			memcpy(&d, imsg.data, sizeof(d));
-			n = ntpd_adjtime(d);
+			synced = ntpd_adjtime(d);
+			if (synced == -1)
+				fatalx("IMSG_ADJTIME with invalid value");
 			imsg_compose(ibuf, IMSG_ADJTIME, 0, 0, -1,
-			     &n, sizeof(n));
+			     &synced, sizeof(synced));
 			break;
 		case IMSG_ADJFREQ:
 			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(d))
@@ -437,7 +442,7 @@ dispatch_imsg(struct ntpd_conf *lconf, int argc, char **argv)
 		case IMSG_CONSTRAINT_QUERY:
 			priv_constraint_msg(imsg.hdr.peerid,
 			    imsg.data, imsg.hdr.len - IMSG_HEADER_SIZE,
-			    argc, argv);
+			    execpath, argc, argv);
 			break;
 		case IMSG_CONSTRAINT_KILL:
 			priv_constraint_kill(imsg.hdr.peerid);
@@ -473,7 +478,8 @@ ntpd_adjtime(double d)
 		log_info("adjusting local clock by %fs", d);
 	else
 		log_debug("adjusting local clock by %fs", d);
-	d_to_tv(d, &tv);
+	if (d_to_tv(d, &tv) == -1)
+		return (-1);
 	if (adjtime(&tv, &olddelta) == -1)
 		log_warn("adjtime failed");
 	else if (!firstadj && olddelta.tv_sec == 0 && olddelta.tv_usec == 0)
@@ -531,7 +537,10 @@ ntpd_settime(double d)
 		log_warn("gettimeofday");
 		return;
 	}
-	d_to_tv(d, &tv);
+	if (d_to_tv(d, &tv) == -1) {
+		log_warn("ntpd_settime: invalid value");
+		return;
+	}
 	curtime.tv_usec += tv.tv_usec + 1000000;
 	curtime.tv_sec += tv.tv_sec - 1 + (curtime.tv_usec / 1000000);
 	curtime.tv_usec %= 1000000;
@@ -670,7 +679,8 @@ ctl_main(int argc, char *argv[])
 
 	if ((ibuf_ctl = malloc(sizeof(struct imsgbuf))) == NULL)
 		err(1, NULL);
-	imsg_init(ibuf_ctl, fd);
+	if (imsgbuf_init(ibuf_ctl, fd) == -1)
+		err(1, NULL);
 
 	switch (action) {
 	case CTL_SHOW_STATUS:
@@ -694,20 +704,19 @@ ctl_main(int argc, char *argv[])
 		break; /* NOTREACHED */
 	}
 
-	while (ibuf_ctl->w.queued)
-		if (msgbuf_write(&ibuf_ctl->w) <= 0 && errno != EAGAIN)
-			err(1, "ibuf_ctl: msgbuf_write error");
+	if (imsgbuf_flush(ibuf_ctl) == -1)
+		err(1, "write error");
 
 	done = 0;
 	while (!done) {
-		if ((n = imsg_read(ibuf_ctl)) == -1 && errno != EAGAIN)
-			err(1, "ibuf_ctl: imsg_read error");
+		if ((n = imsgbuf_read(ibuf_ctl)) == -1)
+			err(1, "read error");
 		if (n == 0)
-			errx(1, "ntpctl: pipe closed");
+			errx(1, "pipe closed");
 
 		while (!done) {
-			if ((n = imsg_get(ibuf_ctl, &imsg)) == -1)
-				err(1, "ibuf_ctl: imsg_get error");
+			if ((n = imsgbuf_get(ibuf_ctl, &imsg)) == -1)
+				err(1, "ibuf_ctl: imsgbuf_get error");
 			if (n == 0)
 				break;
 
@@ -832,7 +841,7 @@ show_peer_msg(struct imsg *imsg, int calledfromshowall)
 {
 	struct ctl_show_peer	*cpeer;
 	int			 cnt;
-	char			 stratum[3];
+	char			 stratum[4];
 	static int		 firsttime = 1;
 
 	if (imsg->hdr.type == IMSG_CTL_SHOW_PEERS_END) {

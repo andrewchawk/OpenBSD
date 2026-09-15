@@ -1,4 +1,4 @@
-.\" $OpenBSD: hostapd.conf.5,v 1.48 2020/04/23 21:10:53 jmc Exp $
+.\" $OpenBSD: hostapd.conf.5,v 1.51 2026/01/18 16:38:02 schwarze Exp $
 .\"
 .\" Copyright (c) 2004, 2005, 2006 Reyk Floeter <reyk@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: April 23 2020 $
+.Dd $Mdocdate: January 18 2026 $
 .Dt HOSTAPD.CONF 5
 .Os
 .Sh NAME
@@ -30,19 +30,19 @@ The
 .Nm
 file is divided into the following main sections:
 .Bl -tag -width xxxx
-.It Sy Macros
-User-defined variables may be defined and used later, simplifying the
+.It Sx MACROS
+Definitions of variables that can be used later, simplifying the
 configuration file.
-.It Sy Tables
+.It Sx TABLES
 Tables provide a mechanism to handle a large number of link layer
 addresses easily, with increased performance and flexibility.
-.It Sy Global Configuration
+.It Sx GLOBAL CONFIGURATION
 Global runtime settings for
 .Xr hostapd 8 .
-.It Sy Event Rules
+.It Sx EVENT RULES
 Event rules provide a powerful mechanism to trigger certain actions
 when receiving specified IEEE 802.11 frames.
-.It Sy IP Roaming
+.It Sx IP ROAMING
 The concepts and details about the optional IP based roaming in
 .Xr hostapd 8 .
 .El
@@ -55,7 +55,7 @@ and extend to the end of the current line.
 Care should be taken when commenting out multi-line text:
 the comment is effective until the end of the entire block.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Additional configuration files can be included with the
@@ -65,15 +65,20 @@ keyword, for example:
 include "/etc/hostapd.conf.local"
 .Ed
 .Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example,
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic set ,
 .Ic interface ,
 or
 .Ic hostap ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
@@ -439,7 +444,7 @@ Allow all addresses for the specified address field.
 Allow allow addresses from the given
 .Ar table
 (see
-.Sx Tables
+.Sx TABLES
 above)
 for the specified address field.
 .It Xo

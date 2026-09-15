@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_esp.c,v 1.196 2024/06/07 13:15:25 jsg Exp $ */
+/*	$OpenBSD: ip_esp.c,v 1.201 2026/08/12 18:23:14 bluhm Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -48,7 +48,6 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
 
 #ifdef INET6
 #include <netinet/ip6.h>
@@ -72,7 +71,7 @@
 #ifdef ENCDEBUG
 #define DPRINTF(fmt, args...)						\
 	do {								\
-		if (encdebug)						\
+		if (atomic_load_int(&encdebug))				\
 			printf("%s: " fmt "\n", __func__, ## args);	\
 	} while (0)
 #else
@@ -338,7 +337,8 @@ esp_zeroize(struct tdb *tdbp)
  * ESP input processing, called (eventually) through the protocol switch.
  */
 int
-esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
+esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff,
+    struct netstack *ns)
 {
 	const struct auth_hash *esph = tdb->tdb_authalgxform;
 	const struct enc_xform *espx = tdb->tdb_encalgxform;
@@ -381,11 +381,16 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 
 	/* Replay window checking, if appropriate -- no value commitment. */
 	if (tdb->tdb_wnd > 0) {
+		int chk_rpl;
+
 		m_copydata(m, skip + sizeof(u_int32_t), sizeof(u_int32_t),
 		    &btsx);
 		btsx = ntohl(btsx);
 
-		switch (checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 0)) {
+		mtx_enter(&tdb->tdb_mtx);
+		chk_rpl = checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 0);
+		mtx_leave(&tdb->tdb_mtx);
+		switch (chk_rpl) {
 		case 0: /* All's well */
 			break;
 		case 1:
@@ -537,11 +542,16 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 
 	/* Replay window checking, if appropriate */
 	if (tdb->tdb_wnd > 0) {
+		int chk_rpl;
+
 		m_copydata(m, skip + sizeof(u_int32_t), sizeof(u_int32_t),
 		    &btsx);
 		btsx = ntohl(btsx);
 
-		switch (checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 1)) {
+		mtx_enter(&tdb->tdb_mtx);
+		chk_rpl = checkreplaywindow(tdb, tdb->tdb_rpl, btsx, &esn, 1);
+		mtx_leave(&tdb->tdb_mtx);
+		switch (chk_rpl) {
 		case 0: /* All's well */
 #if NPFSYNC > 0
 			pfsync_update_tdb(tdb,0);
@@ -672,7 +682,7 @@ esp_input(struct mbuf **mp, struct tdb *tdb, int skip, int protoff)
 	m_copyback(m, protoff, sizeof(u_int8_t), lastthree + 2, M_NOWAIT);
 
 	/* Back to generic IPsec input processing */
-	return ipsec_common_input_cb(mp, tdb, skip, protoff);
+	return ipsec_common_input_cb(mp, tdb, skip, protoff, ns);
 
  drop:
 	m_freemp(mp);
@@ -707,12 +717,11 @@ esp_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 		encif->if_obytes += m->m_pkthdr.len;
 
 		if (encif->if_bpf) {
-			struct enchdr hdr;
+			struct enchdr hdr = {
+				.af = htonl(tdb->tdb_dst.sa.sa_family),
+				.spi = tdb->tdb_spi,
+			};
 
-			memset(&hdr, 0, sizeof(hdr));
-
-			hdr.af = tdb->tdb_dst.sa.sa_family;
-			hdr.spi = tdb->tdb_spi;
 			if (espx)
 				hdr.flags |= M_CONF;
 			if (esph)
@@ -837,7 +846,9 @@ esp_output(struct mbuf *m, struct tdb *tdb, int skip, int protoff)
 	/* Initialize ESP header. */
 	memcpy(mtod(mo, caddr_t) + roff, (caddr_t) &tdb->tdb_spi,
 	    sizeof(u_int32_t));
+	mtx_enter(&tdb->tdb_mtx);
 	replay64 = tdb->tdb_rpl++;	/* used for both header and ESN */
+	mtx_leave(&tdb->tdb_mtx);
 	replay = htonl((u_int32_t)replay64);
 	memcpy(mtod(mo, caddr_t) + roff + sizeof(u_int32_t), (caddr_t) &replay,
 	    sizeof(u_int32_t));
@@ -985,6 +996,8 @@ checkreplaywindow(struct tdb *tdb, u_int64_t t, u_int32_t seq, u_int32_t *seqh,
 	u_int32_t	tl, th, wl;
 	u_int32_t	packet, window = TDB_REPLAYMAX - TDB_REPLAYWASTE;
 	int		idx, esn = tdb->tdb_flags & TDBF_ESN;
+
+	MUTEX_ASSERT_LOCKED(&tdb->tdb_mtx);
 
 	tl = (u_int32_t)t;
 	th = (u_int32_t)(t >> 32);

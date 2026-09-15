@@ -1,4 +1,4 @@
-/*	$OpenBSD: ldapctl.c,v 1.15 2021/01/15 18:57:04 rob Exp $	*/
+/*	$OpenBSD: ldapctl.c,v 1.22 2026/08/04 06:57:31 claudio Exp $	*/
 
 /*
  * Copyright (c) 2009, 2010 Martin Hedenfalk <martin@bzero.se>
@@ -145,7 +145,6 @@ index_namespace(struct namespace *ns, const char *datadir)
 	struct cursor		*cursor;
 	struct ber_element	*elm;
 	char			*path;
-	long long int		 ncomplete = 0;
 	int			 i, rc;
 
 	log_info("indexing namespace %s", ns->suffix);
@@ -201,7 +200,6 @@ index_namespace(struct namespace *ns, const char *datadir)
 			btval_reset(&val);
 			if (rc != 0)
 				break;
-			++ncomplete;
 		}
 
 		if (btree_txn_commit(ns->indx_txn) != BT_SUCCESS)
@@ -244,8 +242,7 @@ main(int argc, char *argv[])
 {
 	int			 ctl_sock;
 	int			 done = 0, verbose = 0, vlog = 0;
-	ssize_t			 n;
-	int			 ch;
+	int			 n, ch;
 	enum action		 action = NONE;
 	const char		*datadir = DATADIR;
 	struct stat		 sb;
@@ -330,7 +327,8 @@ main(int argc, char *argv[])
 	if (connect(ctl_sock, (struct sockaddr *)&sun, sizeof(sun)) == -1)
 		err(1, "connect: %s", sock);
 
-	imsg_init(&ibuf, ctl_sock);
+	if (imsgbuf_init(&ibuf, ctl_sock) == -1)
+		err(1, "imsgbuf_init");
 	done = 0;
 
 	if (pledge("stdio", NULL) == -1)
@@ -357,19 +355,18 @@ main(int argc, char *argv[])
 		fatal("internal error");
 	}
 
-	while (ibuf.w.queued)
-		if (msgbuf_write(&ibuf.w) <= 0 && errno != EAGAIN)
-			err(1, "write error");
+	if (imsgbuf_flush(&ibuf) == -1)
+		err(1, "write error");
 
 	while (!done) {
-		if ((n = imsg_read(&ibuf)) == -1 && errno != EAGAIN)
-			errx(1, "imsg_read error");
+		if ((n = imsgbuf_read(&ibuf)) == -1)
+			err(1, "read error");
 		if (n == 0)
 			errx(1, "pipe closed");
 
 		while (!done) {
-			if ((n = imsg_get(&ibuf, &imsg)) == -1)
-				errx(1, "imsg_get error");
+			if ((n = imsgbuf_get(&ibuf, &imsg)) == -1)
+				errx(1, "imsgbuf_get error");
 			if (n == 0)
 				break;
 			switch (imsg.hdr.type) {
@@ -396,19 +393,20 @@ main(int argc, char *argv[])
 void
 show_stats(struct imsg *imsg)
 {
-	struct ldapd_stats	*st;
+	struct ldapd_stats	st;
 
-	st = imsg->data;
+	if (imsg_get_data(imsg, &st, sizeof(st)) == -1)
+		return;
 
-	printf("start time: %s", ctime(&st->started_at));
-	printf("requests: %llu\n", st->requests);
-	printf("search requests: %llu\n", st->req_search);
-	printf("bind requests: %llu\n", st->req_bind);
-	printf("modify requests: %llu\n", st->req_mod);
-	printf("timeouts: %llu\n", st->timeouts);
-	printf("unindexed searches: %llu\n", st->unindexed);
-	printf("active connections: %u\n", st->conns);
-	printf("active searches: %u\n", st->searches);
+	printf("start time: %s", ctime(&st.started_at));
+	printf("requests: %llu\n", st.requests);
+	printf("search requests: %llu\n", st.req_search);
+	printf("bind requests: %llu\n", st.req_bind);
+	printf("modify requests: %llu\n", st.req_mod);
+	printf("timeouts: %llu\n", st.timeouts);
+	printf("unindexed searches: %llu\n", st.unindexed);
+	printf("active connections: %u\n", st.conns);
+	printf("active searches: %u\n", st.searches);
 }
 
 #define ZDIV(t,n)	((n) == 0 ? 0 : (float)(t) / (n))
@@ -435,12 +433,13 @@ show_dbstats(const char *prefix, struct btree_stat *st)
 void
 show_nsstats(struct imsg *imsg)
 {
-	struct ns_stat		*nss;
+	struct ns_stat	nss;
 
-	nss = imsg->data;
+	if (imsg_get_data(imsg, &nss, sizeof(nss)) == -1)
+		return;
 
-	printf("\nsuffix: %s\n", nss->suffix);
-	show_dbstats("data", &nss->data_stat);
-	show_dbstats("indx", &nss->indx_stat);
+	printf("\nsuffix: %s\n", nss.suffix);
+	show_dbstats("data", &nss.data_stat);
+	show_dbstats("indx", &nss.indx_stat);
 }
 

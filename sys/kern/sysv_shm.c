@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysv_shm.c,v 1.80 2022/08/14 01:58:28 jsg Exp $	*/
+/*	$OpenBSD: sysv_shm.c,v 1.88 2026/08/12 00:52:40 mvs Exp $	*/
 /*	$NetBSD: sysv_shm.c,v 1.50 1998/10/21 22:24:29 tron Exp $	*/
 
 /*
@@ -66,6 +66,8 @@
 
 #include <uvm/uvm_extern.h>
 
+struct rwlock sysvshm_lock = RWLOCK_INITIALIZER("shmlk");
+
 extern struct shminfo shminfo;
 struct shmid_ds **shmsegs;	/* linear mapping of shmid -> shmseg */
 struct pool shm_pool;
@@ -85,6 +87,10 @@ struct shmid_ds *shm_find_segment_by_shmid(int);
  * shmsegs (an array of 'struct shmid_ds *')
  * per proc 'struct shmmap_head' with an array of 'struct shmmap_state'
  */
+
+/* Limit to prevent chunk size overflow in sys_shmat() */
+#define SHMSEG_MAX \
+    ((0xffffffff - sizeof(int)) / sizeof(struct shmmap_state) / 8)
 
 #define	SHMSEG_REMOVED  	0x0200		/* can't overlap ACCESSPERMS */
 
@@ -166,15 +172,15 @@ shm_delete_mapping(struct vmspace *vm, struct shmmap_state *shmmap_s)
 	    (shmseg = shmsegs[segnum]) == NULL)
 		return (EINVAL);
 	end = round_page(shmmap_s->va+shmseg->shm_segsz);
-	uvm_unmap(&vm->vm_map, trunc_page(shmmap_s->va), end);
 	shmmap_s->shmid = -1;
 	shmseg->shm_dtime = gettime();
 	if ((--shmseg->shm_nattch <= 0) &&
 	    (shmseg->shm_perm.mode & SHMSEG_REMOVED)) {
-		shm_deallocate_segment(shmseg);
 		shm_last_free = segnum;
 		shmsegs[shm_last_free] = NULL;
+		shm_deallocate_segment(shmseg);
 	}
+	uvm_unmap(&vm->vm_map, trunc_page(shmmap_s->va), end);
 	return (0);
 }
 
@@ -222,17 +228,30 @@ sys_shmat(struct proc *p, void *v, register_t *retval)
 
 	shmmap_h = (struct shmmap_head *)p->p_vmspace->vm_shm;
 	if (shmmap_h == NULL) {
+		struct shmmap_head *shmmap_h_probe;
+		int shmseg_local = atomic_load_int(&shminfo.shmseg);
+
 		size = sizeof(int) +
-		    shminfo.shmseg * sizeof(struct shmmap_state);
+		    shmseg_local * sizeof(struct shmmap_state);
 		shmmap_h = malloc(size, M_SHM, M_WAITOK | M_CANFAIL);
 		if (shmmap_h == NULL)
 			return (ENOMEM);
-		shmmap_h->shmseg = shminfo.shmseg;
+
+		shmmap_h_probe =
+		    (struct shmmap_head *)READ_ONCE(p->p_vmspace->vm_shm);
+		if (shmmap_h_probe != NULL) {
+			free(shmmap_h, M_SHM, size);
+			shmmap_h = shmmap_h_probe;
+			goto allocated;
+		}
+
+		shmmap_h->shmseg = shmseg_local;
 		for (i = 0, shmmap_s = shmmap_h->state; i < shmmap_h->shmseg;
 		    i++, shmmap_s++)
 			shmmap_s->shmid = -1;
 		p->p_vmspace->vm_shm = (caddr_t)shmmap_h;
 	}
+allocated:
 	shmseg = shm_find_segment_by_shmid(SCARG(uap, shmid));
 	if (shmseg == NULL)
 		return (EINVAL);
@@ -275,9 +294,9 @@ sys_shmat(struct proc *p, void *v, register_t *retval)
 	if (error) {
 		if ((--shmseg->shm_nattch <= 0) &&
 		    (shmseg->shm_perm.mode & SHMSEG_REMOVED)) {
-			shm_deallocate_segment(shmseg);
 			shm_last_free = IPCID_TO_IX(SCARG(uap, shmid));
 			shmsegs[shm_last_free] = NULL;
+			shm_deallocate_segment(shmseg);
 		} else {
 			uao_detach(shm_handle->shm_object);
 		}
@@ -304,11 +323,11 @@ sys_shmctl(struct proc *p, void *v, register_t *retval)
 	int		cmd = SCARG(uap, cmd);
 	void		*buf = SCARG(uap, buf);
 	struct ucred	*cred = p->p_ucred;
-	struct shmid_ds	inbuf, *shmseg;
+	struct shmid_ds	shmbuf, *shmseg;
 	int		error;
 
 	if (cmd == IPC_SET) {
-		error = copyin(buf, &inbuf, sizeof(inbuf));
+		error = copyin(buf, &shmbuf, sizeof(shmbuf));
 		if (error)
 			return (error);
 	}
@@ -320,18 +339,20 @@ sys_shmctl(struct proc *p, void *v, register_t *retval)
 	case IPC_STAT:
 		if ((error = ipcperm(cred, &shmseg->shm_perm, IPC_R)) != 0)
 			return (error);
-		error = copyout(shmseg, buf, sizeof(inbuf));
+		memcpy(&shmbuf, shmseg, sizeof(shmbuf));
+		shmbuf.shm_internal = NULL;
+		error = copyout(&shmbuf, buf, sizeof(shmbuf));
 		if (error)
 			return (error);
 		break;
 	case IPC_SET:
 		if ((error = ipcperm(cred, &shmseg->shm_perm, IPC_M)) != 0)
 			return (error);
-		shmseg->shm_perm.uid = inbuf.shm_perm.uid;
-		shmseg->shm_perm.gid = inbuf.shm_perm.gid;
+		shmseg->shm_perm.uid = shmbuf.shm_perm.uid;
+		shmseg->shm_perm.gid = shmbuf.shm_perm.gid;
 		shmseg->shm_perm.mode =
 		    (shmseg->shm_perm.mode & ~ACCESSPERMS) |
-		    (inbuf.shm_perm.mode & ACCESSPERMS);
+		    (shmbuf.shm_perm.mode & ACCESSPERMS);
 		shmseg->shm_ctime = gettime();
 		break;
 	case IPC_RMID:
@@ -340,9 +361,9 @@ sys_shmctl(struct proc *p, void *v, register_t *retval)
 		shmseg->shm_perm.key = IPC_PRIVATE;
 		shmseg->shm_perm.mode |= SHMSEG_REMOVED;
 		if (shmseg->shm_nattch <= 0) {
-			shm_deallocate_segment(shmseg);
 			shm_last_free = IPCID_TO_IX(shmid);
 			shmsegs[shm_last_free] = NULL;
+			shm_deallocate_segment(shmseg);
 		}
 		break;
 	case SHM_LOCK:
@@ -412,10 +433,10 @@ shmget_allocate_segment(struct proc *p,
 	 * the key we want in the meantime.  Yes, this is ugly.
 	 */
 	key = SCARG(uap, key);
-	shmseg = pool_get(&shm_pool, key == IPC_PRIVATE ? PR_WAITOK :
-	    PR_NOWAIT);
+	shmseg = pool_get(&shm_pool,
+	    (key == IPC_PRIVATE ? PR_WAITOK : PR_NOWAIT) | PR_ZERO);
 	if (shmseg == NULL) {
-		shmseg = pool_get(&shm_pool, PR_WAITOK);
+		shmseg = pool_get(&shm_pool, PR_WAITOK | PR_ZERO);
 		if (shm_find_segment_by_key(key) != -1) {
 			pool_put(&shm_pool, shmseg);
 			shm_nused--;
@@ -574,20 +595,26 @@ shm_reallocate(int val)
  * Userland access to struct shminfo.
  */
 int
-sysctl_sysvshm(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+sysctl_sysvshm_locked(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	void *newp, size_t newlen)
 {
 	int error, val;
 
-	if (namelen != 1)
-                        return (ENOTDIR);       /* leaf-only */
-
 	switch (name[0]) {
 	case KERN_SHMINFO_SHMMAX:
-		if ((error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
-		    &shminfo.shmmax, 0, INT_MAX)) || newp == NULL)
+		/*
+		 * Do not pass shminfo.shmmax directly. If `oldp'
+		 * contains unmapped address sysctl_int_bounded()
+		 * will fail, but value will be updated.
+		 */
+		val = shminfo.shmmax;
+
+		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
+		    &val, 0, INT_MAX);
+		if (error || val == shminfo.shmmax)
 			return (error);
 
+		shminfo.shmmax = val;
 		/* If new shmmax > shmall, crank shmall */
 		if (atop(round_page(shminfo.shmmax)) > shminfo.shmall)
 			shminfo.shmall = atop(round_page(shminfo.shmmax));
@@ -607,7 +634,7 @@ sysctl_sysvshm(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		return (0);
 	case KERN_SHMINFO_SHMSEG:
 		return (sysctl_int_bounded(oldp, oldlenp, newp, newlen,
-		    &shminfo.shmseg, 1, INT_MAX));
+		    &shminfo.shmseg, 1, SHMSEG_MAX));
 	case KERN_SHMINFO_SHMALL:
 		/* can't decrease shmall */
 		return (sysctl_int_bounded(oldp, oldlenp, newp, newlen,
@@ -616,4 +643,23 @@ sysctl_sysvshm(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		return (EOPNOTSUPP);
 	}
 	/* NOTREACHED */
+}
+
+int
+sysctl_sysvshm(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+	void *newp, size_t newlen)
+{
+	int error;
+
+	if (namelen != 1)
+		return (ENOTDIR);       /* leaf-only */
+
+	rw_enter_write(&sysvshm_lock);
+	KERNEL_LOCK();
+	error = sysctl_sysvshm_locked(name, namelen, oldp, oldlenp,
+	    newp, newlen);
+	KERNEL_UNLOCK();
+	rw_exit_write(&sysvshm_lock);
+
+	return (error);
 }

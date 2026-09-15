@@ -1,4 +1,4 @@
-/*	$OpenBSD: server_fcgi.c,v 1.97 2023/11/08 19:19:10 millert Exp $	*/
+/*	$OpenBSD: server_fcgi.c,v 1.103 2026/07/26 14:46:32 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2014 Florian Obser <florian@openbsd.org>
@@ -36,6 +36,7 @@
 
 #include "httpd.h"
 #include "http.h"
+#include "log.h"
 
 #define FCGI_PADDING_SIZE	 255
 #define FCGI_RECORD_SIZE	 \
@@ -83,7 +84,7 @@ int	server_fcgi_writeheader(struct client *, struct kv *, void *);
 int	server_fcgi_writechunk(struct client *);
 int	server_fcgi_getheaders(struct client *);
 int	fcgi_add_param(struct server_fcgi_param *, const char *, const char *,
-	    struct client *);
+    struct client *);
 
 int
 server_fcgi(struct httpd *env, struct client *clt)
@@ -94,7 +95,7 @@ server_fcgi(struct httpd *env, struct client *clt)
 	struct fcgi_record_header	*h;
 	struct fcgi_begin_request_body	*begin;
 	struct fastcgi_param		*fcgiparam;
-	char				 hbuf[HOST_NAME_MAX+1];
+	char				 hbuf[HOST_NAME_MAX + 1];
 	size_t				 scriptlen;
 	int				 pathlen;
 	int				 fd = -1, ret;
@@ -104,7 +105,7 @@ server_fcgi(struct httpd *env, struct client *clt)
 	if ((fd = socket(srv_conf->fastcgi_ss.ss_family,
 	    SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1)
 		goto fail;
-	if ((connect(fd, (struct sockaddr *) &srv_conf->fastcgi_ss,
+	if ((connect(fd, (struct sockaddr *)&srv_conf->fastcgi_ss,
 	    srv_conf->fastcgi_ss.ss_len)) == -1) {
 		if (errno != EINPROGRESS)
 			goto fail;
@@ -149,8 +150,7 @@ server_fcgi(struct httpd *env, struct client *clt)
 	h->content_len = htons(sizeof(struct fcgi_begin_request_body));
 	h->padding_len = 0;
 
-	begin = (struct fcgi_begin_request_body *)&param.buf[sizeof(struct
-	    fcgi_record_header)];
+	begin = (struct fcgi_begin_request_body *)&param.buf[sizeof(struct fcgi_record_header)];
 	begin->role = htons(FCGI_RESPONDER);
 
 	if (bufferevent_write(clt->clt_srvbev, &param.buf,
@@ -163,17 +163,17 @@ server_fcgi(struct httpd *env, struct client *clt)
 	h->type = FCGI_PARAMS;
 	h->content_len = param.total_len = 0;
 
-	alias = desc->http_path_alias != NULL
-	    ? desc->http_path_alias
-	    : desc->http_path;
+	alias = desc->http_path_alias != NULL ?
+	    desc->http_path_alias :
+	    desc->http_path;
 
-	query_alias = desc->http_query_alias != NULL
-	    ? desc->http_query_alias
-	    : desc->http_query;
+	query_alias = desc->http_query_alias != NULL ?
+	    desc->http_query_alias :
+	    desc->http_query;
 
 	stripped = server_root_strip(alias, srv_conf->strip);
-	if ((pathlen = asprintf(&script, "%s%s", srv_conf->root, stripped))
-	    == -1) {
+	if ((pathlen = asprintf(&script, "%s%s", srv_conf->root, stripped)) ==
+	    -1) {
 		errstr = "failed to get script name";
 		goto fail;
 	}
@@ -345,6 +345,7 @@ server_fcgi(struct httpd *env, struct client *clt)
 		goto fail;
 	}
 
+	/* RFC 3875 requires this variable always be present */
 	if (fcgi_add_param(&param, "SERVER_SOFTWARE", HTTPD_SERVERNAME,
 	    clt) == -1) {
 		errstr = "failed to encode param";
@@ -386,7 +387,7 @@ server_fcgi(struct httpd *env, struct client *clt)
 		bufferevent_enable(clt->clt_bev, EV_READ);
 	} else {
 		bufferevent_disable(clt->clt_bev, EV_READ);
-		fcgi_add_stdin(clt, NULL);
+		fcgi_add_stdin(clt, NULL, 0);
 	}
 
 	if (strcmp(desc->http_version, "HTTP/1.1") == 0) {
@@ -412,7 +413,7 @@ server_fcgi(struct httpd *env, struct client *clt)
 }
 
 int
-fcgi_add_stdin(struct client *clt, struct evbuffer *evbuf)
+fcgi_add_stdin(struct client *clt, const char *buf, size_t len)
 {
 	struct fcgi_record_header	h;
 
@@ -422,16 +423,16 @@ fcgi_add_stdin(struct client *clt, struct evbuffer *evbuf)
 	h.id = htons(1);
 	h.padding_len = 0;
 
-	if (evbuf == NULL) {
+	if (len == 0) {
 		h.content_len = 0;
 		return bufferevent_write(clt->clt_srvbev, &h,
 		    sizeof(struct fcgi_record_header));
 	} else {
-		h.content_len = htons(EVBUFFER_LENGTH(evbuf));
+		h.content_len = htons(len);
 		if (bufferevent_write(clt->clt_srvbev, &h,
 		    sizeof(struct fcgi_record_header)) == -1)
 			return -1;
-		return bufferevent_write_buffer(clt->clt_srvbev, evbuf);
+		return bufferevent_write(clt->clt_srvbev, buf, len);
 	}
 	return (0);
 }
@@ -515,7 +516,7 @@ void
 server_fcgi_read(struct bufferevent *bev, void *arg)
 {
 	uint8_t				 buf[FCGI_RECORD_SIZE];
-	struct client			*clt = (struct client *) arg;
+	struct client			*clt = (struct client *)arg;
 	struct fcgi_record_header	*h;
 	size_t				 len;
 	char				*ptr;
@@ -562,9 +563,9 @@ server_fcgi_read(struct bufferevent *bev, void *arg)
 			case FCGI_STDERR:
 				if (EVBUFFER_LENGTH(clt->clt_srvevb) > 0 &&
 				    (ptr = get_string(
-				    EVBUFFER_DATA(clt->clt_srvevb),
-				    EVBUFFER_LENGTH(clt->clt_srvevb)))
-				    != NULL) {
+				     EVBUFFER_DATA(clt->clt_srvevb),
+				     EVBUFFER_LENGTH(clt->clt_srvevb))) !=
+				    NULL) {
 					server_sendlog(clt->clt_srv_conf,
 					    IMSG_LOG_ERROR, "%s", ptr);
 					free(ptr);
@@ -591,8 +592,8 @@ server_fcgi_read(struct bufferevent *bev, void *arg)
 				}
 				/* Don't send content for HEAD requests */
 				if (clt->clt_fcgi.headerssent &&
-				    clt->clt_descreq->http_method
-				    == HTTP_METHOD_HEAD)
+				    clt->clt_descreq->http_method ==
+				    HTTP_METHOD_HEAD)
 					/* nothing */ ;
 				else if (server_fcgi_writechunk(clt) == -1) {
 					server_abort_http(clt, 500,
@@ -644,7 +645,7 @@ server_fcgi_header(struct client *clt, unsigned int code)
 	struct http_descriptor	*resp = clt->clt_descresp;
 	const char		*error;
 	char			 tmbuf[32];
-	struct kv		*kv, *cl, key;
+	struct kv		*cl, key;
 
 	clt->clt_fcgi.headerssent = 1;
 
@@ -659,9 +660,12 @@ server_fcgi_header(struct client *clt, unsigned int code)
 	    kv_set(&resp->http_pathquery, "%s", error) == -1)
 		return (-1);
 
-	/* Add headers */
-	if (kv_add(&resp->http_headers, "Server", HTTPD_SERVERNAME) == NULL)
-		return (-1);
+	/* Add server banner header to response unless suppressed */
+	if ((srv_conf->flags & SRVFLAG_NO_BANNER) == 0) {
+		if (kv_add(&resp->http_headers, "Server",
+		    HTTPD_SERVERNAME) == NULL)
+			return (-1);
+	}
 
 	if (clt->clt_fcgi.type == FCGI_END_REQUEST ||
 	    EVBUFFER_LENGTH(clt->clt_srvevb) == 0) {
@@ -671,7 +675,7 @@ server_fcgi_header(struct client *clt, unsigned int code)
 		/* But then we need a Content-Length unless method is HEAD... */
 		if (desc->http_method != HTTP_METHOD_HEAD) {
 			key.kv_key = "Content-Length";
-			if ((kv = kv_find(&resp->http_headers, &key)) == NULL) {
+			if (kv_find(&resp->http_headers, &key) == NULL) {
 				if (kv_add(&resp->http_headers,
 				    "Content-Length", "0") == NULL)
 					return (-1);
@@ -683,7 +687,7 @@ server_fcgi_header(struct client *clt, unsigned int code)
 	if (clt->clt_fcgi.chunked) {
 		/* but only if no Content-Length header is supplied */
 		key.kv_key = "Content-Length";
-		if ((kv = kv_find(&resp->http_headers, &key)) != NULL) {
+		if (kv_find(&resp->http_headers, &key) != NULL) {
 			clt->clt_fcgi.chunked = 0;
 		} else {
 			/*
@@ -719,11 +723,14 @@ server_fcgi_header(struct client *clt, unsigned int code)
 			return (-1);
 	}
 
+	if (server_custom_headers(srv_conf, &resp->http_headers, code) == -1)
+		return (-1);
+
 	/* Date header is mandatory and should be added as late as possible */
 	key.kv_key = "Date";
 	if (kv_find(&resp->http_headers, &key) == NULL &&
 	    (server_http_time(time(NULL), tmbuf, sizeof(tmbuf)) <= 0 ||
-	    kv_add(&resp->http_headers, "Date", tmbuf) == NULL))
+	     kv_add(&resp->http_headers, "Date", tmbuf) == NULL))
 		return (-1);
 
 	if (server_writeresponse_http(clt) == -1 ||
@@ -787,7 +794,7 @@ server_fcgi_writeheader(struct client *clt, struct kv *hdr, void *arg)
 int
 server_fcgi_writechunk(struct client *clt)
 {
-	struct evbuffer *evb = clt->clt_srvevb;
+	struct evbuffer	*evb = clt->clt_srvevb;
 	size_t		 len;
 
 	if (clt->clt_fcgi.type == FCGI_END_REQUEST) {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: frontend.c,v 1.14 2024/07/11 13:38:03 florian Exp $	*/
+/*	$OpenBSD: frontend.c,v 1.24 2026/08/04 12:50:43 claudio Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021, 2024 Florian Obser <florian@openbsd.org>
@@ -180,7 +180,9 @@ frontend(int debug, int verbose)
 	/* Setup pipe and event handler to the parent process. */
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = frontend_dispatch_main;
 	iev_main->events = EV_READ;
 	event_set(&iev_main->ev, iev_main->ibuf.fd, iev_main->events,
@@ -197,11 +199,11 @@ __dead void
 frontend_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_write(&iev_engine->ibuf.w);
-	msgbuf_clear(&iev_engine->ibuf.w);
+	imsgbuf_write(&iev_engine->ibuf);
+	imsgbuf_clear(&iev_engine->ibuf);
 	close(iev_engine->ibuf.fd);
-	msgbuf_write(&iev_main->ibuf.w);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_write(&iev_main->ibuf);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	config_clear(frontend_conf);
@@ -239,25 +241,26 @@ frontend_dispatch_main(int fd, short event, void *bula)
 	struct imsg			 imsg;
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf = &iev->ibuf;
-	ssize_t				 n;
-	int				 shut = 0, udpsock, if_index;
+	int				 n, shut = 0, udpsock, if_index;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -280,7 +283,8 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			if (iev_engine == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_engine->ibuf, fd);
+			if (imsgbuf_init(&iev_engine->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_engine->handler = frontend_dispatch_engine;
 			iev_engine->events = EV_READ;
 
@@ -342,6 +346,11 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(iface_conf, imsg.data, sizeof(struct
 			    iface_conf));
+			if (iface_conf->name[sizeof(iface_conf->name) - 1]
+			    != '\0')
+				fatalx("%s: IMSG_RECONF_IFACE invalid name",
+				    __func__);
+
 			SIMPLEQ_INIT(&iface_conf->iface_ia_list);
 			SIMPLEQ_INSERT_TAIL(&nconf->iface_list,
 			    iface_conf, entry);
@@ -375,6 +384,11 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(iface_pd_conf, imsg.data, sizeof(struct
 			    iface_pd_conf));
+			if (iface_pd_conf->name[sizeof(iface_pd_conf->name) - 1]
+			    != '\0')
+				fatalx("%s: IMSG_RECONF_IFACE_PD invalid name",
+				    __func__);
+
 			SIMPLEQ_INSERT_TAIL(&iface_ia_conf->iface_pd_list,
 			    iface_pd_conf, entry);
 			break;
@@ -443,25 +457,26 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
 	struct iface		*iface;
-	ssize_t			 n;
-	int			 shut = 0;
+	int			 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -542,9 +557,6 @@ update_iface(uint32_t if_index)
 	int			 flags;
 	char			 ifnamebuf[IF_NAMESIZE], *if_name;
 
-	if (getifaddrs(&ifap) != 0)
-		fatal("getifaddrs");
-
 	if ((if_name = if_indextoname(if_index, ifnamebuf)) == NULL)
 		return;
 
@@ -553,6 +565,9 @@ update_iface(uint32_t if_index)
 
 	if (find_iface_conf(&frontend_conf->iface_list, if_name) == NULL)
 		return;
+
+	if (getifaddrs(&ifap) != 0)
+		fatal("getifaddrs");
 
 	memset(&ifinfo, 0, sizeof(ifinfo));
 	ifinfo.if_index = if_index;

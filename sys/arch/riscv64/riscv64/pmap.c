@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.c,v 1.41 2024/04/29 10:07:37 jsg Exp $	*/
+/*	$OpenBSD: pmap.c,v 1.49 2026/04/15 21:15:08 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2019-2020 Brian Bamsch <bbamsch@google.com>
@@ -276,7 +276,7 @@ VP_IDX3(vaddr_t va)
  * On RISC-V, the encodings for write permission without read
  * permission (r=0, w=1, x=0, or r=0, w=1, x=1) are reserved, so
  * PROT_WRITE implies PROT_READ.  We need to handle PROT_NONE
- * seperately (see pmap_pte_update()) since r=0, w=0, x=0 is reserved
+ * separately (see pmap_pte_update()) since r=0, w=0, x=0 is reserved
  * for non-leaf page table entries.
  */
 const pt_entry_t ap_bits_user[8] = {
@@ -301,7 +301,7 @@ const pt_entry_t ap_bits_kern[8] = {
 	[PROT_EXEC|PROT_WRITE|PROT_READ]	= PTE_A|PTE_X|PTE_R|PTE_D|PTE_W,
 };
 
-/* PBMT encodings for the Svpmbt modes. */
+/* PBMT encodings for the Svpbmt modes. */
 uint64_t pmap_pma;
 uint64_t pmap_nc;
 uint64_t pmap_io;
@@ -388,6 +388,53 @@ pmap_vp_enter(pmap_t pm, vaddr_t va, struct pte_desc *pted, int flags)
 
 	vp3->vp[VP_IDX3(va)] = pted;
 	return 0;
+}
+
+void
+pmap_vp_populate(pmap_t pm, vaddr_t va)
+{
+	struct pte_desc *pted;
+	struct pmapvp1 *vp1;
+	struct pmapvp2 *vp2;
+	struct pmapvp3 *vp3;
+	void *vp;
+
+	pted = pool_get(&pmap_pted_pool, PR_WAITOK | PR_ZERO);
+	vp = pool_get(&pmap_vp_pool, PR_WAITOK | PR_ZERO);
+
+	pmap_lock(pm);
+
+	vp1 = pm->pm_vp.l1;
+
+	vp2 = vp1->vp[VP_IDX1(va)];
+	if (vp2 == NULL) {
+		vp2 = vp; vp = NULL;
+		pmap_set_l2(pm, va, vp2, 0);
+	}
+	
+	if (vp == NULL) {
+		pmap_unlock(pm);
+		vp = pool_get(&pmap_vp_pool, PR_WAITOK | PR_ZERO);
+		pmap_lock(pm);
+	}
+
+	vp3 = vp2->vp[VP_IDX2(va)];
+	if (vp3 == NULL) {
+		vp3 = vp; vp = NULL;
+		pmap_set_l3(pm, va, vp3, 0);
+	}
+
+	if (vp3->vp[VP_IDX3(va)] == NULL) {
+		vp3->vp[VP_IDX3(va)] = pted;
+		pted = NULL;
+	}
+
+	pmap_unlock(pm);
+
+	if (vp)
+		pool_put(&pmap_vp_pool, vp);
+	if (pted)
+		pool_put(&pmap_pted_pool, pted);
 }
 
 void *
@@ -497,6 +544,13 @@ pmap_enter(pmap_t pm, vaddr_t va, paddr_t pa, vm_prot_t prot, int flags)
 	pmap_lock(pm);
 	pted = pmap_vp_lookup(pm, va, NULL);
 	if (pted && PTED_VALID(pted)) {
+		if ((pted->pted_pte & PTE_RPGN) == (pa & PTE_RPGN) &&
+		   (pted->pted_va & PROT_MASK) == (prot & PROT_MASK) &&
+		   (pted->pted_va & PMAP_CACHE_BITS) == cache) {
+			pmap_unlock(pm);
+			return 0;
+		}
+
 		pmap_remove_pted(pm, pted);
 		/* we lost our pted if it was user */
 		if (pm != pmap_kernel())
@@ -563,6 +617,11 @@ out:
 	return error;
 }
 
+void
+pmap_populate(pmap_t pm, vaddr_t va)
+{
+	pmap_vp_populate(pm, va);
+}
 
 /*
  * Remove the given range of mapping entries.
@@ -607,10 +666,6 @@ pmap_remove_pted(pmap_t pm, struct pte_desc *pted)
 	pmap_pte_remove(pted, pm != pmap_kernel());
 	tlb_flush_page(pm, pted->pted_va & ~PAGE_MASK);
 
-	if (pted->pted_va & PTED_VA_EXEC_M) {
-		pted->pted_va &= ~PTED_VA_EXEC_M;
-	}
-
 	if (PTED_MANAGED(pted))
 		pmap_remove_pv(pted);
 
@@ -638,6 +693,12 @@ _pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, int flags, int cache)
 	struct pte_desc *pted;
 	struct vm_page *pg;
 
+	pg = PHYS_TO_VM_PAGE(pa);
+	if (pg && cache == PMAP_CACHE_CI) {
+		_pmap_kenter_pa(va, pa, prot, flags, PMAP_CACHE_WB);
+		cpu_dcache_wbinv_range(va & ~PAGE_MASK, PAGE_SIZE);
+	}
+
 	pted = pmap_vp_lookup(pm, va, NULL);
 
 	/* Do not have pted for this, get one and put it in VP */
@@ -662,17 +723,19 @@ _pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, int flags, int cache)
 	 */
 	pmap_pte_insert(pted);
 	tlb_flush_page(pm, va & ~PAGE_MASK);
-
-	pg = PHYS_TO_VM_PAGE(pa);
-	if (pg && cache == PMAP_CACHE_CI)
-		cpu_dcache_wbinv_range(pa & ~PAGE_MASK, PAGE_SIZE);
 }
 
 void
 pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot)
 {
-	_pmap_kenter_pa(va, pa, prot, prot,
-	    (pa & PMAP_NOCACHE) ? PMAP_CACHE_CI : PMAP_CACHE_WB);
+        int cache = PMAP_CACHE_WB;
+
+        if (pa & PMAP_NOCACHE)
+                cache = PMAP_CACHE_CI;
+        if (pa & PMAP_DEVICE)
+                cache = PMAP_CACHE_DEV;
+
+	_pmap_kenter_pa(va, pa, prot, prot, cache);
 }
 
 void
@@ -709,9 +772,6 @@ pmap_kremove_pg(vaddr_t va)
 	 */
 	pmap_pte_remove(pted, 0);
 	tlb_flush_page(pm, pted->pted_va & ~PAGE_MASK);
-
-	if (pted->pted_va & PTED_VA_EXEC_M)
-		pted->pted_va &= ~PTED_VA_EXEC_M;
 
 	if (PTED_MANAGED(pted))
 		pmap_remove_pv(pted);
@@ -757,7 +817,7 @@ pmap_fill_pte(pmap_t pm, vaddr_t va, paddr_t pa, struct pte_desc *pted,
 	}
 	pted->pted_va |= cache;
 
-	pted->pted_va |= prot & (PROT_READ|PROT_WRITE|PROT_EXEC);
+	pted->pted_va |= prot & PROT_MASK;
 
 	if (flags & PMAP_WIRED) {
 		pted->pted_va |= PTED_VA_WIRED_M;
@@ -765,7 +825,7 @@ pmap_fill_pte(pmap_t pm, vaddr_t va, paddr_t pa, struct pte_desc *pted,
 	}
 
 	pted->pted_pte = pa & PTE_RPGN;
-	pted->pted_pte |= flags & (PROT_READ|PROT_WRITE|PROT_EXEC);
+	pted->pted_pte |= flags & PROT_MASK;
 }
 
 /*
@@ -792,12 +852,19 @@ pmap_copy_page(struct vm_page *srcpg, struct vm_page *dstpg)
 	paddr_t dstpa = VM_PAGE_TO_PHYS(dstpg);
 	vaddr_t srcva = copy_src_page + cpu_number() * PAGE_SIZE;
 	vaddr_t dstva = copy_dst_page + cpu_number() * PAGE_SIZE;
+	int s;
 
+	/*
+	 * XXX The buffer flipper (incorrectly?) uses pmap_copy_page()
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
 	pmap_kenter_pa(srcva, srcpa, PROT_READ);
 	pmap_kenter_pa(dstva, dstpa, PROT_READ|PROT_WRITE);
 	memcpy((void *)dstva, (void *)srcva, PAGE_SIZE);
 	pmap_kremove_pg(srcva);
 	pmap_kremove_pg(dstva);
+	splx(s);
 }
 
 void
@@ -1057,14 +1124,7 @@ pmap_growkernel(vaddr_t maxkvaddr)
 
 	for (i = VP_IDX1(pmap_maxkvaddr); i <= VP_IDX1(maxkvaddr - 1); i++) {
 		vp2 = vp1->vp[i];
-		if (vp2 == NULL) {
-			vp2 = pmap_kvp_alloc();
-			if (vp2 == NULL)
-				goto fail;
-			pmap_extract(pmap_kernel(), (vaddr_t)vp2, &pa);
-			vp1->vp[i] = vp2;
-			vp1->l1[i] = VP_Lx(pa);
-		}
+		KASSERT(vp2 != NULL);
 
 		if (i == VP_IDX1(pmap_maxkvaddr)) {
 			lb_idx2 = VP_IDX2(pmap_maxkvaddr);
@@ -1210,7 +1270,7 @@ pmap_bootstrap(long kvo, vaddr_t l1pt, vaddr_t kernelstart, vaddr_t kernelend,
 
 	/* allocate memory (in unit of pages) for l2 and l3 page table */
 	for (i = VP_IDX1(VM_MIN_KERNEL_ADDRESS);
-	    i <= VP_IDX1(pmap_maxkvaddr - 1);
+	    i <= VP_IDX1(VM_MAX_KERNEL_ADDRESS - 1);
 	    i++) {
 		mappings_allocated++;
 		pa = pmap_steal_avail(sizeof(struct pmapvp2), Lx_TABLE_ALIGN,
@@ -1218,6 +1278,16 @@ pmap_bootstrap(long kvo, vaddr_t l1pt, vaddr_t kernelstart, vaddr_t kernelend,
 		vp2 = (struct pmapvp2 *)PHYS_TO_DMAP(pa);
 		vp1->vp[i] = va;
 		vp1->l1[i] = VP_Lx(pa);
+
+		/*
+		 * We must fully populate the l1 page tables since
+		 * they get copied into the page tables for userland
+		 * processes.  But skip populating the l2 page tables
+		 * above pmap_maxkvaddr.  They will be populated by
+		 * pmap_growkernel() when necessary.
+		 */
+		if (i > VP_IDX1(pmap_maxkvaddr - 1))
+			continue;
 
 		if (i == VP_IDX1(VM_MIN_KERNEL_ADDRESS)) {
 			lb_idx2 = VP_IDX2(VM_MIN_KERNEL_ADDRESS);

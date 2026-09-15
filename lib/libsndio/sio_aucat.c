@@ -1,4 +1,4 @@
-/*	$OpenBSD: sio_aucat.c,v 1.21 2022/04/29 08:30:48 ratchov Exp $	*/
+/*	$OpenBSD: sio_aucat.c,v 1.23 2026/03/10 06:23:44 ratchov Exp $	*/
 /*
  * Copyright (c) 2008 Alexandre Ratchov <alex@caoua.org>
  *
@@ -38,7 +38,6 @@ struct sio_aucat_hdl {
 	unsigned int rbpf, wbpf;	/* read and write bytes-per-frame */
 	int events;			/* events the user requested */
 	unsigned int curvol, reqvol;	/* current and requested volume */
-	int delta;			/* some of received deltas */
 #define PSTATE_INIT	0
 #define PSTATE_RUN	1
 	int pstate;
@@ -107,13 +106,13 @@ sio_aucat_runmsg(struct sio_aucat_hdl *hdl)
 		break;
 	case AMSG_MOVE:
 		delta = ntohl(hdl->aucat.rmsg.u.ts.delta);
-		hdl->delta += delta;
-		DPRINTFN(3, "aucat: move(%d), delta = %d, maxwrite = %d\n",
-		    delta, hdl->delta, hdl->aucat.maxwrite);
-		if (hdl->delta >= 0) {
-			_sio_onmove_cb(&hdl->sio, hdl->delta);
-			hdl->delta = 0;
-		}
+		DPRINTFN(3, "aucat: move(%d), maxwrite = %d\n",
+		    delta, hdl->aucat.maxwrite);
+		_sio_onmove_cb(&hdl->sio, delta);
+		break;
+	case AMSG_XRUN:
+		DPRINTFN(3, "aucat: xrun\n");
+		_sio_onxrun_cb(&hdl->sio);
 		break;
 	case AMSG_SETVOL:
 		ctl = ntohl(hdl->aucat.rmsg.u.vol.ctl);
@@ -191,11 +190,11 @@ sio_aucat_start(struct sio_hdl *sh)
 	hdl->rbpf = hdl->sio.par.bps * hdl->sio.par.rchan;
 	hdl->aucat.maxwrite = 0;
 	hdl->round = hdl->sio.par.round;
-	hdl->delta = 0;
 	DPRINTFN(2, "aucat: start, maxwrite = %d\n", hdl->aucat.maxwrite);
 
 	AMSG_INIT(&hdl->aucat.wmsg);
 	hdl->aucat.wmsg.cmd = htonl(AMSG_START);
+	hdl->aucat.wmsg.u.start.xrunnotify = 1;
 	hdl->aucat.wtodo = sizeof(struct amsg);
 	if (!_aucat_wmsg(&hdl->aucat, &hdl->sio.eof))
 		return 0;

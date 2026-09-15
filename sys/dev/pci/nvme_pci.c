@@ -1,4 +1,4 @@
-/*	$OpenBSD: nvme_pci.c,v 1.11 2024/05/24 06:02:58 jsg Exp $ */
+/*	$OpenBSD: nvme_pci.c,v 1.15 2026/06/30 16:24:33 jcs Exp $ */
 
 /*
  * Copyright (c) 2014 David Gwynne <dlg@openbsd.org>
@@ -67,15 +67,12 @@ nvme_pci_match(struct device *parent, void *match, void *aux)
 
 	if (PCI_VENDOR(pa->pa_id) == PCI_VENDOR_APPLE &&
 	    (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_APPLE_NVME1 ||
-	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_APPLE_NVME2))
+	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_APPLE_NVME2 ||
+	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_APPLE_NVME3))
 	    	return (1);
 
 	return (0);
 }
-
-static const struct pci_matchid nvme_msi_blacklist[] = {
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_OPTANE },
-};
 
 void
 nvme_pci_attach(struct device *parent, struct device *self, void *aux)
@@ -91,9 +88,6 @@ nvme_pci_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dmat = pa->pa_dmat;
 
 	printf(": ");
-
-	if (pci_matchbyid(pa, nvme_msi_blacklist, nitems(nvme_msi_blacklist)))
-		CLR(pa->pa_flags, PCI_FLAGS_MSI_ENABLED);
 
 	maptype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, NVME_PCI_BAR);
 	if (pci_mapreg_map(pa, NVME_PCI_BAR, maptype, 0,
@@ -119,6 +113,12 @@ nvme_pci_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	printf("%s, ", pci_intr_string(pa->pa_pc, ih));
+
+	if (PCI_VENDOR(pa->pa_id) == PCI_VENDOR_APPLE &&
+	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_APPLE_NVME3)
+		/* Apple T2 requires 128-byte submission queue entries */
+		sc->sc_sqe_size = 128;
+
 	if (nvme_attach(sc) != 0) {
 		/* error printed by nvme_attach() */
 		goto disestablish;
@@ -138,7 +138,7 @@ unmap:
 int
 nvme_pci_detach(struct device *self, int flags)
 {
-	return (0);
+	return config_detach_children(self, flags);
 }
 
 int

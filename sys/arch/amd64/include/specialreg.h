@@ -1,4 +1,4 @@
-/*	$OpenBSD: specialreg.h,v 1.116 2024/08/04 11:05:18 kettenis Exp $	*/
+/*	$OpenBSD: specialreg.h,v 1.127 2026/09/08 21:01:59 daniel Exp $	*/
 /*	$NetBSD: specialreg.h,v 1.1 2003/04/26 18:39:48 fvdl Exp $	*/
 /*	$NetBSD: x86/specialreg.h,v 1.2 2003/04/25 21:54:30 fvdl Exp $	*/
 
@@ -281,13 +281,19 @@
     ("\20" "\03AVX512FNNIW" "\04AVX512FMAPS" "\012SRBDS_CTRL" "\013MD_CLEAR" \
      "\016TSXFA" "\025IBT" "\033IBRS,IBPB" "\034STIBP" "\035L1DF" "\040SSBD" )
 
+/* SEFF subleaf 2 EDX bits */
+#define SEFF2EDX_BHI_CTRL	0x00000010 /* BHI_DIS_S supported */
+#define SEFF2_EDX_BITS \
+    ("\20" "\05BHI_CTRL" )
+
 /*
  * Thermal and Power Management (CPUID function 0x6) EAX bits
  */
 #define	TPM_SENSOR	0x00000001	 /* Digital temp sensor */
 #define	TPM_ARAT	0x00000004	 /* APIC Timer Always Running */
+#define	TPM_PTS		0x00000040	 /* Intel Package Thermal Status */ 
 #define TPM_EAX_BITS \
-    ("\20" "\01SENSOR" "\03ARAT" )
+    ("\20" "\01SENSOR" "\03ARAT" "\07PTS")
 /* Thermal and Power Management (CPUID function 0x6) ECX bits */
 #define	TPM_EFFFREQ	0x00000001	 /* APERF & MPERF MSR present */
 #define TPM_ECX_BITS \
@@ -405,7 +411,7 @@
 #define CPUIDEAX_SEVSNP		(1ULL << 4)  /* SEV-SNP */
 #define CPUIDEAX_VMPL		(1ULL << 5)  /* VM Permission Levels */
 #define CPUIDEAX_RMPQUERY	(1ULL << 6)  /* RMPQUERY */
-#define CPUIDEAX_VMPLSSS	(1ULL << 7)  /* VMPL Supservisor Shadow Stack */
+#define CPUIDEAX_VMPLSSS	(1ULL << 7)  /* VMPL Supervisor Shadow Stack */
 #define CPUIDEAX_SECTSC		(1ULL << 8)  /* Secure TSC */
 #define CPUIDEAX_TSCAUXVIRT	(1ULL << 9)  /* TSC Aux Virtualization */
 #define CPUIDEAX_HWECACHECOH	(1ULL << 10) /* Coherency Across Enc. Domains */
@@ -473,6 +479,7 @@
 #define SPEC_CTRL_IBRS		(1ULL << 0)
 #define SPEC_CTRL_STIBP		(1ULL << 1)
 #define SPEC_CTRL_SSBD		(1ULL << 2)
+#define SPEC_CTRL_BHI_DIS_S	(1ULL << 10)
 #define MSR_PRED_CMD		0x049	/* Speculation Control IBPB */
 #define PRED_CMD_IBPB		(1ULL << 0)
 #define MSR_BIOS_UPDT_TRIG	0x079
@@ -698,13 +705,19 @@
 #define MSR_FSBASE	0xc0000100	/* 64bit offset for fs: */
 #define MSR_GSBASE	0xc0000101	/* 64bit offset for gs: */
 #define MSR_KERNELGSBASE 0xc0000102	/* storage for swapgs ins */
+#define MSR_SYS_CFG	0xc0010010	/* System Configuration */
 #define MSR_PATCH_LOADER	0xc0010020
 #define MSR_INT_PEN_MSG	0xc0010055	/* Interrupt pending message */
 
+#define MSR_FP_CFG	0xc0011028	/* Floating Point Configuration */
+#define FP_CFG_9	(1 << 9)	/* FP-DSS chickenbit */
 #define MSR_DE_CFG	0xc0011029	/* Decode Configuration */
 #define	DE_CFG_721	0x00000001	/* errata 721 */
 #define DE_CFG_SERIALIZE_LFENCE	(1 << 1)	/* Enable serializing lfence */
 #define DE_CFG_SERIALIZE_9 (1 << 9)	/* Zenbleed chickenbit */
+
+#define MSR_BP_CFG	0xc001102e
+#define BP_CFG_33	(1ULL << 33)	/* op cache chickenbit, AMD-SB-7052 */
 
 #define IPM_C1E_CMP_HLT	0x10000000
 #define IPM_SMI_CMP_HLT	0x08000000
@@ -723,8 +736,14 @@
 #define		NB_CFG_DISIOREQLOCK	0x0000000000000004ULL
 #define		NB_CFG_DISDATMSK	0x0000001000000000ULL
 
+#define MSR_SEV_GHCB	0xc0010130
+#define		SEV_CPUID_REQ		0x00000004
+#define		SEV_CPUID_RESP		0x00000005
+
 #define MSR_SEV_STATUS	0xc0010131
 #define		SEV_STAT_ENABLED	0x00000001
+#define		SEV_STAT_ES_ENABLED	0x00000002
+#define		SEV_STAT_SNP_ACTIVE	0x00000004
 
 #define	MSR_LS_CFG	0xc0011020
 #define		LS_CFG_DIS_LS2_SQUISH	0x02000000
@@ -1396,6 +1415,8 @@
 #define VMCS_GUEST_IA32_SYSENTER_ESP	0x6824
 #define VMCS_GUEST_IA32_SYSENTER_EIP	0x6826
 #define VMCS_GUEST_IA32_S_CET		0x6828
+#define VMCS_GUEST_SSP			0x682A
+#define VMCS_GUEST_IA32_INTR_SSP_TABLE	0x682C
 
 /* Natural-width host state fields */
 #define VMCS_HOST_IA32_CR0		0x6C00
@@ -1411,6 +1432,8 @@
 #define VMCS_HOST_IA32_RSP		0x6C14
 #define VMCS_HOST_IA32_RIP		0x6C16
 #define VMCS_HOST_IA32_S_CET		0x6C18
+#define VMCS_HOST_SSP			0x6C1A
+#define VMCS_HOST_IA32_INTR_SSP_TABLE	0x6C1C
 
 #define IA32_VMX_INVVPID_INDIV_ADDR_CTX	0x0
 #define IA32_VMX_INVVPID_SINGLE_CTX	0x1
@@ -1441,6 +1464,7 @@
 #define MSR_AMD_VM_HSAVE_PA		0xc0010117
 #define CPUID_AMD_SVM_CAP		0x8000000A
 #define AMD_SVM_NESTED_PAGING_CAP	(1 << 0)
+#define AMD_SVM_NRIP_SAVE_CAP		(1 << 3)
 #define AMD_SVM_VMCB_CLEAN_CAP		(1 << 5)
 #define AMD_SVM_FLUSH_BY_ASID_CAP	(1 << 6)
 #define AMD_SVM_DECODE_ASSIST_CAP	(1 << 7)

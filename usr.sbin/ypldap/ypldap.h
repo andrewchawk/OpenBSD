@@ -1,4 +1,4 @@
-/*	$OpenBSD: ypldap.h,v 1.24 2023/07/18 13:06:33 claudio Exp $ */
+/*	$OpenBSD: ypldap.h,v 1.26 2026/08/07 21:06:39 claudio Exp $ */
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -15,6 +15,10 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 #include <imsg.h>
 #include <tls.h>
@@ -89,7 +93,7 @@ enum client_state {
 struct idm {
 	TAILQ_ENTRY(idm)		 idm_entry;
 	u_int32_t                        idm_id;
-	char				 idm_name[HOST_NAME_MAX+1];
+	char				 idm_name[NI_MAXHOST];
 #define F_SSL				 0x00100000
 #define F_CONFIGURING			 0x00200000
 #define F_NEEDAUTH			 0x00400000
@@ -198,7 +202,7 @@ int		 parse_config(struct env *, const char *, int);
 int		 cmdline_symset(char *);
 
 /* ldapclient.c */
-pid_t		 ldapclient(int []);
+pid_t		 ldapclient(int [2]);
 
 /* ypldap.c */
 void		 purge_config(struct env *);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cal.c,v 1.31 2022/12/04 23:50:47 cheloha Exp $	*/
+/*	$OpenBSD: cal.c,v 1.36 2026/07/02 20:40:53 jtt Exp $	*/
 /*	$NetBSD: cal.c,v 1.6 1995/03/26 03:10:24 glass Exp $	*/
 
 /*
@@ -193,15 +193,15 @@ main(int argc, char *argv[])
 	month = 0;
 	switch(argc) {
 	case 2:
+		if (yflag)
+			errx(1, "specifying a month conflicts with -y");
 		month = parsemonth(*argv++);
-		if (!month)
-			errx(1, "Unable to parse month");
 		/* FALLTHROUGH */
 	case 1:
 		if (argc == 1 && !isdigit((unsigned char)*argv[0])) {
+			if (yflag)
+				errx(1, "specifying a month conflicts with -y");
 			month = parsemonth(*argv);
-			if (!month)
-				errx(1, "illegal year value: use 1-9999");
 			(void)time(&now);
 			local_time = localtime(&now);
 			year = local_time->tm_year + 1900;
@@ -248,7 +248,7 @@ week(int day, int month, int year)
 	int	firstday;
 	int	firstsunday;
 	int	shift;
-	
+
 	if (mflag)
 		return isoweek(day, month, year);
 
@@ -261,7 +261,7 @@ week(int day, int month, int year)
 	shift = 1;
 	if (yearday < firstsunday)
 		return (1);
-	if (firstweekday > THURSDAY - 1) 
+	if (firstweekday > THURSDAY - 1)
 		shift = 2;
 	return ((((yearday + 1) - (weekday - 1)) / 7) + shift);
 }
@@ -269,7 +269,7 @@ week(int day, int month, int year)
 int
 isoweek(int day, int month, int year)
 {
-	/* http://www.tondering.dk/claus/cal/node8.html */
+	/* https://www.tondering.dk/claus/cal/week.php#calcweekno */
 	int a, b, c, s, e, f, g, d, n;
 
 	a = month <= 2 ? year - 1 : year;
@@ -291,7 +291,7 @@ isoweek(int day, int month, int year)
 		return 53 - (g - s) / 5;
 	else if (n > 364 + s)
 		return 1;
-	else 
+	else
 		return n/7 + 1;
 }
 
@@ -388,7 +388,7 @@ yearly(int year)
 		for (row = 0; row < 6; row++) {
 			for (which_cal = 0; which_cal < 3; which_cal++) {
 				p = lineout + which_cal * (week_len + 2);
-				
+
 				dp = &days[month + which_cal][row * 7];
 				firstday = SPACE;
 				for (col = 0; col < 7; col++, p += DAY_LEN) {

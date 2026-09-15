@@ -1,4 +1,4 @@
-/* $OpenBSD: s_cb.c,v 1.21 2023/04/14 15:27:13 tb Exp $ */
+/* $OpenBSD: s_cb.c,v 1.23 2026/08/10 20:27:51 kenjiro Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -123,8 +123,6 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
-
-#include "s_apps.h"
 
 #define	COOKIE_SECRET_LENGTH	16
 
@@ -849,8 +847,12 @@ generate_cookie_callback(SSL * ssl, unsigned char *cookie,
 	}
 
 	/* Calculate HMAC of buffer using the secret */
-	HMAC(EVP_sha1(), cookie_secret, COOKIE_SECRET_LENGTH,
-	    buffer, length, result, &resultlength);
+	if (HMAC(EVP_sha1(), cookie_secret, COOKIE_SECRET_LENGTH,
+	    buffer, length, result, &resultlength) == NULL) {
+		free(buffer);
+		return 0;
+	}
+
 	free(buffer);
 
 	memcpy(cookie, result, resultlength);

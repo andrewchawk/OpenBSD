@@ -1,4 +1,4 @@
-/*	$OpenBSD: output-json.c,v 1.49 2024/04/21 19:27:44 claudio Exp $ */
+/*	$OpenBSD: output-json.c,v 1.61 2026/07/07 13:38:54 claudio Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  *
@@ -24,15 +24,13 @@
 #include "json.h"
 
 static void
-outputheader_json(struct stats *st)
+outputheader_json(struct validation_data *vd, struct stats *st)
 {
 	char		 hn[NI_MAXHOST], tbuf[26];
 	struct tm	*tp;
-	time_t		 t;
 	int		 i;
 
-	time(&t);
-	tp = gmtime(&t);
+	tp = gmtime(&vd->buildtime);
 	strftime(tbuf, sizeof tbuf, "%FT%TZ", tp);
 
 	gethostname(hn, sizeof hn);
@@ -44,18 +42,29 @@ outputheader_json(struct stats *st)
 	json_do_int("elapsedtime", st->elapsed_time.tv_sec);
 	json_do_int("usertime", st->user_time.tv_sec);
 	json_do_int("systemtime", st->system_time.tv_sec);
+
+	json_do_string("ccr_mfts_hash", vd->ccr.mfts_hash);
+	json_do_string("ccr_vrps_hash", vd->ccr.vrps_hash);
+	json_do_string("ccr_vaps_hash", vd->ccr.vaps_hash);
+	json_do_string("ccr_brks_hash", vd->ccr.brks_hash);
+	json_do_string("ccr_tas_hash", vd->ccr.tas_hash);
+
 	json_do_int("roas", st->repo_tal_stats.roas);
 	json_do_int("failedroas", st->repo_tal_stats.roas_fail);
 	json_do_int("invalidroas", st->repo_tal_stats.roas_invalid);
-	json_do_int("spls", st->repo_tal_stats.spls);
-	json_do_int("failedspls", st->repo_tal_stats.spls_fail);
-	json_do_int("invalidspls", st->repo_tal_stats.spls_invalid);
+	if (experimental) {
+		json_do_int("spls", st->repo_tal_stats.spls);
+		json_do_int("failedspls", st->repo_tal_stats.spls_fail);
+		json_do_int("invalidspls", st->repo_tal_stats.spls_invalid);
+	}
 	json_do_int("aspas", st->repo_tal_stats.aspas);
 	json_do_int("failedaspas", st->repo_tal_stats.aspas_fail);
 	json_do_int("invalidaspas", st->repo_tal_stats.aspas_invalid);
 	json_do_int("bgpsec_pubkeys", st->repo_tal_stats.brks);
 	json_do_int("certificates", st->repo_tal_stats.certs);
 	json_do_int("invalidcertificates", st->repo_tal_stats.certs_fail);
+	json_do_int("nonfunctionalcas", st->repo_tal_stats.certs_nonfunc);
+	json_do_int("deferredcas", st->repo_tal_stats.certs_nonfunc_deferred);
 	json_do_int("taks", st->repo_tal_stats.taks);
 	json_do_int("tals", st->tals);
 	json_do_int("invalidtals", talsz - st->tals);
@@ -68,7 +77,6 @@ outputheader_json(struct stats *st)
 	json_do_int("manifests", st->repo_tal_stats.mfts);
 	json_do_int("failedmanifests", st->repo_tal_stats.mfts_fail);
 	json_do_int("crls", st->repo_tal_stats.crls);
-	json_do_int("gbrs", st->repo_tal_stats.gbrs);
 	json_do_int("repositories", st->repos);
 	json_do_int("vrps", st->repo_tal_stats.vrps);
 	json_do_int("uniquevrps", st->repo_tal_stats.vrps_uniqs);
@@ -95,12 +103,12 @@ print_vap(struct vap *v)
 		return;
 
 	json_do_object("aspa", 1);
-	json_do_int("customer_asid", v->custasid);
+	json_do_uint("customer_asid", v->custasid);
 	json_do_int("expires", v->expires);
 
 	json_do_array("providers");
-	for (i = 0; i < v->providersz; i++)
-		json_do_int("provider", v->providers[i]);
+	for (i = 0; i < v->num_providers; i++)
+		json_do_uint("provider", v->providers[i]);
 
 	json_do_end();
 }
@@ -126,9 +134,9 @@ output_spl(struct vsp_tree *vsps)
 	json_do_array("signedprefixlists");
 	RB_FOREACH(vsp, vsp_tree, vsps) {
 		json_do_object("vsp", 1);
-		json_do_int("origin_as", vsp->asid);
+		json_do_uint("origin_as", vsp->asid);
 		json_do_array("prefixes");
-		for (i = 0; i < vsp->prefixesz; i++) {
+		for (i = 0; i < vsp->num_prefixes; i++) {
 			ip_addr_print(&vsp->prefixes[i].prefix,
 			    vsp->prefixes[i].afi, buf, sizeof(buf));
 			json_do_string("prefix", buf);
@@ -142,22 +150,22 @@ output_spl(struct vsp_tree *vsps)
 }
 
 int
-output_json(FILE *out, struct vrp_tree *vrps, struct brk_tree *brks,
-    struct vap_tree *vaps, struct vsp_tree *vsps, struct stats *st)
+output_json(FILE *out, struct validation_data *vd, struct stats *st)
 {
-	char		 buf[64];
-	struct vrp	*v;
-	struct brk	*b;
+	char			 buf[64];
+	struct vrp		*v;
+	struct brk		*b;
+	struct nonfunc_ca	*nca;
 
 	json_do_start(out);
-	outputheader_json(st);
+	outputheader_json(vd, st);
 
 	json_do_array("roas");
-	RB_FOREACH(v, vrp_tree, vrps) {
+	RB_FOREACH(v, vrp_tree, &vd->vrps) {
 		ip_addr_print(&v->addr, v->afi, buf, sizeof(buf));
 
 		json_do_object("roa", 1);
-		json_do_int("asn", v->asid);
+		json_do_uint("asn", v->asid);
 		json_do_string("prefix", buf);
 		json_do_int("maxLength", v->maxlength);
 		json_do_string("ta", taldescs[v->talid]);
@@ -167,9 +175,9 @@ output_json(FILE *out, struct vrp_tree *vrps, struct brk_tree *brks,
 	json_do_end();
 
 	json_do_array("bgpsec_keys");
-	RB_FOREACH(b, brk_tree, brks) {
+	RB_FOREACH(b, brk_tree, &vd->brks) {
 		json_do_object("brks", 0);
-		json_do_int("asn", b->asid);
+		json_do_uint("asn", b->asid);
 		json_do_string("ski", b->ski);
 		json_do_string("pubkey", b->pubkey);
 		json_do_string("ta", taldescs[b->talid]);
@@ -178,11 +186,29 @@ output_json(FILE *out, struct vrp_tree *vrps, struct brk_tree *brks,
 	}
 	json_do_end();
 
+	json_do_array("nonfunc_cas");
+	RB_FOREACH(nca, nca_tree, &vd->ncas) {
+		json_do_object("nca", 1);
+		json_do_string("location", nca->location);
+		json_do_string("ta", taldescs[nca->talid]);
+		json_do_string("caRepository", nca->carepo);
+		json_do_string("rpkiManifest", nca->mfturi);
+		if (nca->notify != NULL)
+			json_do_string("rpkiNotify", nca->notify);
+		json_do_string("aki", nca->aki);
+		json_do_string("ski", nca->ski);
+		json_do_int("since", (long long)nca->since);
+		json_do_int("last_attempt", (long long)nca->last_attempt);
+		json_do_int("total_attempts", nca->attempts);
+		json_do_end();
+	}
+	json_do_end();
+
 	if (!excludeaspa)
-		output_aspa(vaps);
+		output_aspa(&vd->vaps);
 
 	if (experimental)
-		output_spl(vsps);
+		output_spl(&vd->vsps);
 
 	return json_do_finish();
 }

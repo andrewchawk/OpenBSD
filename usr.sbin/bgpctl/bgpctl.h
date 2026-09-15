@@ -1,4 +1,4 @@
-/*	$OpenBSD: bgpctl.h,v 1.24 2024/01/31 11:23:20 claudio Exp $ */
+/*	$OpenBSD: bgpctl.h,v 1.26 2026/06/24 06:02:48 claudio Exp $ */
 
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
@@ -20,7 +20,7 @@ struct parse_result;
 
 struct output {
 	void	(*head)(struct parse_result *);
-	void	(*neighbor)(struct peer *, struct parse_result *);
+	void	(*neighbor)(struct ctl_peer *, struct parse_result *);
 	void	(*timer)(struct ctl_timer *);
 	void	(*fib)(struct kroute_full *);
 	void	(*fib_table)(struct ktable *);
@@ -42,10 +42,9 @@ extern const struct output show_output, json_output, ometric_output;
 
 #define EOL0(flag)	((flag & F_CTL_SSV) ? ';' : '\n')
 
-time_t		 get_monotime(time_t);
+time_t		 get_rel_monotime(monotime_t);
 char		*fmt_peer(const char *, const struct bgpd_addr *, int);
-const char	*fmt_timeframe(time_t);
-const char	*fmt_monotime(time_t);
+const char	*fmt_monotime(monotime_t);
 const char	*fmt_fib_flags(uint16_t);
 const char	*fmt_origin(uint8_t, int);
 const char	*fmt_flags(uint32_t, int);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtp_session.c,v 1.442 2024/03/20 17:52:43 op Exp $	*/
+/*	$OpenBSD: smtp_session.c,v 1.451 2026/09/13 19:14:41 op Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -82,7 +82,6 @@ enum smtp_command {
 	CMD_RSET,
 	CMD_QUIT,
 	CMD_HELP,
-	CMD_WIZ,
 	CMD_NOOP,
 	CMD_COMMIT,
 };
@@ -228,7 +227,6 @@ static void smtp_proceed_rcpt_to(struct smtp_session *, const char *);
 static void smtp_proceed_data(struct smtp_session *, const char *);
 static void smtp_proceed_noop(struct smtp_session *, const char *);
 static void smtp_proceed_help(struct smtp_session *, const char *);
-static void smtp_proceed_wiz(struct smtp_session *, const char *);
 static void smtp_proceed_quit(struct smtp_session *, const char *);
 static void smtp_proceed_commit(struct smtp_session *, const char *);
 static void smtp_proceed_rollback(struct smtp_session *, const char *);
@@ -279,7 +277,6 @@ static struct {
 	{ CMD_QUIT,             FILTER_QUIT,            "QUIT",         smtp_check_noparam,     smtp_proceed_quit },
 	{ CMD_NOOP,             FILTER_NOOP,            "NOOP",         smtp_check_noop,        smtp_proceed_noop },
 	{ CMD_HELP,             FILTER_HELP,            "HELP",         smtp_check_noparam,     smtp_proceed_help },
-	{ CMD_WIZ,              FILTER_WIZ,             "WIZ",          smtp_check_noparam,     smtp_proceed_wiz },
 	{ CMD_COMMIT,  		FILTER_COMMIT,		".",		smtp_check_noparam,	smtp_proceed_commit },
 	{ -1,                   0,                      NULL,           NULL },
 };
@@ -1026,6 +1023,7 @@ smtp_session_imsg(struct mproc *p, struct imsg *imsg)
 			filter_param = s->filter_param;
 			/* fallthrough */
 
+		case FILTER_REPORT:
 		case FILTER_REWRITE:
 			smtp_report_filter_response(s, s->filter_phase,
 			    filter_response,
@@ -1357,12 +1355,6 @@ smtp_command(struct smtp_session *s, char *line)
 		smtp_proceed_help(s, NULL);
 		break;
 
-	case CMD_WIZ:
-		if (!smtp_check_noparam(s, args))
-			break;
-		smtp_proceed_wiz(s, NULL);
-		break;
-
 	default:
 		smtp_reply(s, "500 %s %s: Command unrecognized",
 			    esc_code(ESC_STATUS_PERMFAIL, ESC_INVALID_COMMAND),
@@ -1425,13 +1417,6 @@ smtp_check_ehlo(struct smtp_session *s, const char *args)
 {
 	if (!s->banner_sent) {
 		smtp_reply(s, "503 %s %s: Command not allowed at this point.",
-		    esc_code(ESC_STATUS_PERMFAIL, ESC_INVALID_COMMAND),
-		    esc_description(ESC_INVALID_COMMAND));
-		return 0;
-	}
-
-	if (s->helo[0]) {
-		smtp_reply(s, "503 %s %s: Already identified",
 		    esc_code(ESC_STATUS_PERMFAIL, ESC_INVALID_COMMAND),
 		    esc_description(ESC_INVALID_COMMAND));
 		return 0;
@@ -1592,7 +1577,7 @@ smtp_check_rcpt_to(struct smtp_session *s, const char *args)
 	}
 
 	if (s->tx->rcptcount >= env->sc_session_max_rcpt) {
-		smtp_reply(s->tx->session, "451 %s %s: Too many recipients",
+		smtp_reply(s->tx->session, "452 %s %s: Too many recipients",
 		    esc_code(ESC_STATUS_TEMPFAIL, ESC_TOO_MANY_RECIPIENTS),
 		    esc_description(ESC_TOO_MANY_RECIPIENTS));
 		return 0;
@@ -1778,6 +1763,13 @@ smtp_proceed_ehlo(struct smtp_session *s, const char *args)
 	s->flags |= SF_EHLO;
 	s->flags |= SF_8BITMIME;
 
+	/* EHLO should behave like a RSET */
+	if (s->tx) {
+		if (s->tx->msgid)
+			smtp_tx_rollback(s->tx);
+		smtp_tx_free(s->tx);
+	}
+
 	smtp_report_link_identify(s, "EHLO", s->helo);
 
 	smtp_enter_state(s, STATE_HELO);
@@ -1900,14 +1892,6 @@ smtp_proceed_help(struct smtp_session *s, const char *args)
 }
 
 static void
-smtp_proceed_wiz(struct smtp_session *s, const char *args)
-{
-	smtp_reply(s, "500 %s %s: this feature is not supported yet ;-)",
-	    esc_code(ESC_STATUS_PERMFAIL, ESC_INVALID_COMMAND),
-	    esc_description(ESC_INVALID_COMMAND));
-}
-
-static void
 smtp_proceed_commit(struct smtp_session *s, const char *args)
 {
 	smtp_message_end(s->tx);
@@ -1959,14 +1943,18 @@ smtp_rfc4954_auth_plain(struct smtp_session *s, char *arg)
 		if (user == NULL || user >= buf + len - 2)
 			goto abort;
 		user++; /* skip NUL */
+		if (user[strcspn(user, "\r\n")] != '\0')
+			goto abort;
 		if (strlcpy(s->username, user, sizeof(s->username))
 		    >= sizeof(s->username))
 			goto abort;
 
 		pass = memchr(user, '\0', len - (user - buf));
-		if (pass == NULL || pass >= buf + len - 2)
+		if (pass == NULL || pass >= buf + len - 1)
 			goto abort;
 		pass++; /* skip NUL */
+		if (pass[strcspn(pass, "\r\n")] != '\0')
+			goto abort;
 
 		m_create(p_lka,  IMSG_SMTP_AUTHENTICATE, 0, 0, -1);
 		m_add_id(p_lka, s->id);
@@ -2009,6 +1997,9 @@ smtp_rfc4954_auth_login(struct smtp_session *s, char *arg)
 				  sizeof(s->username) - 1) == -1)
 			goto abort;
 
+		if (s->username[strcspn(s->username, "\r\n")] != '\0')
+			goto abort;
+
 		smtp_enter_state(s, STATE_AUTH_PASSWORD);
 		smtp_reply(s, "334 UGFzc3dvcmQ6");
 		return;
@@ -2017,6 +2008,9 @@ smtp_rfc4954_auth_login(struct smtp_session *s, char *arg)
 		memset(buf, 0, sizeof(buf));
 		if (base64_decode(arg, (unsigned char *)buf,
 				  sizeof(buf)-1) == -1)
+			goto abort;
+
+		if (buf[strcspn(buf, "\r\n")] != '\0')
 			goto abort;
 
 		m_create(p_lka,  IMSG_SMTP_AUTHENTICATE, 0, 0, -1);
@@ -2108,6 +2102,9 @@ smtp_reply(struct smtp_session *s, char *fmt, ...)
 	va_start(ap, fmt);
 	n = vsnprintf(buf, sizeof buf, fmt, ap);
 	va_end(ap);
+	if (n >= (int)sizeof buf)
+		n = (int)sizeof buf - 1;
+
 	if (n < 0)
 		fatalx("smtp_reply: response format error");
 	if (n < 4)
@@ -2203,6 +2200,18 @@ smtp_free(struct smtp_session *s, const char * reason)
 
 	smtp_report_link_disconnect(s);
 	smtp_filter_end(s);
+
+	tree_pop(&wait_lka_helo, s->id);
+	tree_pop(&wait_lka_mail, s->id);
+	tree_pop(&wait_lka_rcpt, s->id);
+	tree_pop(&wait_parent_auth, s->id);
+	tree_pop(&wait_queue_msg, s->id);
+	tree_pop(&wait_queue_fd, s->id);
+	tree_pop(&wait_queue_commit, s->id);
+	tree_pop(&wait_ssl_init, s->id);
+	tree_pop(&wait_ssl_verify, s->id);
+	tree_pop(&wait_filters, s->id);
+	tree_pop(&wait_filter_fd, s->id);
 
 	if (s->flags & SF_SECURE && s->listener->flags & F_SMTPS)
 		stat_decrement("smtp.smtps", 1);
@@ -2312,6 +2321,8 @@ smtp_tx(struct smtp_session *s)
 		tx->evp.flags |= EF_BOUNCE;
 	if (s->flags & SF_AUTHENTICATED)
 		tx->evp.flags |= EF_AUTHENTICATED;
+	if (s->flags & SF_SECURE)
+		tx->evp.flags |= EF_TLS;
 
 	if ((tx->parser = rfc5322_parser_new()) == NULL) {
 		free(tx);
@@ -2433,7 +2444,7 @@ smtp_tx_rcpt_to(struct smtp_tx *tx, const char *line)
 	copy = tmp;
 
 	if (tx->rcptcount >= env->sc_session_max_rcpt) {
-		smtp_reply(tx->session, "451 %s %s: Too many recipients",
+		smtp_reply(tx->session, "452 %s %s: Too many recipients",
 		    esc_code(ESC_STATUS_TEMPFAIL, ESC_TOO_MANY_RECIPIENTS),
 		    esc_description(ESC_TOO_MANY_RECIPIENTS));
 		return;
@@ -2760,22 +2771,27 @@ smtp_message_begin(struct smtp_tx *tx)
 
 	m_printf(tx, "Received: ");
 	if (!(s->listener->flags & F_MASK_SOURCE)) {
-		m_printf(tx, "from %s (%s %s%s%s)",
+		m_printf(tx, "from %s (%s %s%s%s)\n\t",
 		    s->helo,
 		    s->rdns,
 		    s->ss.ss_family == AF_INET6 ? "" : "[",
 		    ss_to_text(&s->ss),
 		    s->ss.ss_family == AF_INET6 ? "" : "]");
 	}
-	m_printf(tx, "\n\tby %s (%s) with %sSMTP%s%s id %08x",
-	    s->smtpname,
-	    SMTPD_NAME,
-	    s->flags & SF_EHLO ? "E" : "",
-	    s->flags & SF_SECURE ? "S" : "",
-	    s->flags & SF_AUTHENTICATED ? "A" : "",
-	    tx->msgid);
 
-	if (s->flags & SF_SECURE) {
+	m_printf(tx, "by %s (%s) ",
+	    s->smtpname,
+	    SMTPD_NAME);
+
+	if (!(s->listener->flags & F_MASK_SOURCE)) {
+		m_printf(tx, "with %sSMTP%s%s ",
+		    s->flags & SF_EHLO ? "E" : "",
+		    s->flags & SF_SECURE ? "S" : "",
+		    s->flags & SF_AUTHENTICATED ? "A" : "");
+	}
+	m_printf(tx, "id %08x", tx->msgid);
+
+	if (!(s->listener->flags & F_MASK_SOURCE) && s->flags & SF_SECURE) {
 		m_printf(tx, " (%s:%s:%d:%s)",
 		    tls_conn_version(io_tls(s->io)),
 		    tls_conn_cipher(io_tls(s->io)),

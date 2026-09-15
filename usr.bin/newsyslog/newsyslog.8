@@ -1,4 +1,4 @@
-.\"	$OpenBSD: newsyslog.8,v 1.55 2024/04/22 14:16:14 jmc Exp $
+.\"	$OpenBSD: newsyslog.8,v 1.58 2026/06/08 09:53:54 jsg Exp $
 .\"
 .\" Copyright (c) 1997, Jason Downs.  All rights reserved.
 .\"
@@ -41,7 +41,7 @@
 .\" the suitability of this software for any purpose.  It is
 .\" provided "as is" without express or implied warranty.
 .\"
-.Dd $Mdocdate: April 22 2024 $
+.Dd $Mdocdate: June 8 2026 $
 .Dt NEWSYSLOG 8
 .Os
 .Sh NAME
@@ -180,6 +180,9 @@ follows:
 .Bl -tag -width XXXXXXXXXXXXXXXX
 .It Ar logfile_name
 The full pathname of the system log file to be archived.
+This path may be a
+.Xr glob 7
+pattern, which will be expanded accordingly.
 .It Ar owner:group
 This optional field specifies the owner and group for the archive file.
 The
@@ -253,6 +256,14 @@ If an interval is specified, the log file will be trimmed if that
 many hours have passed since the last rotation.
 When both a time and an interval are specified, both conditions
 must be satisfied for the rotation to take place.
+If the
+.Ar size
+field is set and not
+.Ql *
+or
+.Ql 0 ,
+the file will be rotated either if the size is
+exceeded or the specified time or interval is reached.
 .Pp
 There is no provision for the specification of a time zone.
 There is little point in specifying an explicit minutes or seconds
@@ -435,6 +446,7 @@ default configuration file
 .Xr compress 1 ,
 .Xr gzip 1 ,
 .Xr syslog 3 ,
+.Xr glob 7 ,
 .Xr syslogd 8
 .Sh AUTHORS
 .An Theodore Ts'o ,

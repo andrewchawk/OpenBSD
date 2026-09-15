@@ -1,4 +1,4 @@
-/*	$OpenBSD: evp_names.c,v 1.17 2024/07/29 06:05:31 tb Exp $ */
+/*	$OpenBSD: evp_names.c,v 1.19 2025/05/10 05:54:38 tb Exp $ */
 /*
  * Copyright (c) 2023 Theo Buehler <tb@openbsd.org>
  *
@@ -15,7 +15,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/objects.h>
 
@@ -1463,11 +1462,6 @@ static const struct digest_name digest_names[] = {
 		.name = "ssl3-sha1",
 		.digest = EVP_sha1,
 		.alias = SN_sha1,
-	},
-
-	{
-		.name = SN_whirlpool,
-		.digest = EVP_whirlpool,
 	},
 };
 

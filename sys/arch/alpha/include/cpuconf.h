@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpuconf.h,v 1.7 2022/12/10 15:02:29 cheloha Exp $	*/
+/*	$OpenBSD: cpuconf.h,v 1.9 2025/06/29 15:55:21 miod Exp $	*/
 /*	$NetBSD: cpuconf.h,v 1.12 2000/06/08 03:10:06 thorpej Exp $	*/
 
 /*
@@ -42,13 +42,11 @@
  * Platform Specific Information and Function Hooks.
  *
  * The tags family and model information are strings describing the platform.
- * 
+ *
  * The tag iobus describes the primary iobus for the platform- primarily
  * to give a hint as to where to start configuring. The likely choices
  * are one of tcasic, lca, apecs, cia, or tlsb.
  */
-
-struct clockframe;
 
 struct platform {
 	/*

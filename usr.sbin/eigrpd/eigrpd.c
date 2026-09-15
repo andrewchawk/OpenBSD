@@ -1,4 +1,4 @@
-/*	$OpenBSD: eigrpd.c,v 1.29 2023/03/08 04:43:13 guenther Exp $ */
+/*	$OpenBSD: eigrpd.c,v 1.40 2026/09/09 00:59:24 deraadt Exp $ */
 
 /*
  * Copyright (c) 2015 Renato Westphal <renato@openbsd.org>
@@ -99,7 +99,7 @@ int
 main(int argc, char *argv[])
 {
 	struct event		 ev_sigint, ev_sigterm, ev_sighup;
-	char			*saved_argv0;
+	char			 execpath[PATH_MAX];
 	int			 ch;
 	int			 debug = 0, rflag = 0, eflag = 0;
 	int			 ipforwarding;
@@ -115,10 +115,6 @@ main(int argc, char *argv[])
 
 	log_init(1);	/* log to stderr until daemonized */
 	log_verbose(1);
-
-	saved_argv0 = argv[0];
-	if (saved_argv0 == NULL)
-		saved_argv0 = "eigrpd";
 
 	while ((ch = getopt(argc, argv, "dD:f:ns:vRE")) != -1) {
 		switch (ch) {
@@ -155,6 +151,9 @@ main(int argc, char *argv[])
 			/* NOTREACHED */
 		}
 	}
+
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	argc -= optind;
 	argv += optind;
@@ -219,9 +218,9 @@ main(int argc, char *argv[])
 		fatal("socketpair");
 
 	/* start children */
-	rde_pid = start_child(PROC_RDE_ENGINE, saved_argv0, pipe_parent2rde[1],
+	rde_pid = start_child(PROC_RDE_ENGINE, execpath, pipe_parent2rde[1],
 	    debug, global.cmd_opts & EIGRPD_OPT_VERBOSE, NULL);
-	eigrpe_pid = start_child(PROC_EIGRP_ENGINE, saved_argv0,
+	eigrpe_pid = start_child(PROC_EIGRP_ENGINE, execpath,
 	    pipe_parent2eigrpe[1], debug, global.cmd_opts & EIGRPD_OPT_VERBOSE,
 	    sockname);
 
@@ -240,9 +239,13 @@ main(int argc, char *argv[])
 	if ((iev_eigrpe = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_rde = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_eigrpe->ibuf, pipe_parent2eigrpe[0]);
+	if (imsgbuf_init(&iev_eigrpe->ibuf, pipe_parent2eigrpe[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_eigrpe->ibuf);
 	iev_eigrpe->handler = main_dispatch_eigrpe;
-	imsg_init(&iev_rde->ibuf, pipe_parent2rde[0]);
+	if (imsgbuf_init(&iev_rde->ibuf, pipe_parent2rde[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_rde->ibuf);
 	iev_rde->handler = main_dispatch_rde;
 
 	/* setup event handler */
@@ -284,9 +287,9 @@ eigrpd_shutdown(void)
 	int		 status;
 
 	/* close pipes */
-	msgbuf_clear(&iev_eigrpe->ibuf.w);
+	imsgbuf_clear(&iev_eigrpe->ibuf);
 	close(iev_eigrpe->ibuf.fd);
-	msgbuf_clear(&iev_rde->ibuf.w);
+	imsgbuf_clear(&iev_rde->ibuf);
 	close(iev_rde->ibuf.fd);
 
 	kr_shutdown();
@@ -312,7 +315,7 @@ eigrpd_shutdown(void)
 }
 
 static pid_t
-start_child(enum eigrpd_process p, char *argv0, int fd, int debug, int verbose,
+start_child(enum eigrpd_process p, char *execpath, int fd, int debug, int verbose,
     char *sockname)
 {
 	char	*argv[7];
@@ -335,7 +338,7 @@ start_child(enum eigrpd_process p, char *argv0, int fd, int debug, int verbose,
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	switch (p) {
 	case PROC_MAIN:
 		fatalx("Can not start main process");
@@ -356,8 +359,8 @@ start_child(enum eigrpd_process p, char *argv0, int fd, int debug, int verbose,
 	}
 	argv[argc++] = NULL;
 
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 /* imsg handling */
@@ -367,28 +370,28 @@ main_dispatch_eigrpe(int fd, short event, void *bula)
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -417,9 +420,11 @@ main_dispatch_eigrpe(int fd, short event, void *bula)
 				log_warnx("IFINFO request with wrong len");
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by eigrpe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warnx("%s: wrong imsg len", __func__);
+			else
+				log_verbose(verbose);
 			break;
 		default:
 			log_debug("%s: error handling imsg %d", __func__,
@@ -443,28 +448,28 @@ main_dispatch_rde(int fd, short event, void *bula)
 	struct imsgev	*iev = bula;
 	struct imsgbuf  *ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 shut = 0;
+	int		 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
-
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)
 			break;
 
@@ -520,7 +525,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);

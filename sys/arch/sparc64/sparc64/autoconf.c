@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.151 2024/05/17 20:05:08 miod Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.156 2026/06/24 19:57:11 miod Exp $	*/
 /*	$NetBSD: autoconf.c,v 1.51 2001/07/24 19:32:11 eeh Exp $ */
 
 /*
@@ -519,7 +519,7 @@ bootpath_build(void)
 				 * be an ethernet media specification, so be
 				 * sure to skip all letters.
 				 */
-				bp->val[2] = *++cp - 'a';
+				bp->val[2] = DL_PARTNAME2NUM(*++cp);
 				while (*cp != '\0' && *cp != '/')
 					cp++;
 			}
@@ -605,15 +605,14 @@ bootpath_print(struct bootpath *bp)
 		else
 			printf("/%s@%lx,%lx", bp->name, bp->val[0], bp->val[1]);
 		if (bp->val[2] != 0)
-			printf(":%c", (int)bp->val[2] + 'a');
+			printf(":%c", DL_PARTNUM2NAME((int)bp->val[2]));
 		bp++;
 	}
 	printf("\n");
 }
 
-
 /*
- * save or read a bootpath pointer from the boothpath store.
+ * save or read a bootpath pointer from the bootpath store.
  *
  * XXX. required because of SCSI... we don't have control over the "sd"
  * device, so we can't set boot device there.   we patch in with
@@ -1253,9 +1252,19 @@ checkstatus(int node)
 	 * it will mark it with "fail" or "fail-xxx", where "xxx" is
 	 * additional human-readable information about the particular
 	 * fault-condition.
+	 *
+	 * But we will nevertheless attach failed clocks, in order to
+	 * invoke todr_attach on the right device, so as not to attach
+	 * prtc on systems where it wouldn't work (and then complain that
+	 * "unix-gettod?" is not available).
 	 */
-	if (strcmp(buf, "disabled") == 0 || strncmp(buf, "fail", 4) == 0)
+	if (strcmp(buf, "disabled") == 0)
 		return 0;
+	if (strncmp(buf, "fail", 4) == 0) {
+		if (OF_getprop(node, "name", buf, sizeof(buf)) <= 0 ||
+		    strcmp(buf, "eeprom") != 0)
+			return 0;
+	}
 
 	return 1;
 }
@@ -1471,7 +1480,8 @@ device_register(struct device *dev, void *aux)
 		struct ata_atapi_attach *aa = aux;
 		u_int channel, drive;
 
-		if (strcmp(bp->name, "ata") == 0 &&
+		if ((strcmp(bp->name, "ata") == 0 ||
+		    strcmp(bp->name, "ide") == 0) &&
 		    bp->val[0] == aa->aa_channel) {
 			channel = bp->val[0]; bp++;
 			drive = bp->val[0];

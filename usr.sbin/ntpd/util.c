@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.28 2023/12/20 15:36:36 otto Exp $ */
+/*	$OpenBSD: util.c,v 1.31 2026/09/10 15:06:22 deraadt Exp $ */
 
 /*
  * Copyright (c) 2004 Alexander Guy <alexander.guy@andern.org>
@@ -18,6 +18,7 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,15 +74,21 @@ getmonotime(void)
 }
 
 
-void
+int
 d_to_tv(double d, struct timeval *tv)
 {
+	/* this assumes a 64 bit time_t */
+	if (!isfinite(d) || d > (double)LLONG_MAX || d < (double)LLONG_MIN)
+		return (-1);
+
 	tv->tv_sec = d;
 	tv->tv_usec = (d - tv->tv_sec) * 1000000;
 	while (tv->tv_usec < 0) {
 		tv->tv_usec += 1000000;
 		tv->tv_sec -= 1;
 	}
+
+	return (0);
 }
 
 double
@@ -142,7 +149,7 @@ d_to_sfp(double d)
 char *
 print_rtable(int r)
 {
-	static char b[11];
+	static char b[19];
 
 	b[0] = 0;
 	if (r > 0)
@@ -172,7 +179,7 @@ log_ntp_addr(struct ntp_addr *addr)
 }
 
 pid_t
-start_child(char *pname, int cfd, int argc, char **argv)
+start_child(char *pname, int cfd, char *execpath, int argc, char **argv)
 {
 	char		**nargv;
 	int		  nargc, i;
@@ -207,8 +214,8 @@ start_child(char *pname, int cfd, int argc, char **argv)
 		} else if (fcntl(cfd, F_SETFD, 0) == -1)
 			fatal("fcntl");
 
-		execvp(argv[0], nargv);
-		fatal("%s: execvp", __func__);
+		execv(execpath, nargv);
+		fatal("%s: execv", __func__);
 		break;
 
 	default:

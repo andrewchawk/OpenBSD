@@ -71,7 +71,6 @@
 #else
 #  include "mini_event.h"
 #endif
-#include "remote.h"
 #include "util.h"
 #include "xfrd.h"
 #include "xfrd-catalog-zones.h"
@@ -81,6 +80,12 @@
 #include "options.h"
 #include "difffile.h"
 #include "ipc.h"
+#include "remote.h"
+#include "rdata.h"
+
+#ifdef USE_METRICS
+#include "metrics.h"
+#endif /* USE_METRICS */
 
 #ifdef HAVE_SYS_TYPES_H
 #  include <sys/types.h>
@@ -221,11 +226,6 @@ remote_accept_callback(int fd, short event, void* arg);
 static void
 remote_control_callback(int fd, short event, void* arg);
 
-#ifdef BIND8_STATS
-/* process the statistics and output them */
-static void process_stats(RES* ssl, xfrd_state_type* xfrd, int peek);
-#endif
-
 /** ---- end of private defines ---- **/
 
 #ifdef HAVE_SSL
@@ -247,7 +247,7 @@ log_crypto_err(const char* str)
 
 #ifdef BIND8_STATS
 /** subtract timers and the values do not overflow or become negative */
-static void
+void
 timeval_subtract(struct timeval* d, const struct timeval* end, 
 	const struct timeval* start)
 {
@@ -1043,6 +1043,7 @@ print_zonestatus(RES* ssl, xfrd_state_type* xfrd, struct zone_options* zo)
 			return 0;
 	}
 	if(zone_is_catalog_consumer(zo)) {
+		uint32_t serial = 0;
 		zone_type* zone = namedb_find_zone(xfrd->nsd->db,
 				(const dname_type*)zo->node.key);
 		struct xfrd_catalog_consumer_zone* consumer_zone =
@@ -1052,13 +1053,14 @@ print_zonestatus(RES* ssl, xfrd_state_type* xfrd, struct zone_options* zo)
 
 		if(!ssl_printf(ssl, "	catalog: consumer"))
 			return 0;
-		if(zone && zone->soa_rrset && zone->soa_rrset->rrs
-		&& zone->soa_rrset->rrs[0].rdata_count > 2
-		&& rdata_atom_size(zone->soa_rrset->rrs[0].rdatas[2]) ==
-							sizeof(uint32_t)) {
+		if(zone && zone->soa_rrset
+#ifndef PACKED_STRUCTS
+		&& zone->soa_rrset->rrs
+#endif
+		&& retrieve_soa_rdata_serial(zone->soa_rrset->rrs[0],
+			&serial)) {
 			if(!ssl_printf(ssl, " (serial: %u, # members: %zu)\n",
-					read_uint32(rdata_atom_data(
-					zone->soa_rrset->rrs[0].rdatas[2])),
+					serial,
 					  consumer_zone
 					? consumer_zone->member_ids.count : 0))
 				return 0;
@@ -1123,8 +1125,13 @@ print_zonestatus(RES* ssl, xfrd_state_type* xfrd, struct zone_options* zo)
 		return 1;
 	}
 	if(!ssl_printf(ssl, "	state: %s\n",
-		(xz->state == xfrd_zone_ok)?"ok":(
-		(xz->state == xfrd_zone_expired)?"expired":"refreshing")))
+	     xz->state == xfrd_zone_expired                  ? "expired"
+	   : xz->state != xfrd_zone_ok                       ? "refreshing"
+	   : !xz->soa_nsd_acquired || !xz->soa_disk_acquired
+	   || xz->soa_nsd.serial   ==  xz->soa_disk.serial   ? "ok"
+	   : compare_serial( ntohl(xz->soa_nsd.serial)
+	                   , ntohl(xz->soa_disk.serial)) < 0 ? "old-serial"
+	                                                     : "future-serial"))
 		return 0;
 	if(!print_soa_status(ssl, "served-serial", &xz->soa_nsd,
 		xz->soa_nsd_acquired))
@@ -1266,7 +1273,7 @@ static void
 do_stats(RES* ssl, xfrd_state_type* xfrd, int peek)
 {
 #ifdef BIND8_STATS
-	process_stats(ssl, xfrd, peek);
+	process_stats(ssl, NULL, xfrd, peek);
 #else
 	(void)xfrd; (void)peek;
 	(void)ssl_printf(ssl, "error no stats enabled at compile time\n");
@@ -1755,7 +1762,104 @@ add_pat(xfrd_state_type* xfrd, struct pattern_options* p)
 	xfrd_set_reload_now(xfrd);
 }
 
-/** interrupt zones that are using changed or removed patterns */
+/** check if a zone's transfer configuration has actually changed */
+static int
+zone_transfer_config_changed(xfrd_zone_type* xz, struct pattern_options* oldp, struct pattern_options* newp)
+{
+	/* If pattern doesn't exist in new config, we must interrupt */
+	if(!newp) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: pattern removed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	/* Check if request_xfr ACL list has changed */
+	/* This also tests for TSIG key name changes. */
+	if(!acl_list_equal(oldp->request_xfr, newp->request_xfr)) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: request_xfr ACL changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	/* Check if other transfer-related settings have changed */
+	if(oldp->size_limit_xfr != newp->size_limit_xfr) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: size_limit_xfr changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	if(oldp->allow_axfr_fallback != newp->allow_axfr_fallback) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: allow_axfr_fallback changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	if(oldp->max_refresh_time != newp->max_refresh_time) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: max_refresh_time changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	if(oldp->min_refresh_time != newp->min_refresh_time) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: min_refresh_time changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	if(oldp->max_retry_time != newp->max_retry_time) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: max_retry_time changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	if(oldp->min_retry_time != newp->min_retry_time) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: min_retry_time changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+	
+	if(oldp->min_expire_time != newp->min_expire_time) {
+		VERBOSITY(1, (LOG_INFO, "zone %s: min_expire_time changed, interrupting transfer", 
+			xz->zone_options->name));
+		return 1;
+	}
+
+	/* No significant changes detected */
+	/* Suppress logging when no changes detected to reduce log noise */
+	return 0;
+}
+
+/** check if a zone's notify configuration has actually changed */
+static int
+zone_notify_config_changed(struct notify_zone* nz, struct pattern_options* oldp, struct pattern_options* newp)
+{
+	/* If pattern doesn't exist in new config, we must interrupt */
+	if(!newp) {
+		VERBOSITY(1, (LOG_INFO, "notify zone %s: pattern removed, interrupting notify", 
+			nz->options->name));
+		return 1;
+	}
+	
+	/* Check if notify ACL list has changed */
+	/* This also tests for TSIG key name changes. */
+	if(!acl_list_equal(oldp->notify, newp->notify)) {
+		VERBOSITY(1, (LOG_INFO, "notify zone %s: notify ACL changed, interrupting notify", 
+			nz->options->name));
+		return 1;
+	}
+	
+	/* Check if notify-related settings have changed */
+	if(oldp->notify_retry != newp->notify_retry) {
+		VERBOSITY(1, (LOG_INFO, "notify zone %s: notify_retry changed, interrupting notify", 
+			nz->options->name));
+		return 1;
+	}
+
+	/* No significant changes detected */
+	/* Suppress logging when no changes detected to reduce log noise */
+	return 0;
+}
+
 static void
 repat_interrupt_zones(xfrd_state_type* xfrd, struct nsd_options* newopt)
 {
@@ -1769,8 +1873,9 @@ repat_interrupt_zones(xfrd_state_type* xfrd, struct nsd_options* newopt)
 		struct pattern_options* oldp = xz->zone_options->pattern;
 		struct pattern_options* newp = pattern_options_find(newopt,
 			oldp->pname);
-		if(!newp || !acl_list_equal(oldp->request_xfr,
-			newp->request_xfr)) {
+		
+		/* Only interrupt if the zone's transfer configuration has actually changed */
+		if(zone_transfer_config_changed(xz, oldp, newp)) {
 			/* interrupt transfer */
 			if(xz->tcp_conn != -1) {
 				xfrd_tcp_release(xfrd->tcp_set, xz);
@@ -1793,7 +1898,9 @@ repat_interrupt_zones(xfrd_state_type* xfrd, struct nsd_options* newopt)
 		struct pattern_options* oldp = nz->options->pattern;
 		struct pattern_options* newp = pattern_options_find(newopt,
 			oldp->pname);
-		if(!newp || !acl_list_equal(oldp->notify, newp->notify)) {
+		
+		/* Only interrupt if the zone's notify configuration has actually changed */
+		if(zone_notify_config_changed(nz, oldp, newp)) {
 			/* interrupt notify */
 			if(nz->notify_send_enable) {
 				notify_disable(nz);
@@ -1886,7 +1993,7 @@ repat_patterns(xfrd_state_type* xfrd, struct nsd_options* newopt)
 				const dname_type* dname =
 					parse_implicit_name(xfrd, p->pname);
 				if (dname) {
-					if (newstate & REPAT_SLAVE) {
+					if ((newstate & REPAT_SLAVE)) {
 						struct zone_options* zopt =
 							zone_options_find(
 							oldopt, dname);
@@ -1894,11 +2001,11 @@ repat_patterns(xfrd_state_type* xfrd, struct nsd_options* newopt)
 							xfrd_init_slave_zone(
 								xfrd, zopt);
 						}
-					} else if (newstate & REPAT_MASTER) {
+					} else if ((newstate & REPAT_MASTER)) {
 						xfrd_del_slave_zone(xfrd,
 							dname);
 					}
-					if (newstate & REPAT_CATALOG_CONSUMER) {
+					if ((newstate & REPAT_CATALOG_CONSUMER)) {
 						struct zone_options* zopt =
 							zone_options_find(
 							oldopt, dname);
@@ -1906,7 +2013,7 @@ repat_patterns(xfrd_state_type* xfrd, struct nsd_options* newopt)
 							xfrd_init_catalog_consumer_zone(
 								xfrd, zopt);
 						}
-					} else if (newstate & REPAT_CATALOG_CONSUMER_DEINIT) {
+					} else if ((newstate & REPAT_CATALOG_CONSUMER_DEINIT)) {
 						xfrd_deinit_catalog_consumer_zone(
 								xfrd, dname);
 					}
@@ -1928,19 +2035,19 @@ repat_patterns(xfrd_state_type* xfrd, struct nsd_options* newopt)
 		RBTREE_FOR(zone_opt, struct zone_options*, oldopt->zone_options) {
 			struct pattern_options* oldp = zone_opt->pattern;
 			if (!oldp->implicit) {
-				if (oldp->xfrd_flags & REPAT_SLAVE) {
+				if ((oldp->xfrd_flags & REPAT_SLAVE)) {
 					/* xfrd needs stable reference so get
 					 * it from the oldopt(modified) tree */
 					xfrd_init_slave_zone(xfrd, zone_opt);
-				} else if (oldp->xfrd_flags & REPAT_MASTER) {
+				} else if ((oldp->xfrd_flags & REPAT_MASTER)) {
 					xfrd_del_slave_zone(xfrd,
 						(const dname_type*)
 						zone_opt->node.key);
 				}
-				if (oldp->xfrd_flags & REPAT_CATALOG_CONSUMER) {
+				if ((oldp->xfrd_flags & REPAT_CATALOG_CONSUMER)) {
 					xfrd_init_catalog_consumer_zone(xfrd,
 							zone_opt);
-				} else if (oldp->xfrd_flags & REPAT_CATALOG_CONSUMER_DEINIT) {
+				} else if ((oldp->xfrd_flags & REPAT_CATALOG_CONSUMER_DEINIT)) {
 					xfrd_deinit_catalog_consumer_zone(xfrd,
 						(const dname_type*)
 						zone_opt->node.key);
@@ -1969,19 +2076,64 @@ repat_options_changed(xfrd_state_type* xfrd, struct nsd_options* newopt)
 	return 0;
 }
 
+static int opt_str_changed(const char* old, const char* new)
+{ return !old ? ( !new ? 0 : 1 ) : ( !new ? 1 : strcasecmp(old, new) ); }
+
+/** true if cookie options are different that can be set via repat. */
+static int
+repat_cookie_options_changed(struct nsd_options* old, struct nsd_options* new)
+{
+	return old->answer_cookie != new->answer_cookie
+	    || opt_str_changed( old->cookie_secret
+	                      , new->cookie_secret)
+	    || opt_str_changed( old->cookie_staging_secret
+	                      , new->cookie_staging_secret)
+	    || old->cookie_secret_file_is_default !=
+	       new->cookie_secret_file_is_default
+	    || opt_str_changed( old->cookie_secret_file
+	                      , new->cookie_secret_file);
+}
+
 /** check if global options have changed */
 static void
 repat_options(xfrd_state_type* xfrd, struct nsd_options* newopt)
 {
+	struct nsd_options* oldopt = xfrd->nsd->options;
+
 	if(repat_options_changed(xfrd, newopt)) {
 		/* update our options */
 #ifdef RATELIMIT
-		xfrd->nsd->options->rrl_ratelimit = newopt->rrl_ratelimit;
-		xfrd->nsd->options->rrl_whitelist_ratelimit = newopt->rrl_whitelist_ratelimit;
-		xfrd->nsd->options->rrl_slip = newopt->rrl_slip;
+		oldopt->rrl_ratelimit = newopt->rrl_ratelimit;
+		oldopt->rrl_whitelist_ratelimit = newopt->rrl_whitelist_ratelimit;
+		oldopt->rrl_slip = newopt->rrl_slip;
 #endif
 		task_new_opt_change(xfrd->nsd->task[xfrd->nsd->mytask],
 			xfrd->last_task, newopt);
+		xfrd_set_reload_now(xfrd);
+	}
+	if(repat_cookie_options_changed(oldopt, newopt)) {
+		/* update our options */
+		oldopt->answer_cookie = newopt->answer_cookie;
+		region_str_replace(  oldopt->region
+		                  , &oldopt->cookie_secret
+		                  ,  newopt->cookie_secret);
+		region_str_replace(  oldopt->region
+		                  , &oldopt->cookie_staging_secret
+		                  ,  newopt->cookie_staging_secret);
+		oldopt->cookie_secret_file_is_default =
+			newopt->cookie_secret_file_is_default;
+		region_str_replace(  oldopt->region
+		                  , &oldopt->cookie_secret_file
+		                  ,  newopt->cookie_secret_file);
+
+		xfrd->nsd->cookie_count = 0;
+		xfrd->nsd->cookie_secrets_source = COOKIE_SECRETS_NONE;
+		reconfig_cookies(xfrd->nsd, newopt);
+		task_new_cookies( xfrd->nsd->task[xfrd->nsd->mytask]
+		                , xfrd->last_task
+		                , xfrd->nsd->do_answer_cookie
+		                , xfrd->nsd->cookie_count
+		                , xfrd->nsd->cookie_secrets);
 		xfrd_set_reload_now(xfrd);
 	}
 }
@@ -2004,6 +2156,7 @@ do_repattern(RES* ssl, xfrd_state_type* xfrd)
 	region_type* region = region_create(xalloc, free);
 	struct nsd_options* opt;
 	const char* cfgfile = xfrd->nsd->options->configfile;
+	int reload_needed_before = xfrd->need_to_send_reload;
 
 	/* check chroot and configfile, if possible to reread */
 	if(xfrd->nsd->chrootdir) {
@@ -2034,8 +2187,57 @@ do_repattern(RES* ssl, xfrd_state_type* xfrd)
 	repat_patterns(xfrd, opt);
 	repat_options(xfrd, opt);
 	zonestat_inc_ifneeded(xfrd);
+	
+	/* Check if any changes were actually made by comparing reload state */
+	if(xfrd->need_to_send_reload == reload_needed_before) {
+		(void)ssl_printf(ssl, "reconfig completed: no changes detected\n");
+	} else {
+		(void)ssl_printf(ssl, "reconfig completed: changes applied\n");
+	}
 	send_ok(ssl);
 	region_destroy(region);
+}
+
+static void print_cfg_err(void *unused, const char *message)
+{
+	(void)unused;
+	log_msg(LOG_ERR, "%s", message);
+}
+
+/* mostly identical to do_repattern */
+void xfrd_reload_config(xfrd_state_type *xfrd)
+{
+	const char *chrootdir = xfrd->nsd->chrootdir;
+	const char *file = xfrd->nsd->options->configfile;
+	region_type* region;
+	struct nsd_options* options;
+
+	if (chrootdir && !file_inside_chroot(file, chrootdir))
+	{
+		log_msg(LOG_ERR, "%s is not relative to %s: %s",
+			xfrd->nsd->options->configfile, xfrd->nsd->chrootdir,
+			"chroot prevents reread of config");
+		goto error_chroot;
+	}
+
+	region = region_create(xalloc, free);
+	options = nsd_options_create(region);
+
+	if (!parse_options_file(
+		options, file, print_cfg_err, NULL, xfrd->nsd->options))
+	{
+		goto error_parse;
+	}
+
+	repat_keys(xfrd, options);
+	repat_patterns(xfrd, options); /* adds/deletes zones too */
+	repat_options(xfrd, options);
+	zonestat_inc_ifneeded(xfrd);
+
+error_parse:
+	region_destroy(region);
+error_chroot:
+	return;
 }
 
 /** do the serverpid command: printout pid of server process */
@@ -2205,6 +2407,7 @@ do_assoc_tsig(RES* ssl, xfrd_state_type* xfrd, char* arg)
 	char* arg2 = NULL;
 	struct zone_options* zone;
 	struct key_options* key_opt;
+	struct xfrd_zone* xzone;
 
 	if(*arg == '\0') {
 		(void)ssl_printf(ssl, "error: missing argument (zonename)\n");
@@ -2225,6 +2428,23 @@ do_assoc_tsig(RES* ssl, xfrd_state_type* xfrd, char* arg)
 	if(!key_opt) {
 		(void)ssl_printf(ssl, "error: key: %s does not exist\n", arg2);
 		return;
+	}
+
+	/* Abort any in-flight transfer for this zone before mutating its ACL
+	 * so that xfr->tsig stays consistent with zone->master->key_options. */
+	xzone = xfrd_find_zone(xfrd, (dname_type*)zone->node.key);
+	if(xzone && xzone->tcp_conn != -1) {
+		xfrd_tcp_release(xfrd->tcp_set, xzone);
+		/* probe the current target again, if possible. */
+		if(xzone->next_master == -1)
+			xzone->next_master = xzone->master_num;
+		xfrd_set_refresh_now(xzone);
+	} else if(xzone && xzone->zone_handler.ev_fd != -1) {
+		/* Also UDP can use the TSIG for signature. */
+		xfrd_udp_release(xzone);
+		if(xzone->next_master == -1)
+			xzone->next_master = xzone->master_num;
+		xfrd_set_refresh_now(xzone);
 	}
 
 	zopt_set_acl_to_tsig(zone->pattern->allow_notify, region, arg2,
@@ -2274,11 +2494,21 @@ do_del_tsig(RES* ssl, xfrd_state_type* xfrd, char* arg) {
 	}
 	RBTREE_FOR(zone, struct zone_options*, xfrd->nsd->options->zone_options)
 	{
+		xfrd_zone_type* xzone;
 		if(acl_contains_tsig_key(zone->pattern->allow_notify, arg) ||
 		   acl_contains_tsig_key(zone->pattern->notify, arg) ||
 		   acl_contains_tsig_key(zone->pattern->request_xfr, arg) ||
 		   acl_contains_tsig_key(zone->pattern->provide_xfr, arg) ||
 		   acl_contains_tsig_key(zone->pattern->allow_query, arg)) {
+			if(!ssl_printf(ssl, "zone %s uses key %s\n",
+				zone->name, arg))
+				return;
+			used_key = 1;
+			break;
+		}
+		xzone = xfrd_find_zone(xfrd, (dname_type*)zone->node.key);
+		if(xzone && xzone->latest_xfr &&
+			xzone->latest_xfr->tsig.key == key_opt->tsig_key) {
 			if(!ssl_printf(ssl, "zone %s uses key %s\n",
 				zone->name, arg))
 				return;
@@ -2298,19 +2528,42 @@ do_del_tsig(RES* ssl, xfrd_state_type* xfrd, char* arg) {
 	send_ok(ssl);
 }
 
+
+static int
+can_dump_cookie_secrets(RES* ssl, nsd_type* const nsd)
+{
+	if(!nsd->options->cookie_secret_file)
+		(void)ssl_printf(ssl, "error: empty cookie-secret-file\n");
+
+	else if(nsd->cookie_secrets_source == COOKIE_SECRETS_FROM_CONFIG)
+		(void)ssl_printf(ssl, "error: cookie secrets are already "
+			"configured. Remove \"cookie-secret:\" and "
+			"\"cookie-staging-secret:\" entries from configuration "
+			"first (and reconfig) before managing cookies with "
+			"nsd-control\n");
+	else
+		return 1;
+	return 0;
+	
+}
+
 /* returns `0` on failure */
 static int
-cookie_secret_file_dump(RES* ssl, nsd_type const* nsd) {
-	char const* secret_file = nsd->options->cookie_secret_file;
+cookie_secret_file_dump_and_reload(RES* ssl, nsd_type* const nsd) {
 	char secret_hex[NSD_COOKIE_SECRET_SIZE * 2 + 1];
 	FILE* f;
 	size_t i;
-	assert( secret_file != NULL );
 
 	/* open write only and truncate */
-	if((f = fopen(secret_file, "w")) == NULL ) {
-		(void)ssl_printf(ssl, "unable to open cookie secret file %s: %s",
-		                 secret_file, strerror(errno));
+	if(!nsd->options->cookie_secret_file) {
+		(void)ssl_printf(ssl, "cookie-secret-file empty\n");
+		return 0;
+	}
+	else if((f = fopen(nsd->options->cookie_secret_file, "w")) == NULL ) {
+		(void)ssl_printf( ssl
+		                , "unable to open cookie secret file %s: %s\n"
+		                , nsd->options->cookie_secret_file
+		                , strerror(errno));
 		return 0;
 	}
 	for(i = 0; i < nsd->cookie_count; i++) {
@@ -2324,65 +2577,77 @@ cookie_secret_file_dump(RES* ssl, nsd_type const* nsd) {
 	}
 	explicit_bzero(secret_hex, sizeof(secret_hex));
 	fclose(f);
+	nsd->cookie_secrets_source = COOKIE_SECRETS_FROM_FILE;
+	region_str_replace(nsd->region, &nsd->cookie_secrets_filename
+	                              , nsd->options->cookie_secret_file);
+	task_new_cookies(xfrd->nsd->task[xfrd->nsd->mytask], xfrd->last_task,
+		nsd->do_answer_cookie, nsd->cookie_count, nsd->cookie_secrets);
+	xfrd_set_reload_now(xfrd);
+	send_ok(ssl);
 	return 1;
 }
 
 static void
 do_activate_cookie_secret(RES* ssl, xfrd_state_type* xrfd, char* arg) {
 	nsd_type* nsd = xrfd->nsd;
+	size_t backup_cookie_count;
+	cookie_secrets_type backup_cookie_secrets;
 	(void)arg;
+
+	if(!can_dump_cookie_secrets(ssl, xfrd->nsd))
+		return;
 
 	if(nsd->cookie_count <= 1 ) {
 		(void)ssl_printf(ssl, "error: no staging cookie secret to activate\n");
 		return;
 	}
-	if(!nsd->options->cookie_secret_file || !nsd->options->cookie_secret_file[0]) {
-		(void)ssl_printf(ssl, "error: no cookie secret file configured\n");
-		return;
-	}
-	if(!cookie_secret_file_dump(ssl, nsd)) {
-		(void)ssl_printf(ssl, "error: writing to cookie secret file: \"%s\"\n",
-				nsd->options->cookie_secret_file);
-		return;
-	}
+	backup_cookie_count = nsd->cookie_count;
+	memcpy( backup_cookie_secrets, nsd->cookie_secrets
+	      , sizeof(cookie_secrets_type));
 	activate_cookie_secret(nsd);
-	(void)cookie_secret_file_dump(ssl, nsd);
-	task_new_activate_cookie_secret(xfrd->nsd->task[xfrd->nsd->mytask],
-	    xfrd->last_task);
-	xfrd_set_reload_now(xfrd);
-	send_ok(ssl);
+	if(!cookie_secret_file_dump_and_reload(ssl, nsd)) {
+		memcpy( nsd->cookie_secrets, backup_cookie_secrets
+		      , sizeof(cookie_secrets_type));
+		nsd->cookie_count = backup_cookie_count;
+	}
+	explicit_bzero(backup_cookie_secrets, sizeof(cookie_secrets_type));
 }
 
 static void
 do_drop_cookie_secret(RES* ssl, xfrd_state_type* xrfd, char* arg) {
 	nsd_type* nsd = xrfd->nsd;
+	size_t backup_cookie_count;
+	cookie_secrets_type backup_cookie_secrets;
 	(void)arg;
+
+	if(!can_dump_cookie_secrets(ssl, xfrd->nsd))
+		return;
 
 	if(nsd->cookie_count <= 1 ) {
 		(void)ssl_printf(ssl, "error: can not drop the currently active cookie secret\n");
 		return;
 	}
-	if(!nsd->options->cookie_secret_file || !nsd->options->cookie_secret_file[0]) {
-		(void)ssl_printf(ssl, "error: no cookie secret file configured\n");
-		return;
-	}
-	if(!cookie_secret_file_dump(ssl, nsd)) {
-		(void)ssl_printf(ssl, "error: writing to cookie secret file: \"%s\"\n",
-				nsd->options->cookie_secret_file);
-		return;
-	}
+	backup_cookie_count = nsd->cookie_count;
+	memcpy( backup_cookie_secrets, nsd->cookie_secrets
+	      , sizeof(cookie_secrets_type));
 	drop_cookie_secret(nsd);
-	(void)cookie_secret_file_dump(ssl, nsd);
-	task_new_drop_cookie_secret(xfrd->nsd->task[xfrd->nsd->mytask],
-	    xfrd->last_task);
-	xfrd_set_reload_now(xfrd);
-	send_ok(ssl);
+	if(!cookie_secret_file_dump_and_reload(ssl, nsd)) {
+		memcpy( nsd->cookie_secrets, backup_cookie_secrets
+		      , sizeof(cookie_secrets_type));
+		nsd->cookie_count = backup_cookie_count;
+	}
+	explicit_bzero(backup_cookie_secrets, sizeof(cookie_secrets_type));
 }
 
 static void
 do_add_cookie_secret(RES* ssl, xfrd_state_type* xrfd, char* arg) {
 	nsd_type* nsd = xrfd->nsd;
 	uint8_t secret[NSD_COOKIE_SECRET_SIZE];
+	size_t backup_cookie_count;
+	cookie_secrets_type backup_cookie_secrets;
+
+	if(!can_dump_cookie_secrets(ssl, xfrd->nsd))
+		return;
 
 	if(*arg == '\0') {
 		(void)ssl_printf(ssl, "error: missing argument (cookie_secret)\n");
@@ -2401,27 +2666,26 @@ do_add_cookie_secret(RES* ssl, xfrd_state_type* xrfd, char* arg) {
 		(void)ssl_printf(ssl, "please provide a 128bit hex encoded secret\n");
 		return;
 	}
-	if(!nsd->options->cookie_secret_file || !nsd->options->cookie_secret_file[0]) {
-		explicit_bzero(secret, NSD_COOKIE_SECRET_SIZE);
-		explicit_bzero(arg, strlen(arg));
-		(void)ssl_printf(ssl, "error: no cookie secret file configured\n");
-		return;
-	}
-	if(!cookie_secret_file_dump(ssl, nsd)) {
-		explicit_bzero(secret, NSD_COOKIE_SECRET_SIZE);
-		explicit_bzero(arg, strlen(arg));
-		(void)ssl_printf(ssl, "error: writing to cookie secret file: \"%s\"\n",
-				nsd->options->cookie_secret_file);
-		return;
+	explicit_bzero(arg, strlen(arg));
+
+	backup_cookie_count = nsd->cookie_count;
+	memcpy( backup_cookie_secrets, nsd->cookie_secrets
+	      , sizeof(cookie_secrets_type));
+	if(nsd->cookie_secrets_source != COOKIE_SECRETS_FROM_FILE
+	&& nsd->cookie_secrets_source != COOKIE_SECRETS_FROM_CONFIG) {
+		nsd->cookie_count = 0;
 	}
 	add_cookie_secret(nsd, secret);
 	explicit_bzero(secret, NSD_COOKIE_SECRET_SIZE);
-	(void)cookie_secret_file_dump(ssl, nsd);
-	task_new_add_cookie_secret(xfrd->nsd->task[xfrd->nsd->mytask],
-	    xfrd->last_task, arg);
-	explicit_bzero(arg, strlen(arg));
-	xfrd_set_reload_now(xfrd);
-	send_ok(ssl);
+	if(!cookie_secret_file_dump_and_reload(ssl, nsd)) {
+		explicit_bzero(arg, strlen(arg));
+		(void)ssl_printf(ssl, "error: writing to cookie secret file: \"%s\"\n"
+		                , nsd->options->cookie_secret_file);
+		memcpy( nsd->cookie_secrets, backup_cookie_secrets
+		      , sizeof(cookie_secrets_type));
+		nsd->cookie_count = backup_cookie_count;
+	}
+	explicit_bzero(backup_cookie_secrets, sizeof(cookie_secrets_type));
 }
 
 static void
@@ -2431,7 +2695,27 @@ do_print_cookie_secrets(RES* ssl, xfrd_state_type* xrfd, char* arg) {
 	int i;
 	(void)arg;
 
-	/* (void)ssl_printf(ssl, "cookie_secret_count=%zu\n", nsd->cookie_count); */
+	switch(nsd->cookie_secrets_source){
+	case COOKIE_SECRETS_NONE:
+		break;
+	case COOKIE_SECRETS_GENERATED:
+		if(!ssl_printf(ssl, "source : random generated\n"))
+			return;
+		break;
+	case COOKIE_SECRETS_FROM_FILE:
+		if(!ssl_printf( ssl, "source : \"%s\"\n"
+		          , nsd->cookie_secrets_filename))
+			return;
+		break;
+	case COOKIE_SECRETS_FROM_CONFIG:
+		if(!ssl_printf(ssl, "source : configuration\n"))
+			return;
+		break;
+	default:
+		if(!ssl_printf(ssl, "source : unknown\n"))
+			return;
+		break;
+	}
 	for(i = 0; (size_t)i < nsd->cookie_count; i++) {
 		struct cookie_secret const* cs = &nsd->cookie_secrets[i];
 		ssize_t const len = hex_ntop(cs->cookie_secret, NSD_COOKIE_SECRET_SIZE,
@@ -2582,8 +2866,17 @@ handle_req(struct daemon_remote* rc, struct rc_state* s, RES* res)
 		(void)ssl_printf(res, "error version mismatch\n");
 		return;
 	}
-	/* always log control commands */
-	VERBOSITY(0, (LOG_INFO, "control cmd: %s", buf));
+	/* always log control command 'verbosity', others at 2, so
+	 * they can be squelched if needed. */
+	if(verbosity < 2) {
+		/* only the 'verbosity' command. */
+		if(strncmp(skipwhite(buf), "verbosity", 9) == 0) {
+			VERBOSITY(0, (LOG_INFO, "control cmd: %s", buf));
+		}
+	} else {
+		/* always log every control command. */
+		VERBOSITY(2, (LOG_INFO, "control cmd: %s", buf));
+	}
 
 	/* figure out what to do */
 	execute_cmd(rc, res, buf);
@@ -2669,7 +2962,11 @@ remote_control_callback(int fd, short event, void* arg)
 		VERBOSITY(3, (LOG_INFO, "unauthenticated remote control connection"));
 #ifdef HAVE_SSL
 	} else if(SSL_get_verify_result(s->ssl) == X509_V_OK) {
+#  ifdef HAVE_SSL_GET1_PEER_CERTIFICATE
+		X509* x = SSL_get1_peer_certificate(s->ssl);
+#  else
 		X509* x = SSL_get_peer_certificate(s->ssl);
+#  endif
 		if(!x) {
 			VERBOSITY(2, (LOG_INFO, "remote control connection "
 				"provided no client certificate"));
@@ -2698,7 +2995,7 @@ remote_control_callback(int fd, short event, void* arg)
 }
 
 #ifdef BIND8_STATS
-static const char*
+const char*
 opcode2str(int o)
 {
 	switch(o) {
@@ -2846,9 +3143,9 @@ resize_zonestat(xfrd_state_type* xfrd, size_t num)
 	xfrd->zonestat_clear_num = num;
 }
 
-static void
-zonestat_print(RES* ssl, xfrd_state_type* xfrd, int clear,
-	struct nsdst** zonestats)
+void
+zonestat_print(RES *ssl, struct evbuffer *evbuf, xfrd_state_type *xfrd,
+               int clear, struct nsdst **zonestats)
 {
 	struct zonestatname* n;
 	struct nsdst stat0, stat1;
@@ -2890,11 +3187,21 @@ zonestat_print(RES* ssl, xfrd_state_type* xfrd, int clear,
 		}
 
 		/* stat0 contains the details that we want to print */
-		if(!ssl_printf(ssl, "%s%snum.queries=%lu\n", name, ".",
-			(unsigned long)(stat0.qudp + stat0.qudp6 + stat0.ctcp +
-				stat0.ctcp6 + stat0.ctls + stat0.ctls6)))
-			return;
-		print_stat_block(ssl, name, ".", &stat0);
+		if (ssl) {
+			if(!ssl_printf(ssl, "%s%snum.queries=%lu\n", name, ".",
+				(unsigned long)(stat0.qudp + stat0.qudp6 + stat0.ctcp +
+					stat0.ctcp6 + stat0.ctls + stat0.ctls6)))
+				return;
+			print_stat_block(ssl, name, ".", &stat0);
+		}
+
+#ifdef USE_METRICS
+		if (evbuf) {
+			metrics_zonestat_print_one(evbuf, name, &stat0);
+		}
+#else
+		(void)evbuf;
+#endif /* USE_METRICS */
 	}
 }
 #endif /* USE_ZONE_STATS */
@@ -2954,16 +3261,14 @@ print_stats(RES* ssl, xfrd_state_type* xfrd, struct timeval* now, int clear,
 	if(!ssl_printf(ssl, "zone.slave=%lu\n", (unsigned long)xfrd->zones->count))
 		return;
 #ifdef USE_ZONE_STATS
-	zonestat_print(ssl, xfrd, clear, zonestats); /* per-zone statistics */
+	zonestat_print(ssl, NULL, xfrd, clear, zonestats); /* per-zone statistics */
 #else
 	(void)clear; (void)zonestats;
 #endif
 }
 
-/* allocate stats temp arrays, for taking a coherent snapshot of the
- * statistics values at that time. */
-static void
-process_stats_alloc(xfrd_state_type* xfrd, struct nsdst** stats,
+void
+process_stats_alloc(struct xfrd_state* xfrd, struct nsdst** stats,
 	struct nsdst** zonestats)
 {
 	*stats = xmallocarray(xfrd->nsd->child_count*2, sizeof(struct nsdst));
@@ -2975,9 +3280,8 @@ process_stats_alloc(xfrd_state_type* xfrd, struct nsdst** stats,
 #endif
 }
 
-/* grab a copy of the statistics, at this particular time. */
-static void
-process_stats_grab(xfrd_state_type* xfrd, struct timeval* stattime,
+void
+process_stats_grab(struct xfrd_state* xfrd, struct timeval* stattime,
 	struct nsdst* stats, struct nsdst** zonestats)
 {
 	if(gettimeofday(stattime, NULL) == -1)
@@ -2994,14 +3298,24 @@ process_stats_grab(xfrd_state_type* xfrd, struct timeval* stattime,
 #endif
 }
 
-/* add the old and new processes stat values into the first part of the
- * array of stats */
-static void
-process_stats_add_old_new(xfrd_state_type* xfrd, struct nsdst* stats)
+void
+process_stats_add_old_new(struct xfrd_state* xfrd, struct nsdst* stats)
 {
 	size_t i;
 	uint64_t dbd = stats[0].db_disk;
 	uint64_t dbm = stats[0].db_mem;
+	stc_type count1, count2;
+
+	/* Pick up the latest database memory use value. */
+	count1 = stats[0].reloadcount;
+	count2 = stats[xfrd->nsd->child_count+0].reloadcount;
+	/* This comparison allows roll over, the check is count2 > count1. */
+	if((count2 > count1 && count2-count1 < 0xffff) ||
+	   (count2 < count1 && count1-count2 > 0xffff)) {
+		dbd = stats[xfrd->nsd->child_count+0].db_disk;
+		dbm = stats[xfrd->nsd->child_count+0].db_mem;
+	}
+
 	/* The old and new server processes have separate stat blocks,
 	 * and these are added up together. This results in the statistics
 	 * values per server-child. The reload task briefly forks both
@@ -3013,9 +3327,8 @@ process_stats_add_old_new(xfrd_state_type* xfrd, struct nsdst* stats)
 	stats[0].db_mem = dbm;
 }
 
-/* manage clearing of stats, a cumulative count of cleared statistics */
-static void
-process_stats_manage_clear(xfrd_state_type* xfrd, struct nsdst* stats,
+void
+process_stats_manage_clear(struct xfrd_state* xfrd, struct nsdst* stats,
 	int peek)
 {
 	struct nsdst st;
@@ -3044,9 +3357,8 @@ process_stats_manage_clear(xfrd_state_type* xfrd, struct nsdst* stats,
 	}
 }
 
-/* add up the statistics to get the total over the server children. */
-static void
-process_stats_add_total(xfrd_state_type* xfrd, struct nsdst* total,
+void
+process_stats_add_total(struct xfrd_state* xfrd, struct nsdst* total,
 	struct nsdst* stats)
 {
 	size_t i;
@@ -3063,19 +3375,39 @@ process_stats_add_total(xfrd_state_type* xfrd, struct nsdst* total,
 	}
 }
 
-/* process the statistics and output them */
-static void
-process_stats(RES* ssl, xfrd_state_type* xfrd, int peek)
+void
+process_stats(RES* ssl, struct evbuffer *evbuf, struct xfrd_state* xfrd, int peek)
 {
 	struct timeval stattime;
 	struct nsdst* stats, *zonestats[2], total;
+
+	/* it only really makes sense for one to be used at a time and would
+	 * otherwise cause issues if peek is zero */
+	assert((ssl && !evbuf) || (!ssl && evbuf));
 
 	process_stats_alloc(xfrd, &stats, zonestats);
 	process_stats_grab(xfrd, &stattime, stats, zonestats);
 	process_stats_add_old_new(xfrd, stats);
 	process_stats_manage_clear(xfrd, stats, peek);
 	process_stats_add_total(xfrd, &total, stats);
-	print_stats(ssl, xfrd, &stattime, !peek, &total, zonestats);
+	if (ssl) {
+		print_stats(ssl, xfrd, &stattime, !peek, &total, zonestats);
+	}
+#ifdef USE_METRICS
+	if (evbuf) {
+		if (xfrd->nsd->options->control_enable) {
+			/* only pass in rc->stats_time if remote-conrol is enabled,
+			 * otherwise stats_time is uninitialized */
+			metrics_print_stats(evbuf, xfrd, &stattime, !peek, &total, zonestats,
+			                    &xfrd->nsd->rc->stats_time);
+		} else {
+			metrics_print_stats(evbuf, xfrd, &stattime, !peek, &total, zonestats,
+			                    NULL);
+		}
+	}
+#else
+	(void)evbuf;
+#endif /* USE_METRICS */
 	if(!peek) {
 		xfrd->nsd->rc->stats_time = stattime;
 	}
@@ -3131,7 +3463,7 @@ create_local_accept_sock(const char *path, int* noproto)
 		goto err;
 	}
 
-	if (listen(s, TCP_BACKLOG) == -1) {
+	if (listen(s, nsd.options->tcp_listen_queue) == -1) {
 		log_msg(LOG_ERR, "can't listen: %s", strerror(errno));
 		goto err;
 	}

@@ -28,6 +28,12 @@
 
 #include "bzlib_private.h"
 
+/*
+  Perl-specific change to allow building with C++
+  The 'register' keyword not allowed from C++17
+  see https://github.com/pmqs/Compress-Raw-Bzip2/issues/11
+*/
+#define register
 
 /*---------------------------------------------------*/
 /*--- Bit stream I/O                              ---*/
@@ -187,15 +193,15 @@ void generateMTFValues ( EState* s )
             zPend = 0;
          }
          {
-            UChar  rtmp;
-            UChar* ryy_j;
-            UChar  rll_i;
+            register UChar  rtmp;
+            register UChar* ryy_j;
+            register UChar  rll_i;
             rtmp  = yy[1];
             yy[1] = yy[0];
             ryy_j = &(yy[1]);
             rll_i = ll_i;
             while ( rll_i != rtmp ) {
-               UChar rtmp2;
+               register UChar rtmp2;
                ryy_j++;
                rtmp2  = rtmp;
                rtmp   = *ryy_j;
@@ -240,7 +246,8 @@ void sendMTFValues ( EState* s )
 {
    Int32 v, t, i, j, gs, ge, totc, bt, bc, iter;
    Int32 nSelectors, alphaSize, minLen, maxLen, selCtr;
-   Int32 nGroups, nBytes;
+   Int32 nGroups;
+   Int32 nBytes = 0;
 
    /*--
    UChar  len [BZ_N_GROUPS][BZ_MAX_ALPHA_SIZE];
@@ -259,6 +266,7 @@ void sendMTFValues ( EState* s )
    UInt16* mtfv = s->mtfv;
 
    ((void)nBytes); /* Silence variable ‘nBytes’ set but not used warning */
+   ((void)totc); /* Silence variable ‘totc’ set but not used warning */
    if (s->verbosity >= 3)
       VPrintf3( "      %d in block, %d after MTF & 1-2 coding, "
                 "%d+2 syms in use\n",
@@ -358,8 +366,8 @@ void sendMTFValues ( EState* s )
 
          if (nGroups == 6 && 50 == ge-gs+1) {
             /*--- fast track the common case ---*/
-            UInt32 cost01, cost23, cost45;
-            UInt16 icv;
+            register UInt32 cost01, cost23, cost45;
+            register UInt16 icv;
             cost01 = cost23 = cost45 = 0;
 
 #           define BZ_ITER(nn)                \

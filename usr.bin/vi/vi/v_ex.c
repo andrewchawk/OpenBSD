@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_ex.c,v 1.13 2016/01/06 22:28:52 millert Exp $	*/
+/*	$OpenBSD: v_ex.c,v 1.14 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -582,7 +582,7 @@ v_ecl_exec(SCR *sp)
 		msgq(sp, M_BERR, "No ex command to execute");
 		return (1);
 	}
-	
+
 	/* Push the command on the command stack. */
 	if (ex_run_str(sp, NULL, p, len, 0, 0))
 		return (1);

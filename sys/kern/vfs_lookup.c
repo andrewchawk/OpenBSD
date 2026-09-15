@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_lookup.c,v 1.88 2023/01/06 19:08:36 miod Exp $	*/
+/*	$OpenBSD: vfs_lookup.c,v 1.93 2026/05/21 02:20:53 deraadt Exp $	*/
 /*	$NetBSD: vfs_lookup.c,v 1.17 1996/02/09 19:00:59 christos Exp $	*/
 
 /*
@@ -315,6 +315,19 @@ badlink:
 		} else
 			cnp->cn_pnbuf[linklen] = '\0';
 		ndp->ni_pathlen += linklen;
+		if (cnp->cn_flags & BPU_LOCALTIME) {
+			/*
+			 * /etc/localtime can be a symbolic link
+			 * but must point into /usr/share/zoneinfo/
+			 * without ..
+			 */
+			if (checkzoneinfopath(cnp->cn_pnbuf) != 0) {
+				error = EACCES;
+				break;
+			}
+			cnp->cn_flags &= ~BPU_LOCALTIME;
+			cnp->cn_flags |= BPU_ZONEINFO;
+		}
 		vput(ndp->ni_vp);
 		dp = ndp->ni_dvp;
 		/*
@@ -408,7 +421,7 @@ vfs_lookup(struct nameidata *ndp)
 	ndp->ni_dvp = NULL;
 	cnp->cn_flags &= ~ISSYMLINK;
 	dp = ndp->ni_startdir;
-	ndp->ni_startdir = NULLVP;
+	ndp->ni_startdir = NULL;
 	vn_lock(dp, LK_EXCLUSIVE | LK_RETRY);
 
 	/*
@@ -536,6 +549,7 @@ dirloop:
 	 */
 	if (cnp->cn_flags & ISDOTDOT) {
 		for (;;) {
+			unveil_check_component(curproc, ndp, dp);
 			if (dp == ndp->ni_rootdir || dp == rootvnode) {
 				ndp->ni_dvp = dp;
 				ndp->ni_vp = dp;
@@ -602,7 +616,7 @@ dirloop:
 		/*
 		 * We return with ni_vp NULL to indicate that the entry
 		 * doesn't currently exist, leaving a pointer to the
-		 * (possibly locked) directory inode in ndp->ni_dvp.
+		 * (possibly locked) directory vnode in ndp->ni_dvp.
 		 */
 		if (cnp->cn_flags & SAVESTART) {
 			ndp->ni_startdir = ndp->ni_dvp;
@@ -659,6 +673,11 @@ dirloop:
 		ndp->ni_pathlen += slashes;
 		ndp->ni_next -= slashes;
 		cnp->cn_flags |= ISSYMLINK;
+		if (cnp->cn_flags & BPU_ZONEINFO) {
+			/* /usr/share/zoneinfo prohibits symbolic links */
+			error = ELOOP;
+			goto bad2;
+		}
 		return (0);
 	}
 
@@ -683,6 +702,11 @@ nextname:
 	}
 
 terminal:
+	/* __pledge_open() only opens regular files in /usr/share/zoneinfo */
+	if ((cnp->cn_flags & BPU_ZONEINFO) && dp->v_type != VREG) {
+		error = EACCES;
+		goto bad2;
+	}
 	/*
 	 * Check for read-only file systems.
 	 */
@@ -805,7 +829,7 @@ vfs_relookup(struct vnode *dvp, struct vnode **vpp, struct componentname *cnp)
 		/*
 		 * We return with ni_vp NULL to indicate that the entry
 		 * doesn't currently exist, leaving a pointer to the
-		 * (possibly locked) directory inode in ndp->ni_dvp.
+		 * (possibly locked) directory vnode in ndp->ni_dvp.
 		 */
 		return (0);
 	}

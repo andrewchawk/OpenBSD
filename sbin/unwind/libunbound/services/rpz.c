@@ -153,6 +153,7 @@ rpz_type_ignored(uint16_t rr_type)
 		case LDNS_RR_TYPE_SOA:
 		case LDNS_RR_TYPE_NS:
 		case LDNS_RR_TYPE_DNAME:
+		case LDNS_RR_TYPE_ZONEMD:
 		/* all DNSSEC-related RRs must be ignored */
 		case LDNS_RR_TYPE_DNSKEY:
 		case LDNS_RR_TYPE_DS:
@@ -242,10 +243,14 @@ rpz_action_to_localzone_type(enum rpz_action a)
 	case RPZ_NODATA_ACTION: return local_zone_always_nodata;
 	case RPZ_DROP_ACTION: return local_zone_always_deny;
 	case RPZ_PASSTHRU_ACTION: return local_zone_always_transparent;
-	case RPZ_LOCAL_DATA_ACTION:	/* fallthrough */
+	case RPZ_LOCAL_DATA_ACTION:
+		ATTR_FALLTHROUGH
+		/* fallthrough */
 	case RPZ_CNAME_OVERRIDE_ACTION: return local_zone_redirect;
 	case RPZ_TCP_ONLY_ACTION: return local_zone_truncate;
-	case RPZ_INVALID_ACTION: /* fallthrough */
+	case RPZ_INVALID_ACTION:
+		ATTR_FALLTHROUGH
+		/* fallthrough */
 	default: return local_zone_invalid;
 	}
 }
@@ -258,10 +263,14 @@ rpz_action_to_respip_action(enum rpz_action a)
 	case RPZ_NODATA_ACTION: return respip_always_nodata;
 	case RPZ_DROP_ACTION: return respip_always_deny;
 	case RPZ_PASSTHRU_ACTION: return respip_always_transparent;
-	case RPZ_LOCAL_DATA_ACTION: /* fallthrough */
+	case RPZ_LOCAL_DATA_ACTION:
+		ATTR_FALLTHROUGH
+		/* fallthrough */
 	case RPZ_CNAME_OVERRIDE_ACTION: return respip_redirect;
 	case RPZ_TCP_ONLY_ACTION: return respip_truncate;
-	case RPZ_INVALID_ACTION: /* fallthrough */
+	case RPZ_INVALID_ACTION:
+		ATTR_FALLTHROUGH
+		/* fallthrough */
 	default: return respip_invalid;
 	}
 }
@@ -276,7 +285,9 @@ localzone_type_to_rpz_action(enum localzone_type lzt)
 	case local_zone_always_transparent: return RPZ_PASSTHRU_ACTION;
 	case local_zone_redirect: return RPZ_LOCAL_DATA_ACTION;
 	case local_zone_truncate: return RPZ_TCP_ONLY_ACTION;
-	case local_zone_invalid: /* fallthrough */
+	case local_zone_invalid:
+		ATTR_FALLTHROUGH
+		/* fallthrough */
 	default: return RPZ_INVALID_ACTION;
 	}
 }
@@ -291,7 +302,9 @@ respip_action_to_rpz_action(enum respip_action a)
 	case respip_always_transparent: return RPZ_PASSTHRU_ACTION;
 	case respip_redirect: return RPZ_LOCAL_DATA_ACTION;
 	case respip_truncate: return RPZ_TCP_ONLY_ACTION;
-	case respip_invalid: /* fallthrough */
+	case respip_invalid:
+		ATTR_FALLTHROUGH
+		/* fallthrough */
 	default: return RPZ_INVALID_ACTION;
 	}
 }
@@ -654,7 +667,7 @@ rpz_insert_local_zones_trigger(struct local_zones* lz, uint8_t* dname,
 	int newzone = 0;
 
 	if(a == RPZ_INVALID_ACTION) {
-		char str[255+1];
+		char str[LDNS_MAX_DOMAINLEN];
 		if(rrtype == LDNS_RR_TYPE_SOA || rrtype == LDNS_RR_TYPE_NS ||
 			rrtype == LDNS_RR_TYPE_DNAME ||
 			rrtype == LDNS_RR_TYPE_DNSKEY ||
@@ -727,7 +740,7 @@ rpz_insert_local_zones_trigger(struct local_zones* lz, uint8_t* dname,
 static void
 rpz_log_dname(char const* msg, uint8_t* dname, size_t dname_len)
 {
-	char buf[LDNS_MAX_DOMAINLEN+1];
+	char buf[LDNS_MAX_DOMAINLEN];
 	(void)dname_len;
 	dname_str(dname, buf);
 	verbose(VERB_ALGO, "rpz: %s: <%s>", msg, buf);
@@ -1050,7 +1063,7 @@ rpz_insert_response_ip_trigger(struct rpz* r, uint8_t* dname, size_t dnamelen,
 
 	if(a == RPZ_INVALID_ACTION ||
 		rpz_action_to_respip_action(a) == respip_invalid) {
-		char str[255+1];
+		char str[LDNS_MAX_DOMAINLEN];
 		dname_str(dname, str);
 		verbose(VERB_ALGO, "rpz: respip trigger, %s skipping unsupported action: %s",
 			str, rpz_action_to_string(a));
@@ -1621,7 +1634,7 @@ log_rpz_apply(char* trigger, uint8_t* dname, struct addr_tree_node* addrnode,
 	struct comm_reply* repinfo, struct module_qstate* ms, char* log_name)
 {
 	char ip[128], txt[512], portstr[32];
-	char dnamestr[LDNS_MAX_DOMAINLEN+1];
+	char dnamestr[LDNS_MAX_DOMAINLEN];
 	uint16_t port = 0;
 	if(dname) {
 		dname_str(dname, dnamestr);
@@ -1957,6 +1970,7 @@ rpz_synthesize_nodata(struct rpz* ATTR_UNUSED(r), struct module_qstate* ms,
 					     0, /* ttl */
 					     0, /* prettl */
 					     0, /* expttl */
+					     0, /* norecttl */
 					     0, /* an */
 					     0, /* ns */
 					     0, /* ar */
@@ -1987,6 +2001,7 @@ rpz_synthesize_nxdomain(struct rpz* r, struct module_qstate* ms,
 					     0, /* ttl */
 					     0, /* prettl */
 					     0, /* expttl */
+					     0, /* norecttl */
 					     0, /* an */
 					     0, /* ns */
 					     0, /* ar */
@@ -2019,6 +2034,7 @@ rpz_synthesize_localdata_from_rrset(struct rpz* ATTR_UNUSED(r), struct module_qs
                                                    0, /* ttl */
                                                    0, /* prettl */
                                                    0, /* expttl */
+                                                   0, /* norecttl */
                                                    1, /* an */
                                                    0, /* ns */
                                                    0, /* ar */
@@ -2106,8 +2122,17 @@ rpz_synthesize_nsdname_localdata(struct rpz* r, struct module_qstate* ms,
 	rpz_log_dname("nsdname local data", key.name, key.namelen);
 
 	ld = (struct local_data*)rbtree_search(&z->data, &key.node);
+	if(ld == NULL && dname_is_wild(z->name)) {
+		key.name = z->name;
+		key.namelen = z->namelen;
+		key.namelabs = z->namelabs;
+		ld = (struct local_data*)rbtree_search(&z->data, &key.node);
+		/* rpz_synthesize_localdata_from_rrset is going to make
+		 * the rrset source name equal to the query name. So no need
+		 * to make the wildcard rrset here. */
+	}
 	if(ld == NULL) {
-		verbose(VERB_ALGO, "rpz: nsdname: impossible: qname not found");
+		verbose(VERB_ALGO, "rpz: nsdname: qname not found");
 		return NULL;
 	}
 
@@ -2133,6 +2158,15 @@ rpz_synthesize_qname_localdata_msg(struct rpz* r, struct module_qstate* ms,
 	key.namelen = qinfo->qname_len;
 	key.namelabs = dname_count_labels(qinfo->qname);
 	ld = (struct local_data*)rbtree_search(&z->data, &key.node);
+	if(ld == NULL && dname_is_wild(z->name)) {
+		key.name = z->name;
+		key.namelen = z->namelen;
+		key.namelabs = z->namelabs;
+		ld = (struct local_data*)rbtree_search(&z->data, &key.node);
+		/* rpz_synthesize_localdata_from_rrset is going to make
+		 * the rrset source name equal to the query name. So no need
+		 * to make the wildcard rrset here. */
+	}
 	if(ld == NULL) {
 		verbose(VERB_ALGO, "rpz: qname: name not found");
 		return NULL;
@@ -2164,6 +2198,7 @@ rpz_synthesize_cname_override_msg(struct rpz* r, struct module_qstate* ms,
                                                    0, /* ttl */
                                                    0, /* prettl */
                                                    0, /* expttl */
+                                                   0, /* norecttl */
                                                    1, /* an */
                                                    0, /* ns */
                                                    0, /* ar */
@@ -2276,15 +2311,18 @@ rpz_apply_nsip_trigger(struct module_qstate* ms, struct query_info* qchase,
 	if(action == RPZ_LOCAL_DATA_ACTION && raddr->data == NULL) {
 		verbose(VERB_ALGO, "rpz: bug: nsip local data action but no local data");
 		ret = rpz_synthesize_nodata(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		goto done;
 	}
 
 	switch(action) {
 	case RPZ_NXDOMAIN_ACTION:
 		ret = rpz_synthesize_nxdomain(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_NODATA_ACTION:
 		ret = rpz_synthesize_nodata(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_TCP_ONLY_ACTION:
 		/* basically a passthru here but the tcp-only will be
@@ -2294,11 +2332,13 @@ rpz_apply_nsip_trigger(struct module_qstate* ms, struct query_info* qchase,
 		break;
 	case RPZ_DROP_ACTION:
 		ret = rpz_synthesize_nodata(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		ms->is_drop = 1;
 		break;
 	case RPZ_LOCAL_DATA_ACTION:
 		ret = rpz_synthesize_nsip_localdata(r, ms, qchase, raddr, az);
 		if(ret == NULL) { ret = rpz_synthesize_nodata(r, ms, qchase, az); }
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_PASSTHRU_ACTION:
 		ret = NULL;
@@ -2306,6 +2346,7 @@ rpz_apply_nsip_trigger(struct module_qstate* ms, struct query_info* qchase,
 		break;
 	case RPZ_CNAME_OVERRIDE_ACTION:
 		ret = rpz_synthesize_cname_override_msg(r, ms, qchase);
+		ms->rpz_applied = 1;
 		break;
 	default:
 		verbose(VERB_ALGO, "rpz: nsip: bug: unhandled or invalid action: '%s'",
@@ -2340,9 +2381,11 @@ rpz_apply_nsdname_trigger(struct module_qstate* ms, struct query_info* qchase,
 	switch(action) {
 	case RPZ_NXDOMAIN_ACTION:
 		ret = rpz_synthesize_nxdomain(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_NODATA_ACTION:
 		ret = rpz_synthesize_nodata(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_TCP_ONLY_ACTION:
 		/* basically a passthru here but the tcp-only will be
@@ -2352,11 +2395,13 @@ rpz_apply_nsdname_trigger(struct module_qstate* ms, struct query_info* qchase,
 		break;
 	case RPZ_DROP_ACTION:
 		ret = rpz_synthesize_nodata(r, ms, qchase, az);
+		ms->rpz_applied = 1;
 		ms->is_drop = 1;
 		break;
 	case RPZ_LOCAL_DATA_ACTION:
 		ret = rpz_synthesize_nsdname_localdata(r, ms, qchase, z, match, az);
 		if(ret == NULL) { ret = rpz_synthesize_nodata(r, ms, qchase, az); }
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_PASSTHRU_ACTION:
 		ret = NULL;
@@ -2364,6 +2409,7 @@ rpz_apply_nsdname_trigger(struct module_qstate* ms, struct query_info* qchase,
 		break;
 	case RPZ_CNAME_OVERRIDE_ACTION:
 		ret = rpz_synthesize_cname_override_msg(r, ms, qchase);
+		ms->rpz_applied = 1;
 		break;
 	default:
 		verbose(VERB_ALGO, "rpz: nsdname: bug: unhandled or invalid action: '%s'",
@@ -2400,7 +2446,8 @@ rpz_delegation_point_zone_lookup(struct delegpt* dp, struct local_zones* zones,
 			match->dname = nameserver->name;
 			match->dname_len = nameserver->namelen;
 			if(verbosity >= VERB_ALGO) {
-				char nm[255+1], zn[255+1];
+				char nm[LDNS_MAX_DOMAINLEN];
+				char zn[LDNS_MAX_DOMAINLEN];
 				dname_str(match->dname, nm);
 				dname_str(z->name, zn);
 				if(strcmp(nm, zn) != 0)
@@ -2422,6 +2469,7 @@ rpz_callback_from_iterator_module(struct module_qstate* ms, struct iter_qstate* 
 {
 	struct auth_zones* az;
 	struct auth_zone* a;
+	struct dns_msg* ret = NULL;
 	struct clientip_synthesized_rr* raddr = NULL;
 	struct rpz* r = NULL;
 	struct local_zone* z = NULL;
@@ -2435,10 +2483,9 @@ rpz_callback_from_iterator_module(struct module_qstate* ms, struct iter_qstate* 
 	if(ms->env == NULL || ms->env->auth_zones == NULL) { return 0; }
 
 	az = ms->env->auth_zones;
+	lock_rw_rdlock(&az->rpz_lock);
 
 	verbose(VERB_ALGO, "rpz: iterator module callback: have_rpz=%d", az->rpz_first != NULL);
-
-	lock_rw_rdlock(&az->rpz_lock);
 
 	/* precedence of RPZ works, loosely, like this:
 	 * CNAMEs in order of the CNAME chain. rpzs in the order they are
@@ -2454,18 +2501,23 @@ rpz_callback_from_iterator_module(struct module_qstate* ms, struct iter_qstate* 
 			lock_rw_unlock(&a->lock);
 			continue;
 		}
+		if(r->taglist && (!ms->client_info ||
+			!taglist_intersect(r->taglist, r->taglistlen,
+				ms->client_info->taglist,
+				ms->client_info->taglen))) {
+			lock_rw_unlock(&a->lock);
+			continue;
+		}
 
 		/* the nsdname has precedence over the nsip triggers */
 		z = rpz_delegation_point_zone_lookup(is->dp, r->nsdname_zones,
 						     is->qchase.qclass, &match);
 		if(z != NULL) {
-			lock_rw_unlock(&a->lock);
 			break;
 		}
 
 		raddr = rpz_delegation_point_ipbased_trigger_lookup(r, is);
 		if(raddr != NULL) {
-			lock_rw_unlock(&a->lock);
 			break;
 		}
 		lock_rw_unlock(&a->lock);
@@ -2480,9 +2532,12 @@ rpz_callback_from_iterator_module(struct module_qstate* ms, struct iter_qstate* 
 		if(z) {
 			lock_rw_unlock(&z->lock);
 		}
-		return rpz_apply_nsip_trigger(ms, &is->qchase, r, raddr, a);
+		ret = rpz_apply_nsip_trigger(ms, &is->qchase, r, raddr, a);
+	} else {
+		ret = rpz_apply_nsdname_trigger(ms, &is->qchase, r, z, &match, a);
 	}
-	return rpz_apply_nsdname_trigger(ms, &is->qchase, r, z, &match, a);
+	lock_rw_unlock(&a->lock);
+	return ret;
 }
 
 struct dns_msg* rpz_callback_from_iterator_cname(struct module_qstate* ms,
@@ -2509,6 +2564,13 @@ struct dns_msg* rpz_callback_from_iterator_cname(struct module_qstate* ms,
 		lock_rw_rdlock(&a->lock);
 		r = a->rpz;
 		if(r->disabled) {
+			lock_rw_unlock(&a->lock);
+			continue;
+		}
+		if(r->taglist && (!ms->client_info ||
+			!taglist_intersect(r->taglist, r->taglistlen,
+				ms->client_info->taglist,
+				ms->client_info->taglen))) {
 			lock_rw_unlock(&a->lock);
 			continue;
 		}
@@ -2541,7 +2603,7 @@ struct dns_msg* rpz_callback_from_iterator_cname(struct module_qstate* ms,
 	}
 
 	if(verbosity >= VERB_ALGO) {
-		char nm[255+1], zn[255+1];
+		char nm[LDNS_MAX_DOMAINLEN], zn[LDNS_MAX_DOMAINLEN];
 		dname_str(is->qchase.qname, nm);
 		dname_str(z->name, zn);
 		if(strcmp(zn, nm) != 0)
@@ -2554,9 +2616,11 @@ struct dns_msg* rpz_callback_from_iterator_cname(struct module_qstate* ms,
 	switch(localzone_type_to_rpz_action(lzt)) {
 	case RPZ_NXDOMAIN_ACTION:
 		ret = rpz_synthesize_nxdomain(r, ms, &is->qchase, a);
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_NODATA_ACTION:
 		ret = rpz_synthesize_nodata(r, ms, &is->qchase, a);
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_TCP_ONLY_ACTION:
 		/* basically a passthru here but the tcp-only will be
@@ -2566,11 +2630,13 @@ struct dns_msg* rpz_callback_from_iterator_cname(struct module_qstate* ms,
 		break;
 	case RPZ_DROP_ACTION:
 		ret = rpz_synthesize_nodata(r, ms, &is->qchase, a);
+		ms->rpz_applied = 1;
 		ms->is_drop = 1;
 		break;
 	case RPZ_LOCAL_DATA_ACTION:
 		ret = rpz_synthesize_qname_localdata_msg(r, ms, &is->qchase, z, a);
 		if(ret == NULL) { ret = rpz_synthesize_nodata(r, ms, &is->qchase, a); }
+		ms->rpz_applied = 1;
 		break;
 	case RPZ_PASSTHRU_ACTION:
 		ret = NULL;
@@ -2714,7 +2780,7 @@ rpz_callback_from_worker_request(struct auth_zones* az, struct module_env* env,
 	}
 
 	if(verbosity >= VERB_ALGO) {
-		char nm[255+1], zn[255+1];
+		char nm[LDNS_MAX_DOMAINLEN], zn[LDNS_MAX_DOMAINLEN];
 		dname_str(qinfo->qname, nm);
 		dname_str(z->name, zn);
 		if(strcmp(zn, nm) != 0)
@@ -2746,4 +2812,32 @@ void rpz_disable(struct rpz* r)
     if(!r)
         return;
     r->disabled = 1;
+}
+
+/** Get memory usage for clientip_synthesized_rrset. Ignores memory usage
+ * of locks. */
+static size_t
+rpz_clientip_synthesized_set_get_mem(struct clientip_synthesized_rrset* set)
+{
+	size_t m = sizeof(*set);
+	lock_rw_rdlock(&set->lock);
+	m += regional_get_mem(set->region);
+	lock_rw_unlock(&set->lock);
+	return m;
+}
+
+size_t rpz_get_mem(struct rpz* r)
+{
+	size_t m = sizeof(*r);
+	if(r->taglist)
+		m += r->taglistlen;
+	if(r->log_name)
+		m += strlen(r->log_name) + 1;
+	m += regional_get_mem(r->region);
+	m += local_zones_get_mem(r->local_zones);
+	m += local_zones_get_mem(r->nsdname_zones);
+	m += respip_set_get_mem(r->respip_set);
+	m += rpz_clientip_synthesized_set_get_mem(r->client_set);
+	m += rpz_clientip_synthesized_set_get_mem(r->ns_set);
+	return m;
 }

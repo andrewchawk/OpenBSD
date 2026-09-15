@@ -1,4 +1,4 @@
-/*	$OpenBSD: protosw.h,v 1.67 2024/07/12 19:50:35 bluhm Exp $	*/
+/*	$OpenBSD: protosw.h,v 1.73 2025/10/24 15:09:56 bluhm Exp $	*/
 /*	$NetBSD: protosw.h,v 1.10 1996/04/09 20:55:32 cgd Exp $	*/
 
 /*-
@@ -63,6 +63,7 @@ struct domain;
 struct proc;
 struct stat;
 struct ifnet;
+struct netstack;
 
 struct pr_usrreqs {
 	int	(*pru_attach)(struct socket *, int, int);
@@ -85,6 +86,7 @@ struct pr_usrreqs {
 		    struct mbuf *);
 	int	(*pru_sockaddr)(struct socket *, struct mbuf *);
 	int	(*pru_peeraddr)(struct socket *, struct mbuf *);
+	int	(*pru_flowid)(struct socket *);
 	int	(*pru_connect2)(struct socket *, struct socket *);
 };
 
@@ -96,7 +98,7 @@ struct protosw {
 
 /* protocol-protocol hooks */
 					/* input to protocol (from below) */
-	int	(*pr_input)(struct mbuf **, int *, int, int);
+	int	(*pr_input)(struct mbuf **, int *, int, int, struct netstack *);
 					/* control input (from below) */
 	void	(*pr_ctlinput)(int, struct sockaddr *, u_int, void *);
 					/* control output (from above) */
@@ -130,7 +132,7 @@ struct protosw {
 					   socket */
 #define PR_SPLICE	0x0040		/* socket splicing is possible */
 #define PR_MPINPUT	0x0080		/* input runs with shared netlock */
-#define PR_MPSOCKET	0x0100		/* socket uses shared netlock */
+#define PR_MPSYSCTL	0x0200		/* mp-safe sysctl(2) handler */
 
 /*
  * The arguments to usrreq are:
@@ -253,10 +255,7 @@ char	*prcorequests[] = {
 
 #include <sys/mbuf.h>
 #include <sys/socketvar.h>
-#include <sys/systm.h>
 
-struct ifnet;
-struct sockaddr;
 const struct protosw *pffindproto(int, int, int);
 const struct protosw *pffindtype(int, int);
 const struct domain *pffinddomain(int);
@@ -394,6 +393,12 @@ static inline int
 pru_peeraddr(struct socket *so, struct mbuf *addr)
 {
 	return (*so->so_proto->pr_usrreqs->pru_peeraddr)(so, addr);
+}
+
+static inline int
+pru_flowid(struct socket *so)
+{
+	return (*so->so_proto->pr_usrreqs->pru_flowid)(so);
 }
 
 static inline int

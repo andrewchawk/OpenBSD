@@ -1,4 +1,4 @@
-/*	$OpenBSD: misc.h,v 1.50 2023/03/25 20:34:28 krw Exp $	*/
+/*	$OpenBSD: misc.h,v 1.52 2025/07/31 13:37:06 krw Exp $	*/
 
 /*
  * Copyright (c) 1997 Tobias Weingartner
@@ -31,6 +31,8 @@ struct unit_type {
 #define	TRIMMED		1
 #define	LINEBUFSZ	100
 
+extern int	verbosity;
+
 double		 units_size(const char *, const uint64_t,
     const struct unit_type **);
 void		 string_from_line(char *, const size_t, const int);
@@ -38,3 +40,5 @@ int		 ask_yn(const char *);
 int		 hex_octet(char *);
 uint64_t	 getuint64(const char *, uint64_t, const uint64_t,
     const uint64_t);
+
+uint32_t	 string_to_uuid(const char *, struct uuid *);

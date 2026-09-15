@@ -32,12 +32,18 @@ my $make_exceptions_list = ($ARGV[0]||'') eq '--make-exceptions-list'
 
 require './regen/embed_lib.pl';
 
+# List of functions which don't have diag format as their argument
+my %explicit_opt_out = map +($_ => 1), qw (
+    warn_expect_operator
+);
+
 # Look for functions that look like they could be diagnostic ones.
 my @functions;
 foreach (@{(setup_embed())[0]}) {
   my $embed= $_->{embed}
     or next;
   next unless $embed->{name}  =~ /warn|(?<!ov)err|(\b|_)die|croak|deprecate/i;
+  next if exists $explicit_opt_out{$embed->{name}};
   # Skip some known exceptions
   next if $embed->{name} =~ /croak_kw_unless_class/;
   # The flag p means that this function may have a 'Perl_' prefix
@@ -58,7 +64,7 @@ my $source_msg_re =
    "(?<routine>\\bDIE\\b|$function_re)";
 my $text_re = '"(?<text>(?:\\\\"|[^"]|"\s*[A-Z_]+\s*")*)"';
 my $source_msg_call_re = qr/$source_msg_re(?:_nocontext)? \s*
-    \( (?: \s* Perl_form \( )? (?:aTHX_)? \s*
+    \( (?: \s* (?: Perl_ )? form \( )? (?: \s* aTHX_)? \s*
     (?:packWARN\d*\((?<category>.*?)\),)? \s*
     (?:(?<category>WARN_DEPRECATED__\w+)\s*,(?:\s*(?<version_string>"[^"]+")\s*,)?)? \s*
     $text_re /x;
@@ -243,6 +249,8 @@ my $specialformats_re = qr/%$format_modifiers"\s*($specialformats)(\s*(?:"|\z))?
 # We skip the bodies of most XS functions, but not within these files
 my @include_xs_files = (
   "builtin.c",
+  "class.c",
+  "universal.c",
 );
 
 if (@ARGV) {
@@ -360,7 +368,7 @@ sub check_file {
     s/ (?<!%) % $format_modifiers ( [dioxXucsfeEgGp] ) /%$1/xg;
 
     # The %"foo" thing needs to happen *before* this regex.
-    # diag(">$_<");
+    # diag("$first_line:>$_<");
     # DIE is just return Perl_die
     my ($name, $category, $routine, $wrapper);
     if (/\b$source_msg_call_re/) {
@@ -426,7 +434,7 @@ sub check_file {
                  :  $routine =~ /ckWARN\d*reg_d/? 'S'
                  :  $routine =~ /ckWARN\d*reg/ ?  'W'
                  :  $routine =~ /vWARN\d/      ? '[WDS]'
-                 :  $routine =~ /^deprecate/   ? '[WDS]'
+                 :  $routine =~ /^deprecate/   ? '[DS]'
                  :                             '[PFX]';
     my $categories;
     if (defined $category) {
@@ -530,7 +538,12 @@ sub check_message {
         like($entries{$key}{severity}, $qr,
           ($severity =~ /\[/
             ? "severity is one of $severity"
-            : "severity is $severity") . "for '$name' at $codefn line $.$pod_line");
+            : "severity is $severity") . " for '$name' at $codefn line $.$pod_line")
+        or do {
+            if ($severity=~/D/ and $entries{$key}{severity}=~/W/) {
+                diag("You should change W to D if this is a deprecation");
+            }
+        };
 
         is($entries{$key}{category}, $categories,
            ($categories ? "categories are [$categories]" : "no category")
@@ -688,7 +701,6 @@ setnetent not implemented!
 setprotoent not implemented!
 set %s %p %p %p
 setservent not implemented!
-%s free() ignored (RMAGIC, PERL_CORE)
 %s has too many errors.
 SIG%s handler "%s" not defined.
 %s in %s
@@ -696,7 +708,6 @@ Size magic not implemented
 %s: name `%s' too long
 %s not implemented!
 %s number > %s non-portable
-%srealloc() %signored
 %s on %s %s
 %s: %s
 Starting Full Screen process with flag=%d, mytype=%d
@@ -726,9 +737,6 @@ Wrong syntax (suid) fd script name "%s"
 'X' outside of string in unpack
 
 __CATEGORIES__
-
-# This is a warning, but is currently followed immediately by a croak (toke.c)
-Illegal character \%o (carriage return)
 
 # Because uses WARN_MISSING as a synonym for WARN_UNINITIALIZED (sv.c)
 Missing argument in %s

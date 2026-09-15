@@ -1,4 +1,4 @@
-/* 	$OpenBSD: tests.c,v 1.4 2024/01/11 01:45:59 djm Exp $ */
+/* 	$OpenBSD: tests.c,v 1.8 2026/06/29 07:46:22 djm Exp $ */
 /*
  * Regress test for sshbuf.h buffer API
  *
@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
 
@@ -80,7 +81,7 @@ tests(void)
 #endif
 
 	OpenSSL_add_all_algorithms();
-	ERR_load_CRYPTO_strings();
+	OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 
 	TEST_START("load data");
 	msg = load_file("namespace");
@@ -94,11 +95,6 @@ tests(void)
 	check_sig("rsa.pub", "rsa.sig", msg, namespace);
 	TEST_DONE();
 
-#ifdef WITH_DSA
-	TEST_START("check DSA signature");
-	check_sig("dsa.pub", "dsa.sig", msg, namespace);
-	TEST_DONE();
-#endif
 
 	TEST_START("check ECDSA signature");
 	check_sig("ecdsa.pub", "ecdsa.sig", msg, namespace);
@@ -106,6 +102,10 @@ tests(void)
 
 	TEST_START("check ED25519 signature");
 	check_sig("ed25519.pub", "ed25519.sig", msg, namespace);
+	TEST_DONE();
+
+	TEST_START("check MLDSA44-ED25519 signature");
+	check_sig("mldsa44-ed25519.pub", "mldsa44-ed25519.sig", msg, namespace);
 	TEST_DONE();
 
 	TEST_START("check ECDSA-SK signature");
@@ -123,4 +123,10 @@ tests(void)
 
 	sshbuf_free(msg);
 	free(namespace);
+}
+
+void
+benchmarks(void)
+{
+	printf("no benchmarks\n");
 }

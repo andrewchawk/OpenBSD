@@ -8,6 +8,7 @@
 #include <linux/list.h>
 #include <linux/spinlock_types.h>
 #include <linux/lockdep.h>
+#include <linux/cleanup.h>
 
 #define DEFINE_MUTEX(x)		struct rwlock x = RWLOCK_INITIALIZER(#x)
 
@@ -29,22 +30,20 @@ mutex_lock_interruptible(struct rwlock *rwl)
 	return 0;
 }
 
-enum mutex_trylock_recursive_result {
-	MUTEX_TRYLOCK_FAILED,
-	MUTEX_TRYLOCK_SUCCESS,
-	MUTEX_TRYLOCK_RECURSIVE
-};
+int atomic_dec_and_mutex_lock(volatile int *, struct rwlock *);
 
-static inline enum mutex_trylock_recursive_result
-mutex_trylock_recursive(struct rwlock *rwl)
+static inline struct rwlock *
+class_mutex_constructor(struct rwlock *rwl)
 {
-	if (rw_status(rwl) == RW_WRITE)
-		return MUTEX_TRYLOCK_RECURSIVE;
-	if (mutex_trylock(rwl))
-		return MUTEX_TRYLOCK_SUCCESS;
-	return MUTEX_TRYLOCK_FAILED;
+	mutex_lock(rwl);
+	return rwl;
 }
 
-int atomic_dec_and_mutex_lock(volatile int *, struct rwlock *);
+static inline void
+class_mutex_destructor(struct rwlock **p)
+{
+	mutex_unlock(*p);
+}
+typedef struct rwlock * class_mutex_t;
 
 #endif

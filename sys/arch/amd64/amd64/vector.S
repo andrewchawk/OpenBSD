@@ -1,4 +1,4 @@
-/*	$OpenBSD: vector.S,v 1.96 2024/07/21 16:19:25 deraadt Exp $	*/
+/*	$OpenBSD: vector.S,v 1.108 2026/08/19 08:56:28 hshoexer Exp $	*/
 /*	$NetBSD: vector.S,v 1.5 2004/06/28 09:13:11 fvdl Exp $	*/
 
 /*
@@ -83,6 +83,8 @@
 #include "assym.h"
 #include "xen.h"
 #include "hyperv.h"
+#include "vmm.h"
+#include "xcall.h"
 
 /*****************************************************************************/
 
@@ -372,6 +374,45 @@ IDTVEC(trap14)
 	ZTRAP(T_VE)
 IDTVEC(trap15)
 	TRAP(T_CP)
+
+#ifdef AMDSEV
+IDTVEC(trap1d)
+	/*
+	 * #VC is AMD CPU specific, thus we don't use any Intel Meltdown
+	 * workarounds.
+	 *
+	 * We handle #VC different from other traps, as we do not want
+	 * to re-enable interrupts.  #VC might happen during IRQ handling
+	 * before a specific hardware interrupt gets masked.  Re-enabling
+	 * interrupts in the trap handler might cause nested IRQs of
+	 * the same level.  Thus keep interrupts disabled.
+	 */
+	pushq	$T_VC
+	testb	$SEL_RPL,24(%rsp)
+	je	vctrap_kern
+	swapgs
+	FENCE_SWAPGS_MIS_TAKEN
+	movq	%rax,CPUVAR(SCRATCH)
+
+	/* #VC from userspace */
+	TRAP_ENTRY_USER
+	cld
+	SMAP_CLAC
+	/* shortcut to regular path, but with interrupts disabled */
+	jmp	recall_trap
+
+	/* #VC from kernspace */
+vctrap_kern:
+	FENCE_NO_SAFE_SMAP
+	TRAP_ENTRY_KERN
+	cld
+	SMAP_CLAC
+	/* shortcut to regular path, but with interrupts disabled */
+	jmp	.Lreal_kern_trap
+#else
+IDTVEC_ALIAS(trap1d, trap1f)
+#endif	/* AMDSEV */
+
 IDTVEC(trap1f)
 IDTVEC_ALIAS(trap16, trap1f)
 IDTVEC_ALIAS(trap17, trap1f)
@@ -380,7 +421,6 @@ IDTVEC_ALIAS(trap19, trap1f)
 IDTVEC_ALIAS(trap1a, trap1f)
 IDTVEC_ALIAS(trap1b, trap1f)
 IDTVEC_ALIAS(trap1c, trap1f)
-IDTVEC_ALIAS(trap1d, trap1f)
 IDTVEC_ALIAS(trap1e, trap1f)
 	/* 22 - 31 reserved for future exp */
 	ZTRAP(T_RESERVED)
@@ -512,6 +552,18 @@ END(alltraps_kern)
 END(alltraps_kern_meltdown)
 KTEXT_PAGE_END
 
+#ifdef AMDSEV
+/* #VC trap entry for early bootstrap */
+IDTVEC(vctrap_early)
+	pushq	$T_VC
+	TRAP_ENTRY_KERN		/* early #VC has to be in kernel mode */
+	cld
+	movq	%rsp, %rdi
+	movq	$0x0, %rsi
+	call	vctrap
+	movq	$0,-8(%rsp)
+	INTRFASTEXIT
+#endif
 
 /*
  * Macros for interrupt entry, call to handler, and exit.
@@ -529,9 +581,6 @@ KTEXT_PAGE_END
  * If the interrupt frame is made more flexible,  INTR can push %eax first and
  * decide the ipending case with less overhead
  */
-
-/* XXX See comment in locore.s */
-#define	XINTR(name,num)		Xintr_##name##num
 
 KUENTRY(x2apic_eoi)
 	pushq   %rax
@@ -594,12 +643,43 @@ IDTVEC(ipi_invltlb)
 	movq	%cr3, %rax
 	movq	%rax, %cr3
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decq	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popq	%rax
 	iretq
 END(Xipi_invltlb)
+
+#if NVMM > 0
+/* Invalidate VMX EPT */
+IDTVEC(ipi_invept)
+	pushq	%rax
+	pushq	%rdx
+
+	ioapic_asm_ack()
+
+	movq	$ept_shoot_vid, %rax
+	movq	ept_shoot_mode, %rdx
+	invept	(%rax), %rdx
+
+	movl	tlb_shoot_cpu, %eax
+	lock
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
+
+	popq	%rdx
+	popq	%rax
+	iretq
+END(Xipi_invept)
+#endif /* NVMM > 0 */
 
 /* invalidate a single page, no PCIDs version */
 IDTVEC(ipi_invlpg)
@@ -610,8 +690,13 @@ IDTVEC(ipi_invlpg)
 	movq	tlb_shoot_addr1, %rax
 	invlpg	(%rax)
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decq	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popq	%rax
 	iretq
@@ -631,8 +716,13 @@ IDTVEC(ipi_invlrange)
 	cmpq	%rdx, %rax
 	jb	1b
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decq	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	popq	%rdx
 	popq	%rax
@@ -663,8 +753,13 @@ IDTVEC(ipi_invltlb_pcid)
 	movl	$PCID_PROC_INTEL,(%rsp)
 	invpcid	(%rsp),%rax
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decq	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	/* restore the stack */
 	popq	%rax
@@ -700,8 +795,20 @@ IDTVEC(ipi_invlpg_pcid)
 	addl	$1,(%rsp)
 	invpcid	(%rsp),%rax
 
+	/* Kernel VAs are also cached under PCID_TEMP */
+	cmpl	$PCID_PROC,(%rsp)
+	jne	.Lskip_temp_invlpg_pcid
+	movl	$PCID_TEMP,(%rsp)
+	invpcid	(%rsp),%rax
+.Lskip_temp_invlpg_pcid:
+
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decq	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	/* restore the stack */
 	addq	$16,%rsp
@@ -737,13 +844,26 @@ IDTVEC(ipi_invlrange_pcid)
 	invpcid	(%rsp),%rcx
 	addl	$1,(%rsp)
 	invpcid	(%rsp),%rcx
+
+	/* Kernel VAs are also cached under PCID_TEMP */
+	cmpl	$PCID_PROC,(%rsp)
+	jne	.Lskip_temp_invlrange_pcid
+	movl	$PCID_TEMP,(%rsp)
+	invpcid	(%rsp),%rcx
+	movl	$PCID_PROC,(%rsp)
+.Lskip_temp_invlrange_pcid:
 	subl	$1,(%rsp)
 	addq	$PAGE_SIZE,%rax
 	cmpq	%rdx,%rax
 	jb	1b
 
+	movl	tlb_shoot_cpu, %eax
 	lock
-	decq	tlb_shoot_wait
+	decl	tlb_shoot_counts(,%rax,4)	# decrement outstanding shoots
+	jnz	9f
+	xorl    %eax, %eax
+	movl	%eax, tlb_shoot_lock		# release lock for next shooter
+9:
 
 	/* restore the stack */
 	addq	$16,%rsp
@@ -1298,8 +1418,8 @@ KIDTVEC(softtty)
 	movl	$IPL_SOFTTTY, CPUVAR(ILEVEL)
 	sti
 	incl	CPUVAR(IDEPTH)
-	movl	$X86_SOFTINTR_SOFTTTY,%edi
-	call	softintr_dispatch
+	movl	$SOFTINTR_TTY,%edi
+	call	dosoftint
 	movq	$0,-8(%rsp)
 	decl	CPUVAR(IDEPTH)
 	CODEPATCH_START
@@ -1312,8 +1432,8 @@ KIDTVEC(softnet)
 	movl	$IPL_SOFTNET, CPUVAR(ILEVEL)
 	sti
 	incl	CPUVAR(IDEPTH)
-	movl	$X86_SOFTINTR_SOFTNET,%edi
-	call	softintr_dispatch
+	movl	$SOFTINTR_NET,%edi
+	call	dosoftint
 	movq	$0,-8(%rsp)
 	decl	CPUVAR(IDEPTH)
 	CODEPATCH_START
@@ -1326,11 +1446,29 @@ KIDTVEC(softclock)
 	movl	$IPL_SOFTCLOCK, CPUVAR(ILEVEL)
 	sti
 	incl	CPUVAR(IDEPTH)
-	movl	$X86_SOFTINTR_SOFTCLOCK,%edi
-	call	softintr_dispatch
+	movl	$SOFTINTR_CLOCK,%edi
+	call	dosoftint
 	movq	$0,-8(%rsp)
 	decl	CPUVAR(IDEPTH)
 	CODEPATCH_START
 	jmp	retpoline_r13
 	CODEPATCH_END(CPTAG_RETPOLINE_R13)
 END(Xsoftclock)
+
+#if NXCALL > 0
+#ifdef MULTIPROCESSOR
+KIDTVEC(xcallintr)
+	endbr64
+	movl	$IPL_SOFTCLOCK, CPUVAR(ILEVEL)
+	sti
+	incl	CPUVAR(IDEPTH)
+	movq	CPUVAR(SELF),%rdi
+	call	cpu_xcall_dispatch
+	movq	$0,-8(%rsp)
+	decl	CPUVAR(IDEPTH)
+	CODEPATCH_START
+	jmp	retpoline_r13
+	CODEPATCH_END(CPTAG_RETPOLINE_R13)
+END(Xxcallintr)
+#endif /* MULTIPROCESSOR */
+#endif /* NXCALL > 0 */

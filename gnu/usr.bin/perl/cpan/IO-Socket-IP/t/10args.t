@@ -1,10 +1,9 @@
 #!/usr/bin/perl
 
-use v5;
-use strict;
+use v5.14;
 use warnings;
 
-use Test::More;
+use Test2::V0;
 
 use IO::Socket::IP;
 
@@ -30,7 +29,7 @@ sub arguments_is {
       $args;
    };
 
-   is_deeply($got, $exp, $name);
+   is($got, $exp, $name);
 }
 
 my @tests = (
@@ -56,21 +55,21 @@ my @tests = (
    [ [ PeerHost => '127.0.0.1:443', PeerPort => '80' ], { PeerHost => '127.0.0.1', PeerService => '443' } ],
 );
 
-is_deeply( [ IO::Socket::IP->split_addr( "hostname:http" ) ],
-           [ "hostname",  "http" ],
-           "split_addr hostname:http" );
+is( [ IO::Socket::IP->split_addr( "hostname:http" ) ],
+    [ "hostname",  "http" ],
+    "split_addr hostname:http" );
 
-is_deeply( [ IO::Socket::IP->split_addr( "192.0.2.1:80" ) ],
-           [ "192.0.2.1", "80"   ],
-           "split_addr 192.0.2.1:80" );
+is( [ IO::Socket::IP->split_addr( "192.0.2.1:80" ) ],
+    [ "192.0.2.1", "80"   ],
+    "split_addr 192.0.2.1:80" );
 
-is_deeply( [ IO::Socket::IP->split_addr( "[2001:db8::1]:80" ) ],
-           [ "2001:db8::1", "80" ],
-           "split_addr [2001:db8::1]:80" );
+is( [ IO::Socket::IP->split_addr( "[2001:db8::1]:80" ) ],
+    [ "2001:db8::1", "80" ],
+    "split_addr [2001:db8::1]:80" );
 
-is_deeply( [ IO::Socket::IP->split_addr( "something.else" ) ],
-           [ "something.else", undef ],
-           "split_addr something.else" );
+is( [ IO::Socket::IP->split_addr( "something.else" ) ],
+    [ "something.else", undef ],
+    "split_addr something.else" );
 
 is( IO::Socket::IP->join_addr( "hostname", "http" ),
     "hostname:http",

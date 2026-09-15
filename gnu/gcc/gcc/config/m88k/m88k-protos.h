@@ -22,9 +22,9 @@ the Free Software Foundation, 51 Franklin Street, Fifth Floor,
 Boston, MA 02110-1301, USA.  */
 
 #ifdef RTX_CODE
-extern int m88k_debugger_offset (rtx, int);
-extern void emit_bcnd (enum rtx_code, rtx);
-extern void expand_block_move (rtx, rtx, rtx *);
+extern void m88k_emit_bcnd (enum rtx_code, rtx);
+extern void m88k_emit_trailing_label (rtx);
+extern int expand_block_move (rtx *);
 extern void print_operand (FILE *, rtx, int);
 extern void print_operand_address (FILE *, rtx);
 extern const char *output_load_const_int (enum machine_mode, rtx *);
@@ -36,32 +36,35 @@ extern const char *output_ior (rtx[]);
 extern const char *output_xor (rtx[]);
 extern const char *output_call (rtx[], rtx);
 
-extern struct rtx_def *emit_test (enum rtx_code, enum machine_mode);
-extern struct rtx_def *legitimize_address (int, rtx, rtx, rtx);
-extern struct rtx_def *legitimize_operand (rtx, enum machine_mode);
+extern rtx m88k_emit_test (enum rtx_code, enum machine_mode);
+extern rtx legitimize_address (int, rtx, rtx, rtx);
+extern rtx legitimize_operand (rtx, enum machine_mode);
 
 extern bool pic_address_needs_scratch (rtx);
 extern bool symbolic_address_p (rtx);
 extern int condition_value (rtx);
 extern int emit_move_sequence (rtx *, enum machine_mode, rtx);
-extern bool mostly_false_jump (rtx, rtx);
-extern bool real_power_of_2_operand (rtx);
+extern bool mostly_false_jump (rtx);
 #ifdef TREE_CODE
 extern void m88k_va_start (tree, rtx);
 #endif /* TREE_CODE */
 #endif /* RTX_CODE */
 
-extern bool null_prologue (void);
+extern bool m88k_regno_ok_for_base_p (int);
+extern bool m88k_regno_ok_for_index_p (int);
+extern bool m88k_legitimate_address_p (enum machine_mode, rtx, int);
+extern rtx m88k_legitimize_address (rtx, enum machine_mode);
 extern bool integer_ok_for_set (unsigned int);
-extern void m88k_layout_frame (void);
+extern int m88k_initial_elimination_offset (int, int);
 extern void m88k_expand_prologue (void);
 extern void m88k_expand_epilogue (void);
 extern void output_function_profiler (FILE *, int, const char *);
 extern enum m88k_instruction classify_integer (enum machine_mode, int);
 extern bool mak_mask_p (int);
 
+extern void m88k_order_regs_for_local_alloc (void);
 #ifdef TREE_CODE
-extern struct rtx_def *m88k_function_arg (CUMULATIVE_ARGS, enum machine_mode,
+extern rtx m88k_function_arg (CUMULATIVE_ARGS, enum machine_mode,
 					  tree, int);
 extern void m88k_function_arg_advance (CUMULATIVE_ARGS *, enum machine_mode,
 				       tree, int);

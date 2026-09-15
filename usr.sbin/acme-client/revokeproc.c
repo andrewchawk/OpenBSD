@@ -1,4 +1,4 @@
-/*	$Id: revokeproc.c,v 1.25 2022/12/18 12:04:55 tb Exp $ */
+/*	$Id: revokeproc.c,v 1.31 2026/06/21 19:23:56 tb Exp $ */
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -15,6 +15,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <assert.h>
 #include <ctype.h>
 #include <err.h>
@@ -32,46 +34,68 @@
 
 #include "extern.h"
 
-#define	RENEW_ALLOW (30 * 24 * 60 * 60)
-
 /*
- * Convert the X509's expiration time into a time_t value.
+ * Convert the X509's notAfter time into a time_t value.
  */
-static time_t
-X509expires(X509 *x)
+static int
+X509notafter(const X509 *x, time_t *notafter)
 {
-	ASN1_TIME	*atim;
+	const ASN1_TIME	*atim;
 	struct tm	 t;
 
-	if ((atim = X509_getm_notAfter(x)) == NULL) {
-		warnx("missing notAfter");
+	if ((atim = X509_get0_notAfter(x)) == NULL)
 		return -1;
-	}
 
 	memset(&t, 0, sizeof(t));
 
-	if (!ASN1_TIME_to_tm(atim, &t)) {
-		warnx("invalid ASN1_TIME");
+	if (!ASN1_TIME_to_tm(atim, &t))
 		return -1;
-	}
 
-	return timegm(&t);
+	t.tm_wday = -1;		/* sentinel for error */
+	if ((*notafter = timegm(&t)) == -1 && t.tm_wday == -1)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Convert the X509's notBefore time into a time_t value.
+ */
+static int
+X509notbefore(const X509 *x, time_t *notbefore)
+{
+	const ASN1_TIME	*atim;
+	struct tm	 t;
+
+	if ((atim = X509_get0_notBefore(x)) == NULL)
+		return -1;
+
+	memset(&t, 0, sizeof(t));
+
+	if (!ASN1_TIME_to_tm(atim, &t))
+		return -1;
+
+	t.tm_wday = -1;		/* sentinel for error */
+	if ((*notbefore = timegm(&t)) == -1 && t.tm_wday == -1)
+		return -1;
+
+	return 0;
 }
 
 int
 revokeproc(int fd, const char *certfile, int force,
-    int revocate, const char *const *alts, size_t altsz)
+    int revocate, struct domain_c *domain)
 {
 	GENERAL_NAMES			*sans = NULL;
 	char				*der = NULL, *dercp, *der64 = NULL;
-	int				 rc = 0, cc, i, len;
-	size_t				*found = NULL;
+	int				 rc = 0, cc, sanidx, len, j, k;
+	int				*found_altnames = NULL;
 	FILE				*f = NULL;
 	X509				*x = NULL;
 	long				 lval;
 	enum revokeop			 op, rop;
-	time_t				 t;
-	size_t				 j;
+	time_t				 notafter, notbefore, cert_validity;
+	time_t				 remaining_validity, renew_allow;
 
 	/*
 	 * First try to open the certificate before we drop privileges
@@ -125,8 +149,13 @@ revokeproc(int fd, const char *certfile, int force,
 
 	/* Read out the expiration date. */
 
-	if ((t = X509expires(x)) == -1) {
-		warnx("X509expires");
+	if (X509notafter(x, &notafter) == -1) {
+		warnx("X509notafter");
+		goto out;
+	}
+
+	if (X509notbefore(x, &notbefore) == -1) {
+		warnx("X509notbefore");
 		goto out;
 	}
 
@@ -142,7 +171,8 @@ revokeproc(int fd, const char *certfile, int force,
 
 	/* An array of buckets: the number of entries found. */
 
-	if ((found = calloc(altsz, sizeof(size_t))) == NULL) {
+	if ((found_altnames = (int *)calloc(domain->altname_count,
+	    sizeof(int))) == NULL) {
 		warn("calloc");
 		goto out;
 	}
@@ -152,63 +182,121 @@ revokeproc(int fd, const char *certfile, int force,
 	 * configuration file and that all domains are represented only once.
 	 */
 
-	for (i = 0; i < sk_GENERAL_NAME_num(sans); i++) {
+	for (sanidx = 0; sanidx < sk_GENERAL_NAME_num(sans); sanidx++) {
 		GENERAL_NAME		*gen_name;
-		const ASN1_IA5STRING	*name;
-		const unsigned char	*name_buf;
+		char			*name_buf = NULL;
 		int			 name_len;
-		int			 name_type;
+		struct altname_c	*ac;
 
-		gen_name = sk_GENERAL_NAME_value(sans, i);
+		gen_name = sk_GENERAL_NAME_value(sans, sanidx);
 		assert(gen_name != NULL);
 
-		name = GENERAL_NAME_get0_value(gen_name, &name_type);
-		if (name_type != GEN_DNS)
+		if (gen_name->type == GEN_IPADD) {
+			char		 ip_buf[INET6_ADDRSTRLEN];
+			const char	*ip;
+
+			name_len = ASN1_STRING_length(gen_name->d.iPAddress);
+			switch (name_len) {
+			case 4:
+				ip = inet_ntop(AF_INET,
+				    ASN1_STRING_get0_data(gen_name->d.iPAddress),
+				    ip_buf, INET6_ADDRSTRLEN);
+				break;
+			case 16:
+				ip = inet_ntop(AF_INET6,
+				    ASN1_STRING_get0_data(gen_name->d.iPAddress),
+				    ip_buf, INET6_ADDRSTRLEN);
+				break;
+			default:
+				ip = NULL;
+				break;
+			}
+			if (ip == NULL) {
+				warnx("invalid IP address");
+				continue;
+			}
+			name_len = asprintf(&name_buf, "%s", ip);
+		} else if (gen_name->type == GEN_DNS) {
+			name_len = ASN1_STRING_length(gen_name->d.dNSName);
+			name_len = asprintf(&name_buf, "%.*s",
+			    name_len,
+			    ASN1_STRING_get0_data(gen_name->d.dNSName));
+		} else
 			continue;
 
-		/* name_buf isn't a C string and could contain embedded NULs. */
-		name_buf = ASN1_STRING_get0_data(name);
-		name_len = ASN1_STRING_length(name);
-
-		for (j = 0; j < altsz; j++) {
-			if ((size_t)name_len != strlen(alts[j]))
-				continue;
-			if (memcmp(name_buf, alts[j], name_len) == 0)
-				break;
+		if (name_len == -1) {
+			warn("asprintf");
+			continue;
 		}
-		if (j == altsz) {
+
+		j = 0;
+		TAILQ_FOREACH(ac, &domain->altname_list, entry) {
+			if (strcmp(name_buf, ac->domain) == 0) {
+				found_altnames[j]++;
+				break;
+			}
+			/* increment if didn't match */
+			j++;
+		}
+		if (j >= domain->altname_count) {
+			/* we haven't matched any */
 			if (revocate) {
 				char *visbuf;
 
 				visbuf = calloc(4, name_len + 1);
 				if (visbuf == NULL) {
-					warn("%s: unexpected SAN", certfile);
+					warn("%s: unexpected SAN in "
+					    "certificate", certfile);
+					free(name_buf);
 					goto out;
 				}
 				strvisx(visbuf, name_buf, name_len, VIS_SAFE);
-				warnx("%s: unexpected SAN entry: %s",
-				    certfile, visbuf);
+				warnx("%s: unexpected SAN entry in "
+				    "certificate: %s", certfile, visbuf);
+				free(visbuf);
+				free(name_buf);
+				goto out;
+			}
+			force = 2;
+			continue;
+		}
+		/* should not reach here if j is out of bounds */
+		if (found_altnames[j] > 1) {
+			if (revocate) {
+				char *visbuf;
+				visbuf = calloc(4, name_len + 1);
+				if (visbuf == NULL) {
+					warn("%s: duplicate SAN in "
+					    "certificate", certfile);
+					free(name_buf);
+					goto out;
+				}
+				warnx("%s: duplicate SAN entry in "
+				    "certificate: %s", certfile, visbuf);
+				free(name_buf);
 				free(visbuf);
 				goto out;
 			}
 			force = 2;
-			continue;
 		}
-		if (found[j]++) {
-			if (revocate) {
-				warnx("%s: duplicate SAN entry: %.*s",
-				    certfile, name_len, name_buf);
-				goto out;
-			}
-			force = 2;
-		}
+
+		free(name_buf);
 	}
 
-	for (j = 0; j < altsz; j++) {
-		if (found[j])
+	for (j = 0; j < domain->altname_count; j++) {
+		struct altname_c	*ac;
+
+		if (found_altnames[j])
 			continue;
 		if (revocate) {
-			warnx("%s: domain not listed: %s", certfile, alts[j]);
+			k = 0;
+			TAILQ_FOREACH(ac, &domain->altname_list, entry) {
+				if (j == k)
+					break;
+				k++;
+			}
+			warnx("%s: domain not listed: %s", certfile,
+			    ac->domain);
 			goto out;
 		}
 		force = 2;
@@ -252,14 +340,35 @@ revokeproc(int fd, const char *certfile, int force,
 		goto out;
 	}
 
-	rop = time(NULL) >= (t - RENEW_ALLOW) ? REVOKE_EXP : REVOKE_OK;
+	cert_validity = notafter - notbefore;
+
+	if (cert_validity < 0) {
+		warnx("Invalid cert, expire time before inception time");
+		rc = -1;
+		goto out;
+	}
+	if (cert_validity > 10 * 24 * 60 * 60)
+		renew_allow = cert_validity / 3;
+	else
+		renew_allow = cert_validity / 2;
+
+	/* We suggest to run renewals daily. Make sure we have 2 chances. */
+	if (renew_allow < 3 * 24 * 60 * 60)
+		renew_allow = 3 * 24 * 60 * 60;
+
+	remaining_validity = notafter - time(NULL);
+
+	if (remaining_validity < renew_allow)
+		rop = REVOKE_EXP;
+	else
+		rop = REVOKE_OK;
 
 	if (rop == REVOKE_EXP)
 		dodbg("%s: certificate renewable: %lld days left",
-		    certfile, (long long)(t - time(NULL)) / 24 / 60 / 60);
+		    certfile, (long long)(remaining_validity / 24 / 60 / 60));
 	else
 		dodbg("%s: certificate valid: %lld days left",
-		    certfile, (long long)(t - time(NULL)) / 24 / 60 / 60);
+		    certfile, (long long)(remaining_validity / 24 / 60 / 60));
 
 	if (rop == REVOKE_OK && force) {
 		warnx("%s: %sforcing renewal", certfile,
@@ -299,7 +408,7 @@ out:
 	X509_free(x);
 	GENERAL_NAMES_free(sans);
 	free(der);
-	free(found);
+	free(found_altnames);
 	free(der64);
 	ERR_print_errors_fp(stderr);
 	ERR_free_strings();

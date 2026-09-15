@@ -1,4 +1,4 @@
-/*	$OpenBSD: dsp.c,v 1.21 2024/04/22 14:11:35 ratchov Exp $	*/
+/*	$OpenBSD: dsp.c,v 1.24 2026/07/09 09:25:22 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -14,6 +14,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+#include <stdio.h>
 #include <string.h>
 #include "dsp.h"
 #include "utils.h"
@@ -259,18 +260,6 @@ aparams_init(struct aparams *par)
 }
 
 /*
- * log the given format/channels/encoding
- */
-void
-aparams_log(struct aparams *par)
-{
-	char enc[ENCMAX];
-
-	aparams_enctostr(par, enc);
-	log_puts(enc);
-}
-
-/*
  * return true if encoding corresponds to what we store in adata_t
  */
 int
@@ -348,15 +337,7 @@ resamp_do(struct resamp *p, adata_t *in, adata_t *out, int icnt, int ocnt)
 	 * Start conversion.
 	 */
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("resamp: copying ");
-		log_puti(ifr);
-		log_puts(" -> ");
-		log_putu(ofr);
-		log_puts(" frames, diff = ");
-		log_puti(diff);
-		log_puts("\n");
-	}
+	logx(4, "resamp: copying %d -> %d frames, diff = %d", ifr, ofr, diff);
 #endif
 	for (;;) {
 		if (diff >= oblksz) {
@@ -423,15 +404,11 @@ resamp_do(struct resamp *p, adata_t *in, adata_t *out, int icnt, int ocnt)
 	p->ctx_start = ctx_start;
 #ifdef DEBUG
 	if (ifr != 0) {
-		log_puts("resamp_do: ");
-		log_puti(ifr);
-		log_puts(": too many input frames\n");
+		logx(0, "resamp_do: %d: too many input frames", ifr);
 		panic();
 	}
 	if (ofr != 0) {
-		log_puts("resamp_do: ");
-		log_puti(ofr);
-		log_puts(": too many output frames\n");
+		logx(0, "resamp_do: %d: too many output frames", ofr);
 		panic();
 	}
 #endif
@@ -458,6 +435,7 @@ resamp_init(struct resamp *p, unsigned int iblksz,
     unsigned int oblksz, int nch)
 {
 	unsigned int g;
+	size_t ctx_size;
 
 	/*
 	 * reduce iblksz/oblksz fraction
@@ -479,7 +457,9 @@ resamp_init(struct resamp *p, unsigned int iblksz,
 	p->diff = 0;
 	p->nch = nch;
 	p->ctx_start = 0;
-	memset(p->ctx, 0, sizeof(p->ctx));
+	ctx_size = p->nch * RESAMP_NCTX * sizeof(adata_t);
+	p->ctx = xmalloc(ctx_size);
+	memset(p->ctx, 0, ctx_size);
 	if (p->iblksz < p->oblksz) {
 		p->filt_cutoff = RESAMP_UNIT;
 		p->filt_step = RESAMP_UNIT / p->oblksz;
@@ -488,14 +468,17 @@ resamp_init(struct resamp *p, unsigned int iblksz,
 		p->filt_step = RESAMP_UNIT / p->iblksz;
 	}
 #ifdef DEBUG
-	if (log_level >= 3) {
-		log_puts("resamp: ");
-		log_putu(iblksz);
-		log_puts("/");
-		log_putu(oblksz);
-		log_puts("\n");
-	}
+	logx(3, "resamp_init: %u/%u", iblksz, oblksz);
 #endif
+}
+
+void
+resamp_done(struct resamp *p)
+{
+#ifdef DEBUG
+	logx(3, "resamp_done");
+#endif
+	xfree(p->ctx);
 }
 
 /*
@@ -516,11 +499,7 @@ enc_do(struct conv *p, unsigned char *in, unsigned char *out, int todo)
 	int osnext;
 
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("enc: copying ");
-		log_putu(todo);
-		log_puts(" frames\n");
-	}
+	logx(4, "enc: copying %u frames", todo);
 #endif
 	/*
 	 * Partially copy structures into local variables, to avoid
@@ -574,11 +553,7 @@ enc_sil_do(struct conv *p, unsigned char *out, int todo)
 	int osnext;
 
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("enc: silence ");
-		log_putu(todo);
-		log_puts(" frames\n");
-	}
+	logx(4, "enc: silence %u frames", todo);
 #endif
 	/*
 	 * Partially copy structures into local variables, to avoid
@@ -613,6 +588,10 @@ enc_sil_do(struct conv *p, unsigned char *out, int todo)
 void
 enc_init(struct conv *p, struct aparams *par, int nch)
 {
+#ifdef DEBUG
+	char enc_str[ENCMAX];
+#endif
+
 	p->nch = nch;
 	p->bps = par->bps;
 	if (par->msb) {
@@ -635,13 +614,8 @@ enc_init(struct conv *p, struct aparams *par, int nch)
 		p->snext = 0;
 	}
 #ifdef DEBUG
-	if (log_level >= 3) {
-		log_puts("enc: ");
-		aparams_log(par);
-		log_puts(", ");
-		log_puti(p->nch);
-		log_puts(" channels\n");
-	}
+	logx(3, "enc: %s, %d channels",
+	    (aparams_enctostr(par, enc_str), enc_str), p->nch);
 #endif
 }
 
@@ -663,11 +637,7 @@ dec_do(struct conv *p, unsigned char *in, unsigned char *out, int todo)
 	adata_t *odata;
 
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("dec: copying ");
-		log_putu(todo);
-		log_puts(" frames\n");
-	}
+	logx(4, "dec: copying %u frames", todo);
 #endif
 	/*
 	 * Partially copy structures into local variables, to avoid
@@ -706,6 +676,10 @@ dec_do(struct conv *p, unsigned char *in, unsigned char *out, int todo)
 void
 dec_init(struct conv *p, struct aparams *par, int nch)
 {
+#ifdef DEBUG
+	char enc_str[ENCMAX];
+#endif
+
 	p->bps = par->bps;
 	p->nch = nch;
 	if (par->msb) {
@@ -728,31 +702,22 @@ dec_init(struct conv *p, struct aparams *par, int nch)
 		p->snext = 0;
 	}
 #ifdef DEBUG
-	if (log_level >= 3) {
-		log_puts("dec: ");
-		aparams_log(par);
-		log_puts(", ");
-		log_puti(p->nch);
-		log_puts(" channels\n");
-	}
+	logx(3, "dec: %s, %d channels",
+	    (aparams_enctostr(par, enc_str), enc_str), p->nch);
 #endif
 }
 
 /*
  * mix "todo" input frames on the output with the given volume
  */
-void
+static void
 cmap_add(struct cmap *p, void *in, void *out, int vol, int todo)
 {
 	adata_t *idata, *odata;
 	int i, j, nch, istart, inext, onext, ostart, y, v;
 
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("cmap: adding ");
-		log_puti(todo);
-		log_puts(" frames\n");
-	}
+	logx(4, "cmap: adding %d frames", todo);
 #endif
 	idata = in;
 	odata = out;
@@ -787,18 +752,14 @@ cmap_add(struct cmap *p, void *in, void *out, int vol, int todo)
 /*
  * overwrite output with "todo" input frames with the given volume
  */
-void
+static void
 cmap_copy(struct cmap *p, void *in, void *out, int vol, int todo)
 {
 	adata_t *idata, *odata;
 	int i, j, nch, istart, inext, onext, ostart, v;
 
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("cmap: copying ");
-		log_puti(todo);
-		log_puts(" frames\n");
-	}
+	logx(4, "cmap: copying %d frames", todo);
 #endif
 	idata = in;
 	odata = out;
@@ -826,13 +787,39 @@ cmap_copy(struct cmap *p, void *in, void *out, int vol, int todo)
 }
 
 /*
+ * Mix or overwrite "todo" input frames on the output with the given volume
+ */
+void
+cmap_do(struct cmap *p, adata_t *in, adata_t *out, int vol, int todo, int mix)
+{
+	void (*copy_func)(struct cmap *, void *, void *, int, int);
+	int offs, i;
+
+	vol /= p->join;
+	copy_func = mix ? cmap_add : cmap_copy;
+
+	copy_func(p, in, out, vol, todo);
+
+	offs = 0;
+	for (i = p->join - 1; i > 0; i--) {
+		offs += p->nch;
+		cmap_add(p, in + offs, out, vol, todo);
+	}
+	offs = 0;
+	for (i = p->expand - 1; i > 0; i--) {
+		offs += p->nch;
+		copy_func(p, in, out + offs, vol, todo);
+	}
+}
+
+/*
  * initialize channel mapper, to map a subset of input channel range
  * into a subset of the output channel range
  */
 void
 cmap_init(struct cmap *p,
     int imin, int imax, int isubmin, int isubmax,
-    int omin, int omax, int osubmin, int osubmax)
+    int omin, int omax, int osubmin, int osubmax, int dup)
 {
 	int inch, onch, nch;
 
@@ -863,19 +850,22 @@ cmap_init(struct cmap *p,
 	p->istart = isubmin - imin;
 	p->inext = imax - isubmax;
 	p->nch = nch;
-#ifdef DEBUG
-	if (log_level >= 3) {
-		log_puts("cmap: nch = ");
-		log_puti(p->nch);
-		log_puts(", ostart = ");
-		log_puti(p->ostart);
-		log_puts(", onext = ");
-		log_puti(p->onext);
-		log_puts(", istart = ");
-		log_puti(p->istart);
-		log_puts(", inext = ");
-		log_puti(p->inext);
-		log_puts("\n");
+
+	/*
+	 * how many times we can join or expand the channels?
+	 */
+	p->join = 1;
+	p->expand = 1;
+	if (dup && nch > 0) {
+		if (inch > nch)
+			p->join = inch / nch;
+		else if (onch > nch)
+			p->expand = onch / nch;
 	}
+
+#ifdef DEBUG
+	logx(3, "%s: nch = %d, join = %d, expand = %d, "
+	    "ostart = %d, onext = %d, istart = %d, inext = %d",  __func__,
+	    p->nch, p->join, p->nch, p->ostart, p->onext, p->istart, p->inext);
 #endif
 }

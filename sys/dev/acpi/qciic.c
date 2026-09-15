@@ -1,4 +1,4 @@
-/*	$OpenBSD: qciic.c,v 1.6 2024/06/19 21:27:22 patrick Exp $	*/
+/*	$OpenBSD: qciic.c,v 1.9 2026/09/08 23:42:30 tobhe Exp $	*/
 /*
  * Copyright (c) 2022 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -74,6 +74,7 @@ struct qciic_crs {
 	uint16_t gpio_int_pin;
 	uint16_t gpio_int_flags;
 	struct aml_node *node;
+	int skip;
 };
 
 int	qciic_acpi_match(struct device *, void *, void *);
@@ -108,6 +109,7 @@ const char *qciic_hids[] = {
 	"QCOM0610",
 	"QCOM0811",
 	"QCOM0C10",
+	"QCOM0F10",
 	NULL
 };
 
@@ -334,7 +336,7 @@ qciic_i2c_intr_establish(void *cookie, void *ih, int level,
 
 		struct acpi_gpio *gpio = crs->gpio_int_node->gpio;
 		gpio->intr_establish(gpio->cookie, crs->gpio_int_pin,
-				     crs->gpio_int_flags, func, arg);
+				     crs->gpio_int_flags, level, func, arg);
 		return ih;
 	}
 
@@ -373,6 +375,11 @@ qciic_acpi_parse_crs(int crsidx, union acpi_resource *crs, void *arg)
 	uint16_t pin;
 
 	switch (AML_CRSTYPE(crs)) {
+	case LR_MEM32FIXED:
+		/* An MMIO address means this is not an I2C device. */
+		sc_crs->skip = 1;
+		break;
+
 	case LR_SERBUS:
 		if (crs->lr_serbus.type == LR_SERBUS_I2C) {
 			sc_crs->i2c_addr = crs->lr_i2cbus._adr;
@@ -440,7 +447,7 @@ qciic_acpi_found_hid(struct aml_node *node, void *arg)
 	aml_freevalue(&res);
 
 	/* Skip if not using this bus. */
-	if (crs.i2c_bus != sc->sc_node)
+	if (crs.skip || crs.i2c_bus != sc->sc_node)
 		return 0;
 
 	acpi_attach_deps(acpi_softc, node->parent);

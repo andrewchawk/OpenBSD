@@ -1,4 +1,4 @@
-/*	$OpenBSD: lock_machdep.c,v 1.12 2024/04/03 19:30:59 gkoehler Exp $	*/
+/*	$OpenBSD: lock_machdep.c,v 1.15 2025/07/15 12:28:05 claudio Exp $	*/
 
 /*
  * Copyright (c) 2021 George Koehler <gkoehler@openbsd.org>
@@ -42,9 +42,6 @@
 #ifndef DDB
 #error "MP_LOCKDEBUG requires DDB"
 #endif
-
-/* CPU-dependent timing, needs this to be settable from ddb. */
-extern int __mp_lock_spinout;
 #endif
 
 static __inline void
@@ -54,14 +51,16 @@ __ppc_lock_spin(struct __ppc_lock *mpl)
 	while (mpl->mpl_cpu != NULL)
 		CPU_BUSY_CYCLE();
 #else
-	int nticks = __mp_lock_spinout;
+	long nticks = __mp_lock_spinout;
 
-	while (mpl->mpl_cpu != NULL && --nticks > 0)
+	while (mpl->mpl_cpu != NULL) {
 		CPU_BUSY_CYCLE();
 
-	if (nticks == 0) {
-		db_printf("__ppc_lock(%p): lock spun out\n", mpl);
-		db_enter();
+		if (nticks-- <= 0) {
+			db_printf("__ppc_lock(%p): lock spun out\n", mpl);
+			db_enter();
+			nticks = __mp_lock_spinout;
+		}
 	}
 #endif
 }

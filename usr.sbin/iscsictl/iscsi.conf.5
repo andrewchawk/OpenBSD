@@ -1,4 +1,4 @@
-.\" $OpenBSD: iscsi.conf.5,v 1.5 2022/03/31 17:27:30 naddy Exp $
+.\" $OpenBSD: iscsi.conf.5,v 1.8 2026/01/18 16:38:02 schwarze Exp $
 .\"
 .\" Copyright (c) 2012 Claudio Jeker <claudio@openbsd.org>
 .\" Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -16,7 +16,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: March 31 2022 $
+.Dd $Mdocdate: January 18 2026 $
 .Dt ISCSI.CONF 5
 .Os
 .Sh NAME
@@ -32,13 +32,13 @@ The
 .Nm
 configuration file is divided into the following main sections:
 .Bl -tag -width xxxx
-.It Sy Macros
-User-defined variables may be defined and used later, simplifying the
+.It Sx Macros
+Definitions of variables that can be used later, simplifying the
 configuration file.
-.It Sy Global Configuration
+.It Sx Global configuration
 Global settings for
 .Xr iscsid 8 .
-.It Sy Target Configuration
+.It Sx Target configuration
 Target-specific parameters.
 .El
 .Pp
@@ -55,7 +55,7 @@ and extend to the end of the current line.
 Care should be taken when commenting out multi-line text:
 the comment is effective until the end of the entire block.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Additional configuration files can be included with the
@@ -64,15 +64,20 @@ keyword, for example:
 .Bd -literal -offset indent
 include "/etc/iscsi-target.conf"
 .Ed
-.Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example,
-.Ic target ,
+.Ss Macros
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
+.Ic target
 or
 .Ic port ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
@@ -81,7 +86,7 @@ target "disk1" {
         targetaddr $target1
 }
 .Ed
-.Sh GLOBAL CONFIGURATION
+.Ss Global configuration
 There are a few settings that affect the operation of the
 .Xr iscsid 8
 daemon globally.
@@ -123,7 +128,7 @@ and a 16-bit
 .Ar qual
 qualifier.
 .El
-.Sh TARGET CONFIGURATION
+.Ss Target configuration
 .Xr iscsid 8
 establishes TCP connections to iSCSI targets.
 Each target is specified by a

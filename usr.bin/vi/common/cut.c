@@ -1,4 +1,4 @@
-/*	$OpenBSD: cut.c,v 1.17 2017/04/18 01:45:35 deraadt Exp $	*/
+/*	$OpenBSD: cut.c,v 1.19 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -68,6 +68,10 @@ cut(SCR *sp, CHAR_T *namep, MARK *fm, MARK *tm, int flags)
 	CHAR_T name = '1';	/* default numeric buffer */
 	recno_t lno;
 	int append, copy_one, copy_def;
+
+	/* Check if the line numbers are out-of-band. */
+	if (fm->lno == OOBLNO || tm->lno == OOBLNO)
+		return (1);
 
 	/*
 	 * If the user specified a buffer, put it there.  (This may require
@@ -171,10 +175,11 @@ copyloop:
 	}
 	return (0);
 
-cut_line_err:	
+cut_line_err:
 	text_lfree(&cbp->textq);
 	cbp->len = 0;
 	cbp->flags = 0;
+	sp->gp->dcbp = NULL;
 	return (1);
 }
 

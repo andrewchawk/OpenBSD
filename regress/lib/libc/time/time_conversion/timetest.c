@@ -1,4 +1,4 @@
-/*	$OpenBSD: timetest.c,v 1.4 2023/04/13 11:32:06 mbuhl Exp $ */
+/*	$OpenBSD: timetest.c,v 1.6 2026/07/17 18:56:42 millert Exp $ */
 
 /*
  * Copyright (c) 2022 Bob Beck <beck@openbsd.org>
@@ -79,12 +79,12 @@ struct timetest timetests[] = {
 			.tm_yday=171,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="moon",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=-16751025,
 		.local_tm=		{
 			.tm_year=69,
@@ -97,7 +97,7 @@ struct timetest timetests[] = {
 			.tm_yday=171,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=69,
@@ -110,7 +110,7 @@ struct timetest timetests[] = {
 			.tm_yday=171,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -141,7 +141,7 @@ struct timetest timetests[] = {
 			.tm_yday=171,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -172,12 +172,12 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="epoch",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=0,
 		.local_tm=		{
 			.tm_year=70,
@@ -190,7 +190,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=70,
@@ -203,7 +203,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -234,7 +234,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -265,12 +265,12 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="epoch - 1",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=-1,
 		.local_tm=		{
 			.tm_year=69,
@@ -283,7 +283,7 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=69,
@@ -296,7 +296,7 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -327,7 +327,7 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -358,12 +358,12 @@ struct timetest timetests[] = {
 			.tm_yday=346,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="legacy min",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=-2147483648,
 		.local_tm=		{
 			.tm_year=1,
@@ -376,7 +376,7 @@ struct timetest timetests[] = {
 			.tm_yday=346,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=1,
@@ -389,7 +389,7 @@ struct timetest timetests[] = {
 			.tm_yday=346,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -420,12 +420,12 @@ struct timetest timetests[] = {
 			.tm_yday=346,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="legacy min - 1",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=-2147483649,
 		.local_tm=		{
 			.tm_year=1,
@@ -438,7 +438,7 @@ struct timetest timetests[] = {
 			.tm_yday=346,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=1,
@@ -451,7 +451,7 @@ struct timetest timetests[] = {
 			.tm_yday=346,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -462,14 +462,14 @@ struct timetest timetests[] = {
 			.tm_year=138,
 			.tm_mon=0,
 			.tm_mday=18,
-			.tm_hour=20,
+			.tm_hour=21,
 			.tm_min=14,
 			.tm_sec=7,
 			.tm_wday=1,
 			.tm_yday=17,
 			.tm_isdst=0,
-			.tm_gmtoff=-25200,
-			.tm_zone="MST"
+			.tm_gmtoff=-21600,
+			.tm_zone="CST"
 		},
 		.gmt_tm=		{
 			.tm_year=138,
@@ -482,12 +482,12 @@ struct timetest timetests[] = {
 			.tm_yday=18,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="legacy max",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=2147483647,
 		.local_tm=		{
 			.tm_year=138,
@@ -500,7 +500,7 @@ struct timetest timetests[] = {
 			.tm_yday=18,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=138,
@@ -513,7 +513,7 @@ struct timetest timetests[] = {
 			.tm_yday=18,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -524,14 +524,14 @@ struct timetest timetests[] = {
 			.tm_year=138,
 			.tm_mon=0,
 			.tm_mday=18,
-			.tm_hour=20,
+			.tm_hour=21,
 			.tm_min=14,
 			.tm_sec=8,
 			.tm_wday=1,
 			.tm_yday=17,
 			.tm_isdst=0,
-			.tm_gmtoff=-25200,
-			.tm_zone="MST"
+			.tm_gmtoff=-21600,
+			.tm_zone="CST"
 		},
 		.gmt_tm=		{
 			.tm_year=138,
@@ -544,12 +544,12 @@ struct timetest timetests[] = {
 			.tm_yday=18,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="legacy max + 1",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=2147483648,
 		.local_tm=		{
 			.tm_year=138,
@@ -562,7 +562,7 @@ struct timetest timetests[] = {
 			.tm_yday=18,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=138,
@@ -575,7 +575,7 @@ struct timetest timetests[] = {
 			.tm_yday=18,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -611,7 +611,7 @@ struct timetest timetests[] = {
 	},
 	{
 		.descr="min",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=INT64_MIN,
 		.local_tm=		{
 			.tm_year=0,
@@ -704,7 +704,7 @@ struct timetest timetests[] = {
 	},
 	{
 		.descr="max",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=9223372036854775807,
 		.local_tm=		{
 			.tm_year=0,
@@ -772,14 +772,14 @@ struct timetest timetests[] = {
                         .tm_year=2147481747,
 			.tm_mon=0,
 			.tm_mday=31,
-			.tm_hour=16,
+			.tm_hour=17,
 			.tm_min=59,
 			.tm_sec=32,
 			.tm_wday=4,
 			.tm_yday=30,
 			.tm_isdst=0,
-			.tm_gmtoff=-25200,
-			.tm_zone="MST"
+			.tm_gmtoff=-21600,
+			.tm_zone="CST"
 		},
 		.gmt_tm=		{
                         .tm_year=2147481747,
@@ -792,7 +792,7 @@ struct timetest timetests[] = {
 			.tm_yday=30,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -823,12 +823,12 @@ struct timetest timetests[] = {
 			.tm_yday=30,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="maxint struct tm",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=67767976204675199,
 		.local_tm=		{
                         .tm_year=2147481747,
@@ -841,7 +841,7 @@ struct timetest timetests[] = {
 			.tm_yday=30,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
                         .tm_year=2147481747,
@@ -854,12 +854,12 @@ struct timetest timetests[] = {
 			.tm_yday=30,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="minint struct tm",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=-67768038398073601,
 		.local_tm=		{
                         .tm_year=-2147483578,
@@ -872,7 +872,7 @@ struct timetest timetests[] = {
 			.tm_yday=30,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
                         .tm_year=-2147483578,
@@ -885,7 +885,7 @@ struct timetest timetests[] = {
 			.tm_yday=30,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -916,12 +916,12 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="0000",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=-62167219200,
 		.local_tm=		{
 			.tm_year=-1900,
@@ -934,7 +934,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=-1900,
@@ -947,7 +947,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -978,7 +978,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -989,14 +989,14 @@ struct timetest timetests[] = {
 			.tm_year=8099,
 			.tm_mon=11,
 			.tm_mday=31,
-			.tm_hour=16,
+			.tm_hour=17,
 			.tm_min=59,
 			.tm_sec=59,
 			.tm_wday=5,
 			.tm_yday=364,
 			.tm_isdst=0,
-			.tm_gmtoff=-25200,
-			.tm_zone="MST"
+			.tm_gmtoff=-21600,
+			.tm_zone="CST"
 		},
 		.gmt_tm=		{
 			.tm_year=8099,
@@ -1009,12 +1009,12 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="9999",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=253402300799,
 		.local_tm=		{
 			.tm_year=8099,
@@ -1027,7 +1027,7 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=8099,
@@ -1040,7 +1040,7 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1051,14 +1051,14 @@ struct timetest timetests[] = {
 			.tm_year=8099,
 			.tm_mon=11,
 			.tm_mday=31,
-			.tm_hour=16,
+			.tm_hour=17,
 			.tm_min=59,
 			.tm_sec=32,
 			.tm_wday=5,
 			.tm_yday=364,
 			.tm_isdst=0,
-			.tm_gmtoff=-25200,
-			.tm_zone="MST"
+			.tm_gmtoff=-21600,
+			.tm_zone="CST"
 		},
 		.gmt_tm=		{
 			.tm_year=8099,
@@ -1071,7 +1071,7 @@ struct timetest timetests[] = {
 			.tm_yday=364,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1102,7 +1102,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1133,7 +1133,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1164,12 +1164,12 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="leap second - 1",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=1483228825,
 		.local_tm=		{
 			.tm_year=116,
@@ -1182,7 +1182,7 @@ struct timetest timetests[] = {
 			.tm_yday=365,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=117,
@@ -1195,12 +1195,12 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="leap second",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=1483228826,
 		.local_tm=		{
 			.tm_year=116,
@@ -1213,7 +1213,7 @@ struct timetest timetests[] = {
 			.tm_yday=365,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=117,
@@ -1226,12 +1226,12 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
 		.descr="leap second + 1",
-		.timezone="right/UTC",
+		.timezone="right/GMT",
 		.time=1483228827,
 		.local_tm=		{
 			.tm_year=117,
@@ -1244,7 +1244,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="UTC"
+			.tm_zone="GMT"
 		},
 		.gmt_tm=		{
 			.tm_year=117,
@@ -1257,7 +1257,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1288,7 +1288,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1319,7 +1319,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1350,7 +1350,7 @@ struct timetest timetests[] = {
 			.tm_yday=0,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1381,7 +1381,7 @@ struct timetest timetests[] = {
 			.tm_yday=72,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1412,7 +1412,7 @@ struct timetest timetests[] = {
 			.tm_yday=72,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1443,7 +1443,7 @@ struct timetest timetests[] = {
 			.tm_yday=72,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1474,7 +1474,7 @@ struct timetest timetests[] = {
 			.tm_yday=72,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1505,7 +1505,7 @@ struct timetest timetests[] = {
 			.tm_yday=72,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1536,7 +1536,7 @@ struct timetest timetests[] = {
 			.tm_yday=72,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1567,7 +1567,7 @@ struct timetest timetests[] = {
 			.tm_yday=310,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1598,7 +1598,7 @@ struct timetest timetests[] = {
 			.tm_yday=310,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1629,7 +1629,7 @@ struct timetest timetests[] = {
 			.tm_yday=310,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1660,7 +1660,7 @@ struct timetest timetests[] = {
 			.tm_yday=310,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1691,7 +1691,7 @@ struct timetest timetests[] = {
 			.tm_yday=310,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
 	{
@@ -1722,7 +1722,7 @@ struct timetest timetests[] = {
 			.tm_yday=310,
 			.tm_isdst=0,
 			.tm_gmtoff=0,
-			.tm_zone="GMT"
+			.tm_zone="UTC"
 		},
 	},
         {
@@ -1830,7 +1830,7 @@ int main() {
 	if (stat("/usr/share/zoneinfo/posix", &sb) == -1 ||
 	    stat("/usr/share/zoneinfo/right", &sb) == -1) {
 		fprintf(stderr, "POSIX time zones missing, run the following command:\n\n"
-		    "\tmake -C ../../../../../share/zoneinfo other_two\n\n"
+		    "\tmake -C ../../../../share/zoneinfo other_two\n\n"
 		    "SKIPPED\n");
 		exit(0);
 	}

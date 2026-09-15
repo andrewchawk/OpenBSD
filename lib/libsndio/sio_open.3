@@ -1,4 +1,4 @@
-.\" $OpenBSD: sio_open.3,v 1.56 2022/05/30 10:31:59 op Exp $
+.\" $OpenBSD: sio_open.3,v 1.59 2026/01/22 09:24:26 ratchov Exp $
 .\"
 .\" Copyright (c) 2007 Alexandre Ratchov <alex@caoua.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: May 30 2022 $
+.Dd $Mdocdate: January 22 2026 $
 .Dt SIO_OPEN 3
 .Os
 .Sh NAME
@@ -29,6 +29,7 @@
 .Nm sio_read ,
 .Nm sio_write ,
 .Nm sio_onmove ,
+.Nm sio_onxrun ,
 .Nm sio_nfds ,
 .Nm sio_pollfd ,
 .Nm sio_revents ,
@@ -39,50 +40,57 @@
 .Nm SIO_BPS
 .Nd sndio interface to audio devices
 .Sh SYNOPSIS
+.Lb libsndio
 .In sndio.h
-.Ft "struct sio_hdl *"
+.Ft struct sio_hdl *
 .Fn sio_open "const char *name" "unsigned int mode" "int nbio_flag"
-.Ft "void"
+.Ft void
 .Fn sio_close "struct sio_hdl *hdl"
-.Ft "int"
+.Ft int
 .Fn sio_setpar "struct sio_hdl *hdl" "struct sio_par *par"
-.Ft "int"
+.Ft int
 .Fn sio_getpar "struct sio_hdl *hdl" "struct sio_par *par"
-.Ft "int"
+.Ft int
 .Fn sio_getcap "struct sio_hdl *hdl" "struct sio_cap *cap"
-.Ft "int"
+.Ft int
 .Fn sio_start "struct sio_hdl *hdl"
-.Ft "int"
+.Ft int
 .Fn sio_stop "struct sio_hdl *hdl"
-.Ft "int"
+.Ft int
 .Fn sio_flush "struct sio_hdl *hdl"
-.Ft "size_t"
+.Ft size_t
 .Fn sio_read "struct sio_hdl *hdl" "void *addr" "size_t nbytes"
-.Ft "size_t"
+.Ft size_t
 .Fn sio_write "struct sio_hdl *hdl" "const void *addr" "size_t nbytes"
-.Ft "void"
+.Ft void
 .Fo sio_onmove
 .Fa "struct sio_hdl *hdl"
 .Fa "void (*cb)(void *arg, int delta)"
 .Fa "void *arg"
 .Fc
-.Ft "int"
+.Ft void
+.Fo sio_onxrun
+.Fa "struct sio_hdl *hdl"
+.Fa "void (*cb)(void *arg)"
+.Fa "void *arg"
+.Fc
+.Ft int
 .Fn sio_nfds "struct sio_hdl *hdl"
-.Ft "int"
+.Ft int
 .Fn sio_pollfd "struct sio_hdl *hdl" "struct pollfd *pfd" "int events"
-.Ft "int"
+.Ft int
 .Fn sio_revents "struct sio_hdl *hdl" "struct pollfd *pfd"
-.Ft "int"
+.Ft int
 .Fn sio_eof "struct sio_hdl *hdl"
-.Ft "int"
+.Ft int
 .Fn sio_setvol "struct sio_hdl *hdl" "unsigned int vol"
-.Ft "int"
+.Ft int
 .Fo sio_onvol
 .Fa "struct sio_hdl *hdl"
 .Fa "void (*cb)(void *arg, unsigned int vol)"
 .Fa "void *arg"
 .Fc
-.Ft "void"
+.Ft void
 .Fn sio_initpar "struct sio_par *par"
 .Ft unsigned int
 .Fn SIO_BPS "unsigned int bits"
@@ -587,6 +595,21 @@ might overrun; in this case recorded data is lost.
 Similarly if the application cannot provide data to play
 fast enough, the play buffer underruns and silence is played
 instead.
+.Pp
+The
+.Fn sio_onxrun
+function can be used to register the
+.Fn cb
+callback function called at buffer underrun or overrun.
+It is called by
+.Fn sio_read ,
+.Fn sio_write ,
+and
+.Fn sio_revents .
+The value of the
+.Fa arg
+pointer is passed to the callback and can contain anything.
+.Pp
 Depending on the
 .Fa xrun
 parameter of the

@@ -1,4 +1,4 @@
-/*	$OpenBSD: exception.S,v 1.8 2023/11/24 07:57:39 miod Exp $	*/
+/*	$OpenBSD: exception.S,v 1.11 2026/05/26 14:12:34 kettenis Exp $	*/
 
 /*-
  * Copyright (c) 2015-2018 Ruslan Bukin <br@bsdpad.com>
@@ -36,7 +36,6 @@
 
 #include "assym.h"
 #include <machine/asm.h>
-#include <machine/trap.h>
 #include <machine/riscvreg.h>
 
 .macro save_registers mode
@@ -46,11 +45,6 @@
 
 .if \mode == 0	/* We came from userspace. */
 	sd	gp, (TF_GP)(sp)
-.option push
-.option norelax
-	/* Load the kernel's global pointer */
-	la	gp, __global_pointer$
-.option pop
 
 	/* Load our pcpu */
 	sd	tp, (TF_TP)(sp)
@@ -108,7 +102,7 @@
 	li	t0, SSTATUS_SUM
 	csrc	sstatus, t0
 .endif
-	li	t0, SSTATUS_FS_MASK
+	li	t0, (SSTATUS_FS_MASK | SSTATUS_VS_MASK)
 	csrc	sstatus, t0
 	csrr	t0, stval
 	sd	t0, (TF_STVAL)(sp)

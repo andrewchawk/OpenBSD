@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ogx.c,v 1.7 2024/05/20 23:13:33 jsg Exp $	*/
+/*	$OpenBSD: if_ogx.c,v 1.9 2026/09/11 16:22:55 visa Exp $	*/
 
 /*
  * Copyright (c) 2019-2020 Visa Hankala
@@ -62,6 +62,8 @@
 #include <octeon/dev/cn30xxsmivar.h>
 #include <octeon/dev/ogxreg.h>
 #include <octeon/dev/ogxvar.h>
+
+#define OGX_MAX_MTU		12288
 
 struct ogx_link_ops;
 
@@ -480,6 +482,7 @@ ogx_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_xflags |= IFXF_MPSAFE;
 	ifp->if_ioctl = ogx_ioctl;
 	ifp->if_qstart = ogx_start;
+	ifp->if_hardmtu = OGX_MAX_MTU;
 	ifp->if_capabilities = IFCAP_CSUM_IPv4 |
 	    IFCAP_CSUM_TCPv4 | IFCAP_CSUM_UDPv4 |
 	    IFCAP_CSUM_TCPv6 | IFCAP_CSUM_UDPv6;
@@ -1277,11 +1280,13 @@ ogx_send_mbuf(struct ogx_softc *sc, struct mbuf *m0)
 			hdr |= (ehdrlen + sizeof(struct ip)) <<
 			    PKO3_SEND_HDR_L4PTR_S;
 			break;
+#ifdef INET6
 		case ETHERTYPE_IPV6:
 			hdr |= ehdrlen << PKO3_SEND_HDR_L3PTR_S;
 			hdr |= (ehdrlen + sizeof(struct ip6_hdr)) <<
 			    PKO3_SEND_HDR_L4PTR_S;
 			break;
+#endif
 		default:
 			break;
 		}
@@ -1401,9 +1406,11 @@ ogx_mii_statchg(struct device *self)
 int
 ogx_sgmii_link_init(struct ogx_softc *sc)
 {
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
 	uint64_t cpu_freq = octeon_boot_info->eclock / 1000000;
 	uint64_t val;
 	int align = 1;
+	unsigned int maxlen;
 
 	val = PORT_RD_8(sc, BGX_GMP_GMI_TX_APPEND);
 	val |= BGX_GMP_GMI_TX_APPEND_FCS;
@@ -1413,6 +1420,11 @@ ogx_sgmii_link_init(struct ogx_softc *sc)
 	PORT_WR_8(sc, BGX_GMP_GMI_TX_APPEND, val);
 	PORT_WR_8(sc, BGX_GMP_GMI_TX_MIN_PKT, 59);
 	PORT_WR_8(sc, BGX_GMP_GMI_TX_THRESH, 0x20);
+
+	maxlen = roundup(ifp->if_hardmtu + ETHER_HDR_LEN + ETHER_CRC_LEN +
+            ETHER_VLAN_ENCAP_LEN, 8);
+	PORT_WR_8(sc, BGX_GMP_GMI_RX_JABBER,
+	    maxlen & BGX_GMP_GMI_RX_JABBER_CNT_M);
 
 	val = PORT_RD_8(sc, BGX_GMP_GMI_TX_SGMII_CTL);
 	if (align)

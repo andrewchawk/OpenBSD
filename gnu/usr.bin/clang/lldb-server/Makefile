@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.11 2024/02/08 20:28:54 miod Exp $
+# $OpenBSD: Makefile,v 1.13 2026/05/29 11:18:32 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -6,8 +6,7 @@ PROG=	lldb-server
 BINDIR=	/usr/bin
 NOMAN=
 
-SRCS=	Acceptor.cpp \
-	lldb-gdbserver.cpp \
+SRCS=	lldb-gdbserver.cpp \
 	lldb-platform.cpp \
 	lldb-server.cpp \
 	LLDBServerUtilities.cpp \
@@ -21,15 +20,18 @@ LDADD+=	-lcurses -ledit -lpanel
 .PATH: ${.CURDIR}/../../../llvm/lldb/source/Version
 .PATH:	${.CURDIR}/../../../llvm/lldb/tools/lldb-server
 
-LLVM_LIBDEPS=	clangAST \
+LLVM_LIBDEPS=	clangAPINotes \
+    clangAST \
     clangASTMatchers \
     clangAnalysis \
+    clangAnalysisLifetimeSafety \
     clangBasic \
     clangCodeGen \
     clangDriver \
     clangEdit \
     clangFrontend \
     clangLex \
+    clangOptions \
     clangParse \
     clangRewrite \
     clangRewriteFrontend \
@@ -67,19 +69,25 @@ LLVM_LIBDEPS=	clangAST \
     lldbPluginSymbolFile \
     lldbPluginSymbolVendor \
     lldbPluginSystemRuntime \
-		lldbPluginTypeSystem \
+    lldbPluginTypeSystem \
     lldbPluginUnwindAssembly \
     lldbSymbol \
     lldbTarget \
-    lldbUtility
+    lldbUtility \
+    lldbValueObject
 
-BUILDFIRST=	VCSVersion.inc LLGSOptions.inc
-CLEANFILES+=	VCSVersion.inc LLGSOptions.inc
+BUILDFIRST=	VCSVersion.inc LLGSOptions.inc PlatformOptions.inc
+CLEANFILES+=	VCSVersion.inc LLGSOptions.inc PlatformOptions.inc
 
 VCSVersion.inc:
 	touch $@
 
 LLGSOptions.inc: ${.CURDIR}/../../../llvm/lldb/tools/lldb-server/LLGSOptions.td
+	${.OBJDIR}/../llvm-tblgen/llvm-tblgen -gen-opt-parser-defs \
+		-I ${LLVM_SRCS}/include \
+		-o ${.TARGET} ${.ALLSRC}
+
+PlatformOptions.inc: ${.CURDIR}/../../../llvm/lldb/tools/lldb-server/PlatformOptions.td
 	${.OBJDIR}/../llvm-tblgen/llvm-tblgen -gen-opt-parser-defs \
 		-I ${LLVM_SRCS}/include \
 		-o ${.TARGET} ${.ALLSRC}

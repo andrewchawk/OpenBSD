@@ -5,9 +5,10 @@
 
 #include <linux/shmem_fs.h>
 
+#include <linux/gpu_buddy.h>
+#include <drm/drm_print.h>
 #include <drm/ttm/ttm_placement.h>
 #include <drm/ttm/ttm_tt.h>
-#include <drm/drm_buddy.h>
 
 #include "i915_drv.h"
 #include "i915_ttm_buddy_manager.h"
@@ -52,7 +53,11 @@ struct i915_ttm_tt {
 	struct i915_refct_sgt cached_rsgt;
 
 	bool is_shmem;
+#ifdef __linux__
 	struct file *filp;
+#else
+	struct uvm_object *filp;
+#endif
 };
 
 static const struct ttm_place sys_placement_flags = {
@@ -65,8 +70,6 @@ static const struct ttm_place sys_placement_flags = {
 static struct ttm_placement i915_sys_placement = {
 	.num_placement = 1,
 	.placement = &sys_placement_flags,
-	.num_busy_placement = 1,
-	.busy_placement = &sys_placement_flags,
 };
 
 /**
@@ -144,54 +147,47 @@ i915_ttm_place_from_region(const struct intel_memory_region *mr,
 		place->fpfn = offset >> PAGE_SHIFT;
 		WARN_ON(overflows_type(place->fpfn + (size >> PAGE_SHIFT), place->lpfn));
 		place->lpfn = place->fpfn + (size >> PAGE_SHIFT);
-	} else if (mr->io_size && mr->io_size < mr->total) {
+	} else if (resource_size(&mr->io) && resource_size(&mr->io) < mr->total) {
 		if (flags & I915_BO_ALLOC_GPU_ONLY) {
 			place->flags |= TTM_PL_FLAG_TOPDOWN;
 		} else {
 			place->fpfn = 0;
-			WARN_ON(overflows_type(mr->io_size >> PAGE_SHIFT, place->lpfn));
-			place->lpfn = mr->io_size >> PAGE_SHIFT;
+			WARN_ON(overflows_type(resource_size(&mr->io) >> PAGE_SHIFT, place->lpfn));
+			place->lpfn = resource_size(&mr->io) >> PAGE_SHIFT;
 		}
 	}
 }
 
 static void
 i915_ttm_placement_from_obj(const struct drm_i915_gem_object *obj,
-			    struct ttm_place *requested,
-			    struct ttm_place *busy,
+			    struct ttm_place *places,
 			    struct ttm_placement *placement)
 {
 	unsigned int num_allowed = obj->mm.n_placements;
 	unsigned int flags = obj->flags;
 	unsigned int i;
 
-	placement->num_placement = 1;
 	i915_ttm_place_from_region(num_allowed ? obj->mm.placements[0] :
-				   obj->mm.region, requested, obj->bo_offset,
+				   obj->mm.region, &places[0], obj->bo_offset,
 				   obj->base.size, flags);
 
 	/* Cache this on object? */
-	placement->num_busy_placement = num_allowed;
-	for (i = 0; i < placement->num_busy_placement; ++i)
-		i915_ttm_place_from_region(obj->mm.placements[i], busy + i,
-					   obj->bo_offset, obj->base.size, flags);
-
-	if (num_allowed == 0) {
-		*busy = *requested;
-		placement->num_busy_placement = 1;
+	for (i = 0; i < num_allowed; ++i) {
+		i915_ttm_place_from_region(obj->mm.placements[i],
+					   &places[i + 1], obj->bo_offset,
+					   obj->base.size, flags);
+		places[i + 1].flags |= TTM_PL_FLAG_FALLBACK;
 	}
 
-	placement->placement = requested;
-	placement->busy_placement = busy;
+	placement->num_placement = num_allowed + 1;
+	placement->placement = places;
 }
 
+#ifdef __linux__
 static int i915_ttm_tt_shmem_populate(struct ttm_device *bdev,
 				      struct ttm_tt *ttm,
 				      struct ttm_operation_ctx *ctx)
 {
-	STUB();
-	return -ENOSYS;
-#ifdef notyet
 	struct drm_i915_private *i915 = container_of(bdev, typeof(*i915), bdev);
 	struct intel_memory_region *mr = i915->mm.regions[INTEL_MEMORY_SYSTEM];
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
@@ -245,19 +241,71 @@ err_free_st:
 	shmem_sg_free_table(st, filp->f_mapping, false, false);
 
 	return err;
-#endif
 }
+#else /* !__linux__ */
+static int i915_ttm_tt_shmem_populate(struct ttm_device *bdev,
+				      struct ttm_tt *ttm,
+				      struct ttm_operation_ctx *ctx)
+{
+	struct drm_i915_private *i915 = container_of(bdev, typeof(*i915), bdev);
+	struct intel_memory_region *mr = i915->mm.regions[INTEL_MEMORY_SYSTEM];
+	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
+	const unsigned int max_segment = i915_sg_segment_size(i915->drm.dev);
+	const size_t size = (size_t)ttm->num_pages << PAGE_SHIFT;
+	struct uvm_object *uao = i915_tt->filp;
+	struct sgt_iter sgt_iter;
+	struct sg_table *st;
+	struct vm_page *page;
+	unsigned long i;
+	int err;
+
+	if (!uao) {
+		uao = uao_create(size, 0);
+		if (uao == NULL)
+			return -ENOMEM;
+
+		i915_tt->filp = uao;
+	}
+
+	st = &i915_tt->cached_rsgt.table;
+	err = shmem_sg_alloc_table(i915, st, size, mr, /*filp->f_mapping*/NULL,
+				   max_segment, uao);
+	if (err)
+		return err;
+
+	err = dma_map_sgtable(i915_tt->dev, st, DMA_BIDIRECTIONAL,
+			      DMA_ATTR_SKIP_CPU_SYNC);
+	if (err)
+		goto err_free_st;
+
+	i = 0;
+	for_each_sgt_page(page, sgt_iter, st)
+		ttm->pages[i++] = page;
+
+	if (ttm->page_flags & TTM_TT_FLAG_SWAPPED)
+		ttm->page_flags &= ~TTM_TT_FLAG_SWAPPED;
+
+	return 0;
+
+err_free_st:
+	shmem_sg_free_table(st, NULL, false, false, uao, size);
+
+	return err;
+}
+#endif /* !__linux__ */
 
 static void i915_ttm_tt_shmem_unpopulate(struct ttm_tt *ttm)
 {
-	STUB();
-#ifdef notyet
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 	bool backup = ttm->page_flags & TTM_TT_FLAG_SWAPPED;
 	struct sg_table *st = &i915_tt->cached_rsgt.table;
 
+#ifdef __linux__
 	shmem_sg_free_table(st, file_inode(i915_tt->filp)->i_mapping,
 			    backup, backup);
+#else
+	const size_t size = (size_t)ttm->num_pages << PAGE_SHIFT;
+	shmem_sg_free_table(st, NULL, backup, backup, i915_tt->filp, size);
 #endif
 }
 
@@ -340,8 +388,6 @@ static int i915_ttm_tt_populate(struct ttm_device *bdev,
 
 static void i915_ttm_tt_unpopulate(struct ttm_device *bdev, struct ttm_tt *ttm)
 {
-	STUB();
-#ifdef notyet
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 	struct sg_table *st = &i915_tt->cached_rsgt.table;
 
@@ -354,7 +400,6 @@ static void i915_ttm_tt_unpopulate(struct ttm_device *bdev, struct ttm_tt *ttm)
 		sg_free_table(st);
 		ttm_pool_free(&bdev->pool, ttm);
 	}
-#endif
 }
 
 static void i915_ttm_tt_destroy(struct ttm_device *bdev, struct ttm_tt *ttm)
@@ -362,7 +407,11 @@ static void i915_ttm_tt_destroy(struct ttm_device *bdev, struct ttm_tt *ttm)
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 
 	if (i915_tt->filp)
+#ifdef __linux__
 		fput(i915_tt->filp);
+#else
+		uao_detach(i915_tt->filp);
+#endif
 
 	ttm_tt_fini(ttm);
 	i915_refct_sgt_put(&i915_tt->cached_rsgt);
@@ -433,8 +482,6 @@ void i915_ttm_free_cached_io_rsgt(struct drm_i915_gem_object *obj)
 int i915_ttm_purge(struct drm_i915_gem_object *obj)
 {
 	struct ttm_buffer_object *bo = i915_gem_to_ttm(obj);
-	struct i915_ttm_tt *i915_tt =
-		container_of(bo->ttm, typeof(*i915_tt), ttm);
 	struct ttm_operation_ctx ctx = {
 		.interruptible = true,
 		.no_wait_gpu = false,
@@ -449,23 +496,30 @@ int i915_ttm_purge(struct drm_i915_gem_object *obj)
 	if (ret)
 		return ret;
 
-	if (bo->ttm && i915_tt->filp) {
-		/*
-		 * The below fput(which eventually calls shmem_truncate) might
-		 * be delayed by worker, so when directly called to purge the
-		 * pages(like by the shrinker) we should try to be more
-		 * aggressive and release the pages immediately.
-		 */
+	if (bo->ttm) {
+		struct i915_ttm_tt *i915_tt =
+			container_of(bo->ttm, typeof(*i915_tt), ttm);
+
+		if (i915_tt->filp) {
+			/*
+			 * The below fput(which eventually calls shmem_truncate)
+			 * might be delayed by worker, so when directly called
+			 * to purge the pages(like by the shrinker) we should
+			 * try to be more aggressive and release the pages
+			 * immediately.
+			 */
 #ifdef __linux__
-		shmem_truncate_range(file_inode(i915_tt->filp),
-				     0, (loff_t)-1);
+			shmem_truncate_range(file_inode(i915_tt->filp),
+					     0, (loff_t)-1);
+			fput(fetch_and_zero(&i915_tt->filp));
 #else
-		rw_enter(obj->base.uao->vmobjlock, RW_WRITE);
-		obj->base.uao->pgops->pgo_flush(obj->base.uao, 0, obj->base.size,
-		    PGO_ALLPAGES | PGO_FREE);
-		rw_exit(obj->base.uao->vmobjlock);
+			rw_enter(i915_tt->filp->vmobjlock, RW_WRITE);
+			i915_tt->filp->pgops->pgo_flush(i915_tt->filp, 0,
+			    obj->base.size, PGO_ALLPAGES | PGO_FREE);
+			rw_exit(i915_tt->filp->vmobjlock);
+			uao_detach(fetch_and_zero(&i915_tt->filp));
 #endif
-		fput(fetch_and_zero(&i915_tt->filp));
+		}
 	}
 
 	obj->write_domain = 0;
@@ -546,9 +600,6 @@ static void i915_ttm_delete_mem_notify(struct ttm_buffer_object *bo)
 
 static struct i915_refct_sgt *i915_ttm_tt_get_st(struct ttm_tt *ttm)
 {
-	STUB();
-	return ERR_PTR(-ENOSYS);
-#ifdef notyet
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 	struct sg_table *st;
 	int ret;
@@ -573,7 +624,6 @@ static struct i915_refct_sgt *i915_ttm_tt_get_st(struct ttm_tt *ttm)
 	}
 
 	return i915_refct_sgt_get(&i915_tt->cached_rsgt);
-#endif
 }
 
 /**
@@ -814,12 +864,16 @@ static int __i915_ttm_get_pages(struct drm_i915_gem_object *obj,
 		.interruptible = true,
 		.no_wait_gpu = false,
 	};
-	int real_num_busy;
+	struct ttm_placement initial_placement;
+	struct ttm_place initial_place;
 	int ret;
 
 	/* First try only the requested placement. No eviction. */
-	real_num_busy = fetch_and_zero(&placement->num_busy_placement);
-	ret = ttm_bo_validate(bo, placement, &ctx);
+	initial_placement.num_placement = 1;
+	memcpy(&initial_place, placement->placement, sizeof(struct ttm_place));
+	initial_place.flags |= TTM_PL_FLAG_DESIRED;
+	initial_placement.placement = &initial_place;
+	ret = ttm_bo_validate(bo, &initial_placement, &ctx);
 	if (ret) {
 		ret = i915_ttm_err_to_gem(ret);
 		/*
@@ -834,14 +888,13 @@ static int __i915_ttm_get_pages(struct drm_i915_gem_object *obj,
 		 * If the initial attempt fails, allow all accepted placements,
 		 * evicting if necessary.
 		 */
-		placement->num_busy_placement = real_num_busy;
 		ret = ttm_bo_validate(bo, placement, &ctx);
 		if (ret)
 			return i915_ttm_err_to_gem(ret);
 	}
 
 	if (bo->ttm && !ttm_tt_is_populated(bo->ttm)) {
-		ret = ttm_tt_populate(bo->bdev, bo->ttm, &ctx);
+		ret = ttm_bo_populate(bo, &ctx);
 		if (ret)
 			return ret;
 
@@ -868,7 +921,7 @@ static int __i915_ttm_get_pages(struct drm_i915_gem_object *obj,
 
 static int i915_ttm_get_pages(struct drm_i915_gem_object *obj)
 {
-	struct ttm_place requested, busy[I915_TTM_MAX_PLACEMENTS];
+	struct ttm_place places[I915_TTM_MAX_PLACEMENTS + 1];
 	struct ttm_placement placement;
 
 	/* restricted by sg_alloc_table */
@@ -878,7 +931,7 @@ static int i915_ttm_get_pages(struct drm_i915_gem_object *obj)
 	GEM_BUG_ON(obj->mm.n_placements > I915_TTM_MAX_PLACEMENTS);
 
 	/* Move to the requested placement. */
-	i915_ttm_placement_from_obj(obj, &requested, busy, &placement);
+	i915_ttm_placement_from_obj(obj, places, &placement);
 
 	return __i915_ttm_get_pages(obj, &placement);
 }
@@ -908,9 +961,7 @@ static int __i915_ttm_migrate(struct drm_i915_gem_object *obj,
 	i915_ttm_place_from_region(mr, &requested, obj->bo_offset,
 				   obj->base.size, flags);
 	placement.num_placement = 1;
-	placement.num_busy_placement = 1;
 	placement.placement = &requested;
-	placement.busy_placement = &requested;
 
 	ret = __i915_ttm_get_pages(obj, &placement);
 	if (ret)
@@ -1029,7 +1080,7 @@ void i915_ttm_adjust_lru(struct drm_i915_gem_object *obj)
 		 * If we need to place an LMEM resource which doesn't need CPU
 		 * access then we should try not to victimize mappable objects
 		 * first, since we likely end up stealing more of the mappable
-		 * portion. And likewise when we try to find space for a mappble
+		 * portion. And likewise when we try to find space for a mappable
 		 * object, we know not to ever victimize objects that don't
 		 * occupy any mappable pages.
 		 */
@@ -1075,7 +1126,7 @@ static vm_fault_t vm_fault_ttm(struct vm_fault *vmf)
 	struct ttm_buffer_object *bo = area->vm_private_data;
 	struct drm_device *dev = bo->base.dev;
 	struct drm_i915_gem_object *obj = i915_ttm_to_gem(bo);
-	intel_wakeref_t wakeref = 0;
+	intel_wakeref_t wakeref = NULL;
 	vm_fault_t ret;
 	int idx;
 
@@ -1121,7 +1172,7 @@ static vm_fault_t vm_fault_ttm(struct vm_fault *vmf)
 			struct intel_memory_region *mr = obj->mm.placements[i];
 			unsigned int flags;
 
-			if (!mr->io_size && mr->type != INTEL_MEMORY_SYSTEM)
+			if (!resource_size(&mr->io) && mr->type != INTEL_MEMORY_SYSTEM)
 				continue;
 
 			flags = obj->flags;
@@ -1132,8 +1183,9 @@ static vm_fault_t vm_fault_ttm(struct vm_fault *vmf)
 		}
 
 		if (err) {
-			drm_dbg(dev, "Unable to make resource CPU accessible(err = %pe)\n",
-				ERR_PTR(err));
+			drm_dbg_ratelimited(dev,
+					    "Unable to make resource CPU accessible(err = %pe)\n",
+					    ERR_PTR(err));
 			dma_resv_unlock(bo->base.resv);
 			ret = VM_FAULT_SIGBUS;
 			goto out_rpm;
@@ -1167,7 +1219,7 @@ static vm_fault_t vm_fault_ttm(struct vm_fault *vmf)
 		GEM_WARN_ON(!i915_ttm_cpu_maps_iomem(bo->resource));
 	}
 
-	if (wakeref & CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND)
+	if (wakeref && CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND != 0)
 		intel_wakeref_auto(&to_i915(obj->base.dev)->runtime_pm.userfault_wakeref,
 				   msecs_to_jiffies_timeout(CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND));
 
@@ -1232,7 +1284,7 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)uobj;
 	struct drm_device *dev = bo->base.dev;
 	struct drm_i915_gem_object *obj = i915_ttm_to_gem(bo);
-	intel_wakeref_t wakeref = 0;
+	intel_wakeref_t wakeref = NULL;
 	vm_fault_t ret;
 	int idx;
 	int write = !!(access_type & PROT_WRITE);
@@ -1240,20 +1292,20 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 	/* Sanity check that we allow writing into this object */
 	if (unlikely(i915_gem_object_is_readonly(obj) && write)) {
 		uvmfault_unlockall(ufi, NULL, &obj->base.uobj);
-		return VM_PAGER_BAD;
+		return EACCES;
 	}
 
 	ret = ttm_bo_vm_reserve(bo);
 	if (ret) {
 		switch (ret) {
 		case VM_FAULT_NOPAGE:
-			ret = VM_PAGER_OK;
+			ret = 0;
 			break;
 		case VM_FAULT_RETRY:
-			ret = VM_PAGER_REFAULT;
+			ret = ERESTART;
 			break;
 		default:
-			ret = VM_PAGER_BAD;
+			ret = EACCES;
 			break;
 		}
 		uvmfault_unlockall(ufi, NULL, &obj->base.uobj);
@@ -1263,7 +1315,7 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 	if (obj->mm.madv != I915_MADV_WILLNEED) {
 		dma_resv_unlock(bo->base.resv);
 		uvmfault_unlockall(ufi, NULL, &obj->base.uobj);
-		return VM_PAGER_BAD;
+		return EACCES;
 	}
 
 	/*
@@ -1285,7 +1337,7 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 		if (err) {
 			dma_resv_unlock(bo->base.resv);
 			uvmfault_unlockall(ufi, NULL, &obj->base.uobj);
-			return VM_PAGER_BAD;
+			return EACCES;
 		}
 	} else if (!i915_ttm_resource_mappable(bo->resource)) {
 		int err = -ENODEV;
@@ -1295,7 +1347,7 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 			struct intel_memory_region *mr = obj->mm.placements[i];
 			unsigned int flags;
 
-			if (!mr->io_size && mr->type != INTEL_MEMORY_SYSTEM)
+			if (!resource_size(&mr->io) && mr->type != INTEL_MEMORY_SYSTEM)
 				continue;
 
 			flags = obj->flags;
@@ -1348,7 +1400,7 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 		GEM_WARN_ON(!i915_ttm_cpu_maps_iomem(bo->resource));
 	}
 
-	if (wakeref & CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND)
+	if (wakeref && CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND != 0)
 		intel_wakeref_auto(&to_i915(obj->base.dev)->runtime_pm.userfault_wakeref,
 				   msecs_to_jiffies_timeout(CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND));
 
@@ -1359,13 +1411,13 @@ vm_fault_ttm(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps,
 out_rpm:
 	switch (ret) {
 	case VM_FAULT_NOPAGE:
-		ret = VM_PAGER_OK;
+		ret = 0;
 		break;
 	case VM_FAULT_RETRY:
-		ret = VM_PAGER_REFAULT;
+		ret = ERESTART;
 		break;
 	default:
-		ret = VM_PAGER_BAD;
+		ret = EACCES;
 		break;
 	}
 
@@ -1414,7 +1466,7 @@ static u64 i915_ttm_mmap_offset(struct drm_i915_gem_object *obj)
 static void i915_ttm_unmap_virtual(struct drm_i915_gem_object *obj)
 {
 	struct ttm_buffer_object *bo = i915_gem_to_ttm(obj);
-	intel_wakeref_t wakeref = 0;
+	intel_wakeref_t wakeref = NULL;
 
 	assert_object_held_shared(obj);
 

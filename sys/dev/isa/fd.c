@@ -1,4 +1,4 @@
-/*	$OpenBSD: fd.c,v 1.109 2024/05/13 01:15:50 jsg Exp $	*/
+/*	$OpenBSD: fd.c,v 1.111 2025/11/17 14:27:43 jsg Exp $	*/
 /*	$NetBSD: fd.c,v 1.90 1996/05/12 23:12:03 mycroft Exp $	*/
 
 /*-
@@ -563,7 +563,8 @@ fd_motor_on(void *arg)
 int
 fdopen(dev_t dev, int flags, int fmt, struct proc *p)
 {
- 	int unit, pmask;
+ 	uint64_t pmask;
+ 	int unit;
 	struct fd_softc *fd;
 	struct fd_type *type;
 
@@ -591,7 +592,7 @@ fdopen(dev_t dev, int flags, int fmt, struct proc *p)
 	if (fd->sc_dk.dk_openmask == 0)
 		fdgetdisklabel(dev, fd, fd->sc_dk.dk_label, 0);
 
-	pmask = (1 << FDPART(dev));
+	pmask = (1ULL << FDPART(dev));
 
 	switch (fmt) {
 	case S_IFCHR:
@@ -612,7 +613,7 @@ int
 fdclose(dev_t dev, int flags, int fmt, struct proc *p)
 {
 	struct fd_softc *fd = fd_cd.cd_devs[FDUNIT(dev)];
-	int pmask = (1 << FDPART(dev));
+	uint64_t pmask = (1ULL << FDPART(dev));
 
 	fd->sc_flags &= ~FD_OPEN;
 	fd->sc_opts &= ~FDOPT_NORETRY;

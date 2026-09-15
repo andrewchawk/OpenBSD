@@ -7,10 +7,9 @@
 BEGIN {
     chdir 't' if -d 't';
     @INC = '../lib';
-    require Config; import Config;
+    require "./test.pl";
+    require "./loc_tools.pl";
 }
-
-BEGIN { require "./test.pl";  require "./loc_tools.pl"; }
 
 use Config;
 
@@ -127,7 +126,7 @@ SKIP: {
     # Win32 won't let us open the directory, so we never get to die with
     # EISDIR, which happens after open.
     require Errno;
-    import Errno qw(EACCES EISDIR);
+    Errno->import(qw(EACCES EISDIR));
     my $error  = do {
         local $! = $^O eq 'MSWin32' ? &EACCES : &EISDIR; "$!"
     };
@@ -695,7 +694,12 @@ $TODO = '';  # the -E tests work on VMS
 $r = runperl(
     switches	=> [ '-E', '"say q(Hello, world!)"']
 );
-is( $r, "Hello, world!\n", "-E say" );
+is( $r, "Hello, world!\n", "-E enables 'say' feature" );
+
+$r = runperl(
+    switches	=> [ '-E', '"say reftype []"']
+);
+is( $r, "ARRAY\n", "-E enables 'reftype' builtin" );
 
 $r = runperl(
     switches    => [ '-nE', q("} END { say q/affe/") ],
@@ -723,5 +727,33 @@ SWTEST
     );
     like( $r, qr/ok/, 'Spaces on the #! line (#30660)' );
 }
+
+$r = runperl(
+    switches	=> [ '-W', ],
+    prog	=> 'my $b = $a + 0',
+	stderr => 1,
+);
+is( $r, "Use of uninitialized value \$a in addition (+) at -e line 1.\n", "-W" );
+
+$r = runperl(
+    switches	=> [ '-W', ],
+    prog	=> 'no warnings; my $b = $a + 0',
+	stderr => 1,
+);
+is( $r, "Use of uninitialized value \$a in addition (+) at -e line 1.\n", "-W with no warnings" );
+
+$r = runperl(
+    switches	=> [ '-X', ],
+    prog	=> 'use warnings; my $b = $a + 0',
+	stderr => 1,
+);
+is( $r, "", "-X with use warnings" );
+
+$r = runperl(
+    switches	=> [ '-X', ],
+    prog	=> 'use 5.036; my $b = $a + 0',
+	stderr => 1,
+);
+is( $r, "", "-X with use 5.36" );
 
 done_testing();

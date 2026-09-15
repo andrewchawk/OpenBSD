@@ -15,6 +15,8 @@
    Copyright (c) 2016-2024 Sebastian Pipping <sebastian@pipping.org>
    Copyright (c) 2017      Rhodri James <rhodri@wildebeest.org.uk>
    Copyright (c) 2019      Zhongyuan Zhou <zhouzhongyuan@huawei.com>
+   Copyright (c) 2024      Hanno Böck <hanno@gentoo.org>
+   Copyright (c) 2026      Matthew Fernandez <matthew.fernandez@gmail.com>
    Licensed under the MIT license:
 
    Permission is  hereby granted,  free of charge,  to any  person obtaining
@@ -35,6 +37,8 @@
    DAMAGES OR  OTHER LIABILITY, WHETHER  IN AN  ACTION OF CONTRACT,  TORT OR
    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+   SPDX-License-Identifier: MIT
 */
 
 #include <stdbool.h>
@@ -81,7 +85,7 @@ stackPopFree(Stack *stackTop) {
   return newStackTop;
 }
 
-static char *
+static const char *
 contentTypeName(enum XML_Content_Type contentType) {
   switch (contentType) {
   case XML_CTYPE_EMPTY:
@@ -101,7 +105,7 @@ contentTypeName(enum XML_Content_Type contentType) {
   }
 }
 
-static char *
+static const char *
 contentQuantName(enum XML_Content_Quant contentQuant) {
   switch (contentQuant) {
   case XML_CQUANT_NONE:
@@ -127,15 +131,15 @@ dumpContentModelElement(const XML_Content *model, unsigned level,
   }
 
   // Node
-  printf("[%u] type=%s(%d), quant=%s(%d)", (unsigned)(model - root),
-         contentTypeName(model->type), model->type,
-         contentQuantName(model->quant), model->quant);
+  printf("[%u] type=%s(%u), quant=%s(%u)", (unsigned)(model - root),
+         contentTypeName(model->type), (unsigned int)model->type,
+         contentQuantName(model->quant), (unsigned int)model->quant);
   if (model->name) {
     printf(", name=\"%" XML_FMT_STR "\"", model->name);
   } else {
     printf(", name=NULL");
   }
-  printf(", numchildren=%d", model->numchildren);
+  printf(", numchildren=%u", model->numchildren);
   printf("\n");
 }
 

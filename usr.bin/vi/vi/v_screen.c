@@ -1,4 +1,4 @@
-/*	$OpenBSD: v_screen.c,v 1.9 2016/01/06 22:28:52 millert Exp $	*/
+/*	$OpenBSD: v_screen.c,v 1.10 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -42,7 +42,7 @@ v_screen(SCR *sp, VICMD *vp)
 		    "Enter <CR> to execute a command, :q to exit");
 		return (1);
 	}
-		
+
 	/*
 	 * Try for the next lower screen, or, go back to the first
 	 * screen on the stack.

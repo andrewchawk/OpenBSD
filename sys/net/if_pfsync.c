@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_pfsync.c,v 1.326 2024/05/24 06:38:41 sashan Exp $	*/
+/*	$OpenBSD: if_pfsync.c,v 1.335 2026/08/12 18:23:14 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2002 Michael Shalayeff
@@ -43,7 +43,6 @@
  */
 
 #include "bpfilter.h"
-#include "pfsync.h"
 #include "kstat.h"
 
 #include <sys/param.h>
@@ -54,11 +53,9 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/timeout.h>
-#include <sys/kernel.h>
 #include <sys/sysctl.h>
 #include <sys/pool.h>
 #include <sys/syslog.h>
-#include <sys/tree.h>
 #include <sys/smr.h>
 #include <sys/percpu.h>
 #include <sys/refcnt.h>
@@ -68,8 +65,6 @@
 #include <net/if.h>
 #include <net/if_types.h>
 #include <net/bpf.h>
-#include <net/netisr.h>
-#include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
@@ -85,10 +80,8 @@
 #include <netinet/udp.h>
 
 #ifdef INET6
-#include <netinet6/in6_var.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
-#include <netinet6/nd6.h>
 #endif /* INET6 */
 
 #include "carp.h"
@@ -863,7 +856,7 @@ pfsync_encap(struct pfsync_softc *sc, struct mbuf *m)
 	mlen += sizeof(h->ph);
 	h->ph.version = PFSYNC_VERSION;
 	h->ph.len = htons(mlen);
-	/* h->ph.pfcksum */
+	/* h->ph.spare is all zero */
 
 	mlen += sizeof(h->ip);
 	h->ip = sc->sc_template;
@@ -2388,6 +2381,8 @@ pfsync_out_tdb(struct tdb *tdb, void *buf)
 {
 	struct pfsync_tdb *ut = buf;
 
+	MUTEX_ASSERT_LOCKED(&tdb->tdb_mtx);
+
 	memset(ut, 0, sizeof(*ut));
 	ut->spi = tdb->tdb_spi;
 	memcpy(&ut->dst, &tdb->tdb_dst, sizeof(ut->dst));
@@ -2963,7 +2958,8 @@ pfsync_in_updates(struct pfsync_softc *sc, struct pf_state *st,
 	st->pfsync_time = getuptime();
 	if (sync < 2) {
 		st->expire = st->pfsync_time;
-		st->timeout = timeout;
+		if (st->timeout != PFTM_UNLINKED)
+			st->timeout = timeout;
 	}
 
 	mtx_leave(&st->mtx);
@@ -3318,7 +3314,8 @@ pfsync_in_tdb(struct pfsync_softc *sc,
 }
 
 int
-pfsync_input4(struct mbuf **mp, int *offp, int proto, int af)
+pfsync_input4(struct mbuf **mp, int *offp, int proto, int af,
+    struct netstack *ns)
 {
 	struct mbuf *m = *mp;
 	struct ip *ip;

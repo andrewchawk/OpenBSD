@@ -1,4 +1,4 @@
-/*	$OpenBSD: ntfs_vfsops.c,v 1.65 2022/01/11 03:13:59 jsg Exp $	*/
+/*	$OpenBSD: ntfs_vfsops.c,v 1.68 2026/06/30 14:04:04 kirill Exp $	*/
 /*	$NetBSD: ntfs_vfsops.c,v 1.7 2003/04/24 07:50:19 christos Exp $	*/
 
 /*-
@@ -340,7 +340,7 @@ ntfs_mountfs(struct vnode *devvp, struct mount *mp, struct ntfs_args *argsp,
 
 	/*
 	 * We read in some system nodes to do not allow 
-	 * reclaim them and to have everytime access to them.
+	 * reclaim them and to have every time access to them.
 	 */ 
 	{
 		int pi[3] = { NTFS_MFTINO, NTFS_ROOTINO, NTFS_BITMAPINO };
@@ -426,7 +426,7 @@ out1:
 		if (ntmp->ntm_sysvn[i])
 			vrele(ntmp->ntm_sysvn[i]);
 
-	if (vflush(mp,NULLVP,0))
+	if (vflush(mp,NULL,0))
 		DPRINTF("ntfs_mountfs: vflush failed\n");
 
 out:
@@ -470,7 +470,7 @@ ntfs_unmount(struct mount *mp, int mntflags, struct proc *p)
 		flags |= FORCECLOSE;
 
 	DPRINTF("ntfs_unmount: vflushing...\n");
-	error = vflush(mp,NULLVP,flags | SKIPSYSTEM);
+	error = vflush(mp,NULL,flags | SKIPSYSTEM);
 	if (error) {
 		DPRINTF("ntfs_unmount: vflush failed: %d\n", error);
 		return (error);
@@ -488,7 +488,7 @@ ntfs_unmount(struct mount *mp, int mntflags, struct proc *p)
 		 if(ntmp->ntm_sysvn[i]) vrele(ntmp->ntm_sysvn[i]);
 
 	/* vflush system vnodes */
-	error = vflush(mp,NULLVP,flags);
+	error = vflush(mp,NULL,flags);
 	if (error) {
 		/* XXX should this be panic() ? */
 		printf("ntfs_unmount: vflush failed(sysnodes): %d\n",error);
@@ -630,7 +630,7 @@ ntfs_fhtovp(struct mount *mp, struct fid *fhp, struct vnode **vpp)
 	error = ntfs_vgetex(mp, ntfhp->ntfid_ino, ntfhp->ntfid_attr, NULL,
 			LK_EXCLUSIVE | LK_RETRY, 0, vpp); /* XXX */
 	if (error != 0) {
-		*vpp = NULLVP;
+		*vpp = NULL;
 		return (error);
 	}
 
@@ -671,6 +671,7 @@ ntfs_vgetex(struct mount *mp, ntfsino_t ino, u_int32_t attrtype, char *attrname,
 	struct fnode *fp;
 	struct vnode *vp;
 	enum vtype f_type;
+	u_int vpid;
 
 	DPRINTF("ntfs_vgetex: ino: %u, attr: 0x%x:%s, lkf: 0x%lx, f: 0x%lx\n",
 	    ino, attrtype, attrname ? attrname : "", lkflags, flags);
@@ -678,6 +679,7 @@ ntfs_vgetex(struct mount *mp, ntfsino_t ino, u_int32_t attrtype, char *attrname,
 	ntmp = VFSTONTFS(mp);
 	*vpp = NULL;
 
+retry:
 	/* Get ntnode */
 	error = ntfs_ntlookup(ntmp, ino, &ip);
 	if (error) {
@@ -734,14 +736,21 @@ ntfs_vgetex(struct mount *mp, ntfsino_t ino, u_int32_t attrtype, char *attrname,
 	 * ntfs_fget() bumped ntnode usecount, so ntnode won't be recycled
 	 * prematurely.
 	 */
+	vp = FTOV(fp);
+	if (vp != NULL)
+		vpid = vp->v_id;
 	ntfs_ntput(ip);
 
-	if (FTOV(fp)) {
+	if (vp != NULL) {
 		/* vget() returns error if the vnode has been recycled */
-		if (vget(FTOV(fp), lkflags) == 0) {
-			*vpp = FTOV(fp);
+		if (vget(vp, lkflags) != 0)
+			goto retry;
+		if (vpid == vp->v_id) {
+			*vpp = vp;
 			return (0);
 		}
+		vput(vp);
+		goto retry;
 	}
 
 	error = getnewvnode(VT_NTFS, ntmp->ntm_mountp, &ntfs_vops, &vp);

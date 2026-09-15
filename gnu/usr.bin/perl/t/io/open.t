@@ -10,7 +10,7 @@ $|  = 1;
 use warnings;
 use Config;
 
-plan tests => 188;
+plan tests => 186 + 6*3 + 6*2;
 
 sub ok_cloexec {
     SKIP: {
@@ -254,9 +254,23 @@ like( $@, qr/Bad filehandle:\s+$afile/,          '       right error' );
     ok( open(STDOUT,     ">&", $stdout),        'restore dupped STDOUT from lexical fh');
 
     {
-	use strict; # the below should not warn
-	ok( open(my $stdout, ">&", STDOUT),         'dup STDOUT into lexical fh');
-	ok_cloexec($stdout);
+	use strict; # the below should not die
+	for my $dupmode (qw( >& >>& <& +>& +>>& +<& )) {
+	    my $stdout;
+	    ok( eval("open(\$stdout, '$dupmode', STDOUT)"), "dup STDOUT into lexical fh with '$dupmode'" );
+	    is $@, "", "no errors for using '$dupmode' with bareword",
+	    ok_cloexec($stdout);
+	}
+
+	# sanity check
+	for my $xmode (qw( > >> < +> +>> +< )) {
+	    is(
+	        eval("open(my \$fh, '$xmode', STDOUT) unless \$xmode"),
+	        undef,
+	        "open with bareword filename fails to compile with '$xmode'"
+	    );
+	    like $@, qr/^Bareword "STDOUT" not allowed while "strict subs" in use /;
+        }
     }
 
     # used to try to open a file [perl #17830]
@@ -401,7 +415,6 @@ fresh_perl_is(
 
 # [perl #77684] Opening a reference to a glob copy.
 SKIP: {
-    skip_if_miniperl("no dynamic loading on miniperl, so can't load PerlIO::scalar", 1);
     my $var = *STDOUT;
     open my $fh, ">", \$var;
     print $fh "hello";
@@ -477,7 +490,7 @@ pass("no crash when open autovivifies glob in freed package");
             skip "Errno not built yet", 8;
         }
         require Errno;
-        import Errno 'ENOENT';
+        Errno->import('ENOENT');
         # check handling of multiple arguments, which the original patch
         # mis-handled
         $! = 0;
@@ -528,8 +541,6 @@ pass("no crash when open autovivifies glob in freed package");
 SKIP: {
     # The bug doesn't depend on perlio, but perlio provides this nice
     # way of discerning when a handle actually closes.
-    skip("These tests use perlio", 5) unless $Config{useperlio};
-    skip_if_miniperl("miniperl can't load PerlIO::scalar", 5);
     my($a, $b, $s, $t);
     $s = "";
     open($a, ">:scalar:perlio", \$s) or die;

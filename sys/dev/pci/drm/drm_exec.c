@@ -2,7 +2,9 @@
 
 #include <drm/drm_exec.h>
 #include <drm/drm_gem.h>
+
 #include <linux/dma-resv.h>
+#include <linux/export.h>
 
 /**
  * DOC: Overview
@@ -22,7 +24,6 @@
  *
  *	struct drm_gem_object *obj;
  *	struct drm_exec exec;
- *	unsigned long index;
  *	int ret;
  *
  *	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT);
@@ -38,7 +39,7 @@
  *			goto error;
  *	}
  *
- *	drm_exec_for_each_locked_object(&exec, index, obj) {
+ *	drm_exec_for_each_locked_object(&exec, obj) {
  *		dma_resv_add_fence(obj->resv, fence, DMA_RESV_USAGE_READ);
  *		...
  *	}
@@ -54,9 +55,8 @@
 static void drm_exec_unlock_all(struct drm_exec *exec)
 {
 	struct drm_gem_object *obj;
-	unsigned long index;
 
-	drm_exec_for_each_locked_object_reverse(exec, index, obj) {
+	drm_exec_for_each_locked_object_reverse(exec, obj) {
 		dma_resv_unlock(obj->resv);
 		drm_gem_object_put(obj);
 	}
@@ -69,16 +69,23 @@ static void drm_exec_unlock_all(struct drm_exec *exec)
  * drm_exec_init - initialize a drm_exec object
  * @exec: the drm_exec object to initialize
  * @flags: controls locking behavior, see DRM_EXEC_* defines
+ * @nr: the initial # of objects
  *
  * Initialize the object and make sure that we can track locked objects.
+ *
+ * If nr is non-zero then it is used as the initial objects table size.
+ * In either case, the table will grow (be re-allocated) on demand.
  */
-void drm_exec_init(struct drm_exec *exec, uint32_t flags)
+void drm_exec_init(struct drm_exec *exec, u32 flags, unsigned nr)
 {
+	if (!nr)
+		nr = PAGE_SIZE / sizeof(void *);
+
 	exec->flags = flags;
-	exec->objects = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	exec->objects = kvmalloc_array(nr, sizeof(void *), GFP_KERNEL);
 
 	/* If allocation here fails, just delay that till the first use */
-	exec->max_objects = exec->objects ? PAGE_SIZE / sizeof(void *) : 0;
+	exec->max_objects = exec->objects ? nr : 0;
 	exec->num_objects = 0;
 	exec->contended = DRM_EXEC_DUMMY;
 	exec->prelocked = NULL;
@@ -139,8 +146,7 @@ static int drm_exec_obj_locked(struct drm_exec *exec,
 		void *tmp;
 
 #ifdef __linux__
-		tmp = kvrealloc(exec->objects, size, size + PAGE_SIZE,
-				GFP_KERNEL);
+		tmp = kvrealloc(exec->objects, size + PAGE_SIZE, GFP_KERNEL);
 		if (!tmp)
 			return -ENOMEM;
 #else

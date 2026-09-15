@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.11 2023/11/11 18:35:37 robert Exp $
+# $OpenBSD: Makefile,v 1.13 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMGlobalISel
 NOPROFILE=
@@ -6,12 +6,17 @@ NOPROFILE=
 CPPFLAGS+=-I${LLVM_SRC}/include/llvm/CodeGen/GlobalISel
 
 SRCS+=	CSEInfo.cpp \
-	GISelKnownBits.cpp \
+	GISelValueTracking.cpp \
 	CSEMIRBuilder.cpp \
 	CallLowering.cpp \
 	GlobalISel.cpp \
 	Combiner.cpp \
 	CombinerHelper.cpp \
+	CombinerHelperArtifacts.cpp \
+	CombinerHelperCasts.cpp \
+	CombinerHelperCompares.cpp \
+	CombinerHelperVectorOps.cpp \
+	GIMatchTableExecutor.cpp \
 	GISelChangeObserver.cpp \
 	IRTranslator.cpp \
 	InlineAsmLowering.cpp \
@@ -26,6 +31,7 @@ SRCS+=	CSEInfo.cpp \
 	LoadStoreOpt.cpp \
 	Localizer.cpp \
 	LostDebugLocObserver.cpp \
+	MachineFloatingPointPredicateUtils.cpp \
 	MachineIRBuilder.cpp \
 	RegBankSelect.cpp \
 	GlobalISelUtils.cpp

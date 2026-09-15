@@ -163,7 +163,7 @@ generate_request(struct module_qstate* qstate, int id, uint8_t* name,
 	}
 
 	fptr_ok(fptr_whitelist_modenv_attach_sub(qstate->env->attach_sub));
-	if(!(*qstate->env->attach_sub)(qstate, &ask,
+	if(!(*qstate->env->attach_sub)(qstate, &ask, NULL,
 		(uint16_t)(BIT_RD|flags), 0, 0, &newq)){
 		log_err("Could not generate request: out of memory");
 		return 0;
@@ -456,7 +456,8 @@ ipsecmod_handle_query(struct module_qstate* qstate,
 	/* Store A/AAAA in cache. */
 	if(!dns_cache_store(qstate->env, &qstate->qinfo,
 		qstate->return_msg->rep, 0, qstate->prefetch_leeway,
-		0, qstate->region, qstate->query_flags, qstate->qstarttime)) {
+		0, qstate->region, qstate->query_flags, qstate->qstarttime,
+		qstate->is_valrec)) {
 		log_err("ipsecmod: out of memory caching record");
 	}
 	qstate->ext_state[id] = module_finished;
@@ -615,7 +616,7 @@ ipsecmod_get_mem(struct module_env* env, int id)
  */
 static struct module_func_block ipsecmod_block = {
 	"ipsecmod",
-	&ipsecmod_init, &ipsecmod_deinit, &ipsecmod_operate,
+	NULL, NULL, &ipsecmod_init, &ipsecmod_deinit, &ipsecmod_operate,
 	&ipsecmod_inform_super, &ipsecmod_clear, &ipsecmod_get_mem
 };
 

@@ -9,7 +9,7 @@ use Text::ParseWords;
 use IPC::Cmd qw(can_run);
 use File::Temp qw(tempfile);
 
-our $VERSION = '0.280238'; # VERSION
+our $VERSION = '0.280242'; # VERSION
 
 # More details about C/C++ compilers:
 # http://developers.sun.com/sunstudio/documentation/product/compiler.jsp
@@ -24,6 +24,7 @@ my %cc2cxx = (
     xlc => [ 'xlC' ], # IBM C/C++ Set, xlc without thread-safety
     xlc_r => [ 'xlC_r' ], # IBM C/C++ Set, xlc with thread-safety
     cl    => [ 'cl' ], # Microsoft Visual Studio
+    clang => [ 'clang++' ], # LLVM compiler frontend
 );
 
 sub new {
@@ -51,24 +52,31 @@ sub new {
 
     ## If the path is just "cc", fileparse returns $ccpath as "./"
     $ccpath = "" if $self->{config}{cc} =~ /^\Q$ccbase$ccsfx\E$/;
-      
+
     foreach my $cxx (@{$cc2cxx{$ccbase}}) {
-      my $cxx1 = File::Spec->catfile( $ccpath, $cxx . $ccsfx);
 
-      if( can_run( $cxx1 ) ) {
-        $self->{config}{cxx} = $cxx1;
-	last;
+      if ( $ccpath ) {
+          my $cxx1 = File::Spec->catfile( $ccpath, $cxx . $ccsfx);
+
+          if( can_run( $cxx1 ) ) {
+              $self->{config}{cxx} = $cxx1;
+              last;
+          }
+
       }
-      my $cxx2 = $cxx . $ccsfx;
+      else {
+          my $cxx2 = $cxx . $ccsfx;
 
-      if( can_run( $cxx2 ) ) {
-        $self->{config}{cxx} = $cxx2;
-	last;
-      }
+          if( can_run( $cxx2 ) ) {
+              $self->{config}{cxx} = $cxx2;
+              last;
+          }
 
-      if( can_run( $cxx ) ) {
-        $self->{config}{cxx} = $cxx;
-	last;
+          if( can_run( $cxx ) ) {
+              $self->{config}{cxx} = $cxx;
+              last;
+          }
+
       }
     }
     unless ( exists $self->{config}{cxx} ) {
@@ -202,10 +210,16 @@ sub have_compiler {
   binmode $FH;
 
   if ( $is_cplusplus ) {
-    print $FH "class Bogus { public: int boot_compilet() { return 1; } };\n";
+    print $FH q<namespace Bogus { extern "C" int boot_compilet() { return 1; } };> . "\n";
   }
   else {
-    print $FH "int boot_compilet() { return 1; }\n";
+    # Use extern "C" if "cc" was set to a C++ compiler.
+    print $FH <<EOF;
+#ifdef __cplusplus
+extern "C"
+#endif
+int boot_compilet(void) { return 1; }
+EOF
   }
   close $FH;
 

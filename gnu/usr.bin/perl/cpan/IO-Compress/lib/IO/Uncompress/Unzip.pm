@@ -9,14 +9,14 @@ use warnings;
 use bytes;
 
 use IO::File;
-use IO::Uncompress::RawInflate  2.204 ;
-use IO::Compress::Base::Common  2.204 qw(:Status );
-use IO::Uncompress::Adapter::Inflate  2.204 ;
-use IO::Uncompress::Adapter::Identity 2.204 ;
-use IO::Compress::Zlib::Extra 2.204 ;
-use IO::Compress::Zip::Constants 2.204 ;
+use IO::Uncompress::RawInflate  2.223 ;
+use IO::Compress::Base::Common  2.223 qw(:Status );
+use IO::Uncompress::Adapter::Inflate  2.223 ;
+use IO::Uncompress::Adapter::Identity 2.223 ;
+use IO::Compress::Zlib::Extra 2.223 ;
+use IO::Compress::Zip::Constants 2.223 ;
 
-use Compress::Raw::Zlib  2.204 () ;
+use Compress::Raw::Zlib 2.222 () ;
 
 BEGIN
 {
@@ -24,13 +24,13 @@ BEGIN
    local $SIG{__DIE__};
 
     eval{ require IO::Uncompress::Adapter::Bunzip2 ;
-          IO::Uncompress::Adapter::Bunzip2->import() } ;
+          IO::Uncompress::Adapter::Bunzip2->VERSION(2.223) } ;
     eval{ require IO::Uncompress::Adapter::UnLzma ;
-          IO::Uncompress::Adapter::UnLzma->import() } ;
+          IO::Uncompress::Adapter::UnLzma->VERSION(2.217) } ;
     eval{ require IO::Uncompress::Adapter::UnXz ;
-          IO::Uncompress::Adapter::UnXz->import() } ;
+          IO::Uncompress::Adapter::UnXz->VERSION(2.217) } ;
     eval{ require IO::Uncompress::Adapter::UnZstd ;
-          IO::Uncompress::Adapter::UnZstd->import() } ;
+          IO::Uncompress::Adapter::UnZstd->VERSION(2.217) } ;
 }
 
 
@@ -38,13 +38,13 @@ require Exporter ;
 
 our ($VERSION, @ISA, @EXPORT_OK, %EXPORT_TAGS, $UnzipError, %headerLookup);
 
-$VERSION = '2.204';
+$VERSION = '2.223';
 $UnzipError = '';
 
 @ISA    = qw(IO::Uncompress::RawInflate Exporter);
 @EXPORT_OK = qw($UnzipError unzip );
 %EXPORT_TAGS = %IO::Uncompress::RawInflate::EXPORT_TAGS ;
-push @{ $EXPORT_TAGS{all} }, @EXPORT_OK ;
+$EXPORT_TAGS{all} = [ defined $EXPORT_TAGS{all} ? @{ $EXPORT_TAGS{all} } : (), @EXPORT_OK ] ;
 Exporter::export_ok_tags('all');
 
 %headerLookup = (
@@ -157,8 +157,8 @@ sub fastForward
 
     while ($offset > 0)
     {
-        $c = length $offset
-            if length $offset < $c ;
+        $c = $offset
+            if $offset < $c ;
 
         $offset -= $c;
 
@@ -802,7 +802,14 @@ sub filterUncompressed
 # from Archive::Zip & info-zip
 sub _dosToUnixTime
 {
+    # Returns zero when $dt is already zero or it doesn't expand to a value that Time::Local::timelocal()
+    # can handle.
+
 	my $dt = shift;
+    # warn "_dosToUnixTime dt=[$dt]\n";
+
+    # some zip files don't populate the datetime field at all
+    return 0 if ! $dt;
 
 	my $year = ( ( $dt >> 25 ) & 0x7f ) + 80;
 	my $mon  = ( ( $dt >> 21 ) & 0x0f ) - 1;
@@ -813,10 +820,15 @@ sub _dosToUnixTime
 	my $sec  = ( ( $dt << 1 ) & 0x3e );
 
     use Time::Local ;
-    my $time_t = Time::Local::timelocal( $sec, $min, $hour, $mday, $mon, $year);
+
+    my $time_t ;
+    # wrap in an eval to catch out of range errors
+    eval {
+        $time_t = Time::Local::timelocal( $sec, $min, $hour, $mday, $mon, $year);
+    } ;
+
     return 0 if ! defined $time_t;
     return $time_t;
-
 }
 
 #sub scanCentralDirectory
@@ -1396,7 +1408,7 @@ C<InputLength> option.
 
 =back
 
-=head2 Examples
+=head2 OneShot Examples
 
 Say you have a zip file, C<file1.zip>, that only contains a
 single member, you can read it and write the uncompressed data to the
@@ -1459,6 +1471,9 @@ The format of the constructor for IO::Uncompress::Unzip is shown below
     my $z = IO::Uncompress::Unzip->new( $input [OPTS] )
         or die "IO::Uncompress::Unzip failed: $UnzipError\n";
 
+The constructor takes one mandatory parameter, C<$input>, defined below, and
+zero or more C<OPTS>, defined in L<Constructor Options>.
+
 Returns an C<IO::Uncompress::Unzip> object on success and undef on failure.
 The variable C<$UnzipError> will contain an error message on failure.
 
@@ -1470,6 +1485,20 @@ use either of these forms
 
     $line = $z->getline();
     $line = <$z>;
+
+Below is a simple exaple of using the OO interface to read the compressed file
+C<myfile.zip> and write its contents to stdout.
+
+    my $filename = "myfile.zip";
+    my $z = IO::Uncompress::Unzip->new($filename)
+        or die "IO::Uncompress::Unzip failed: $UnzipError\n";
+
+    while (<$z>) {
+        print $_;
+    }
+    $z->close();
+
+See L</EXAMPLES> for further examples
 
 The mandatory parameter C<$input> is used to determine the source of the
 compressed data. This parameter can take one of three forms.
@@ -1606,10 +1635,6 @@ carried out, when Strict is off they are not.
 The default for this option is off.
 
 =back
-
-=head2 Examples
-
-TODO
 
 =head1 Methods
 
@@ -1877,9 +1902,37 @@ Same as doing this
 
 =head1 EXAMPLES
 
-=head2 Working with Net::FTP
+=head2  Simple Read
 
-See L<IO::Compress::FAQ|IO::Compress::FAQ/"Compressed files and Net::FTP">
+Say you have a zip file, C<file1.zip>, that only contains a
+single member, you can read it and write the uncompressed data to the
+file C<file1.txt> like this.
+
+    use strict ;
+    use warnings ;
+    use IO::Uncompress::Unzip qw(unzip $UnzipError) ;
+
+    my $filename = "file1.zip";
+    my $z = IO::Uncompress::Unzip->new($filename)
+        or die "IO::Uncompress::Unzip failed: $UnzipError\n";
+    open my $out, ">", "file1.txt";
+
+    while (<$z>) {
+        print $out $_;
+    }
+    $z->close();
+
+If you have a zip file that contains multiple members and want to read a
+specific member from the file, say C<"data1">, use the C<Name> option when
+constructing the
+
+    use strict ;
+    use warnings ;
+    use IO::Uncompress::Unzip qw(unzip $UnzipError) ;
+
+    my $filename = "file1.zip";
+    my $z = IO::Uncompress::Unzip->new($filename, Name => "data1")
+        or die "IO::Uncompress::Unzip failed: $UnzipError\n";
 
 =head2 Walking through a zip file
 
@@ -1925,6 +1978,10 @@ to read a zip file and unzip its contents to disk.
 
 The script is available from L<https://gist.github.com/eqhmcow/5389877>
 
+=head2 Working with Net::FTP
+
+See L<IO::Compress::FAQ|IO::Compress::FAQ/"Compressed files and Net::FTP">
+
 =head1 SUPPORT
 
 General feedback/questions/bug reports should be sent to
@@ -1967,7 +2024,7 @@ See the Changes file.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (c) 2005-2023 Paul Marquess. All rights reserved.
+Copyright (c) 2005-2026 Paul Marquess. All rights reserved.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.

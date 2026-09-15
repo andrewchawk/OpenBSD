@@ -1,4 +1,4 @@
-/* $OpenBSD: by_dir.c,v 1.47 2024/03/25 00:05:49 beck Exp $ */
+/* $OpenBSD: by_dir.c,v 1.49 2025/05/10 05:54:39 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -64,9 +64,9 @@
 
 #include <openssl/opensslconf.h>
 
-#include <openssl/err.h>
 #include <openssl/x509.h>
 
+#include "err_local.h"
 #include "x509_local.h"
 
 typedef struct lookup_dir_hashes_st {
@@ -96,7 +96,7 @@ static int add_cert_dir(BY_DIR *ctx, const char *dir, int type);
 static int get_cert_by_subject(X509_LOOKUP *xl, int type, X509_NAME *name,
     X509_OBJECT *ret);
 
-static X509_LOOKUP_METHOD x509_dir_lookup = {
+static const X509_LOOKUP_METHOD x509_dir_lookup = {
 	.name = "Load certs from files in a directory",
 	.new_item = new_dir,
 	.free = free_dir,
@@ -104,7 +104,7 @@ static X509_LOOKUP_METHOD x509_dir_lookup = {
 	.get_by_subject = get_cert_by_subject,
 };
 
-X509_LOOKUP_METHOD *
+const X509_LOOKUP_METHOD *
 X509_LOOKUP_hash_dir(void)
 {
 	return &x509_dir_lookup;

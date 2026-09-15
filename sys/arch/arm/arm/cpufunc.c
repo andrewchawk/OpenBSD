@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpufunc.c,v 1.57 2021/05/16 03:39:27 jsg Exp $	*/
+/*	$OpenBSD: cpufunc.c,v 1.59 2026/05/25 01:56:50 jsg Exp $	*/
 /*	$NetBSD: cpufunc.c,v 1.65 2003/11/05 12:53:15 scw Exp $	*/
 
 /*
@@ -52,7 +52,6 @@
 #include <uvm/uvm_extern.h>
 
 #include <machine/pmap.h>
-#include <arm/cpuconf.h>
 
 #if defined(PERFCTRS)
 struct arm_pmc_funcs *arm_pmc;
@@ -392,7 +391,6 @@ armv7_setup(void)
 	    | CPU_CONTROL_AFE;
 
 	cpuctrl = CPU_CONTROL_MMU_ENABLE
-	    | CPU_CONTROL_AFLT_ENABLE
 	    | CPU_CONTROL_DC_ENABLE
 	    | CPU_CONTROL_BPRD_ENABLE
 	    | CPU_CONTROL_IC_ENABLE

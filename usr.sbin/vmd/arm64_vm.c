@@ -1,4 +1,4 @@
-/*	$OpenBSD: arm64_vm.c,v 1.1 2024/07/10 10:41:19 dv Exp $	*/
+/*	$OpenBSD: arm64_vm.c,v 1.11 2026/01/14 03:09:05 dv Exp $	*/
 /*
  * Copyright (c) 2024 Dave Voutila <dv@openbsd.org>
  *
@@ -17,9 +17,10 @@
 #include <sys/types.h>
 
 #include "vmd.h"
+#include "vmm.h"
 
 void
-create_memory_map(struct vm_create_params *vcp)
+create_memory_map(struct vmd_vm *vm)
 {
 	fatalx("%s: unimplemented", __func__);
 	/* NOTREACHED */
@@ -33,20 +34,13 @@ load_firmware(struct vmd_vm *vm, struct vcpu_reg_state *vrs)
 	return (-1);
 }
 
-void
-init_emulated_hw(struct vmop_create_params *vcp, int child_cdrom,
+int
+init_emulated_hw(struct vmd_vm *vm, int child_cdrom,
     int child_disks[][VM_MAX_BASE_PER_DISK], int *child_taps)
 {
 	fatalx("%s: unimplemented", __func__);
 	/* NOTREACHED */
-}
-
-void
-restore_emulated_hw(struct vm_create_params *vcp, int fd, int *child_taps,
-    int child_disks[][VM_MAX_BASE_PER_DISK], int child_cdrom)
-{
-	fatalx("%s: unimplemented", __func__);
-	/* NOTREACHED */
+	return (1);
 }
 
 void
@@ -61,22 +55,6 @@ unpause_vm_md(struct vmd_vm *vm)
 {
 	fatalx("%s: unimplemented", __func__);
 	/* NOTREACHED */
-}
-
-int
-dump_devs(int fd)
-{
-	fatalx("%s: unimplemented", __func__);
-	/* NOTREACHED */
-	return (-1);
-}
-
-int
-dump_send_header(int fd)
-{
-	fatalx("%s: unimplemented", __func__);
-	/* NOTREACHED */
-	return (-1);
 }
 
 void *
@@ -138,14 +116,6 @@ vcpu_deassert_irq(uint32_t vm_id, uint32_t vcpu_id, int irq)
 }
 
 int
-vmd_check_vmh(struct vm_dump_header *vmh)
-{
-	fatalx("%s: unimplemented", __func__);
-	/* NOTREACHED */
-	return (-1);
-}
-
-int
 vcpu_exit(struct vm_run_params *vrp)
 {
 	fatalx("%s: unimplemented", __func__);
@@ -159,4 +129,73 @@ vcpu_exit_pci(struct vm_run_params *vrp)
 	fatalx("%s: unimplemented", __func__);
 	/* NOTREACHED */
 	return (0xff);
+}
+
+void
+set_return_data(struct vm_exit *vei, uint32_t data)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return;
+}
+
+void
+get_input_data(struct vm_exit *vei, uint32_t *data)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return;
+}
+
+int
+sev_init(struct vmd_vm *vm)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return (-1);
+}
+
+int
+sev_shutdown(struct vmd_vm *vm)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return (-1);
+}
+
+int
+sev_activate(struct vmd_vm *vm, int vcpu_id)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return (-1);
+}
+
+int
+sev_encrypt_memory(struct vmd_vm *vm)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return (-1);
+}
+
+int
+sev_encrypt_state(struct vmd_vm *vm, int vcpu_id)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return (-1);
+}
+
+int
+sev_launch_finalize(struct vmd_vm *vm)
+{
+	fatalx("%s: unimplemented", __func__);
+	/* NOTREACHED */
+	return (-1);
+}
+
+void
+psp_setup(void)
+{
 }

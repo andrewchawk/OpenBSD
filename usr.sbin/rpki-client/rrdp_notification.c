@@ -1,4 +1,4 @@
-/*	$OpenBSD: rrdp_notification.c,v 1.21 2024/04/12 11:50:29 job Exp $ */
+/*	$OpenBSD: rrdp_notification.c,v 1.25 2026/08/06 13:18:22 claudio Exp $ */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
@@ -107,9 +107,17 @@ static int
 check_delta(struct notification_xml *nxml)
 {
 	struct delta_item *d;
-	long long serial = 0;
+	long long serial = 0, min_serial;
+
+	/* Limit deltas to the ones which matter for us. */
+	if (nxml->serial > MAX_RRDP_DELTAS)
+		min_serial = nxml->serial - MAX_RRDP_DELTAS - 1;
+	else
+		min_serial = 0;
 
 	TAILQ_FOREACH(d, &nxml->delta_q, q) {
+		if (d->serial <= min_serial)
+			continue;
 		if (serial != 0 && serial + 1 != d->serial)
 			return 0;
 		serial = d->serial;
@@ -137,7 +145,7 @@ delta_parse(struct rrdp_session *s, size_t idx, char **hash)
 
 	if (hash != NULL)
 		*hash = NULL;
-	if (idx < 0 || idx >= sizeof(s->deltas) / sizeof(s->deltas[0]))
+	if (idx >= sizeof(s->deltas) / sizeof(s->deltas[0]))
 		return 0;
 	if ((line = s->deltas[idx]) == NULL)
 		return 0;
@@ -163,26 +171,24 @@ start_notification_elem(struct notification_xml *nxml, const char **attr)
 
 	if (nxml->scope != NOTIFICATION_SCOPE_START)
 		PARSE_FAIL(p,
-		    "parse failed - entered notification elem unexpectedely");
+		    "parse failed - entered notification elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		const char *errstr;
 		if (strcmp("xmlns", attr[i]) == 0 &&
-		    strcmp(RRDP_XMLNS, attr[i + 1]) == 0) {
-			has_xmlns = 1;
+		    strcmp(RRDP_XMLNS, attr[i + 1]) == 0 && has_xmlns++ == 0)
 			continue;
-		}
 		if (strcmp("session_id", attr[i]) == 0 &&
-		    valid_uuid(attr[i + 1])) {
+		    valid_uuid(attr[i + 1]) && nxml->session_id == NULL) {
 			nxml->session_id = xstrdup(attr[i + 1]);
 			continue;
 		}
-		if (strcmp("version", attr[i]) == 0) {
+		if (strcmp("version", attr[i]) == 0 && nxml->version == 0) {
 			nxml->version = strtonum(attr[i + 1],
 			    1, MAX_VERSION, &errstr);
 			if (errstr == NULL)
 				continue;
 		}
-		if (strcmp("serial", attr[i]) == 0) {
+		if (strcmp("serial", attr[i]) == 0 && nxml->serial == 0) {
 			nxml->serial = strtonum(attr[i + 1],
 			    1, LLONG_MAX, &errstr);
 			if (errstr == NULL)
@@ -195,10 +201,6 @@ start_notification_elem(struct notification_xml *nxml, const char **attr)
 		PARSE_FAIL(p, "parse failed - incomplete "
 		    "notification attributes");
 
-	/* Limit deltas to the ones which matter for us. */
-	if (nxml->min_serial == 0 && nxml->serial > MAX_RRDP_DELTAS)
-		nxml->min_serial = nxml->serial - MAX_RRDP_DELTAS;
-
 	nxml->scope = NOTIFICATION_SCOPE_NOTIFICATION;
 }
 
@@ -209,7 +211,7 @@ end_notification_elem(struct notification_xml *nxml)
 
 	if (nxml->scope != NOTIFICATION_SCOPE_NOTIFICATION_POST_SNAPSHOT)
 		PARSE_FAIL(p, "parse failed - exited notification "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 	nxml->scope = NOTIFICATION_SCOPE_END;
 
 	if (!check_delta(nxml))
@@ -224,7 +226,7 @@ start_snapshot_elem(struct notification_xml *nxml, const char **attr)
 
 	if (nxml->scope != NOTIFICATION_SCOPE_NOTIFICATION)
 		PARSE_FAIL(p,
-		    "parse failed - entered snapshot elem unexpectedely");
+		    "parse failed - entered snapshot elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		if (strcmp("uri", attr[i]) == 0 && hasUri++ == 0) {
 			if (valid_uri(attr[i + 1], strlen(attr[i + 1]),
@@ -255,7 +257,7 @@ end_snapshot_elem(struct notification_xml *nxml)
 
 	if (nxml->scope != NOTIFICATION_SCOPE_SNAPSHOT)
 		PARSE_FAIL(p, "parse failed - exited snapshot "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 	nxml->scope = NOTIFICATION_SCOPE_NOTIFICATION_POST_SNAPSHOT;
 }
 
@@ -266,11 +268,11 @@ start_delta_elem(struct notification_xml *nxml, const char **attr)
 	int i, hasUri = 0, hasHash = 0;
 	const char *delta_uri = NULL;
 	char delta_hash[SHA256_DIGEST_LENGTH];
-	long long delta_serial = 0;
+	long long delta_serial = 0, new_min_serial = 0;
 
 	if (nxml->scope != NOTIFICATION_SCOPE_NOTIFICATION_POST_SNAPSHOT)
 		PARSE_FAIL(p, "parse failed - entered delta "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		if (strcmp("uri", attr[i]) == 0 && hasUri++ == 0) {
 			if (valid_uri(attr[i + 1], strlen(attr[i + 1]),
@@ -304,8 +306,16 @@ start_delta_elem(struct notification_xml *nxml, const char **attr)
 	if (nxml->serial < delta_serial)
 		PARSE_FAIL(p, "parse failed - bad delta serial");
 
-	/* optimisation, add only deltas that could be interesting */
-	if (nxml->min_serial < delta_serial) {
+	/* Limit deltas to the ones which matter for us. */
+	if (nxml->serial > MAX_RRDP_DELTAS)
+		new_min_serial = nxml->serial - MAX_RRDP_DELTAS;
+	else
+		new_min_serial = 0;
+
+	if ((nxml->min_serial != 0 && nxml->min_serial < delta_serial &&
+	    delta_serial <= nxml->min_serial + MAX_RRDP_DELTAS) ||
+	    (new_min_serial < delta_serial &&
+	    delta_serial <= new_min_serial + MAX_RRDP_DELTAS)) {
 		if (add_delta(nxml, delta_uri, delta_hash, delta_serial) == 0)
 			PARSE_FAIL(p, "parse failed - adding delta failed");
 	}
@@ -319,7 +329,7 @@ end_delta_elem(struct notification_xml *nxml)
 	XML_Parser p = nxml->parser;
 
 	if (nxml->scope != NOTIFICATION_SCOPE_DELTA)
-		PARSE_FAIL(p, "parse failed - exited delta elem unexpectedely");
+		PARSE_FAIL(p, "parse failed - exited delta elem unexpectedly");
 	nxml->scope = NOTIFICATION_SCOPE_NOTIFICATION_POST_SNAPSHOT;
 }
 

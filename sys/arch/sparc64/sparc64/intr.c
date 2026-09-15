@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.67 2024/03/29 21:29:34 miod Exp $	*/
+/*	$OpenBSD: intr.c,v 1.72 2025/06/28 11:34:21 miod Exp $	*/
 /*	$NetBSD: intr.c,v 1.39 2001/07/19 23:38:11 eeh Exp $ */
 
 /*
@@ -54,9 +54,6 @@
 #include <machine/instr.h>
 #include <machine/trap.h>
 
-/* Grab interrupt map stuff (what is it doing there???) */
-#include <sparc64/dev/iommureg.h>
-
 /*
  * The following array is to used by locore.s to map interrupt packets
  * to the proper IPL to send ourselves a softint.  It should be filled
@@ -74,6 +71,7 @@ void	intr_ack(struct intrhand *);
 int
 intr_handler(struct trapframe *tf, struct intrhand *ih)
 {
+	struct cpu_info *ci = curcpu();
 	int rc;
 #ifdef MULTIPROCESSOR
 	int need_lock;
@@ -86,7 +84,9 @@ intr_handler(struct trapframe *tf, struct intrhand *ih)
 	if (need_lock)
 		KERNEL_LOCK();
 #endif
+	ci->ci_idepth++;
 	rc = (*ih->ih_fun)(ih->ih_arg ? ih->ih_arg : tf);
+	ci->ci_idepth--;
 #ifdef MULTIPROCESSOR
 	if (need_lock)
 		KERNEL_UNLOCK();
@@ -280,10 +280,18 @@ intr_barrier(void *cookie)
 void *
 softintr_establish(int level, void (*fun)(void *), void *arg)
 {
-	struct intrhand *ih;
+	level &= ~IPL_MPSAFE;
 
 	if (level == IPL_TTY)
 		level = IPL_SOFTTTY;
+
+	return softintr_establish_raw(level, fun, arg);
+}
+
+void *
+softintr_establish_raw(int level, void (*fun)(void *), void *arg)
+{
+	struct intrhand *ih;
 
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK | M_ZERO);
 	ih->ih_fun = (int (*)(void *))fun;	/* XXX */

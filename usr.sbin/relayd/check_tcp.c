@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_tcp.c,v 1.61 2023/07/03 09:38:08 claudio Exp $	*/
+/*	$OpenBSD: check_tcp.c,v 1.63 2026/06/15 11:02:13 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -34,6 +34,7 @@
 #include <imsg.h>
 
 #include "relayd.h"
+#include "log.h"
 
 void	tcp_write(int, short, void *);
 void	tcp_host_up(struct ctl_tcp_event *);
@@ -57,11 +58,11 @@ check_tcp(struct ctl_tcp_event *cte)
 	switch (cte->host->conf.ss.ss_family) {
 	case AF_INET:
 		((struct sockaddr_in *)&cte->host->conf.ss)->sin_port =
-			cte->table->conf.port;
+		    cte->table->conf.port;
 		break;
 	case AF_INET6:
 		((struct sockaddr_in6 *)&cte->host->conf.ss)->sin6_port =
-			cte->table->conf.port;
+		    cte->table->conf.port;
 		break;
 	}
 

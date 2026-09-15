@@ -1,4 +1,4 @@
-/*	$OpenBSD: validate.c,v 1.76 2024/06/17 18:52:50 tb Exp $ */
+/*	$OpenBSD: validate.c,v 1.86 2026/09/12 07:03:00 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -27,8 +27,6 @@
 
 #include "extern.h"
 
-extern ASN1_OBJECT	*certpol_oid;
-
 /*
  * Walk up the chain of certificates trying to match our AS number to
  * one of the allocations in that chain.
@@ -43,7 +41,7 @@ valid_as(struct auth *a, uint32_t min, uint32_t max)
 		return 0;
 
 	/* Does this certificate cover our AS number? */
-	c = as_check_covered(min, max, a->cert->as, a->cert->asz);
+	c = as_check_covered(min, max, a->cert->ases, a->cert->num_ases);
 	if (c > 0)
 		return 1;
 	else if (c < 0)
@@ -69,7 +67,8 @@ valid_ip(struct auth *a, enum afi afi,
 		return 0;
 
 	/* Does this certificate cover our IP prefix? */
-	c = ip_addr_check_covered(afi, min, max, a->cert->ips, a->cert->ipsz);
+	c = ip_addr_check_covered(afi, min, max, a->cert->ips,
+	    a->cert->num_ips);
 	if (c > 0)
 		return 1;
 	else if (c < 0)
@@ -90,28 +89,54 @@ valid_cert(const char *fn, struct auth *a, const struct cert *cert)
 	size_t		 i;
 	uint32_t	 min, max;
 
-	for (i = 0; i < cert->asz; i++) {
-		if (cert->as[i].type == CERT_AS_INHERIT)
-			continue;
+	for (i = 0; i < cert->num_ases; i++) {
+		if (cert->ases[i].type == CERT_AS_INHERIT) {
+			if (a->cert->num_ases > 0)
+				continue;
 
-		if (cert->as[i].type == CERT_AS_ID) {
-			min = cert->as[i].id;
-			max = cert->as[i].id;
+			/*
+			 * Many MFTs are issued by a CA without AS resources.
+			 * Accept this non-compliance with RFC 3779, 3.3.
+			 * Apart from MFTs, this affects only TAKs and GBRs.
+			 */
+			if (cert->purpose == CERT_PURPOSE_EE)
+				continue;
+
+			warnx("%s: parent without AS resources", fn);
+			return 0;
+		}
+
+		if (cert->ases[i].type == CERT_AS_ID) {
+			min = cert->ases[i].id;
+			max = cert->ases[i].id;
 		} else {
-			min = cert->as[i].range.min;
-			max = cert->as[i].range.max;
+			min = cert->ases[i].range.min;
+			max = cert->ases[i].range.max;
 		}
 
 		if (valid_as(a, min, max))
 			continue;
 
-		as_warn(fn, "RFC 6487: uncovered resource", &cert->as[i]);
+		as_warn(fn, "RFC 6487: uncovered resource", &cert->ases[i]);
 		return 0;
 	}
 
-	for (i = 0; i < cert->ipsz; i++) {
-		if (cert->ips[i].type == CERT_IP_INHERIT)
-			continue;
+	for (i = 0; i < cert->num_ips; i++) {
+		if (cert->ips[i].type == CERT_IP_INHERIT) {
+			if (a->cert->num_ips > 0)
+				continue;
+
+			/*
+			 * Many MFT are issued by a CA without IP resources.
+			 * Accept this non-compliance with RFC 3779, 2.3.
+			 * Apart from MFTs, this affects only TAKs and GBRs.
+			 */
+			if (cert->purpose == CERT_PURPOSE_EE)
+				continue;
+
+			warnx("%s: parent without IP resources", fn);
+			return 0;
+		}
 
 		if (valid_ip(a, cert->ips[i].afi, cert->ips[i].min,
 		    cert->ips[i].max))
@@ -134,14 +159,14 @@ valid_roa(const char *fn, struct cert *cert, struct roa *roa)
 	size_t	 i;
 	char	 buf[64];
 
-	for (i = 0; i < roa->ipsz; i++) {
+	for (i = 0; i < roa->num_ips; i++) {
 		if (ip_addr_check_covered(roa->ips[i].afi, roa->ips[i].min,
-		    roa->ips[i].max, cert->ips, cert->ipsz) > 0)
+		    roa->ips[i].max, cert->ips, cert->num_ips) > 0)
 			continue;
 
 		ip_addr_print(&roa->ips[i].addr, roa->ips[i].afi, buf,
 		    sizeof(buf));
-		warnx("%s: RFC 6482: uncovered IP: %s", fn, buf);
+		warnx("%s: RFC 9582: uncovered IP: %s", fn, buf);
 		return 0;
 	}
 
@@ -156,7 +181,8 @@ valid_roa(const char *fn, struct cert *cert, struct roa *roa)
 int
 valid_spl(const char *fn, struct cert *cert, struct spl *spl)
 {
-	if (as_check_covered(spl->asid, spl->asid, cert->as, cert->asz) > 0)
+	if (as_check_covered(spl->asid, spl->asid, cert->ases,
+	    cert->num_ases) > 0)
 		return 1;
 
 	warnx("%s: SPL: uncovered ASID: %u", fn, spl->asid);
@@ -218,7 +244,8 @@ valid_hash(unsigned char *buf, size_t len, const char *hash, size_t hlen)
 
 /*
  * Validate that a filename only contains characters from the POSIX portable
- * filename character set [A-Za-z0-9._-], see IEEE Std 1003.1-2013, 3.278.
+ * filename character set [A-Za-z0-9._-], and not longer than _XOPEN_NAME_MAX.
+ * see IEEE Std 1003.1-2013, 3.278, and implementation-defined constants.
  */
 int
 valid_filename(const char *fn, size_t len)
@@ -226,9 +253,13 @@ valid_filename(const char *fn, size_t len)
 	const unsigned char *c;
 	size_t i;
 
+	if (len > MAX_FN_LENGTH)
+		return 0;
+
 	for (c = fn, i = 0; i < len; i++, c++)
 		if (!isalnum(*c) && *c != '-' && *c != '_' && *c != '.')
 			return 0;
+
 	return 1;
 }
 
@@ -236,6 +267,7 @@ valid_filename(const char *fn, size_t len)
  * Validate a URI to make sure it is pure ASCII and does not point backwards
  * or doing some other silly tricks. To enforce the protocol pass either
  * https:// or rsync:// as proto, if NULL is passed no protocol is enforced.
+ * If it's rsync, check that the URI contains a module component.
  * Returns 1 if valid, 0 otherwise.
  */
 int
@@ -260,8 +292,13 @@ valid_uri(const char *uri, size_t usz, const char *proto)
 	}
 
 	/* do not allow files or directories to start with a '.' */
-	if (strstr(uri, "/.") != NULL)
+	if (memmem(uri, usz, "/.", strlen("/.")) != NULL)
 		return 0;
+
+	if (strncasecmp(uri, RSYNC_PROTO, RSYNC_PROTO_LEN) == 0) {
+		if (!rsync_base_uri(uri, NULL))
+			return 0;
+	}
 
 	return 1;
 }
@@ -442,25 +479,25 @@ valid_rsc(const char *fn, struct cert *cert, struct rsc *rsc)
 	size_t		i;
 	uint32_t	min, max;
 
-	for (i = 0; i < rsc->asz; i++) {
-		if (rsc->as[i].type == CERT_AS_ID) {
-			min = rsc->as[i].id;
-			max = rsc->as[i].id;
+	for (i = 0; i < rsc->num_ases; i++) {
+		if (rsc->ases[i].type == CERT_AS_ID) {
+			min = rsc->ases[i].id;
+			max = rsc->ases[i].id;
 		} else {
-			min = rsc->as[i].range.min;
-			max = rsc->as[i].range.max;
+			min = rsc->ases[i].range.min;
+			max = rsc->ases[i].range.max;
 		}
 
-		if (as_check_covered(min, max, cert->as, cert->asz) > 0)
+		if (as_check_covered(min, max, cert->ases, cert->num_ases) > 0)
 			continue;
 
-		as_warn(fn, "RSC ResourceBlock uncovered", &rsc->as[i]);
+		as_warn(fn, "RSC ResourceBlock uncovered", &rsc->ases[i]);
 		return 0;
 	}
 
-	for (i = 0; i < rsc->ipsz; i++) {
+	for (i = 0; i < rsc->num_ips; i++) {
 		if (ip_addr_check_covered(rsc->ips[i].afi, rsc->ips[i].min,
-		    rsc->ips[i].max, cert->ips, cert->ipsz) > 0)
+		    rsc->ips[i].max, cert->ips, cert->num_ips) > 0)
 			continue;
 
 		ip_warn(fn, "RSC ResourceBlock uncovered", &rsc->ips[i]);
@@ -511,37 +548,12 @@ valid_aspa(const char *fn, struct cert *cert, struct aspa *aspa)
 {
 
 	if (as_check_covered(aspa->custasid, aspa->custasid,
-	    cert->as, cert->asz) > 0)
+	    cert->ases, cert->num_ases) > 0)
 		return 1;
 
 	warnx("%s: ASPA: uncovered Customer ASID: %u", fn, aspa->custasid);
 
 	return 0;
-}
-
-/*
- * Validate Geofeed prefixes: check that the prefixes are contained.
- * Returns 1 if valid, 0 otherwise.
- */
-int
-valid_geofeed(const char *fn, struct cert *cert, struct geofeed *g)
-{
-	size_t	 i;
-	char	 buf[64];
-
-	for (i = 0; i < g->geoipsz; i++) {
-		if (ip_addr_check_covered(g->geoips[i].ip->afi,
-		    g->geoips[i].ip->min, g->geoips[i].ip->max, cert->ips,
-		    cert->ipsz) > 0)
-			continue;
-
-		ip_addr_print(&g->geoips[i].ip->ip, g->geoips[i].ip->afi, buf,
-		    sizeof(buf));
-		warnx("%s: Geofeed: uncovered IP: %s", fn, buf);
-		return 0;
-	}
-
-	return 1;
 }
 
 /*
@@ -582,87 +594,4 @@ valid_uuid(const char *s)
 		}
 		n++;
 	}
-}
-
-static int
-valid_ca_pkey_rsa(const char *fn, EVP_PKEY *pkey)
-{
-	RSA		*rsa;
-	const BIGNUM	*rsa_e;
-	int		 key_bits;
-
-	if ((key_bits = EVP_PKEY_bits(pkey)) != 2048) {
-		warnx("%s: RFC 7935: expected 2048-bit modulus, got %d bits",
-		    fn, key_bits);
-		return 0;
-	}
-
-	if ((rsa = EVP_PKEY_get0_RSA(pkey)) == NULL) {
-		warnx("%s: failed to extract RSA public key", fn);
-		return 0;
-	}
-
-	if ((rsa_e = RSA_get0_e(rsa)) == NULL) {
-		warnx("%s: failed to get RSA exponent", fn);
-		return 0;
-	}
-
-	if (!BN_is_word(rsa_e, 65537)) {
-		warnx("%s: incorrect exponent (e) in RSA public key", fn);
-		return 0;
-	}
-
-	return 1;
-}
-
-static int
-valid_ca_pkey_ec(const char *fn, EVP_PKEY *pkey)
-{
-	EC_KEY		*ec;
-	const EC_GROUP	*group;
-	int		 nid;
-	const char	*cname;
-
-	if ((ec = EVP_PKEY_get0_EC_KEY(pkey)) == NULL) {
-		warnx("%s: failed to extract ECDSA public key", fn);
-		return 0;
-	}
-
-	if ((group = EC_KEY_get0_group(ec)) == NULL) {
-		warnx("%s: EC_KEY_get0_group failed", fn);
-		return 0;
-	}
-
-	nid = EC_GROUP_get_curve_name(group);
-	if (nid != NID_X9_62_prime256v1) {
-		if ((cname = EC_curve_nid2nist(nid)) == NULL)
-			cname = nid2str(nid);
-		warnx("%s: Expected P-256, got %s", fn, cname);
-		return 0;
-	}
-
-	if (!EC_KEY_check_key(ec)) {
-		warnx("%s: EC_KEY_check_key failed", fn);
-		return 0;
-	}
-
-	return 1;
-}
-
-int
-valid_ca_pkey(const char *fn, EVP_PKEY *pkey)
-{
-	if (pkey == NULL) {
-		warnx("%s: failure, pkey is NULL", fn);
-		return 0;
-	}
-
-	if (EVP_PKEY_base_id(pkey) == EVP_PKEY_RSA)
-		return valid_ca_pkey_rsa(fn, pkey);
-
-	if (EVP_PKEY_base_id(pkey) == EVP_PKEY_EC)
-		return valid_ca_pkey_ec(fn, pkey);
-
-	warnx("%s: unsupported public key algorithm", fn);
-	return 0;
 }

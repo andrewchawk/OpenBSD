@@ -1,4 +1,4 @@
-/*	$OpenBSD: htpasswd.c,v 1.18 2021/07/12 15:09:19 beck Exp $ */
+/*	$OpenBSD: htpasswd.c,v 1.20 2026/08/30 12:29:37 jsg Exp $ */
 /*
  * Copyright (c) 2014 Florian Obser <florian@openbsd.org>
  *
@@ -78,7 +78,7 @@ main(int argc, char** argv)
 		if (unveil("/tmp", "rwc") == -1)
 			err(1, "unveil /tmp");
 	}
-	if (pledge("stdio rpath wpath cpath flock tmppath tty", NULL) == -1)
+	if (pledge("stdio rpath wpath cpath flock tty", NULL) == -1)
 		err(1, "pledge");
 
 	if (batch) {
@@ -210,7 +210,7 @@ main(int argc, char** argv)
 			err(1, "cannot delete temp file (%s)", tmpl);
 	}
 	if (nagcount >= MAXNAG)
-		warnx("%d more logins not using bcryt.", nagcount - MAXNAG);
+		warnx("%d more logins not using bcrypt.", nagcount - MAXNAG);
 	exit(0);
 }
 

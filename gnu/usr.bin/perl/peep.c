@@ -27,7 +27,7 @@
 
 
 #define CALL_RPEEP(o) PL_rpeepp(aTHX_ o)
-
+#define cMAXARG3x(o)  (o->op_private & OPpARG3_MASK)
 
 static void
 S_scalar_slice_warning(pTHX_ const OP *o)
@@ -601,7 +601,7 @@ S_maybe_multiconcat(pTHX_ OP *o)
 
     /* Benchmarking seems to indicate that we gain if:
      * * we optimise at least two actions into a single multiconcat
-     *    (e.g concat+concat, sassign+concat);
+     *    (e.g., concat+concat, sassign+concat);
      * * or if we can eliminate at least 1 OP_CONST;
      * * or if we can eliminate a padsv via OPpTARGET_MY
      */
@@ -997,6 +997,23 @@ S_maybe_multiconcat(pTHX_ OP *o)
     o->op_type         = OP_MULTICONCAT;
     o->op_ppaddr       = PL_ppaddr[OP_MULTICONCAT];
     cUNOP_AUXo->op_aux = aux;
+
+
+    /* add some PADTMPs, as needed, for the 'fallback to OP_CONCAT
+     * behaviour if magic / overloaded etc present' code path */
+
+    /* general PADTMP for the target of each concat */
+    aux[PERL_MULTICONCAT_IX_PADTMP0].pad_offset =
+                            pad_alloc(OP_MULTICONCAT, SVs_PADTMP);
+
+    /* PADTMP for recreating OP_CONST return values */
+    aux[PERL_MULTICONCAT_IX_PADTMP1].pad_offset =
+        (is_sprintf || nconst) ? pad_alloc(OP_MULTICONCAT, SVs_PADTMP) : 0;
+
+    /* PADTMP for stringifying the result */
+    aux[PERL_MULTICONCAT_IX_PADTMP2].pad_offset =
+    (o->op_private &OPpMULTICONCAT_STRINGIFY)
+            ? pad_alloc(OP_MULTICONCAT, SVs_PADTMP) : 0;
 }
 
 
@@ -1036,7 +1053,7 @@ S_warn_implicit_snail_cvsig(pTHX_ OP *o)
         cv = CvOUTSIDE(cv);
 
     if(cv && CvSIGNATURE(cv))
-        Perl_ck_warner_d(aTHX_ packWARN(WARN_EXPERIMENTAL__ARGS_ARRAY_WITH_SIGNATURES),
+        ck_warner_d(packWARN(WARN_EXPERIMENTAL__ARGS_ARRAY_WITH_SIGNATURES),
             "Implicit use of @_ in %s with signatured subroutine is experimental", OP_DESC(o));
 }
 
@@ -1099,7 +1116,7 @@ S_optimize_op(pTHX_ OP* o)
                 while(OP_TYPE_IS(parent, OP_NULL))
                     parent = op_parent(parent);
 
-                Perl_ck_warner_d(aTHX_ packWARN(WARN_EXPERIMENTAL__ARGS_ARRAY_WITH_SIGNATURES),
+                ck_warner_d(packWARN(WARN_EXPERIMENTAL__ARGS_ARRAY_WITH_SIGNATURES),
                     "Use of @_ in %s with signatured subroutine is experimental", OP_DESC(parent));
             }
             break;
@@ -1236,17 +1253,15 @@ S_finalize_op(pTHX_ OP* o)
         case OP_EXEC:
             if (OpHAS_SIBLING(o)) {
                 OP *sib = OpSIBLING(o);
-                if ((  sib->op_type == OP_NEXTSTATE || sib->op_type == OP_DBSTATE)
-                    && ckWARN(WARN_EXEC)
-                    && OpHAS_SIBLING(sib))
+                if (OP_TYPE_IS_COP_NN(sib) && ckWARN(WARN_EXEC) && OpHAS_SIBLING(sib))
                 {
                     const OPCODE type = OpSIBLING(sib)->op_type;
                     if (type != OP_EXIT && type != OP_WARN && type != OP_DIE) {
                         const line_t oldline = CopLINE(PL_curcop);
                         CopLINE_set(PL_curcop, CopLINE((COP*)sib));
-                        Perl_warner(aTHX_ packWARN(WARN_EXEC),
+                        warner(packWARN(WARN_EXEC),
                             "Statement unlikely to be reached");
-                        Perl_warner(aTHX_ packWARN(WARN_EXEC),
+                        warner(packWARN(WARN_EXEC),
                             "\t(Maybe you meant system() when you said exec()?)\n");
                         CopLINE_set(PL_curcop, oldline);
                     }
@@ -1261,9 +1276,9 @@ S_finalize_op(pTHX_ OP* o)
                     /* XXX could check prototype here instead of just carping */
                     SV * const sv = sv_newmortal();
                     gv_efullname3(sv, gv, NULL);
-                    Perl_warner(aTHX_ packWARN(WARN_PROTOTYPE),
-                                "%" SVf "() called too early to check prototype",
-                                SVfARG(sv));
+                    warner(packWARN(WARN_PROTOTYPE),
+                           "%" SVf "() called too early to check prototype",
+                           SVfARG(sv));
                 }
             }
             break;
@@ -3151,62 +3166,6 @@ Perl_rpeep(pTHX_ OP *o)
                 }
             }
 
-            /* If the pushmark is associated with an empty anonhash
-             * or anonlist, null out the pushmark and swap in a
-             * specialised op for the parent.
-             *     4        <@> anonhash sK* ->5
-             *     3           <0> pushmark s ->4
-             * becomes:
-             *     3        <@> emptyavhv sK* ->4
-             *     -           <0> pushmark s ->3
-             */
-            if (!OpHAS_SIBLING(o) && (o->op_next == o->op_sibparent) && (
-                (o->op_next->op_type == OP_ANONHASH) ||
-                (o->op_next->op_type == OP_ANONLIST) ) &&
-                (o->op_next->op_flags & OPf_SPECIAL) ) {
-
-                OP* anon = o->op_next;
-                /* These next two are _potentially_ a padsv and an sassign */
-                OP* padsv = anon->op_next;
-                OP* sassign = (padsv) ? padsv->op_next: NULL;
-
-                anon->op_private = (anon->op_type == OP_ANONLIST) ?
-                                                0 : OPpEMPTYAVHV_IS_HV;
-                OpTYPE_set(anon, OP_EMPTYAVHV);
-                op_null(o);
-                o = anon;
-                if (oldop) /* A previous optimization may have NULLED it */
-                    oldop->op_next = anon;
-
-                /* Further optimise scalar assignment of an empty anonhash
-                 * or anonlist by subsuming the padsv & sassign OPs. */
-                if ((padsv->op_type == OP_PADSV) &&
-                    !(padsv->op_private & OPpDEREF) &&
-                    sassign && (sassign->op_type == OP_SASSIGN) ){
-
-                    /* Take some public flags from the sassign */
-                    anon->op_flags = OPf_KIDS | OPf_SPECIAL |
-                        (anon->op_flags & OPf_PARENS) |
-                        (sassign->op_flags & (OPf_WANT|OPf_PARENS));
-
-                    /* Take some private flags from the padsv */
-                    anon->op_private |= OPpTARGET_MY |
-                        (padsv->op_private & (OPpLVAL_INTRO|OPpPAD_STATE));
-
-                    /* Take the targ slot from the padsv*/
-                    anon->op_targ = padsv->op_targ;
-                    padsv->op_targ = 0;
-
-                    /* Clean up */
-                    anon->op_next = sassign->op_next;
-                    op_null(padsv);
-                    op_null(sassign);
-                }
-                break;
-
-            }
-
-
             /* Convert a series of PAD ops for my vars plus support into a
              * single padrange op. Basically
              *
@@ -3382,8 +3341,7 @@ Perl_rpeep(pTHX_ OP *o)
                     ) {
                         U8 old_count;
                         assert(oldoldop->op_next == oldop);
-                        assert(   oldop->op_type == OP_NEXTSTATE
-                               || oldop->op_type == OP_DBSTATE);
+                        assert(OP_TYPE_IS_COP_NN(oldop));
                         assert(oldop->op_next == o);
 
                         old_count
@@ -3418,8 +3376,7 @@ Perl_rpeep(pTHX_ OP *o)
                             && (p->op_private & OPpLVAL_INTRO) == intro
                             && !(p->op_private & ~OPpLVAL_INTRO)
                             && p->op_next
-                            && (   p->op_next->op_type == OP_NEXTSTATE
-                                || p->op_next->op_type == OP_DBSTATE)
+                            && OP_TYPE_IS_COP_NN(p->op_next)
                             && count < OPpPADRANGE_COUNTMASK
                             && base + count == p->op_targ
                     ) {
@@ -3911,6 +3868,103 @@ Perl_rpeep(pTHX_ OP *o)
             }
             break;
 
+        case OP_SUBSTR: {
+            OP *expr, *offs, *len, *repl = NULL;
+            /* Specialize substr($x, 0, $y) and substr($x,0,$y,"") */
+            /* Does this substr have 3-4 args and amiable flags? */
+            if (
+                ((cMAXARG3x(o) == 4) || (cMAXARG3x(o) == 3))
+                /* No lvalue cases, no OPpSUBSTR_REPL_FIRST*/
+                && !(o->op_private & (OPpSUBSTR_REPL_FIRST|OPpMAYBE_LVSUB))
+                && !(o->op_flags & OPf_MOD)
+            ){
+                /* Should be a leading ex-pushmark */
+                OP *pushmark = cBINOPx(o)->op_first;
+                assert(pushmark->op_type == OP_NULL);
+                expr = OpSIBLING(pushmark);
+                offs = OpSIBLING(expr);
+
+                /* Gets complicated fast if the expr isn't simple*/
+                if (expr->op_type != OP_PADSV)
+                    break;
+                /* Is the offset CONST zero? */
+                if (offs->op_type != OP_CONST)
+                    break;
+                SV *offs_sv = cSVOPx_sv(offs);
+                if (!(SvIOK(offs_sv) && SvIVX(offs_sv) == 0))
+                    break;
+                len  = OpSIBLING(offs);
+
+                if (cMAXARG3x(o) == 4) {/* replacement */
+                    /* Is the replacement string CONST ""? */
+                    repl = OpSIBLING(len);
+                    if (repl->op_type != OP_CONST)
+                        break;
+                    SV *repl_sv = cSVOPx_sv(repl);
+                    if(!(SvPOK(repl_sv) && SvCUR(repl_sv) == 0))
+                        break;
+                }
+            } else {
+                break;
+            }
+            /* It's on! */
+            /* Take out the static LENGTH OP.  */
+            /* (The finalizer does not seem to change op_next here) */
+            expr->op_next = offs->op_next;
+            o->op_private = cMAXARG3x(o);
+
+            /* We have a problem if padrange pushes the expr OP for us,
+             * then jumps straight to the offs CONST OP. For example:
+             *     push @{$pref{ substr($key, 0, 1) }}, $key;
+             * We don't want to hit that OP, but cannot easily figure
+             * out if that is going to happen and adjust for it.
+             * So we have to null out the OP, and then do a fixup in
+              * B::Deparse. :/  */
+            op_null(offs);
+
+            /* There can be multiple pointers to repl, see GH #22914.
+             *    substr $x, 0, $y ? 2 : 3, "";
+             * So instead of rewriting all of len, null out repl. */
+            if (repl) {
+                op_null(repl);
+                /* We can still rewrite the simple len case though.*/
+                len->op_next = o;
+            }
+
+            /* Upgrade the SUBSTR to a SUBSTR_LEFT */
+            OpTYPE_set(o, OP_SUBSTR_LEFT);
+
+            /* oldop will be the OP_CONST associated with "" */
+            /* oldoldop is more unpredictable */
+            oldoldop = oldop = NULL;
+
+            /* pp_substr may be unsuitable for TARGMY optimization
+             * because of its potential RETPUSHUNDEF, and use of
+             * bit 4 for OPpSUBSTR_REPL_FIRST, but no such
+             * problems with pp_substr_left. Must just avoid
+             * sv == TARG.*/
+            if (OP_TYPE_IS(o->op_next, OP_PADSV) &&
+                !(o->op_next->op_private) &&
+                OP_TYPE_IS(o->op_next->op_next, OP_SASSIGN) &&
+                (o->op_next->op_targ != expr->op_targ)
+            ) {
+                OP * padsv = o->op_next;
+                OP * sassign = padsv->op_next;
+                /* Carry over some flags */
+                o->op_flags = OPf_KIDS | (o->op_flags & OPf_PARENS) |
+                              (sassign->op_flags & (OPf_WANT|OPf_PARENS));
+                o->op_private |= OPpTARGET_MY;
+                /* Steal the TARG, set op_next pointers*/
+                o->op_targ = padsv->op_targ;
+                padsv->op_targ = 0;
+                o->op_next = sassign->op_next;
+                /* Null the replaced OPs*/
+                op_null(padsv);
+                op_null(sassign);
+            }
+        }
+        break;
+
         case OP_SASSIGN: {
             if (OP_GIMME(o,0) == G_VOID
              || (  o->op_next->op_type == OP_LINESEQ
@@ -3939,7 +3993,7 @@ Perl_rpeep(pTHX_ OP *o)
                     */
                     OP *left = OpSIBLING(right);
                     if (left->op_type == OP_SUBSTR
-                         && (left->op_private & 7) < 4) {
+                         && (cMAXARG3x(left) < 4)) {
                         op_null(o);
                         /* cut out right */
                         op_sibling_splice(o, NULL, 1, NULL);
@@ -3973,6 +4027,11 @@ Perl_rpeep(pTHX_ OP *o)
                   * child (PADSV), and gets to it via op_other rather
                   * than op_next. Don't try to optimize this. */
                  && (lval != rhs)
+                 /* For efficiency, pp_padsv_store() doesn't push its
+                  * result onto the stack. For the relatively rare case of
+                  * the $lex assignment not in void context, we just do it
+                  * the old slow way. */
+                 && OP_GIMME(o,0) == G_VOID
                ) {
                 /* SASSIGN's bitfield flags, such as op_moresib and
                  * op_slabbed, will be carried over unchanged. */
@@ -4019,6 +4078,11 @@ Perl_rpeep(pTHX_ OP *o)
             if (!(o->op_private & (OPpASSIGN_BACKWARDS|OPpASSIGN_CV_TO_GV))
                 && (lval->op_type == OP_NULL) && (lval->op_private == 2) &&
                 (cBINOPx(lval)->op_first->op_type == OP_AELEMFAST_LEX)
+                 /* For efficiency, pp_aelemfastlex_store() doesn't push its
+                  * result onto the stack. For the relatively rare case of
+                  * the array assignment not in void context, we just do it
+                  * the old slow way. */
+                 && OP_GIMME(o,0) == G_VOID
             ) {
                 OP * lex = cBINOPx(lval)->op_first;
                 /* SASSIGN's bitfield flags, such as op_moresib and

@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.273 2024/06/17 08:02:57 sashan Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.296 2026/09/07 19:34:30 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -57,9 +57,7 @@
 #define LABEL_NAME_SIZE		1024
 #define TAG_NAME_SIZE		64
 #define TABLE_NAME_SIZE		64
-#define	RD_TAG_NAME_SIZE	64
 #define	RT_LABEL_SIZE		32
-#define SRV_NAME_SIZE		64
 #define MAX_NAME_SIZE		64
 #define SRV_MAX_VIRTS		16
 #define TLS_NAME_SIZE		512
@@ -139,11 +137,12 @@ struct ctl_relaytable {
 };
 
 enum fd_type {
-	RELAY_FD_CERT	= 1,
-	RELAY_FD_CACERT	= 2,
-	RELAY_FD_CAFILE	= 3,
-	RELAY_FD_KEY	= 4,
-	RELAY_FD_OCSP	= 5
+	RELAY_FD_CERT		= 1,
+	RELAY_FD_CACERT		= 2,
+	RELAY_FD_CAFILE		= 3,
+	RELAY_FD_KEY		= 4,
+	RELAY_FD_OCSP		= 5,
+	RELAY_FD_CLIENTCACERT	= 6
 };
 
 struct ctl_relayfd {
@@ -156,7 +155,7 @@ struct ctl_script {
 	objid_t		 host;
 	int		 retval;
 	struct timeval	 timeout;
-	char		 name[HOST_NAME_MAX+1];
+	char		 name[HOST_NAME_MAX + 1];
 	char		 path[PATH_MAX];
 };
 
@@ -175,23 +174,23 @@ struct ctl_icmp_event {
 };
 
 struct ctl_tcp_event {
-	int			 s;
-	struct ibuf		*buf;
-	struct host		*host;
-	struct table		*table;
-	struct timeval		 tv_start;
-	struct event		 ev;
-	int			(*validate_read)(struct ctl_tcp_event *);
-	int			(*validate_close)(struct ctl_tcp_event *);
+	int		 s;
+	struct ibuf	*buf;
+	struct host	*host;
+	struct table	*table;
+	struct timeval	 tv_start;
+	struct event	 ev;
+	int		 (*validate_read)(struct ctl_tcp_event *);
+	int		 (*validate_close)(struct ctl_tcp_event *);
 
-	struct tls		*tls;
+	struct tls	*tls;
 };
 
 enum direction {
 	RELAY_DIR_INVALID	= -1,
-	RELAY_DIR_ANY		=  0,
-	RELAY_DIR_REQUEST	=  1,
-	RELAY_DIR_RESPONSE	=  2
+	RELAY_DIR_ANY		= 0,
+	RELAY_DIR_REQUEST	= 1,
+	RELAY_DIR_RESPONSE	= 2
 };
 
 enum relay_state {
@@ -374,7 +373,7 @@ union hashkey {
 };
 
 #define F_DISABLE		0x00000001
-#define F_BACKUP		0x00000002
+#define F_BACKUP		0x00000002 /* unused */
 #define F_USED			0x00000004
 #define F_DOWN			0x00000008
 #define F_ADD			0x00000010
@@ -403,6 +402,8 @@ union hashkey {
 #define F_HASHKEY		0x08000000
 #define F_AGENTX_TRAPONLY	0x10000000
 #define F_PFLOG			0x20000000
+#define F_PROXYV1		0x40000000
+#define F_PROXYV2		0x80000000
 
 #define F_BITS								\
 	"\10\01DISABLE\02BACKUP\03USED\04DOWN\05ADD\06DEL\07CHANGED"	\
@@ -423,7 +424,7 @@ struct host_config {
 	objid_t			 parentid;
 	objid_t			 tableid;
 	int			 retry;
-	char			 name[HOST_NAME_MAX+1];
+	char			 name[HOST_NAME_MAX + 1];
 	struct sockaddr_storage	 ss;
 	int			 ttl;
 	int			 priority;
@@ -433,7 +434,7 @@ struct host {
 	TAILQ_ENTRY(host)	 entry;
 	TAILQ_ENTRY(host)	 globalentry;
 	SLIST_ENTRY(host)	 child;
-	SLIST_HEAD(,host)	 children;
+	SLIST_HEAD(, host)	 children;
 	struct host_config	 conf;
 	u_int32_t		 flags;
 	char			*tablename;
@@ -545,8 +546,8 @@ struct rdr_config {
 	objid_t			 backup_id;
 	int			 mode;
 	union hashkey		 key;
-	char			 name[SRV_NAME_SIZE];
-	char			 tag[RD_TAG_NAME_SIZE];
+	char			 name[PF_TABLE_NAME_SIZE];
+	char			 tag[PF_TAG_NAME_SIZE];
 	struct timeval		 timeout;
 };
 
@@ -710,7 +711,7 @@ TAILQ_HEAD(relay_rules, relay_rule);
 	"\06\01sslv3\02tlsv1.0\03tlsv1.1\04tlsv1.2\05tlsv1.3"	\
 	"\06cipher-server-preference\07client-renegotiation"
 
-#define TLSCIPHERS_DEFAULT	"HIGH:!aNULL"
+#define TLSCIPHERS_DEFAULT	"secure"
 #define TLSECDHECURVES_DEFAULT	"default"
 #define TLSDHPARAM_DEFAULT	"none"
 
@@ -725,6 +726,9 @@ struct relay_ticket_key {
 struct keyname {
 	TAILQ_ENTRY(keyname)	 entry;
 	char			*name;
+	char			 certificate[PATH_MAX];
+	char			 key[PATH_MAX];
+	char			 ocsp[PATH_MAX];
 };
 TAILQ_HEAD(keynamelist, keyname);
 
@@ -746,18 +750,19 @@ struct protocol {
 	char			 tlscacert[PATH_MAX];
 	char			 tlscakey[PATH_MAX];
 	char			*tlscapass;
+	char			 tlsclientca[PATH_MAX];
 	struct keynamelist	 tlscerts;
 	char			 name[MAX_NAME_SIZE];
 	int			 tickets;
 	enum prototype		 type;
 	char			*style;
 
-	int			(*cmp)(struct rsession *, struct rsession *);
+	int			 (*cmp)(struct rsession *, struct rsession *);
 	void			*(*validate)(struct rsession *, struct relay *,
-				    struct sockaddr_storage *,
-				    u_int8_t *, size_t);
-	int			(*request)(struct rsession *);
-	void			(*close)(struct rsession *);
+	    struct sockaddr_storage *,
+	    u_int8_t *, size_t);
+	int			 (*request)(struct rsession *);
+	void			 (*close)(struct rsession *);
 
 	struct relay_rules	 rules;
 	int			 rulecount;
@@ -799,7 +804,7 @@ struct relay_config {
 	objid_t			 id;
 	u_int32_t		 flags;
 	objid_t			 proto;
-	char			 name[HOST_NAME_MAX+1];
+	char			 name[HOST_NAME_MAX + 1];
 	in_port_t		 port;
 	in_port_t		 dstport;
 	int			 dstretry;
@@ -835,6 +840,7 @@ struct relay {
 
 	int			 rl_tls_ca_fd;
 	int			 rl_tls_cacert_fd;
+	int			 rl_tls_client_ca_fd;
 	EVP_PKEY		*rl_tls_pkey;
 	X509			*rl_tls_cacertx509;
 	char			*rl_tls_cakey;
@@ -876,7 +882,7 @@ TAILQ_HEAD(netroutelist, netroute);
 struct router_config {
 	objid_t			 id;
 	u_int32_t		 flags;
-	char			 name[HOST_NAME_MAX+1];
+	char			 name[HOST_NAME_MAX + 1];
 	char			 label[RT_LABEL_SIZE];
 	int			 nroutes;
 	objid_t			 gwtable;
@@ -904,36 +910,25 @@ struct ctl_netroute {
 
 /* initially control.h */
 struct control_sock {
-	const char	*cs_name;
-	struct event	 cs_ev;
-	struct event	 cs_evt;
-	int		 cs_fd;
-	int		 cs_restricted;
-	void		*cs_env;
+	const char			*cs_name;
+	struct event			 cs_ev;
+	struct event			 cs_evt;
+	int				 cs_fd;
+	int				 cs_restricted;
+	void				*cs_env;
 
-	TAILQ_ENTRY(control_sock) cs_entry;
+	TAILQ_ENTRY(control_sock)	 cs_entry;
 };
 TAILQ_HEAD(control_socks, control_sock);
 
-extern struct {
-	struct event	 ev;
-	int		 fd;
-} control_state;
-
 struct imsgev {
 	struct imsgbuf		 ibuf;
-	void			(*handler)(int, short, void *);
+	void			 (*handler)(int, short, void *);
 	struct event		 ev;
 	struct privsep_proc	*proc;
 	void			*data;
 	short			 events;
 };
-
-#define IMSG_SIZE_CHECK(imsg, p) do {				\
-	if (IMSG_DATA_SIZE(imsg) < sizeof(*p))			\
-		fatalx("bad length imsg received");		\
-} while (0)
-#define IMSG_DATA_SIZE(imsg)	((imsg)->hdr.len - IMSG_HEADER_SIZE)
 
 struct ctl_conn {
 	TAILQ_ENTRY(ctl_conn)	 entry;
@@ -941,7 +936,6 @@ struct ctl_conn {
 	u_int			 waiting;
 #define CTL_CONN_NOTIFY		 0x01
 	struct imsgev		 iev;
-
 };
 TAILQ_HEAD(ctl_connlist, ctl_conn);
 
@@ -1007,6 +1001,7 @@ enum imsg_type {
 	IMSG_CFG_DONE,
 	IMSG_CA_PRIVENC,
 	IMSG_CA_PRIVDEC,
+	IMSG_CA_ECDSA_SIGN,
 	IMSG_SESS_PUBLISH,	/* from relay to pfe */
 	IMSG_SESS_UNPUBLISH,
 	IMSG_TLSTICKET_REKEY
@@ -1042,7 +1037,6 @@ struct privsep {
 	u_int				 ps_instance;
 
 	struct control_sock		 ps_csock;
-	struct control_socks		 ps_rcsocks;
 
 	/* Event and signal handlers */
 	struct event			 ps_evsigint;
@@ -1060,13 +1054,13 @@ struct privsep {
 struct privsep_proc {
 	const char		*p_title;
 	enum privsep_procid	 p_id;
-	int			(*p_cb)(int, struct privsep_proc *,
-				    struct imsg *);
-	void			(*p_init)(struct privsep *,
-				    struct privsep_proc *);
+	int			 (*p_cb)(int, struct privsep_proc *,
+	    struct imsg *);
+	void			 (*p_init)(struct privsep *,
+	    struct privsep_proc *);
 	const char		*p_chroot;
 	struct privsep		*p_ps;
-	void			(*p_shutdown)(void);
+	void			 (*p_shutdown)(void);
 	struct passwd		*p_pw;
 };
 
@@ -1149,13 +1143,13 @@ struct relayd {
 #define RELAYD_OPT_LOGCONERR		0x40
 
 /* control.c */
-int	 control_init(struct privsep *, struct control_sock *);
-int	 control_listen(struct control_sock *);
-void	 control_cleanup(struct control_sock *);
-void	 control_dispatch_imsg(int, short, void *);
-void	 control_imsg_forward(struct privsep *ps, struct imsg *);
-struct ctl_conn	*
-	 control_connbyfd(int);
+int		 control_init(struct privsep *, struct control_sock *);
+int		 control_listen(struct control_sock *);
+void		 control_cleanup(struct control_sock *);
+void		 control_dispatch_imsg(int, short, void *);
+void		 control_imsg_forward(struct imsg *);
+void		 control_imsg_notify(uint32_t, void *, uint16_t);
+struct ctl_conn	*control_connbyfd(int);
 
 /* parse.y */
 int	 parse_config(const char *, struct relayd *);
@@ -1166,14 +1160,12 @@ int	 cmdline_symset(char *);
 const char *host_error(enum host_error);
 const char *host_status(enum host_status);
 const char *table_check(enum table_check);
-#ifdef DEBUG
 const char *relay_state(enum relay_state);
-#endif
-const char *print_availability(u_long, u_long);
-const char *print_host(struct sockaddr_storage *, char *, size_t);
-const char *print_time(struct timeval *, struct timeval *, char *, size_t);
-const char *printb_flags(const u_int32_t, const char *);
-void	 getmonotime(struct timeval *);
+const char	*print_availability(u_long, u_long);
+const char	*print_host(struct sockaddr_storage *, char *, size_t);
+const char	*print_time(struct timeval *, struct timeval *, char *, size_t);
+const char	*printb_flags(const u_int32_t, const char *);
+void		 getmonotime(struct timeval *);
 struct ibuf	*string2binary(const char *);
 void		 print_hex(uint8_t *, off_t, size_t);
 void		 print_debug(const char *, ...);
@@ -1190,14 +1182,13 @@ int	 disable_table(struct ctl_conn *, struct ctl_id *);
 int	 disable_host(struct ctl_conn *, struct ctl_id *, struct host *);
 
 /* pfe_filter.c */
-void	 init_tables(struct relayd *);
-void	 flush_table(struct relayd *, struct rdr *);
-void	 sync_table(struct relayd *, struct rdr *, struct table *);
-void	 sync_ruleset(struct relayd *, struct rdr *, int);
-void	 flush_rulesets(struct relayd *);
-int	 natlook(struct relayd *, struct ctl_natlook *);
-u_int64_t
-	 check_table(struct relayd *, struct rdr *, struct table *);
+void		init_tables(struct relayd *);
+void		flush_table(struct relayd *, struct rdr *);
+void		sync_table(struct relayd *, struct rdr *, struct table *);
+void		sync_ruleset(struct relayd *, struct rdr *, int);
+void		flush_rulesets(struct relayd *);
+int		natlook(struct relayd *, struct ctl_natlook *);
+u_int64_t	check_table(struct relayd *, struct rdr *, struct table *);
 
 /* pfe_route.c */
 void	 init_routes(struct relayd *);
@@ -1209,69 +1200,66 @@ void	 hce(struct privsep *, struct privsep_proc *);
 void	 hce_notify_done(struct host *, enum host_error);
 
 /* relay.c */
-void	 relay(struct privsep *, struct privsep_proc *);
-int	 relay_privinit(struct relay *);
-int	 relay_session_cmp(struct rsession *, struct rsession *);
-void	 relay_close(struct rsession *, const char *, int);
-int	 relay_reset_event(struct rsession *, struct ctl_relay_event *);
-void	 relay_natlook(int, short, void *);
-void	 relay_session(struct rsession *);
-int	 relay_from_table(struct rsession *);
-int	 relay_socket_af(struct sockaddr_storage *, in_port_t);
-in_port_t
-	 relay_socket_getport(struct sockaddr_storage *);
-int	 relay_cmp_af(struct sockaddr_storage *,
-	    struct sockaddr_storage *);
-void	 relay_write(struct bufferevent *, void *);
-void	 relay_read(struct bufferevent *, void *);
-int	 relay_splice(struct ctl_relay_event *);
-int	 relay_splicelen(struct ctl_relay_event *);
-int	 relay_spliceadjust(struct ctl_relay_event *);
-void	 relay_error(struct bufferevent *, short, void *);
-int	 relay_preconnect(struct rsession *);
-int	 relay_connect(struct rsession *);
-void	 relay_connected(int, short, void *);
-void	 relay_bindanyreq(struct rsession *, in_port_t, int);
-void	 relay_bindany(int, short, void *);
-void	 relay_dump(struct ctl_relay_event *, const void *, size_t);
-int	 relay_bufferevent_add(struct event *, int);
-int	 relay_bufferevent_print(struct ctl_relay_event *, const char *);
-int	 relay_bufferevent_write_buffer(struct ctl_relay_event *,
-	    struct evbuffer *);
-int	 relay_bufferevent_write_chunk(struct ctl_relay_event *,
-	    struct evbuffer *, size_t);
-int	 relay_bufferevent_write(struct ctl_relay_event *,
-	    void *, size_t);
-int	 relay_test(struct protocol *, struct ctl_relay_event *);
-void	 relay_calc_skip_steps(struct relay_rules *);
-void	 relay_match(struct kvlist *, struct kv *, struct kv *,
-	    struct kvtree *);
-void	 relay_session_publish(struct rsession *);
-void	 relay_session_unpublish(struct rsession *);
+void		relay(struct privsep *, struct privsep_proc *);
+int		relay_privinit(struct relay *);
+int		relay_session_cmp(struct rsession *, struct rsession *);
+void		relay_close(struct rsession *, const char *, int);
+int		relay_reset_event(struct rsession *, struct ctl_relay_event *);
+void		relay_natlook(int, short, void *);
+void		relay_session(struct rsession *);
+int		relay_from_table(struct rsession *);
+int		relay_socket_af(struct sockaddr_storage *, in_port_t);
+in_port_t	relay_socket_getport(struct sockaddr_storage *);
+int		relay_cmp_af(struct sockaddr_storage *,
+    struct sockaddr_storage *);
+void		relay_write(struct bufferevent *, void *);
+void		relay_read(struct bufferevent *, void *);
+int		relay_splice(struct ctl_relay_event *);
+int		relay_splicelen(struct ctl_relay_event *);
+int		relay_spliceadjust(struct ctl_relay_event *);
+void		relay_error(struct bufferevent *, short, void *);
+int		relay_preconnect(struct rsession *);
+int		relay_connect(struct rsession *);
+void		relay_connected(int, short, void *);
+void		relay_bindanyreq(struct rsession *, in_port_t, int);
+void		relay_bindany(int, short, void *);
+void		relay_dump(struct ctl_relay_event *, const void *, size_t);
+int		relay_bufferevent_add(struct event *, int);
+int		relay_bufferevent_print(struct ctl_relay_event *, const char *);
+int		relay_bufferevent_write_buffer(struct ctl_relay_event *,
+    struct evbuffer *);
+int		relay_bufferevent_write_chunk(struct ctl_relay_event *,
+    struct evbuffer *, size_t);
+int		relay_bufferevent_write(struct ctl_relay_event *,
+    void *, size_t);
+int		relay_test(struct protocol *, struct ctl_relay_event *);
+void		relay_calc_skip_steps(struct relay_rules *);
+void		relay_match(struct kvlist *, struct kv *, struct kv *,
+    struct kvtree *);
+void		relay_session_publish(struct rsession *);
+void		relay_session_unpublish(struct rsession *);
 
 SPLAY_PROTOTYPE(session_tree, rsession, se_nodes, relay_session_cmp);
 
 /* relay_http.c */
-void	 relay_http(struct relayd *);
-void	 relay_http_init(struct relay *);
-void	 relay_abort_http(struct rsession *, u_int, const char *,
-	    u_int16_t);
-void	 relay_read_http(struct bufferevent *, void *);
-void	 relay_close_http(struct rsession *);
-u_int	 relay_httpmethod_byname(const char *);
-const char
-	*relay_httpmethod_byid(u_int);
-const char
-	*relay_httperror_byid(u_int);
-int	 relay_http_priv_init(struct rsession *);
-int	 relay_httpdesc_init(struct ctl_relay_event *);
-ssize_t	 relay_http_time(time_t, char *, size_t);
+void		 relay_http(struct relayd *);
+void		 relay_http_init(struct relay *);
+void		 relay_abort_http(struct rsession *, u_int, const char *,
+    u_int16_t);
+void		 relay_read_http(struct bufferevent *, void *);
+void		 relay_close_http(struct rsession *);
+enum httpmethod	 relay_httpmethod_byname(const char *);
+const char	*relay_httpmethod_byid(u_int);
+const char	*relay_httperror_byid(u_int);
+int		 relay_http_priv_init(struct rsession *);
+int		 relay_httpdesc_init(struct ctl_relay_event *);
+ssize_t		 relay_http_time(time_t, char *, size_t);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relay *);
 void	 relay_udp_init(struct relayd *, struct relay *);
 int	 relay_udp_bind(struct sockaddr_storage *, in_port_t,
-	    struct protocol *);
+    struct protocol *);
 void	 relay_udp_server(int, short, void *);
 
 /* check_icmp.c */
@@ -1291,9 +1279,10 @@ void	 script_done(struct relayd *, struct ctl_script *);
 int	 script_exec(struct relayd *, struct ctl_script *);
 
 /* ssl.c */
+void	 ssl_error(const char *);
 char	*ssl_load_key(struct relayd *, const char *, off_t *, char *);
-uint8_t *ssl_update_certificate(const uint8_t *, size_t, EVP_PKEY *,
-	    EVP_PKEY *, X509 *, size_t *);
+uint8_t	*ssl_update_certificate(const uint8_t *, size_t, EVP_PKEY *,
+    EVP_PKEY *, X509 *, size_t *);
 int	 ssl_load_pkey(char *, off_t, X509 **, EVP_PKEY **);
 
 /* ca.c */
@@ -1302,76 +1291,77 @@ void	 ca_engine_init(struct relayd *);
 void	 hash_x509(X509 *cert, char *hash, size_t hashlen);
 
 /* relayd.c */
-struct host	*host_find(struct relayd *, objid_t);
-struct table	*table_find(struct relayd *, objid_t);
-struct rdr	*rdr_find(struct relayd *, objid_t);
-struct netroute	*route_find(struct relayd *, objid_t);
-struct router	*router_find(struct relayd *, objid_t);
-struct host	*host_findbyname(struct relayd *, const char *);
-struct table	*table_findbyname(struct relayd *, const char *);
-struct table	*table_findbyconf(struct relayd *, struct table *);
-struct rdr	*rdr_findbyname(struct relayd *, const char *);
-void		 event_again(struct event *, int, short,
-		    void (*)(int, short, void *),
-		    struct timeval *, struct timeval *, void *);
-struct relay	*relay_find(struct relayd *, objid_t);
-struct protocol	*proto_find(struct relayd *, objid_t);
-struct rsession	*session_find(struct relayd *, objid_t);
-struct relay	*relay_findbyname(struct relayd *, const char *);
-struct relay	*relay_findbyaddr(struct relayd *, struct relay_config *);
-EVP_PKEY	*pkey_find(struct relayd *, char *hash);
-struct ca_pkey	*pkey_add(struct relayd *, EVP_PKEY *, char *hash);
-struct relay_cert *cert_add(struct relayd *, objid_t);
-struct relay_cert *cert_find(struct relayd *, objid_t);
-char		*relay_load_fd(int, off_t *);
-int		 relay_load_certfiles(struct relayd *, struct relay *,
-		    const char *);
-int		 expand_string(char *, size_t, const char *, const char *);
-void		 translate_string(char *);
-void		 purge_key(char **, off_t);
-void		 purge_table(struct relayd *, struct tablelist *,
-		    struct table *);
-void		 purge_relay(struct relayd *, struct relay *);
-char		*digeststr(enum digest_type, const u_int8_t *, size_t, char *);
-const char	*canonicalize_host(const char *, char *, size_t);
-int		 parse_url(const char *, char **, char **, char **);
-int		 map6to4(struct sockaddr_storage *);
-int		 map4to6(struct sockaddr_storage *, struct sockaddr_storage *);
-void		 imsg_event_add(struct imsgev *);
-int		 imsg_compose_event(struct imsgev *, u_int16_t, u_int32_t,
-		    pid_t, int, void *, u_int16_t);
-void		 socket_rlimit(int);
-char		*get_string(u_int8_t *, size_t);
-void		*get_data(u_int8_t *, size_t);
-int		 sockaddr_cmp(struct sockaddr *, struct sockaddr *, int);
-struct in6_addr *prefixlen2mask6(u_int8_t, u_int32_t *);
-u_int32_t	 prefixlen2mask(u_int8_t);
-int		 accept_reserve(int, struct sockaddr *, socklen_t *, int,
-		     volatile int *);
-struct kv	*kv_add(struct kvtree *, char *, char *, int);
-int		 kv_set(struct kv *, char *, ...)
-				__attribute__((__format__ (printf, 2, 3)));
-int		 kv_setkey(struct kv *, char *, ...)
-				__attribute__((__format__ (printf, 2, 3)));
-void		 kv_delete(struct kvtree *, struct kv *);
-struct kv	*kv_extend(struct kvtree *, struct kv *, char *);
-void		 kv_purge(struct kvtree *);
-void		 kv_free(struct kv *);
-struct kv	*kv_inherit(struct kv *, struct kv *);
-void		 relay_log(struct rsession *, char *);
-int		 kv_log(struct rsession *, struct kv *, u_int16_t,
-		     enum direction);
-struct kv	*kv_find(struct kvtree *, struct kv *);
-struct kv	*kv_find_value(struct kvtree *, char *, const char *,
-		     const char *);
-int		 kv_cmp(struct kv *, struct kv *);
-int		 rule_add(struct protocol *, struct relay_rule *, const char
-		     *);
-void		 rule_delete(struct relay_rules *, struct relay_rule *);
-void		 rule_free(struct relay_rule *);
-struct relay_rule
-		*rule_inherit(struct relay_rule *);
-void		 rule_settable(struct relay_rules *, struct relay_table *);
+struct host		*host_find(struct relayd *, objid_t);
+struct table		*table_find(struct relayd *, objid_t);
+struct rdr		*rdr_find(struct relayd *, objid_t);
+struct netroute		*route_find(struct relayd *, objid_t);
+struct router		*router_find(struct relayd *, objid_t);
+struct host		*host_findbyname(struct relayd *, const char *);
+struct table		*table_findbyname(struct relayd *, const char *);
+struct table		*table_findbyconf(struct relayd *, struct table *);
+struct rdr		*rdr_findbyname(struct relayd *, const char *);
+void			 event_again(struct event *, int, short,
+    void (*)(int, short, void *),
+    struct timeval *, struct timeval *, void *);
+struct relay		*relay_find(struct relayd *, objid_t);
+struct protocol		*proto_find(struct relayd *, objid_t);
+struct rsession		*session_find(struct relayd *, objid_t);
+struct relay		*relay_findbyname(struct relayd *, const char *);
+struct relay		*relay_findbyaddr(struct relayd *,
+    struct relay_config *);
+EVP_PKEY		*pkey_find(struct relayd *, char *hash);
+struct ca_pkey		*pkey_add(struct relayd *, EVP_PKEY *, char *hash);
+struct relay_cert	*cert_add(struct relayd *, objid_t);
+struct relay_cert	*cert_find(struct relayd *, objid_t);
+char			*relay_load_fd(int, off_t *);
+int			 relay_load_certfiles(struct relayd *, struct relay *,
+    const struct keyname *);
+int			 expand_string(char *, size_t, const char *,
+    const char *);
+void			 translate_string(char *);
+void			 purge_key(char **, off_t);
+void			 purge_table(struct relayd *, struct tablelist *,
+    struct table *);
+void			 purge_relay(struct relayd *, struct relay *);
+char			*digeststr(enum digest_type, const u_int8_t *, size_t,
+    char *);
+const char		*canonicalize_host(const char *, char *, size_t);
+int			 parse_url(const char *, char **, char **, char **);
+int			 map6to4(struct sockaddr_storage *);
+int			 map4to6(struct sockaddr_storage *,
+    struct sockaddr_storage *);
+void			 imsg_event_add(struct imsgev *);
+void			 socket_rlimit(int);
+void			*get_data(struct ibuf *, size_t);
+int			 sockaddr_cmp(struct sockaddr *, struct sockaddr *,
+    int);
+struct in6_addr		*prefixlen2mask6(u_int8_t, u_int32_t *);
+u_int32_t		 prefixlen2mask(u_int8_t);
+int			 accept_reserve(int, struct sockaddr *, socklen_t *,
+    int, volatile int *);
+struct kv		*kv_add(struct kvtree *, char *, char *, int);
+int			 kv_set(struct kv *, char *, ...)
+	__attribute__((__format__(printf, 2, 3)));
+int			 kv_setkey(struct kv *, char *, ...)
+	__attribute__((__format__(printf, 2, 3)));
+void			 kv_delete(struct kvtree *, struct kv *);
+void			 kv_purge(struct kvtree *);
+void			 kv_free(struct kv *);
+struct kv		*kv_inherit(struct kv *, struct kv *);
+void			 relay_log(struct rsession *, char *);
+int			 kv_log(struct rsession *, struct kv *, u_int16_t,
+    enum direction);
+struct kv		*kv_find(struct kvtree *, struct kv *);
+struct kv		*kv_find_value(struct kvtree *, char *, const char *,
+    const char *);
+int			 kv_cmp(struct kv *, struct kv *);
+int			 rule_add(struct protocol *, struct relay_rule *,
+    const char *);
+void			 rule_delete(struct relay_rules *, struct relay_rule *);
+void			 rule_free(struct relay_rule *);
+struct relay_rule	*rule_inherit(struct relay_rule *);
+void			 rule_settable(struct relay_rules *,
+    struct relay_table *);
 RB_PROTOTYPE(kvtree, kv, kv_node, kv_cmp);
 
 /* carp.c */
@@ -1401,60 +1391,41 @@ void	 snmp_hosttrap(struct relayd *, struct table *, struct host *);
 void		shuffle_init(struct shuffle *);
 u_int16_t	shuffle_generate16(struct shuffle *);
 
-/* log.c */
-void	log_init(int, int);
-void	log_procinit(const char *);
-void	log_setverbose(int);
-int	log_getverbose(void);
-void	log_warn(const char *, ...)
-	    __attribute__((__format__ (printf, 1, 2)));
-void	log_warnx(const char *, ...)
-	    __attribute__((__format__ (printf, 1, 2)));
-void	log_info(const char *, ...)
-	    __attribute__((__format__ (printf, 1, 2)));
-void	log_debug(const char *, ...)
-	    __attribute__((__format__ (printf, 1, 2)));
-void	logit(int, const char *, ...)
-	    __attribute__((__format__ (printf, 2, 3)));
-void	vlog(int, const char *, va_list)
-	    __attribute__((__format__ (printf, 2, 0)));
-__dead void fatal(const char *, ...)
-	    __attribute__((__format__ (printf, 1, 2)));
-__dead void fatalx(const char *, ...)
-	    __attribute__((__format__ (printf, 1, 2)));
-
 /* proc.c */
-enum privsep_procid
-	    proc_getid(struct privsep_proc *, unsigned int, const char *);
-int	 proc_flush_imsg(struct privsep *, enum privsep_procid, int);
-void	 proc_init(struct privsep *, struct privsep_proc *, unsigned int, int,
-	    int, char **, enum privsep_procid);
-void	 proc_kill(struct privsep *);
-void	 proc_connect(struct privsep *);
-void	 proc_dispatch(int, short event, void *);
-void	 proc_run(struct privsep *, struct privsep_proc *,
-	    struct privsep_proc *, unsigned int,
-	    void (*)(struct privsep *, struct privsep_proc *, void *), void *);
-void	 proc_range(struct privsep *, enum privsep_procid, int *, int *);
-int	 proc_compose_imsg(struct privsep *, enum privsep_procid, int,
-	    u_int16_t, u_int32_t, int, void *, u_int16_t);
-int	 proc_compose(struct privsep *, enum privsep_procid,
-	    uint16_t, void *, uint16_t);
-int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
-	    u_int16_t, u_int32_t, int, const struct iovec *, int);
-int	 proc_composev(struct privsep *, enum privsep_procid,
-	    uint16_t, const struct iovec *, int);
-int	 proc_forward_imsg(struct privsep *, struct imsg *,
-	    enum privsep_procid, int);
-struct imsgbuf *
-	 proc_ibuf(struct privsep *, enum privsep_procid, int);
-struct imsgev *
-	 proc_iev(struct privsep *, enum privsep_procid, int);
-void	 imsg_event_add(struct imsgev *);
-int	 imsg_compose_event(struct imsgev *, uint16_t, uint32_t,
-	    pid_t, int, void *, uint16_t);
-int	 imsg_composev_event(struct imsgev *, uint16_t, uint32_t,
-	    pid_t, int, const struct iovec *, int);
+enum privsep_procid	 proc_getid(struct privsep_proc *, unsigned int,
+    const char *);
+int			 proc_flush_imsg(struct privsep *, enum privsep_procid,
+    int);
+void			 proc_init(struct privsep *, struct privsep_proc *,
+    unsigned int, int,
+    char *, int, char **, enum privsep_procid);
+void			 proc_kill(struct privsep *);
+void			 proc_connect(struct privsep *);
+void			 proc_dispatch(int, short event, void *);
+void			 proc_run(struct privsep *, struct privsep_proc *,
+    struct privsep_proc *, unsigned int,
+    void (*)(struct privsep *, struct privsep_proc *, void *), void *);
+void			 proc_range(struct privsep *, enum privsep_procid,
+    int *, int *);
+int			 proc_compose_imsg(struct privsep *,
+    enum privsep_procid, int,
+    u_int16_t, u_int32_t, int, void *, u_int16_t);
+int			 proc_compose(struct privsep *, enum privsep_procid,
+    uint16_t, void *, uint16_t);
+int			 proc_composev_imsg(struct privsep *,
+    enum privsep_procid, int,
+    u_int16_t, u_int32_t, int, const struct iovec *, int);
+int			 proc_composev(struct privsep *, enum privsep_procid,
+    uint16_t, const struct iovec *, int);
+void			 proc_forward_imsg(struct privsep *, struct imsg *,
+    enum privsep_procid);
+struct imsgbuf		*proc_ibuf(struct privsep *, enum privsep_procid, int);
+struct imsgev		*proc_iev(struct privsep *, enum privsep_procid, int);
+void			 imsg_event_add(struct imsgev *);
+int			 imsg_compose_event(struct imsgev *, uint16_t, uint32_t,
+    pid_t, int, void *, uint16_t);
+int			 imsg_composev_event(struct imsgev *, uint16_t,
+    uint32_t, pid_t, int, const struct iovec *, int);
 
 /* config.c */
 int	 config_init(struct relayd *);
@@ -1479,5 +1450,9 @@ int	 config_setrelay(struct relayd *, struct relay *);
 int	 config_getrelay(struct relayd *, struct imsg *);
 int	 config_getrelaytable(struct relayd *, struct imsg *);
 int	 config_getrelayfd(struct relayd *, struct imsg *);
+
+/* proxy_protocol.c */
+int	proxy_protocol_v1(struct rsession *, struct evbuffer *);
+int	proxy_protocol_v2(struct rsession *, struct evbuffer *);
 
 #endif /* RELAYD_H */

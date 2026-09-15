@@ -1,9 +1,12 @@
-#	$OpenBSD: Makefile,v 1.2 2022/04/21 19:21:04 bluhm Exp $
+#	$OpenBSD: Makefile,v 1.6 2026/02/16 13:08:57 hshoexer Exp $
 
 .if ${MACHINE_ARCH} == "amd64"
-SUBDIR =
+SUBDIR +=	ddb
 SUBDIR +=	dump_tables
 SUBDIR +=	fpu
+SUBDIR +=	seves_mmio
+SUBDIR +=	vmcall
+SUBDIR +=	vmmcall
 SUBDIR +=	vmm
 
 .elif make(regress) || make(all)

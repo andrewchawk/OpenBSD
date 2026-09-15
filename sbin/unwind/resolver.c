@@ -1,4 +1,4 @@
-/*	$OpenBSD: resolver.c,v 1.167 2024/06/29 17:25:56 florian Exp $	*/
+/*	$OpenBSD: resolver.c,v 1.177 2026/08/04 12:44:47 claudio Exp $	*/
 
 
 /*
@@ -415,7 +415,9 @@ resolver(int debug, int verbose)
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
 
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = resolver_dispatch_main;
 
 	/* Setup event handlers. */
@@ -453,9 +455,9 @@ __dead void
 resolver_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	config_clear(resolver_conf);
@@ -488,28 +490,29 @@ resolver_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
 	struct query_imsg	*query_imsg;
-	ssize_t			 n;
-	int			 shut = 0, verbose, i, new_available_afs;
+	int			 n, shut = 0, verbose, i, new_available_afs;
 	char			*ta;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -535,6 +538,9 @@ resolver_dispatch_frontend(int fd, short event, void *bula)
 				break;
 			}
 			memcpy(query_imsg, imsg.data, sizeof(*query_imsg));
+			if (query_imsg->qname[NI_MAXHOST - 1] != '\0')
+				fatalx("%s: IMSG_QUERY invalid", __func__);
+
 			setup_query(query_imsg);
 			break;
 		case IMSG_CTL_STATUS:
@@ -625,27 +631,28 @@ resolver_dispatch_main(int fd, short event, void *bula)
 	struct imsg		 imsg;
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf;
-	ssize_t			 n;
-	int			 shut = 0, i, *restart;
+	int			 n, shut = 0, i, *restart;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -667,7 +674,8 @@ resolver_dispatch_main(int fd, short event, void *bula)
 			if (iev_frontend == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_frontend->ibuf, fd);
+			if (imsgbuf_init(&iev_frontend->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_frontend->handler = resolver_dispatch_frontend;
 			iev_frontend->events = EV_READ;
 
@@ -1287,8 +1295,19 @@ create_resolver(enum uw_resolver_type type)
 		}
 
 		for (i = 0; i < nitems(options); i++) {
+			const char* option = options[i].value;
+
+			if (resolver_conf->force_resolvers[type] &&
+			    strcmp("aggressive-nsec:", options[i].name) == 0) {
+				/*
+				 * Do not enable aggressive-nsec caching,
+				 * because typos can lead to unresolvable
+				 * "force" domains if an nsec proof is cached.
+				 */
+				option = "no";
+			}
 			if ((err = ub_ctx_set_option(res->ctx, options[i].name,
-			    options[i].value)) != 0) {
+			    option)) != 0) {
 				ub_ctx_delete(res->ctx);
 				free(res);
 				log_warnx("error setting %s: %s: %s",

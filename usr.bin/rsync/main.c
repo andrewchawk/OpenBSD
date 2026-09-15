@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.71 2023/11/27 11:30:49 claudio Exp $ */
+/*	$OpenBSD: main.c,v 1.73 2025/05/29 17:03:43 deraadt Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -29,6 +29,7 @@
 #include <util.h>
 
 #include "extern.h"
+#include "version.h"
 
 int verbose;
 int poll_contimeout;
@@ -423,8 +424,8 @@ main(int argc, char *argv[])
 			verbose++;
 			break;
 		case 'V':
-			fprintf(stderr, "openrsync: protocol version %u\n",
-			    RSYNC_PROTOCOL);
+			fprintf(stderr, "openrsync %s (protocol version %u)\n",
+			    RSYNC_VERSION, RSYNC_PROTOCOL);
 			exit(0);
 		case 'x':
 			opts.one_file_system++;
@@ -565,6 +566,15 @@ basedir:
 
 	fargs = fargs_parse(argc, argv, &opts);
 	assert(fargs != NULL);
+
+	/* Create top-level relative paths versions of opts.basedir[] */
+	for (i = 0; opts.basedir[i]; i++) {
+		if (opts.basedir[i][0] == '/')
+			opts.basedir_abs[i] = strdup(opts.basedir[i]);
+		else if (asprintf(&opts.basedir_abs[i], "%s/%s",
+		    fargs->sink, opts.basedir[i]) == -1)
+			err(ERR_FILE_IO, "%s: asprintf", fargs->sink);
+	}
 
 	/*
 	 * If we're contacting an rsync:// daemon, then we don't need to

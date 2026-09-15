@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.c,v 1.88 2024/02/14 06:16:53 miod Exp $	*/
+/*	$OpenBSD: pmap.c,v 1.95 2025/12/23 19:16:51 miod Exp $	*/
 
 /*
  * Copyright (c) 2001-2004, 2010, Miodrag Vallat.
@@ -81,7 +81,6 @@
 /*
  * VM externals
  */
-extern paddr_t last_addr;
 vaddr_t avail_start;
 vaddr_t avail_end;
 vaddr_t virtual_avail = VM_MIN_KERNEL_ADDRESS;
@@ -103,8 +102,7 @@ vaddr_t virtual_end = VM_MAX_KERNEL_ADDRESS;
 #define CD_RMPG		0x00000100	/* pmap_remove_page */
 #define CD_EXP		0x00000200	/* pmap_expand */
 #define CD_ENT		0x00000400	/* pmap_enter / pmap_kenter_pa */
-#define CD_COL		0x00000800	/* pmap_collect */
-#define CD_CBIT		0x00001000	/* pmap_changebit */
+#define CD_WP		0x00001000	/* pmap_write_protect */
 #define CD_TBIT		0x00002000	/* pmap_testbit */
 #define CD_USBIT	0x00004000	/* pmap_unsetbit */
 #define	CD_COPY		0x00008000	/* pmap_copy_page */
@@ -156,11 +154,11 @@ batc_t global_ibatc[BATC_MAX];
 /*
  * Internal routines
  */
-void		 pmap_changebit(struct vm_page *, int, int);
+void		 pmap_write_protect(struct vm_page *);
 void		 pmap_clean_page(paddr_t);
 pt_entry_t	*pmap_expand(pmap_t, vaddr_t, int);
 pt_entry_t	*pmap_expand_kmap(vaddr_t, int);
-void		 pmap_map(paddr_t, psize_t, vm_prot_t, u_int, boolean_t);
+void		 pmap_map(paddr_t, psize_t, vm_prot_t, boolean_t);
 pt_entry_t	*pmap_pte(pmap_t, vaddr_t);
 void		 pmap_remove_page(struct vm_page *);
 void		 pmap_remove_pte(pmap_t, vaddr_t, pt_entry_t *,
@@ -172,6 +170,17 @@ static __inline pv_entry_t
 pg_to_pvh(struct vm_page *pg)
 {
 	return &pg->mdpage.pv_ent;
+}
+
+static __inline pt_entry_t
+invalidate_pte(pt_entry_t *pte)
+{
+	pt_entry_t oldpte;
+
+	oldpte = PG_NV;
+	__asm__ volatile
+	    ("xmem %0, %2, %%r0" : "+r"(oldpte), "+m"(*pte) : "r"(pte));
+	return oldpte;
 }
 
 /*
@@ -567,23 +576,21 @@ pmap_steal_memory(vsize_t size, vaddr_t *vstartp, vaddr_t *vendp)
 /*
  * [INTERNAL]
  * Setup a wired mapping in pmap_kernel(). Similar to pmap_kenter_pa(),
- * but allows explicit cacheability control.
+ * but cache inhibited.
  * This is only used at bootstrap time. Mappings may also be backed up
  * by a BATC entry if requested and possible; but note that the BATC
  * entries set up here may be overwritten by cmmu_batc_setup() later on
  * (which is harmless since we are creating proper ptes anyway).
  */
 void
-pmap_map(paddr_t pa, psize_t sz, vm_prot_t prot, u_int cmode,
-    boolean_t may_use_batc)
+pmap_map(paddr_t pa, psize_t sz, vm_prot_t prot, boolean_t may_use_batc)
 {
 	pt_entry_t *pte, npte;
 	batc_t batc;
 	uint npg, batcno;
 	paddr_t curpa;
 
-	DPRINTF(CD_MAP, ("pmap_map(%lx, %lx, %x, %x)\n",
-	    pa, sz, prot, cmode));
+	DPRINTF(CD_MAP, ("pmap_map(%lx, %lx, %x)\n", pa, sz, prot));
 #ifdef DIAGNOSTIC
 	if (pa != 0 && pa < VM_MAX_KERNEL_ADDRESS)
 		panic("pmap_map: virtual range %p-%p overlaps KVM",
@@ -593,7 +600,7 @@ pmap_map(paddr_t pa, psize_t sz, vm_prot_t prot, u_int cmode,
 	sz = round_page(pa + sz) - trunc_page(pa);
 	pa = trunc_page(pa);
 
-	npte = m88k_protection(prot) | cmode | PG_W | PG_V;
+	npte = m88k_protection(prot) | CACHE_INH | PG_W | PG_V;
 #ifdef M88110
 	if (CPU_IS88110 && m88k_protection(prot) != PG_RO)
 		npte |= PG_M;
@@ -615,13 +622,9 @@ pmap_map(paddr_t pa, psize_t sz, vm_prot_t prot, u_int cmode,
 		sz = round_batc(pa + sz) - trunc_batc(pa);
 		pa = trunc_batc(pa);
 
-		batc = BATC_SO | BATC_V;
+		batc = BATC_SO | BATC_INH | BATC_V;
 		if ((prot & PROT_WRITE) == 0)
 			batc |= BATC_PROT;
-		if (cmode & CACHE_INH)
-			batc |= BATC_INH;
-		if (cmode & CACHE_WT)
-			batc |= BATC_WT;
 		batc |= BATC_GLOBAL;	/* XXX 88110 SP */
 
 		for (; sz != 0; sz -= BATC_BLKBYTES, pa += BATC_BLKBYTES) {
@@ -790,26 +793,18 @@ pmap_bootstrap(paddr_t s_rom, paddr_t e_rom)
 	if (e_rom != s_rom) {
 		s_firmware = s_rom;
 		l_firmware = e_rom - s_rom;
-		pmap_map(s_firmware, l_firmware, PROT_READ | PROT_WRITE,
-		    CACHE_INH, FALSE);
+		pmap_map(s_firmware, l_firmware, PROT_READ | PROT_WRITE, FALSE);
 	}
 
-	for (ptable = pmap_table_build(); ptable->size != (vsize_t)-1; ptable++)
-		if (ptable->size != 0)
-			pmap_map(ptable->start, ptable->size,
-			    ptable->prot, ptable->cacheability,
-			    ptable->may_use_batc);
+	for (ptable = pmap_table_build(); ptable->size != 0; ptable++)
+		pmap_map(ptable->start, ptable->size, ptable->prot,
+		    ptable->may_use_batc);
 
 	/*
 	 * Adjust cache settings according to the hardware we are running on.
 	 */
 
-	kernel_apr = (kernel_apr & ~(CACHE_MASK & ~CACHE_GLOBAL)) |
-	    cmmu_apr_cmode();
-#if defined(M88110) && !defined(MULTIPROCESSOR)
-	if (CPU_IS88110)
-		kernel_apr &= ~CACHE_GLOBAL;
-#endif
+	kernel_apr = (kernel_apr & ~CACHE_MASK) | cmmu_apr_cmode();
 	userland_apr = (userland_apr & ~CACHE_MASK) | (kernel_apr & CACHE_MASK);
 
 	/*
@@ -945,46 +940,6 @@ pmap_reference(pmap_t pmap)
 }
 
 /*
- * [MI]
- * Attempt to regain memory by freeing disposable page tables.
- */
-void
-pmap_collect(pmap_t pmap)
-{
-	u_int u, v;
-	sdt_entry_t *sdt;
-	pt_entry_t *pte;
-	vaddr_t va;
-	paddr_t pa;
-	int s;
-
-	DPRINTF(CD_COL, ("pmap_collect(%p)\n", pmap));
-
-	s = splvm();
-	for (sdt = pmap->pm_stab, va = 0, u = SDT_ENTRIES; u != 0;
-	    sdt++, va += (1 << SDT_SHIFT), u--) {
-		if (!SDT_VALID(sdt))
-			continue;
-		pte = sdt_pte(sdt, 0);
-		for (v = PDT_ENTRIES; v != 0; pte++, v--)
-			if (pmap_pte_w(pte)) /* wired mappings can't go */
-				break;
-		if (v != 0)
-			continue;
-		/* found a suitable pte page to reclaim */
-		pmap_remove_range(pmap, va, va + (1 << SDT_SHIFT));
-
-		pa = *sdt & PG_FRAME;
-		*sdt = SG_NV;
-		pmap_cache_ctrl(pa, pa + PAGE_SIZE, CACHE_DFL);
-		uvm_pagefree(PHYS_TO_VM_PAGE(pa));
-	}
-	splx(s);
-
-	DPRINTF(CD_COL, ("pmap_collect(%p) done\n", pmap));
-}
-
-/*
  * Virtual mapping/unmapping routines
  */
 
@@ -1111,7 +1066,7 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, int flags)
 	/*
 	 * If outside physical memory, disable cache on this (device) page.
 	 */
-	if (pa >= last_addr)
+	if (pg == NULL)
 		npte |= CACHE_INH;
 
 	/*
@@ -1159,11 +1114,6 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot)
 	if (CPU_IS88110 && m88k_protection(prot) != PG_RO)
 		npte |= PG_M;
 #endif
-	/*
-	 * If outside physical memory, disable cache on this (device) page.
-	 */
-	if (pa >= last_addr)
-		npte |= CACHE_INH;
 
 	/*
 	 * Expand pmap to include this pte.
@@ -1419,8 +1369,7 @@ pmap_remove_page(struct vm_page *pg)
 		pmap_remove_pte(pmap, va, pte, pg, TRUE);
 		pvep = head;
 		/*
-		 * Do not free any empty page tables,
-		 * leave that for when VM calls pmap_collect().
+		 * Do not free any empty page tables.
 		 */
 	}
 	splx(s);
@@ -1539,12 +1488,10 @@ pmap_zero_page(struct vm_page *pg)
 
 /*
  * [INTERNAL]
- * Alters bits in the pte of all mappings of `pg'. For each pte, bits in
- * `set' are set and bits not in `mask' are cleared. The flags summary
- * at the head of the pv list is modified in a similar way.
+ * Set the PG_RO bit in the pte of all mappings of `pg'.
  */
 void
-pmap_changebit(struct vm_page *pg, int set, int mask)
+pmap_write_protect(struct vm_page *pg)
 {
 	pv_entry_t head, pvep;
 	pt_entry_t *pte, npte, opte;
@@ -1552,14 +1499,9 @@ pmap_changebit(struct vm_page *pg, int set, int mask)
 	int s;
 	vaddr_t va;
 
-	DPRINTF(CD_CBIT, ("pmap_changebit(%p, %x, %x)\n", pg, set, mask));
+	DPRINTF(CD_WP, ("pmap_write_protect(%p)\n", pg));
 
 	s = splvm();
-
-	/*
-	 * Clear saved attributes (modify, reference)
-	 */
-	pg->mdpage.pv_flags &= mask;
 
 	head = pg_to_pvh(pg);
 	if (head->pv_pmap != NULL) {
@@ -1576,7 +1518,7 @@ pmap_changebit(struct vm_page *pg, int set, int mask)
 				continue;	 /* no page mapping */
 #ifdef PMAPDEBUG
 			if (ptoa(PG_PFNUM(*pte)) != VM_PAGE_TO_PHYS(pg))
-				panic("pmap_changebit: pte %08x in pmap %p doesn't point to page %p@%lx",
+				panic("pmap_write_protect: pte %08x in pmap %p doesn't point to page %p@%lx",
 				    *pte, pmap, pg, VM_PAGE_TO_PHYS(pg));
 #endif
 
@@ -1584,7 +1526,7 @@ pmap_changebit(struct vm_page *pg, int set, int mask)
 			 * Update bits
 			 */
 			opte = *pte;
-			npte = (opte | set) & mask;
+			npte = opte | PG_RO;
 
 			/*
 			 * Invalidate pte temporarily to avoid the modified bit
@@ -1781,7 +1723,7 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
 	if ((prot & PROT_READ) == PROT_NONE)
 		pmap_remove_page(pg);
 	else if ((prot & PROT_WRITE) == PROT_NONE)
-		pmap_changebit(pg, PG_RO, ~0);
+		pmap_write_protect(pg);
 }
 
 /*

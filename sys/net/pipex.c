@@ -1,4 +1,4 @@
-/*	$OpenBSD: pipex.c,v 1.155 2024/07/26 15:45:31 yasuoka Exp $ */
+/*	$OpenBSD: pipex.c,v 1.164 2026/07/17 18:51:29 bluhm Exp $ */
 
 /*-
  * Copyright (c) 2009 Internet Initiative Japan Inc.
@@ -27,16 +27,14 @@
  */
 
 #include <sys/param.h>
+#include <sys/atomic.h>
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
-#include <sys/conf.h>
-#include <sys/time.h>
 #include <sys/timeout.h>
-#include <sys/kernel.h>
 #include <sys/pool.h>
 #include <sys/percpu.h>
 #include <sys/mutex.h>
@@ -100,9 +98,6 @@ struct pipex_hash_head
 struct radix_node_head	*pipex_rd_head4 = NULL;	/* [L] */
 struct timeout pipex_timer_ch;		/* callout timer context */
 int pipex_prune = 1;			/* [I] walk list every seconds */
-
-struct mbuf_queue pipexoutq = MBUF_QUEUE_INITIALIZER(
-    IFQ_MAXLEN, IPL_SOFTNET);
 
 #ifdef PIPEX_DEBUG
 int pipex_debug = 0;		/* [A] systcl net.inet.ip.pipex_debug */
@@ -182,46 +177,6 @@ pipex_ioctl(void *ownersc, u_long cmd, caddr_t data)
 	}
 
 	return (ret);
-}
-
-/************************************************************************
- * Software Interrupt Handler
- ************************************************************************/
-
-void
-pipexintr(void)
-{
-	struct mbuf_list ml;
-	struct mbuf *m;
-	struct pipex_session *session;
-
-	NET_ASSERT_LOCKED();
-
-	mq_delist(&pipexoutq, &ml);
-
-	while ((m = ml_dequeue(&ml)) != NULL) {
-		struct ifnet *ifp;
-
-		session = m->m_pkthdr.ph_cookie;
-
-		ifp = if_get(session->proto.pppoe.over_ifidx);
-		if (ifp != NULL) {
-			struct pipex_pppoe_header *pppoe;
-			int len;
-
-			pppoe = mtod(m, struct pipex_pppoe_header *);
-			len = ntohs(pppoe->length);
-			ifp->if_output(ifp, m, &session->peer.sa, NULL);
-			counters_pkt(session->stat_counters, pxc_opackets,
-			    pxc_obytes, len);
-		} else {
-			m_freem(m);
-			counters_inc(session->stat_counters, pxc_oerrors);
-		}
-		if_put(ifp);
-
-		pipex_rele_session(session);
-	}
 }
 
 /************************************************************************
@@ -935,7 +890,8 @@ drop:
 }
 
 void
-pipex_ppp_input(struct mbuf *m0, struct pipex_session *session, int decrypted)
+pipex_ppp_input(struct mbuf *m0, struct pipex_session *session, int decrypted,
+    struct netstack *ns)
 {
 	int proto, hlen = 0;
 	struct mbuf *n;
@@ -999,7 +955,7 @@ again:
 			 * is required, discard it.
 			 */
 			goto drop;
-		pipex_ip_input(m0, session);
+		pipex_ip_input(m0, session, ns);
 		return;
 #ifdef INET6
 	case PPP_IPV6:
@@ -1009,7 +965,7 @@ again:
 			 * is required, discard it.
 			 */
 			goto drop;
-		pipex_ip6_input(m0, session);
+		pipex_ip6_input(m0, session, ns);
 		return;
 #endif
 	default:
@@ -1028,7 +984,8 @@ drop:
 }
 
 void
-pipex_ip_input(struct mbuf *m0, struct pipex_session *session)
+pipex_ip_input(struct mbuf *m0, struct pipex_session *session,
+    struct netstack *ns)
 {
 	struct ifnet *ifp;
 	struct ip *ip;
@@ -1093,7 +1050,7 @@ pipex_ip_input(struct mbuf *m0, struct pipex_session *session)
 
 	counters_pkt(ifp->if_counters, ifc_ipackets, ifc_ibytes, len);
 	counters_pkt(session->stat_counters, pxc_ipackets, pxc_ibytes, len);
-	ipv4_input(ifp, m0);
+	ipv4_input(ifp, m0, ns);
 
 	if_put(ifp);
 
@@ -1105,7 +1062,8 @@ drop:
 
 #ifdef INET6
 void
-pipex_ip6_input(struct mbuf *m0, struct pipex_session *session)
+pipex_ip6_input(struct mbuf *m0, struct pipex_session *session,
+    struct netstack *ns)
 {
 	struct ifnet *ifp;
 	int len;
@@ -1141,7 +1099,7 @@ pipex_ip6_input(struct mbuf *m0, struct pipex_session *session)
 
 	counters_pkt(ifp->if_counters, ifc_ipackets, ifc_ibytes, len);
 	counters_pkt(session->stat_counters, pxc_ipackets, pxc_ibytes, len);
-	ipv6_input(ifp, m0);
+	ipv6_input(ifp, m0, ns);
 
 	if_put(ifp);
 
@@ -1154,7 +1112,7 @@ drop:
 
 struct mbuf *
 pipex_common_input(struct pipex_session *session, struct mbuf *m0, int hlen,
-    int plen, int locked)
+    int plen, int locked, struct netstack *ns)
 {
 	int proto, ppphlen;
 	u_char code;
@@ -1208,7 +1166,7 @@ pipex_common_input(struct pipex_session *session, struct mbuf *m0, int hlen,
 			m_adj(m0, plen - m0->m_pkthdr.len);
 	}
 
-	pipex_ppp_input(m0, session, 0);
+	pipex_ppp_input(m0, session, 0, ns);
 
 	return (NULL);
 
@@ -1274,6 +1232,7 @@ pipex_pppoe_lookup_session(struct mbuf *m0)
 {
 	struct pipex_session *session;
 	struct pipex_pppoe_header pppoe;
+	struct ether_header eh;
 
 	/* short packet */
 	if (m0->m_pkthdr.len < (sizeof(struct ether_header) + sizeof(pppoe)))
@@ -1289,8 +1248,14 @@ pipex_pppoe_lookup_session(struct mbuf *m0)
 		PIPEX_DBG((NULL, LOG_DEBUG, "<%s> session not found (id=%d)",
 		    __func__, pppoe.session_id));
 #endif
-	if (session && session->proto.pppoe.over_ifidx !=
-	    m0->m_pkthdr.ph_ifidx) {
+	m_copydata(m0, 0, sizeof(struct ether_header), &eh);
+	if (session && (session->proto.pppoe.over_ifidx !=
+	    m0->m_pkthdr.ph_ifidx || memcmp(
+	    ((struct ether_header *)session->peer.sa.sa_data)->ether_dhost,
+	    eh.ether_shost, ETHER_ADDR_LEN) != 0)) {
+		PIPEX_DBG((NULL, LOG_DEBUG,
+		    "<%s> received packet from wrong host (id=%d)", __func__,
+		    pppoe.session_id));
 		pipex_rele_session(session);
 		session = NULL;
 	}
@@ -1299,7 +1264,8 @@ pipex_pppoe_lookup_session(struct mbuf *m0)
 }
 
 struct mbuf *
-pipex_pppoe_input(struct mbuf *m0, struct pipex_session *session)
+pipex_pppoe_input(struct mbuf *m0, struct pipex_session *session,
+    struct netstack *ns)
 {
 	int hlen;
 	struct pipex_pppoe_header pppoe;
@@ -1312,7 +1278,7 @@ pipex_pppoe_input(struct mbuf *m0, struct pipex_session *session)
 	    sizeof(struct pipex_pppoe_header), &pppoe);
 
 	hlen = sizeof(struct ether_header) + sizeof(struct pipex_pppoe_header);
-	m0 = pipex_common_input(session, m0, hlen, ntohs(pppoe.length), 0);
+	m0 = pipex_common_input(session, m0, hlen, ntohs(pppoe.length), 0, ns);
 	if (m0 == NULL)
 		return (NULL);
 	m_freem(m0);
@@ -1326,6 +1292,7 @@ pipex_pppoe_input(struct mbuf *m0, struct pipex_session *session)
 void
 pipex_pppoe_output(struct mbuf *m0, struct pipex_session *session)
 {
+	struct ifnet *ifp;
 	struct pipex_pppoe_header *pppoe;
 	int len, padlen;
 
@@ -1336,7 +1303,7 @@ pipex_pppoe_output(struct mbuf *m0, struct pipex_session *session)
 	M_PREPEND(m0, sizeof(struct pipex_pppoe_header), M_NOWAIT);
 	if (m0 == NULL) {
 		PIPEX_DBG((NULL, LOG_ERR,
-		    "<%s> cannot prepend header.", __func__));
+		    "<%s> cannot prepend pppoe header.", __func__));
 		counters_inc(session->stat_counters, pxc_oerrors);
 		return;
 	}
@@ -1353,15 +1320,37 @@ pipex_pppoe_output(struct mbuf *m0, struct pipex_session *session)
 	pppoe->length = htons(len);
 
 	m0->m_pkthdr.ph_ifidx = session->proto.pppoe.over_ifidx;
-	refcnt_take(&session->pxs_refcnt);
-	m0->m_pkthdr.ph_cookie = session;
 	m0->m_flags &= ~(M_BCAST|M_MCAST);
 
-	if (mq_enqueue(&pipexoutq, m0) != 0) {
+	M_PREPEND(m0, ETHER_ALIGN + sizeof(struct ether_header), M_NOWAIT);
+	if (m0 == NULL) {
+		PIPEX_DBG((NULL, LOG_ERR,
+		    "<%s> cannot prepend ethernet header.", __func__));
 		counters_inc(session->stat_counters, pxc_oerrors);
-		pipex_rele_session(session);
-	} else
-		schednetisr(NETISR_PIPEX);
+		return;
+	}
+
+	ifp = if_get(session->proto.pppoe.over_ifidx);
+	if (ifp != NULL) {
+		struct arpcom *ac = (struct arpcom *)ifp;
+		struct ether_header *eh;
+
+		/* setup ethernet header information */
+		m_adj(m0, ETHER_ALIGN);
+		eh = mtod(m0, struct ether_header *);
+		memcpy(eh, session->peer.sa.sa_data, sizeof(*eh));
+		memcpy(eh->ether_shost, ac->ac_enaddr, sizeof(eh->ether_shost));
+
+		if (if_enqueue(ifp, m0) == 0)
+			counters_pkt(session->stat_counters, pxc_opackets,
+			    pxc_obytes, len);
+		else
+			counters_inc(session->stat_counters, pxc_oerrors);
+	} else {
+		m_freem(m0);
+		counters_inc(session->stat_counters, pxc_oerrors);
+	}
+	if_put(ifp);
 }
 #endif /* PIPEX_PPPOE */
 
@@ -1462,7 +1451,7 @@ pipex_pptp_lookup_session(struct mbuf *m0)
 	struct ip ip;
 	uint16_t flags;
 	uint16_t id;
-	int hlen;
+	int iphlen, hlen;
 
 	if (m0->m_pkthdr.len < PIPEX_IPGRE_HDRLEN) {
 		PIPEX_DBG((NULL, LOG_DEBUG,
@@ -1472,15 +1461,22 @@ pipex_pptp_lookup_session(struct mbuf *m0)
 
 	/* get ip header info */
 	m_copydata(m0, 0, sizeof(struct ip), &ip);
-	hlen = ip.ip_hl << 2;
+	iphlen = ip.ip_hl << 2;
 
 	/*
 	 * m0 has already passed ip_input(), so there is
 	 * no necessity for ip packet inspection.
 	 */
 
+	hlen = iphlen + sizeof(gre);
+	if (m0->m_pkthdr.len < hlen) {
+		PIPEX_DBG((NULL, LOG_DEBUG,
+		    "<%s> packet length is too short", __func__));
+		goto not_ours;
+	}
+
 	/* get gre flags */
-	m_copydata(m0, hlen, sizeof(gre), &gre);
+	m_copydata(m0, iphlen, sizeof(gre), &gre);
 	flags = ntohs(gre.flags);
 
 	/* gre version must be '1' */
@@ -1507,13 +1503,20 @@ pipex_pptp_lookup_session(struct mbuf *m0)
 	/* lookup pipex session table */
 	id = ntohs(gre.call_id);
 	session = pipex_lookup_by_session_id(PIPEX_PROTO_PPTP, id);
-#ifdef PIPEX_DEBUG
 	if (session == NULL) {
 		PIPEX_DBG((NULL, LOG_DEBUG,
 		    "<%s> session not found (id=%d)", __func__, id));
 		goto not_ours;
 	}
-#endif
+
+	if (!(session->peer.sa.sa_family == AF_INET &&
+	    session->peer.sin4.sin_addr.s_addr == ip.ip_src.s_addr)) {
+		PIPEX_DBG((NULL, LOG_DEBUG,
+		    "<%s> the source address of the session is not matched",
+		    __func__));
+		pipex_rele_session(session);
+		session = NULL;
+	}
 
 	return (session);
 
@@ -1522,9 +1525,10 @@ not_ours:
 }
 
 struct mbuf *
-pipex_pptp_input(struct mbuf *m0, struct pipex_session *session)
+pipex_pptp_input(struct mbuf *m0, struct pipex_session *session,
+    struct netstack *ns)
 {
-	int hlen, has_seq, has_ack, nseq;
+	int iphlen, hlen, has_seq, has_ack, nseq;
 	const char *reason = "";
 	u_char *cp, *seqp = NULL, *ackp = NULL;
 	uint32_t flags, seq = 0, ack = 0;
@@ -1538,22 +1542,33 @@ pipex_pptp_input(struct mbuf *m0, struct pipex_session *session)
 
 	/* get ip header */
 	ip = mtod(m0, struct ip *);
-	hlen = ip->ip_hl << 2;
-
-	/* seek gre header */
-	gre = PIPEX_SEEK_NEXTHDR(ip, hlen, struct pipex_gre_header *);
-	flags = ntohs(gre->flags);
-
-	/* pullup for seek sequences in header */
-	has_seq = (flags & PIPEX_GRE_SFLAG) ? 1 : 0;
-	has_ack = (flags & PIPEX_GRE_AFLAG) ? 1 : 0;
-	hlen = PIPEX_IPGRE_HDRLEN + 4 * (has_seq + has_ack);
+	iphlen = ip->ip_hl << 2;
+	hlen = iphlen + sizeof(*gre);
 	if (m0->m_len < hlen) {
 		m0 = m_pullup(m0, hlen);
 		if (m0 == NULL) {
 			PIPEX_DBG((session, LOG_DEBUG, "pullup failed."));
 			goto drop;
 		}
+		ip = mtod(m0, struct ip *);
+	}
+
+	/* seek gre header */
+	gre = PIPEX_SEEK_NEXTHDR(ip, iphlen, struct pipex_gre_header *);
+	flags = ntohs(gre->flags);
+
+	/* pullup for seek sequences in header */
+	has_seq = (flags & PIPEX_GRE_SFLAG) ? 1 : 0;
+	has_ack = (flags & PIPEX_GRE_AFLAG) ? 1 : 0;
+	hlen += 4 * (has_seq + has_ack);
+	if (m0->m_len < hlen) {
+		m0 = m_pullup(m0, hlen);
+		if (m0 == NULL) {
+			PIPEX_DBG((session, LOG_DEBUG, "pullup failed."));
+			goto drop;
+		}
+		ip = mtod(m0, struct ip *);
+		gre = PIPEX_SEEK_NEXTHDR(ip, iphlen, struct pipex_gre_header *);
 	}
 
 	/* check sequence */
@@ -1617,7 +1632,7 @@ pipex_pptp_input(struct mbuf *m0, struct pipex_session *session)
 	 */
 	if (!rewind)
 		session->proto.pptp.rcv_gap += nseq;
-	m0 = pipex_common_input(session, m0, hlen, ntohs(gre->len), 1);
+	m0 = pipex_common_input(session, m0, hlen, ntohs(gre->len), 1, ns);
 	if (m0 == NULL) {
 		/*
 		 * pipex_common_input() releases lock if the
@@ -1926,12 +1941,12 @@ pipex_l2tp_output(struct mbuf *m0, struct pipex_session *session)
 		mtx_enter(&session->pxs_mtx);
 		if (session->proto.l2tp.ipsecflowinfo > 0) {
 			if ((mtag = m_tag_get(PACKET_TAG_IPSEC_FLOWINFO,
-			    sizeof(u_int32_t), M_NOWAIT)) == NULL) {
+			    sizeof(uint32_t), M_NOWAIT)) == NULL) {
 				mtx_leave(&session->pxs_mtx);
 				goto drop;
 			}
 
-			*(u_int32_t *)(mtag + 1) =
+			*(uint32_t *)(mtag + 1) =
 			    session->proto.l2tp.ipsecflowinfo;
 			m_tag_prepend(m0, mtag);
 		}
@@ -1946,6 +1961,7 @@ pipex_l2tp_output(struct mbuf *m0, struct pipex_session *session)
 		ip6->ip6_flow = 0;
 		ip6->ip6_vfc &= ~IPV6_VERSION_MASK;
 		ip6->ip6_vfc |= IPV6_VERSION;
+		ip6->ip6_hlim = atomic_load_int(&ip6_defhlim);
 		ip6->ip6_nxt = IPPROTO_UDP;
 		ip6->ip6_src = session->local.sin6.sin6_addr;
 		in6_embedscope(&ip6->ip6_dst, &session->peer.sin6, NULL, NULL);
@@ -1970,11 +1986,12 @@ drop:
 }
 
 struct pipex_session *
-pipex_l2tp_lookup_session(struct mbuf *m0, int off)
+pipex_l2tp_lookup_session(struct mbuf *m0, int off, struct sockaddr *sasrc)
 {
 	struct pipex_session *session;
 	uint16_t flags, session_id, ver;
 	u_char *cp, buf[PIPEX_L2TP_MINLEN];
+	int srcmatch = 0;
 
 	if (m0->m_pkthdr.len < off + PIPEX_L2TP_MINLEN) {
 		PIPEX_DBG((NULL, LOG_DEBUG,
@@ -2004,13 +2021,34 @@ pipex_l2tp_lookup_session(struct mbuf *m0, int off)
 
 	/* lookup pipex session table */
 	session = pipex_lookup_by_session_id(PIPEX_PROTO_L2TP, session_id);
-#ifdef PIPEX_DEBUG
 	if (session == NULL) {
 		PIPEX_DBG((NULL, LOG_DEBUG,
 		    "<%s> session not found (id=%d)", __func__, session_id));
 		goto not_ours;
 	}
+	switch (sasrc->sa_family) {
+	case AF_INET:
+		if (session->peer.sa.sa_family == AF_INET &&
+		    session->peer.sin4.sin_addr.s_addr ==
+		    ((struct sockaddr_in *)sasrc)->sin_addr.s_addr)
+			srcmatch = 1;
+		break;
+#ifdef INET6
+	case AF_INET6:
+		if (session->peer.sa.sa_family == AF_INET6 &&
+		    IN6_ARE_ADDR_EQUAL(&session->peer.sin6.sin6_addr,
+		    &((struct sockaddr_in6 *)sasrc)->sin6_addr))
+			srcmatch = 1;
+		break;
 #endif
+	}
+	if (!srcmatch) {
+		PIPEX_DBG((NULL, LOG_DEBUG,
+		    "<%s> the source address of the session is not matched",
+		    __func__));
+		pipex_rele_session(session);
+		session = NULL;
+	}
 
 	return (session);
 
@@ -2020,7 +2058,7 @@ not_ours:
 
 struct mbuf *
 pipex_l2tp_input(struct mbuf *m0, int off0, struct pipex_session *session,
-    uint32_t ipsecflowinfo)
+    uint32_t ipsecflowinfo, struct netstack *nst)
 {
 	struct pipex_l2tp_session *l2tp_session;
 	int length = 0, offset = 0, hlen, nseq;
@@ -2031,7 +2069,8 @@ pipex_l2tp_input(struct mbuf *m0, int off0, struct pipex_session *session,
 	mtx_enter(&session->pxs_mtx);
 
 	l2tp_session = &session->proto.l2tp;
-	if (l2tp_session->ipsecflowinfo != ipsecflowinfo) {
+	if (l2tp_session->ipsecflowinfo > 0 &&
+	    l2tp_session->ipsecflowinfo != ipsecflowinfo) {
 		pipex_session_log(session, LOG_DEBUG,
 		    "received message is %s",
 		    (ipsecflowinfo != 0)? "from invalid ipsec flow" :
@@ -2105,7 +2144,7 @@ pipex_l2tp_input(struct mbuf *m0, int off0, struct pipex_session *session,
 	 */
 	if (!rewind)
 		session->proto.l2tp.nr_gap += nseq;
-	m0 = pipex_common_input(session, m0, hlen, length, 1);
+	m0 = pipex_common_input(session, m0, hlen, length, 1, nst);
 	if (m0 == NULL) {
 		/*
 		 * pipex_common_input() releases lock if the

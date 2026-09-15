@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmmvar.h,v 1.1 2024/07/10 10:41:19 dv Exp $	*/
+/*	$OpenBSD: vmmvar.h,v 1.3 2025/08/03 10:17:33 tb Exp $	*/
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -22,9 +22,6 @@
 #define _MACHINE_VMMVAR_H_
 
 #define VMM_HV_SIGNATURE 	"OpenBSDVMM58"
-
-#define VMM_PCI_MMIO_BAR_BASE	0xF0000000ULL
-#define VMM_PCI_MMIO_BAR_END	0xFFDFFFFFULL		/* 2 MiB below 4 GiB */
 
 /* Exit Reasons */
 #define VM_EXIT_TERMINATED			0xFFFE
@@ -83,6 +80,11 @@ struct vm_rwregs_params {
 	uint32_t		vrwp_vcpu_id;
 	uint64_t		vrwp_mask;
 	struct vcpu_reg_state	vrwp_regs;
+};
+
+enum {
+	VEI_DIR_OUT,
+	VEI_DIR_IN
 };
 
 /* IOCTL definitions */

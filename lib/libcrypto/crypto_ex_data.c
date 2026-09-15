@@ -1,4 +1,4 @@
-/* $OpenBSD: crypto_ex_data.c,v 1.4 2024/08/03 07:45:26 tb Exp $ */
+/* $OpenBSD: crypto_ex_data.c,v 1.7 2026/08/30 12:19:37 kenjiro Exp $ */
 /*
  * Copyright (c) 2023 Joel Sing <jsing@openbsd.org>
  *
@@ -18,6 +18,8 @@
 #include <stdlib.h>
 
 #include <openssl/crypto.h>
+
+#include "crypto_internal.h"
 
 #define CRYPTO_EX_DATA_MAX_INDEX 32
 
@@ -52,7 +54,7 @@ crypto_ex_data_classes_init(void)
 		return 1;
 
 	if ((classes_new = calloc(CRYPTO_EX_INDEX__COUNT,
-	    sizeof(struct crypto_ex_data_index))) == NULL)
+	    sizeof(*classes_new))) == NULL)
 		return 0;
 
 	CRYPTO_w_lock(CRYPTO_LOCK_EX_DATA);
@@ -100,11 +102,10 @@ CRYPTO_get_ex_new_index(int class_index, long argl, void *argp,
 		goto err;
 
 	if ((class = classes[class_index]) == NULL) {
-		if ((new_class = calloc(1,
-		    sizeof(struct crypto_ex_data_class))) == NULL)
+		if ((new_class = calloc(1, sizeof(*new_class))) == NULL)
 			goto err;
 		if ((new_class->indexes = calloc(CRYPTO_EX_DATA_MAX_INDEX,
-                    sizeof(struct crypto_ex_data_index *))) == NULL)
+                    sizeof(*new_class->indexes))) == NULL)
 			goto err;
 		new_class->indexes_len = CRYPTO_EX_DATA_MAX_INDEX;
 		new_class->next_index = 1;
@@ -119,7 +120,7 @@ CRYPTO_get_ex_new_index(int class_index, long argl, void *argp,
 		class = classes[class_index];
 	}
 
-	if ((index = calloc(1, sizeof(struct crypto_ex_data_index))) == NULL)
+	if ((index = calloc(1, sizeof(*index))) == NULL)
 		goto err;
 
 	index->new_func = new_func;
@@ -152,6 +153,16 @@ LCRYPTO_ALIAS(CRYPTO_get_ex_new_index);
 void
 CRYPTO_cleanup_all_ex_data(void)
 {
+}
+LCRYPTO_ALIAS(CRYPTO_cleanup_all_ex_data);
+
+/*
+ * Free process-wide ex_data state during OPENSSL_cleanup(). The caller must
+ * ensure that no other thread is using libcrypto.
+ */
+void
+crypto_ex_data_cleanup(void)
+{
 	struct crypto_ex_data_class *class;
 	int i, j;
 
@@ -174,7 +185,6 @@ CRYPTO_cleanup_all_ex_data(void)
 	free(classes);
 	classes = NULL;
 }
-LCRYPTO_ALIAS(CRYPTO_cleanup_all_ex_data);
 
 static void
 crypto_ex_data_clear(CRYPTO_EX_DATA *exdata)
@@ -200,12 +210,12 @@ crypto_ex_data_init(CRYPTO_EX_DATA *exdata)
 	if (exdata->sk != NULL)
 		goto err;
 
-	if ((ced = calloc(1, sizeof(struct crypto_ex_data))) == NULL)
+	if ((ced = calloc(1, sizeof(*ced))) == NULL)
 		goto err;
 
 	ced->class_index = -1;
 
-	if ((ced->slots = calloc(CRYPTO_EX_DATA_MAX_INDEX, sizeof(void *))) == NULL)
+	if ((ced->slots = calloc(CRYPTO_EX_DATA_MAX_INDEX, sizeof(*ced->slots))) == NULL)
 		goto err;
 	ced->slots_len = CRYPTO_EX_DATA_MAX_INDEX;
 

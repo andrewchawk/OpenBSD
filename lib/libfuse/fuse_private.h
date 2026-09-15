@@ -1,4 +1,4 @@
-/* $OpenBSD: fuse_private.h,v 1.22 2018/11/16 02:16:17 tedu Exp $ */
+/* $OpenBSD: fuse_private.h,v 1.30 2026/08/04 15:20:28 helg Exp $ */
 /*
  * Copyright (c) 2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -18,8 +18,8 @@
 #ifndef _FUSE_SUBR_H_
 #define _FUSE_SUBR_H_
 
+#include <sys/types.h>
 #include <sys/dirent.h>
-#include <sys/event.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -28,8 +28,7 @@
 #include <limits.h>
 
 #include "fuse.h"
-
-struct fuse_args;
+#include "fuse_lowlevel.h"
 
 struct fuse_vnode {
 	ino_t ino;
@@ -43,13 +42,14 @@ struct fuse_vnode {
 
 struct fuse_dirhandle {
 	struct fuse *fuse;
-	fuse_fill_dir_t filler;
-	void *buf;
-	int full;
-	uint32_t size;
-	uint32_t start;
-	uint32_t idx;
-	off_t off;
+	fuse_fill_dir_t filler; /* needed by getdir */
+	void *buf;		/* buffer for dirents */
+	int full;		/* whether the buffer is full */
+	size_t size;		/* buffer size */
+	size_t len;		/* buffer space used */
+	fuse_ino_t ino;		/* directory inode */
+	uint64_t fh;		/* file handle returned by opendir */
+	int err;		/* error while filling buffer */
 };
 
 SIMPLEQ_HEAD(fuse_vn_head, fuse_vnode);
@@ -57,18 +57,18 @@ SPLAY_HEAD(dict, dictentry);
 SPLAY_HEAD(tree, treeentry);
 
 struct fuse_session {
-	void *args;
+	struct fuse_lowlevel_ops llops;
+	struct fuse_conn_info fci;
+	struct fuse_chan *chan;
+	void *userdata;
+	int init;
+	int exit;
 };
 
 struct fuse_chan {
-	char *dir;
-	struct fuse_args *args;
-
-	int fd;
-	int dead;
-
-	/* kqueue stuff */
-	int kq;
+	struct fuse_session	*se;
+	int			fd;
+	int			dead;
 };
 
 struct fuse_config {
@@ -98,7 +98,6 @@ struct fuse_mount_opts {
 };
 
 struct fuse {
-	struct fuse_chan	*fc;
 	struct fuse_operations	op;
 
 	int			compat;
@@ -109,20 +108,29 @@ struct fuse {
 	void			*private_data;
 
 	struct fuse_config	conf;
-	struct fuse_session	se;
+	struct fuse_session	*se;
+};
+
+/* fuse_lowlevel.h */
+struct fuse_req {
+	struct fuse_ctx		ctx;
+	struct fusebuf		*fbuf;
+	struct fuse_session	*se;
+	struct fuse_chan	*ch;
 };
 
 #define	FUSE_MAX_OPS	39
 #define FUSE_ROOT_INO ((ino_t)1)
 
 /* fuse_ops.c */
-int	ifuse_exec_opcode(struct fuse *, struct fusebuf *);
+fuse_req_t ifuse_req(void);
 
 /* fuse_subr.c */
 struct fuse_vnode	*alloc_vn(struct fuse *, const char *, ino_t, ino_t);
 void			 ref_vn(struct fuse_vnode *);
-void			 unref_vn(struct fuse *, struct fuse_vnode *);
-struct fuse_vnode	*get_vn_by_name_and_parent(struct fuse *, uint8_t *,
+void			 unref_vn(struct fuse *, struct fuse_vnode *,
+    const uint64_t);
+struct fuse_vnode	*get_vn_by_name_and_parent(struct fuse *, const char *,
     ino_t);
 void			remove_vnode_from_name_tree(struct fuse *,
     struct fuse_vnode *);
@@ -134,13 +142,13 @@ char			*build_realname(struct fuse *, ino_t);
 #define tree_empty(t)	SPLAY_EMPTY((t))
 int			tree_check(struct tree *, uint64_t);
 void			*tree_set(struct tree *, uint64_t, void *);
-void			*tree_get(struct tree *, uint64_t);;
+void			*tree_get(struct tree *, uint64_t);
 void			*tree_pop(struct tree *, uint64_t);
 
 /* dict.c */
 int			dict_check(struct dict *, const char *);
 void			*dict_set(struct dict *, const char *, void *);
-void			*dict_get(struct dict *, const char *);;
+void			*dict_get(struct dict *, const char *);
 void			*dict_pop(struct dict *, const char *);
 
 #define FUSE_VERSION_PKG_INFO "2.8.0"
@@ -150,20 +158,59 @@ void			*dict_pop(struct dict *, const char *);
 #define	DEF(x)		__strong_alias(x, __##x)
 
 PROTO(fuse_daemonize);
+PROTO(fuse_teardown);
 PROTO(fuse_destroy);
 PROTO(fuse_get_context);
 PROTO(fuse_get_session);
 PROTO(fuse_loop);
+PROTO(fuse_loop_mt);
 PROTO(fuse_mount);
 PROTO(fuse_new);
 PROTO(fuse_opt_add_arg);
+PROTO(fuse_opt_add_opt);
+PROTO(fuse_opt_add_opt_escaped);
 PROTO(fuse_opt_free_args);
 PROTO(fuse_opt_insert_arg);
 PROTO(fuse_opt_match);
 PROTO(fuse_opt_parse);
 PROTO(fuse_parse_cmdline);
 PROTO(fuse_remove_signal_handlers);
+PROTO(fuse_set_signal_handlers);
 PROTO(fuse_setup);
 PROTO(fuse_unmount);
+PROTO(fuse_main);
+PROTO(fuse_version);
+PROTO(fuse_invalidate);
+PROTO(fuse_is_lib_option);
+
+/* FUSE low-level */
+PROTO(fuse_chan_fd);
+PROTO(fuse_chan_recv);
+PROTO(fuse_chan_send);
+PROTO(fuse_req_ctx);
+PROTO(fuse_req_userdata);
+PROTO(fuse_reply_err);
+PROTO(fuse_reply_buf);
+PROTO(fuse_reply_attr);
+PROTO(fuse_reply_entry);
+PROTO(fuse_reply_open);
+PROTO(fuse_reply_write);
+PROTO(fuse_reply_readlink);
+PROTO(fuse_reply_statfs);
+PROTO(fuse_reply_none);
+PROTO(fuse_add_direntry);
+PROTO(fuse_lowlevel_new);
+PROTO(fuse_session_destroy);
+PROTO(fuse_session_add_chan);
+PROTO(fuse_session_remove_chan);
+PROTO(fuse_session_exit);
+PROTO(fuse_session_exited);
+PROTO(fuse_session_reset);
+PROTO(fuse_session_loop);
+PROTO(fuse_session_process);
+
+/* Unsupported */
+PROTO(fuse_reply_create);
+PROTO(fuse_reply_bmap);
 
 #endif /* _FUSE_SUBR_ */

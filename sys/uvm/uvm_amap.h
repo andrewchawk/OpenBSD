@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_amap.h,v 1.33 2021/01/19 13:21:36 mpi Exp $	*/
+/*	$OpenBSD: uvm_amap.h,v 1.36 2025/05/25 01:52:00 gnezdo Exp $	*/
 /*	$NetBSD: uvm_amap.h,v 1.14 2001/02/18 21:19:08 chs Exp $	*/
 
 /*
@@ -112,12 +112,9 @@ boolean_t	amap_swap_off(int, int);
 
 /*
  * we currently provide an array-based amap implementation.  in this
- * implementation we provide the option of tracking split references
- * so that we don't lose track of references during partial unmaps
- * ... this is enabled with the "UVM_AMAP_PPREF" define.
+ * implementation we track split references so that we don't lose track of
+ * references during partial unmaps.
  */
-
-#define UVM_AMAP_PPREF		/* track partial references */
 
 /*
  * here is the definition of the vm_amap structure and helper structures for
@@ -138,9 +135,7 @@ struct vm_amap {
 	int am_flags;		/* flags */
 	int am_nslot;		/* # of slots currently in map */
 	int am_nused;		/* # of slots currently in use */
-#ifdef UVM_AMAP_PPREF
 	int *am_ppref;		/* per page reference count (if !NULL) */
-#endif
 	LIST_ENTRY(vm_amap) am_list;
 
 	union {
@@ -191,10 +186,10 @@ struct vm_amap {
  */
 
 /*
- * defines for handling of large sparce amaps:
+ * defines for handling of large sparse amaps:
  * 
  * one of the problems of array-based amaps is that if you allocate a
- * large sparcely-used area of virtual memory you end up allocating
+ * large sparsely-used area of virtual memory you end up allocating
  * large arrays that, for the most part, don't get used.  this is a
  * problem for BSD in that the kernel likes to make these types of
  * allocations to "reserve" memory for possible future use.
@@ -262,8 +257,8 @@ struct vm_amap {
 #define amap_flags(AMAP)	((AMAP)->am_flags)
 #define amap_refs(AMAP)		((AMAP)->am_ref)
 
-#define amap_lock(AMAP)		rw_enter_write((AMAP)->am_lock)
-#define amap_unlock(AMAP)	rw_exit_write((AMAP)->am_lock)
+#define amap_lock(AMAP, RWLT)	rw_enter((AMAP)->am_lock, (RWLT))
+#define amap_unlock(AMAP)	rw_exit((AMAP)->am_lock)
 
 #endif /* _KERNEL */
 

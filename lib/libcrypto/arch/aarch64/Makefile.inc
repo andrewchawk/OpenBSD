@@ -1,15 +1,15 @@
-# $OpenBSD: Makefile.inc,v 1.13 2024/03/29 07:24:09 jsing Exp $
+# $OpenBSD: Makefile.inc,v 1.18 2026/01/17 16:18:31 jsing Exp $
 
 # aarch64-specific libcrypto build rules
 
-.for dir f in ${SSLASM}
-SRCS+=	${f}.S
-GENERATED+=${f}.S
-${f}.S: ${LCRYPTO_SRC}/${dir}/asm/${f}.pl
-	/usr/bin/perl \
-		${LCRYPTO_SRC}/${dir}/asm/${f}.pl void ${.TARGET} > ${.TARGET}
-.endfor
+SRCS += crypto_cpu_caps.c
 
-CFLAGS+= -DOPENSSL_CPUID_OBJ
+CFLAGS+= -DLIBRESSL_USE_SHA_ASSEMBLY
+SRCS += sha1_aarch64.c
+SRCS += sha1_aarch64_ce.S
+SRCS += sha256_aarch64.c
+SRCS += sha256_aarch64_ce.S
+SRCS += sha512_aarch64.c
+SRCS += sha512_aarch64_ce.S
+
 AFLAGS+= -mmark-bti-property
-SRCS+=	arm64cpuid.S arm64cap.c

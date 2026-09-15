@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtr.c,v 1.21 2024/04/09 12:05:07 claudio Exp $ */
+/*	$OpenBSD: rtr.c,v 1.36 2026/07/24 05:01:01 claudio Exp $ */
 
 /*
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -143,7 +143,7 @@ aspa_set_entry(struct aspa_set *aspa, uint32_t asnum)
 	}
 
 	num = aspa->num + 1;
-	newtas = recallocarray(aspa->tas, aspa->num, num, sizeof(uint32_t));
+	newtas = reallocarray(aspa->tas, num, sizeof(uint32_t));
 	if (newtas == NULL)
 		fatal("aspa_set merge");
 
@@ -185,7 +185,7 @@ rtr_main(int debug, int verbose)
 	struct pollfd		*pfd = NULL;
 	void			*newp;
 	size_t			 pfd_elms = 0, i;
-	time_t			 timeout;
+	monotime_t		 timeout;
 
 	log_init(debug, LOG_DAEMON);
 	log_setverbose(verbose);
@@ -219,7 +219,10 @@ rtr_main(int debug, int verbose)
 
 	if ((ibuf_main = malloc(sizeof(struct imsgbuf))) == NULL)
 		fatal(NULL);
-	imsg_init(ibuf_main, 3);
+	if (imsgbuf_init(ibuf_main, 3) == -1 ||
+	    imsgbuf_set_maxsize(ibuf_main, MAX_BGPD_IMSGSIZE) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(ibuf_main);
 
 	conf = new_config();
 	log_info("rtr engine ready");
@@ -239,8 +242,8 @@ rtr_main(int debug, int verbose)
 		}
 
 		/* run the expire timeout every EXPIRE_TIMEOUT seconds */
-		timeout = timer_nextduein(&expire_timer, getmonotime());
-		if (timeout == -1)
+		timeout = timer_nextduein(&expire_timer);
+		if (!monotime_valid(timeout))
 			fatalx("roa-set expire timer no longer running");
 
 		memset(pfd, 0, sizeof(struct pollfd) * pfd_elms);
@@ -251,20 +254,26 @@ rtr_main(int debug, int verbose)
 		i = PFD_PIPE_COUNT;
 		i += rtr_poll_events(pfd + i, pfd_elms - i, &timeout);
 
-		if (poll(pfd, i, timeout * 1000) == -1) {
+		timeout = monotime_sub(timeout, getmonotime());
+		if (!monotime_valid(timeout))
+			timeout = monotime_clear();
+
+		if (poll(pfd, i, monotime_to_msec(timeout)) == -1) {
 			if (errno == EINTR)
 				continue;
 			fatal("poll error");
 		}
 
-		if (handle_pollfd(&pfd[PFD_PIPE_MAIN], ibuf_main) == -1)
-			fatalx("Lost connection to parent");
-		else
+		if (handle_pollfd(&pfd[PFD_PIPE_MAIN], ibuf_main) == -1) {
+			log_warnx("RTR: Lost connection to parent");
+			rtr_quit = 1;
+			continue;
+		} else
 			rtr_dispatch_imsg_parent(ibuf_main);
 
 		if (handle_pollfd(&pfd[PFD_PIPE_RDE], ibuf_rde) == -1) {
 			log_warnx("RTR: Lost connection to RDE");
-			msgbuf_clear(&ibuf_rde->w);
+			imsgbuf_clear(ibuf_rde);
 			free(ibuf_rde);
 			ibuf_rde = NULL;
 		} else
@@ -290,11 +299,11 @@ rtr_main(int debug, int verbose)
 
 	/* close pipes */
 	if (ibuf_rde) {
-		msgbuf_clear(&ibuf_rde->w);
+		imsgbuf_clear(ibuf_rde);
 		close(ibuf_rde->fd);
 		free(ibuf_rde);
 	}
-	msgbuf_clear(&ibuf_main->w);
+	imsgbuf_clear(ibuf_main);
 	close(ibuf_main->fd);
 	free(ibuf_main);
 
@@ -307,16 +316,15 @@ rtr_dispatch_imsg_parent(struct imsgbuf *imsgbuf)
 {
 	static struct aspa_set	*aspa;
 	struct imsg		 imsg;
-	struct bgpd_config	 tconf;
 	struct roa		 roa;
-	char			 descr[PEER_DESCR_LEN];
+	struct rtr_config_msg	 rtrconf;
 	struct rtr_session	*rs;
 	uint32_t		 rtrid;
 	int			 n, fd;
 
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)
 			break;
 
@@ -331,33 +339,34 @@ rtr_dispatch_imsg_parent(struct imsgbuf *imsgbuf)
 			if (ibuf_rde) {
 				log_warnx("Unexpected imsg ctl "
 				    "connection to RDE received");
-				msgbuf_clear(&ibuf_rde->w);
+				imsgbuf_clear(ibuf_rde);
 				free(ibuf_rde);
 			}
 			if ((ibuf_rde = malloc(sizeof(struct imsgbuf))) == NULL)
 				fatal(NULL);
-			imsg_init(ibuf_rde, fd);
+			if (imsgbuf_init(ibuf_rde, fd) == -1 ||
+			    imsgbuf_set_maxsize(ibuf_rde, MAX_BGPD_IMSGSIZE) ==
+			    -1)
+				fatal(NULL);
 			break;
-		case IMSG_SOCKET_CONN:
+		case IMSG_SOCKET_SETUP:
 			if ((fd = imsg_get_fd(&imsg)) == -1) {
 				log_warnx("expected to receive imsg fd "
 				    "but didn't receive any");
 				break;
 			}
 			if ((rs = rtr_get(rtrid)) == NULL) {
-				log_warnx("IMSG_SOCKET_CONN: unknown rtr id %d",
-				    rtrid);
+				log_warnx("IMSG_SOCKET_SETUP: "
+				    "unknown rtr id %d", rtrid);
 				close(fd);
 				break;
 			}
 			rtr_open(rs, fd);
 			break;
 		case IMSG_RECONF_CONF:
-			if (imsg_get_data(&imsg, &tconf, sizeof(tconf)) == -1)
-				fatal("imsg_get_data");
-
 			nconf = new_config();
-			copy_config(nconf, &tconf);
+			if (imsg_recv_config(&imsg, nconf) == -1)
+				fatal("imsg_recv_config");
 			rtr_config_prep();
 			break;
 		case IMSG_RECONF_ROA_ITEM:
@@ -395,13 +404,14 @@ rtr_dispatch_imsg_parent(struct imsgbuf *imsgbuf)
 			aspa = NULL;
 			break;
 		case IMSG_RECONF_RTR_CONFIG:
-			if (imsg_get_data(&imsg, descr, sizeof(descr)) == -1)
+			if (imsg_get_data(&imsg, &rtrconf,
+			    sizeof(rtrconf)) == -1)
 				fatal("imsg_get_data");
 			rs = rtr_get(rtrid);
 			if (rs == NULL)
-				rtr_new(rtrid, descr);
+				rtr_new(rtrid, &rtrconf);
 			else
-				rtr_config_keep(rs);
+				rtr_config_keep(rs, &rtrconf);
 			break;
 		case IMSG_RECONF_DRAIN:
 			imsg_compose(ibuf_main, IMSG_RECONF_DRAIN, 0, 0,
@@ -456,8 +466,8 @@ rtr_dispatch_imsg_rde(struct imsgbuf *imsgbuf)
 	int		n;
 
 	while (imsgbuf) {
-		if ((n = imsg_get(imsgbuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(imsgbuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)
 			break;
 
@@ -479,10 +489,13 @@ rtr_imsg_compose(int type, uint32_t id, pid_t pid, void *data, size_t datalen)
  * At the same time tas_aid is overwritten with the bitmasks or cleared
  * if no extra aid masks are needed.
  */
-static size_t
-rtr_aspa_set_size(struct aspa_set *aspa)
+static void
+rtr_aspa_set_size(const struct aspa_set *aspa, struct aspa_prep *ap)
 {
-	return aspa->num * sizeof(uint32_t);
+	if (aspa->num > MAX_ASPA_SPAS_COUNT)
+		return;
+	ap->datasize += aspa->num * sizeof(uint32_t);
+	ap->entries++;
 }
 
 /*
@@ -521,8 +534,7 @@ rtr_recalc(void)
 	rtr_aspa_merge(&at);
 
 	RB_FOREACH(aspa, aspa_tree, &at) {
-		ap.datasize += rtr_aspa_set_size(aspa);
-		ap.entries++;
+		rtr_aspa_set_size(aspa, &ap);
 	}
 
 	imsg_compose(ibuf_rde, IMSG_RECONF_ASPA_PREP, 0, 0, -1,
@@ -532,11 +544,10 @@ rtr_recalc(void)
 	RB_FOREACH_REVERSE(aspa, aspa_tree, &at) {
 		struct aspa_set	as = { .as = aspa->as, .num = aspa->num };
 
-		/* XXX prevent oversized IMSG for now */
-		if (aspa->num * sizeof(*aspa->tas) >
-		    MAX_IMSGSIZE - IMSG_HEADER_SIZE) {
-			log_warnx("oversized ASPA set for customer-as %s, %s",
-			    log_as(aspa->as), "dropped");
+		if (aspa->num > MAX_ASPA_SPAS_COUNT) {
+			log_warnx("oversized ASPA record after merge: "
+			    "implicit withdraw of customerAS %s",
+			    log_as(aspa->as));
 			continue;
 		}
 

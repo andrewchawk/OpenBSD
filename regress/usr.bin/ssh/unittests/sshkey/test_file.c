@@ -1,4 +1,4 @@
-/* 	$OpenBSD: test_file.c,v 1.11 2024/01/11 01:45:58 djm Exp $ */
+/* 	$OpenBSD: test_file.c,v 1.14 2026/06/14 04:08:06 djm Exp $ */
 /*
  * Regress test for sshkey.h key management API
  *
@@ -17,7 +17,6 @@
 #include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/rsa.h>
-#include <openssl/dsa.h>
 #include <openssl/objects.h>
 
 #include "test_helper.h"
@@ -154,98 +153,6 @@ sshkey_file_tests(void)
 
 	sshkey_free(k1);
 
-#ifdef WITH_DSA
-	TEST_START("parse DSA from private");
-	buf = load_file("dsa_1");
-	ASSERT_INT_EQ(sshkey_parse_private_fileblob(buf, "", &k1, NULL), 0);
-	sshbuf_free(buf);
-	ASSERT_PTR_NE(k1, NULL);
-	a = load_bignum("dsa_1.param.g");
-	b = load_bignum("dsa_1.param.priv");
-	c = load_bignum("dsa_1.param.pub");
-	ASSERT_BIGNUM_EQ(dsa_g(k1), a);
-	ASSERT_BIGNUM_EQ(dsa_priv_key(k1), b);
-	ASSERT_BIGNUM_EQ(dsa_pub_key(k1), c);
-	BN_free(a);
-	BN_free(b);
-	BN_free(c);
-	TEST_DONE();
-
-	TEST_START("parse DSA from private w/ passphrase");
-	buf = load_file("dsa_1_pw");
-	ASSERT_INT_EQ(sshkey_parse_private_fileblob(buf,
-	    (const char *)sshbuf_ptr(pw), &k2, NULL), 0);
-	sshbuf_free(buf);
-	ASSERT_PTR_NE(k2, NULL);
-	ASSERT_INT_EQ(sshkey_equal(k1, k2), 1);
-	sshkey_free(k2);
-	TEST_DONE();
-
-	TEST_START("parse DSA from new-format");
-	buf = load_file("dsa_n");
-	ASSERT_INT_EQ(sshkey_parse_private_fileblob(buf, "", &k2, NULL), 0);
-	sshbuf_free(buf);
-	ASSERT_PTR_NE(k2, NULL);
-	ASSERT_INT_EQ(sshkey_equal(k1, k2), 1);
-	sshkey_free(k2);
-	TEST_DONE();
-
-	TEST_START("parse DSA from new-format w/ passphrase");
-	buf = load_file("dsa_n_pw");
-	ASSERT_INT_EQ(sshkey_parse_private_fileblob(buf,
-	    (const char *)sshbuf_ptr(pw), &k2, NULL), 0);
-	sshbuf_free(buf);
-	ASSERT_PTR_NE(k2, NULL);
-	ASSERT_INT_EQ(sshkey_equal(k1, k2), 1);
-	sshkey_free(k2);
-	TEST_DONE();
-
-	TEST_START("load DSA from public");
-	ASSERT_INT_EQ(sshkey_load_public(test_data_file("dsa_1.pub"), &k2,
-	    NULL), 0);
-	ASSERT_PTR_NE(k2, NULL);
-	ASSERT_INT_EQ(sshkey_equal(k1, k2), 1);
-	sshkey_free(k2);
-	TEST_DONE();
-
-	TEST_START("load DSA cert");
-	ASSERT_INT_EQ(sshkey_load_cert(test_data_file("dsa_1"), &k2), 0);
-	ASSERT_PTR_NE(k2, NULL);
-	ASSERT_INT_EQ(k2->type, KEY_DSA_CERT);
-	ASSERT_INT_EQ(sshkey_equal(k1, k2), 0);
-	ASSERT_INT_EQ(sshkey_equal_public(k1, k2), 1);
-	TEST_DONE();
-
-	TEST_START("DSA key hex fingerprint");
-	buf = load_text_file("dsa_1.fp");
-	cp = sshkey_fingerprint(k1, SSH_DIGEST_SHA256, SSH_FP_BASE64);
-	ASSERT_PTR_NE(cp, NULL);
-	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));
-	sshbuf_free(buf);
-	free(cp);
-	TEST_DONE();
-
-	TEST_START("DSA cert hex fingerprint");
-	buf = load_text_file("dsa_1-cert.fp");
-	cp = sshkey_fingerprint(k2, SSH_DIGEST_SHA256, SSH_FP_BASE64);
-	ASSERT_PTR_NE(cp, NULL);
-	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));
-	sshbuf_free(buf);
-	free(cp);
-	sshkey_free(k2);
-	TEST_DONE();
-
-	TEST_START("DSA key bubblebabble fingerprint");
-	buf = load_text_file("dsa_1.fp.bb");
-	cp = sshkey_fingerprint(k1, SSH_DIGEST_SHA1, SSH_FP_BUBBLEBABBLE);
-	ASSERT_PTR_NE(cp, NULL);
-	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));
-	sshbuf_free(buf);
-	free(cp);
-	TEST_DONE();
-
-	sshkey_free(k1);
-#endif
 
 	TEST_START("parse ECDSA from private");
 	buf = load_file("ecdsa_1");
@@ -258,11 +165,12 @@ sshkey_file_tests(void)
 	sshbuf_free(buf);
 	a = load_bignum("ecdsa_1.param.priv");
 	b = load_bignum("ecdsa_1.param.pub");
-	c = EC_POINT_point2bn(EC_KEY_get0_group(k1->ecdsa),
-	    EC_KEY_get0_public_key(k1->ecdsa), POINT_CONVERSION_UNCOMPRESSED,
-	    NULL, NULL);
+	c = EC_POINT_point2bn(EC_KEY_get0_group(EVP_PKEY_get0_EC_KEY(k1->pkey)),
+	    EC_KEY_get0_public_key(EVP_PKEY_get0_EC_KEY(k1->pkey)),
+	    POINT_CONVERSION_UNCOMPRESSED, NULL, NULL);
 	ASSERT_PTR_NE(c, NULL);
-	ASSERT_BIGNUM_EQ(EC_KEY_get0_private_key(k1->ecdsa), a);
+	ASSERT_BIGNUM_EQ(
+	    EC_KEY_get0_private_key(EVP_PKEY_get0_EC_KEY(k1->pkey)), a);
 	ASSERT_BIGNUM_EQ(b, c);
 	BN_free(a);
 	BN_free(b);
@@ -400,6 +308,71 @@ sshkey_file_tests(void)
 
 	TEST_START("Ed25519 key bubblebabble fingerprint");
 	buf = load_text_file("ed25519_1.fp.bb");
+	cp = sshkey_fingerprint(k1, SSH_DIGEST_SHA1, SSH_FP_BUBBLEBABBLE);
+	ASSERT_PTR_NE(cp, NULL);
+	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));
+	sshbuf_free(buf);
+	free(cp);
+	TEST_DONE();
+
+	sshkey_free(k1);
+
+	TEST_START("parse MLDSA44-ED25519 from private");
+	buf = load_file("mldsa44_ed25519_1");
+	ASSERT_INT_EQ(sshkey_parse_private_fileblob(buf, "", &k1, NULL), 0);
+	sshbuf_free(buf);
+	ASSERT_PTR_NE(k1, NULL);
+	ASSERT_INT_EQ(k1->type, KEY_MLDSA44_ED25519);
+	TEST_DONE();
+
+	TEST_START("parse MLDSA44-ED25519 from private w/ passphrase");
+	buf = load_file("mldsa44_ed25519_1_pw");
+	ASSERT_INT_EQ(sshkey_parse_private_fileblob(buf,
+	    (const char *)sshbuf_ptr(pw), &k2, NULL), 0);
+	sshbuf_free(buf);
+	ASSERT_PTR_NE(k2, NULL);
+	ASSERT_INT_EQ(sshkey_equal(k1, k2), 1);
+	sshkey_free(k2);
+	TEST_DONE();
+
+	TEST_START("load MLDSA44-ED25519 from public");
+	ASSERT_INT_EQ(sshkey_load_public(
+	    test_data_file("mldsa44_ed25519_1.pub"), &k2, NULL), 0);
+	ASSERT_PTR_NE(k2, NULL);
+	ASSERT_INT_EQ(sshkey_equal(k1, k2), 1);
+	sshkey_free(k2);
+	TEST_DONE();
+
+	TEST_START("load MLDSA44-ED25519 cert");
+	ASSERT_INT_EQ(sshkey_load_cert(
+	    test_data_file("mldsa44_ed25519_1"), &k2), 0);
+	ASSERT_PTR_NE(k2, NULL);
+	ASSERT_INT_EQ(k2->type, KEY_MLDSA44_ED25519_CERT);
+	ASSERT_INT_EQ(sshkey_equal(k1, k2), 0);
+	ASSERT_INT_EQ(sshkey_equal_public(k1, k2), 1);
+	TEST_DONE();
+
+	TEST_START("MLDSA44-ED25519 key hex fingerprint");
+	buf = load_text_file("mldsa44_ed25519_1.fp");
+	cp = sshkey_fingerprint(k1, SSH_DIGEST_SHA256, SSH_FP_BASE64);
+	ASSERT_PTR_NE(cp, NULL);
+	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));
+	sshbuf_free(buf);
+	free(cp);
+	TEST_DONE();
+
+	TEST_START("MLDSA44-ED25519 cert hex fingerprint");
+	buf = load_text_file("mldsa44_ed25519_1-cert.fp");
+	cp = sshkey_fingerprint(k2, SSH_DIGEST_SHA256, SSH_FP_BASE64);
+	ASSERT_PTR_NE(cp, NULL);
+	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));
+	sshbuf_free(buf);
+	free(cp);
+	sshkey_free(k2);
+	TEST_DONE();
+
+	TEST_START("MLDSA44-ED25519 key bubblebabble fingerprint");
+	buf = load_text_file("mldsa44_ed25519_1.fp.bb");
 	cp = sshkey_fingerprint(k1, SSH_DIGEST_SHA1, SSH_FP_BUBBLEBABBLE);
 	ASSERT_PTR_NE(cp, NULL);
 	ASSERT_STRING_EQ(cp, (const char *)sshbuf_ptr(buf));

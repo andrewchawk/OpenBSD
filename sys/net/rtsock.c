@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtsock.c,v 1.375 2024/07/12 17:20:18 mvs Exp $	*/
+/*	$OpenBSD: rtsock.c,v 1.391 2026/04/17 18:30:45 claudio Exp $	*/
 /*	$NetBSD: rtsock.c,v 1.18 1996/03/29 00:32:10 cgd Exp $	*/
 
 /*
@@ -67,11 +67,9 @@
 #include <sys/sysctl.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
 #include <sys/domain.h>
 #include <sys/pool.h>
 #include <sys/protosw.h>
-#include <sys/srp.h>
 
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -84,7 +82,6 @@
 #include <netmpls/mpls.h>
 #endif
 #ifdef IPSEC
-#include <netinet/ip_ipsp.h>
 #include <net/if_enc.h>
 #endif
 #ifdef BFD
@@ -92,7 +89,6 @@
 #endif
 
 #include <sys/stdarg.h>
-#include <sys/kernel.h>
 #include <sys/timeout.h>
 
 #define	ROUTESNDQ	8192
@@ -107,8 +103,6 @@ struct walkarg {
 };
 
 void	route_prinit(void);
-void	rcb_ref(void *, void *);
-void	rcb_unref(void *, void *);
 int	route_output(struct mbuf *, struct socket *);
 int	route_ctloutput(int, struct socket *, int, int, struct mbuf *);
 int	route_attach(struct socket *, int, int);
@@ -151,12 +145,13 @@ int		 rt_setsource(unsigned int, const struct sockaddr *);
  * Locks used to protect struct members
  *       I       immutable after creation
  *       s       solock
+ *
+ * Lock order: rtptable.rtp_lk -> solock
  */
 struct rtpcb {
 	struct socket		*rop_socket;		/* [I] */
 
-	SRPL_ENTRY(rtpcb)	rop_list;
-	struct refcnt		rop_refcnt;
+	TAILQ_ENTRY(rtpcb)	rop_list;
 	struct timeout		rop_timeout;
 	unsigned int		rop_msgfilter;		/* [s] */
 	unsigned int		rop_flagfilter;		/* [s] */
@@ -168,8 +163,7 @@ struct rtpcb {
 #define	sotortpcb(so)	((struct rtpcb *)(so)->so_pcb)
 
 struct rtptable {
-	SRPL_HEAD(, rtpcb)	rtp_list;
-	struct srpl_rc		rtp_rc;
+	TAILQ_HEAD(, rtpcb)	rtp_list;
 	struct rwlock		rtp_lk;
 	unsigned int		rtp_count;
 };
@@ -191,27 +185,10 @@ struct rtptable rtptable;
 void
 route_prinit(void)
 {
-	srpl_rc_init(&rtptable.rtp_rc, rcb_ref, rcb_unref, NULL);
 	rw_init(&rtptable.rtp_lk, "rtsock");
-	SRPL_INIT(&rtptable.rtp_list);
+	TAILQ_INIT(&rtptable.rtp_list);
 	pool_init(&rtpcb_pool, sizeof(struct rtpcb), 0,
 	    IPL_SOFTNET, PR_WAITOK, "rtpcb", NULL);
-}
-
-void
-rcb_ref(void *null, void *v)
-{
-	struct rtpcb *rop = v;
-
-	refcnt_take(&rop->rop_refcnt);
-}
-
-void
-rcb_unref(void *null, void *v)
-{
-	struct rtpcb *rop = v;
-
-	refcnt_rele_wake(&rop->rop_refcnt);
 }
 
 int
@@ -219,6 +196,8 @@ route_attach(struct socket *so, int proto, int wait)
 {
 	struct rtpcb	*rop;
 	int		 error;
+
+	soassertlocked(so);
 
 	error = soreserve(so, ROUTESNDQ, ROUTERCVQ);
 	if (error)
@@ -236,7 +215,6 @@ route_attach(struct socket *so, int proto, int wait)
 	/* Init the timeout structure */
 	timeout_set_flags(&rop->rop_timeout, rtm_senddesync_timer, so,
 	    KCLOCK_NONE, TIMEOUT_PROC | TIMEOUT_MPSAFE);
-	refcnt_init(&rop->rop_refcnt);
 
 	rop->rop_socket = so;
 	rop->rop_proto = proto;
@@ -246,11 +224,15 @@ route_attach(struct socket *so, int proto, int wait)
 	soisconnected(so);
 	so->so_options |= SO_USELOOPBACK;
 
+	/* Give up solock before taking rtp_lk for the lock ordering. */
+	sounlock(so);
+
 	rw_enter(&rtptable.rtp_lk, RW_WRITE);
-	SRPL_INSERT_HEAD_LOCKED(&rtptable.rtp_rc, &rtptable.rtp_list, rop,
-	    rop_list);
+	TAILQ_INSERT_TAIL(&rtptable.rtp_list, rop, rop_list);
 	rtptable.rtp_count++;
 	rw_exit(&rtptable.rtp_lk);
+
+	solock(so);
 
 	return (0);
 }
@@ -266,17 +248,15 @@ route_detach(struct socket *so)
 	if (rop == NULL)
 		return (EINVAL);
 
-	rw_enter(&rtptable.rtp_lk, RW_WRITE);
-
-	rtptable.rtp_count--;
-	SRPL_REMOVE_LOCKED(&rtptable.rtp_rc, &rtptable.rtp_list, rop, rtpcb,
-	    rop_list);
-	rw_exit(&rtptable.rtp_lk);
-
+	/* Give up solock before taking rtp_lk for the lock ordering. */
 	sounlock(so);
 
+	rw_enter(&rtptable.rtp_lk, RW_WRITE);
+	rtptable.rtp_count--;
+	TAILQ_REMOVE(&rtptable.rtp_list, rop, rop_list);
+	rw_exit(&rtptable.rtp_lk);
+
 	/* wait for all references to drop */
-	refcnt_finalize(&rop->rop_refcnt, "rtsockrefs");
 	timeout_del_barrier(&rop->rop_timeout);
 
 	solock(so);
@@ -316,7 +296,7 @@ route_rcvd(struct socket *so)
 
 	mtx_enter(&so->so_rcv.sb_mtx);
 	if (((rop->rop_flags & ROUTECB_FLAG_FLUSH) != 0) &&
-	    ((sbspace_locked(so, &so->so_rcv) == so->so_rcv.sb_hiwat)))
+	    ((sbspace_locked(&so->so_rcv) == so->so_rcv.sb_hiwat)))
 		rop->rop_flags &= ~ROUTECB_FLAG_FLUSH;
 	mtx_leave(&so->so_rcv.sb_mtx);
 }
@@ -359,7 +339,7 @@ int
 route_peeraddr(struct socket *so, struct mbuf *nam)
 {
 	/* minimal support, just implement a fake peer address */
-	bcopy(&route_src, mtod(nam, caddr_t), route_src.sa_len);
+	memcpy(mtod(nam, caddr_t), &route_src, route_src.sa_len);
 	nam->m_len = route_src.sa_len;
 	return (0);
 }
@@ -483,8 +463,7 @@ rtm_senddesync(struct socket *so)
 		int ret;
 
 		mtx_enter(&so->so_rcv.sb_mtx);
-		ret = sbappendaddr(so, &so->so_rcv, &route_src,
-		    desync_mbuf, NULL);
+		ret = sbappendaddr(&so->so_rcv, &route_src, desync_mbuf, NULL);
 		mtx_leave(&so->so_rcv.sb_mtx);
 
 		if (ret != 0) {
@@ -505,7 +484,6 @@ route_input(struct mbuf *m0, struct socket *so0, sa_family_t sa_family)
 	struct rtpcb *rop;
 	struct rt_msghdr *rtm;
 	struct mbuf *m = m0;
-	struct srp_ref sr;
 
 	/* ensure that we can access the rtm_type via mtod() */
 	if (m->m_len < offsetof(struct rt_msghdr, rtm_type) + 1) {
@@ -513,7 +491,8 @@ route_input(struct mbuf *m0, struct socket *so0, sa_family_t sa_family)
 		return;
 	}
 
-	SRPL_FOREACH(rop, &sr, &rtptable.rtp_list, rop_list) {
+	rw_enter_read(&rtptable.rtp_lk);
+	TAILQ_FOREACH(rop, &rtptable.rtp_list, rop_list) {
 		/*
 		 * If route socket is bound to an address family only send
 		 * messages that match the address family. Address family
@@ -584,7 +563,7 @@ route_input(struct mbuf *m0, struct socket *so0, sa_family_t sa_family)
 next:
 		sounlock(so);
 	}
-	SRPL_LEAVE(&sr);
+	rw_exit_read(&rtptable.rtp_lk);
 
 	m_freem(m);
 }
@@ -603,8 +582,8 @@ rtm_sendup(struct socket *so, struct mbuf *m0)
 		return (ENOMEM);
 
 	mtx_enter(&so->so_rcv.sb_mtx);
-	if (sbspace_locked(so, &so->so_rcv) < (2 * MSIZE) ||
-	    sbappendaddr(so, &so->so_rcv, &route_src, m, NULL) == 0)
+	if (sbspace_locked(&so->so_rcv) < (2 * MSIZE) ||
+	    sbappendaddr(&so->so_rcv, &route_src, m, NULL) == 0)
 		send_desync = 1;
 	mtx_leave(&so->so_rcv.sb_mtx);
 
@@ -630,6 +609,9 @@ rtm_report(struct rtentry *rt, u_char type, int seq, int tableid)
 #ifdef BFD
 	struct sockaddr_bfd	 sa_bfd;
 #endif
+#ifdef MPLS
+	struct sockaddr_mpls	 sa_mpls;
+#endif
 	struct ifnet		*ifp = NULL;
 	int			 len;
 
@@ -647,8 +629,6 @@ rtm_report(struct rtentry *rt, u_char type, int seq, int tableid)
 #endif
 #ifdef MPLS
 	if (rt->rt_flags & RTF_MPLS) {
-		struct sockaddr_mpls	 sa_mpls;
-
 		bzero(&sa_mpls, sizeof(sa_mpls));
 		sa_mpls.smpls_family = AF_MPLS;
 		sa_mpls.smpls_len = sizeof(sa_mpls);
@@ -703,6 +683,7 @@ route_output(struct mbuf *m, struct socket *so)
 	u_int			 tableid;
 	u_int8_t		 prio;
 	u_char			 vers, type;
+	sa_family_t		 af = AF_UNSPEC;
 
 	if (m == NULL || ((m->m_len < sizeof(int32_t)) &&
 	    (m = m_pullup(m, sizeof(int32_t))) == NULL))
@@ -844,6 +825,9 @@ route_output(struct mbuf *m, struct socket *so)
 		info.rti_flags |= RTF_LLINFO;
 	}
 
+	if (info.rti_info[RTAX_DST] != NULL)
+		af = info.rti_info[RTAX_DST]->sa_family;
+
 	/*
 	 * Validate RTM_PROPOSAL and pass it along or error out.
 	 */
@@ -910,8 +894,7 @@ route_output(struct mbuf *m, struct socket *so)
 		m_adj(m, len - m->m_pkthdr.len);
 	free(rtm, M_RTABLE, len);
 	if (m)
-		route_input(m, so, info.rti_info[RTAX_DST] ?
-		    info.rti_info[RTAX_DST]->sa_family : AF_UNSPEC);
+		route_input(m, so, af);
 	solock(so);
 
 	return (error);
@@ -1345,7 +1328,7 @@ route_cleargateway(struct rtentry *rt, void *arg, unsigned int rtableid)
 
 	if (ISSET(rt->rt_flags, RTF_GATEWAY) && rt->rt_gwroute == nhrt &&
 	    !ISSET(rt->rt_locks, RTV_MTU))
-		rt->rt_mtu = 0;
+		atomic_store_int(&rt->rt_mtu, 0);
 
 	return (0);
 }
@@ -1393,7 +1376,7 @@ rtm_setmetrics(u_long which, const struct rt_metrics *in,
 	int64_t expire;
 
 	if (which & RTV_MTU)
-		out->rmx_mtu = in->rmx_mtu;
+		atomic_store_int(&out->rmx_mtu, in->rmx_mtu);
 	if (which & RTV_EXPIRE) {
 		expire = in->rmx_expire;
 		if (expire != 0) {
@@ -1421,7 +1404,7 @@ rtm_getmetrics(const struct rtentry *rt, struct rt_metrics *out)
 
 	bzero(out, sizeof(*out));
 	out->rmx_locks = in->rmx_locks;
-	out->rmx_mtu = in->rmx_mtu;
+	out->rmx_mtu = atomic_load_int(&in->rmx_mtu);
 	out->rmx_expire = expire;
 	out->rmx_pksent = in->rmx_pksent;
 }
@@ -1958,7 +1941,7 @@ rtm_proposal(struct ifnet *ifp, struct rt_addrinfo *rtinfo, int flags,
  * This is used in dumping the kernel table via sysctl().
  */
 int
-sysctl_dumpentry(struct rtentry *rt, void *v, unsigned int id)
+sysctl_dumpentry(const struct rtentry *rt, void *v, unsigned int id)
 {
 	struct walkarg		*w = v;
 	int			 error = 0, size;
@@ -1966,6 +1949,9 @@ sysctl_dumpentry(struct rtentry *rt, void *v, unsigned int id)
 	struct ifnet		*ifp;
 #ifdef BFD
 	struct sockaddr_bfd	 sa_bfd;
+#endif
+#ifdef MPLS
+	struct sockaddr_mpls	 sa_mpls;
 #endif
 	struct sockaddr_rtlabel	 sa_rl;
 	struct sockaddr_in6	 sa_mask;
@@ -2009,8 +1995,6 @@ sysctl_dumpentry(struct rtentry *rt, void *v, unsigned int id)
 #endif
 #ifdef MPLS
 	if (rt->rt_flags & RTF_MPLS) {
-		struct sockaddr_mpls	 sa_mpls;
-
 		bzero(&sa_mpls, sizeof(sa_mpls));
 		sa_mpls.smpls_family = AF_MPLS;
 		sa_mpls.smpls_len = sizeof(sa_mpls);
@@ -2045,6 +2029,27 @@ sysctl_dumpentry(struct rtentry *rt, void *v, unsigned int id)
 	}
 	return (error);
 }
+
+#ifndef SMALL_KERNEL
+int
+sysctl_rtable_rtstat(void *oldp, size_t *oldlenp, void *newp)
+{
+	extern struct cpumem *rtcounters;
+	uint64_t counters[rts_ncounters];
+	struct rtstat rtstat;
+	uint32_t *words = (uint32_t *)&rtstat;
+	int i;
+
+	CTASSERT(sizeof(rtstat) == (nitems(counters) * sizeof(uint32_t)));
+	memset(&rtstat, 0, sizeof rtstat);
+	counters_read(rtcounters, counters, nitems(counters), NULL);
+
+	for (i = 0; i < nitems(counters); i++)
+		words[i] = (uint32_t)counters[i];
+
+	return (sysctl_rdstruct(oldp, oldlenp, newp, &rtstat, sizeof(rtstat)));
+}
+#endif /* SMALL_KERNEL */
 
 int
 sysctl_iflist(int af, struct walkarg *w)
@@ -2108,14 +2113,23 @@ sysctl_iflist(int af, struct walkarg *w)
 int
 sysctl_ifnames(struct walkarg *w)
 {
+	TAILQ_HEAD(, ifnet) if_tmplist = TAILQ_HEAD_INITIALIZER(if_tmplist);
 	struct if_nameindex_msg ifn;
 	struct ifnet *ifp;
 	int error = 0;
 
+	rw_enter_write(&if_tmplist_lock);
+	NET_LOCK_SHARED();
 	/* XXX ignore tableid for now */
 	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
 		if (w->w_arg && w->w_arg != ifp->if_index)
 			continue;
+		if_ref(ifp);
+		TAILQ_INSERT_TAIL(&if_tmplist, ifp, if_tmplist);
+	}
+	NET_UNLOCK_SHARED();
+
+	TAILQ_FOREACH(ifp, &if_tmplist, if_tmplist) {
 		w->w_needed += sizeof(ifn);
 		if (w->w_where && w->w_needed <= w->w_given) {
 
@@ -2125,22 +2139,34 @@ sysctl_ifnames(struct walkarg *w)
 			    sizeof(ifn.if_name));
 			error = copyout(&ifn, w->w_where, sizeof(ifn));
 			if (error)
-				return (error);
+				break;
 			w->w_where += sizeof(ifn);
 		}
 	}
 
-	return (0);
+	while ((ifp = TAILQ_FIRST(&if_tmplist))) {
+		TAILQ_REMOVE(&if_tmplist, ifp, if_tmplist);
+		if_put(ifp);
+	}
+	rw_exit_write(&if_tmplist_lock);
+
+	return (error);
 }
 
 int
 sysctl_source(int af, u_int tableid, struct walkarg *w)
 {
+	union {
+		struct sockaddr_in in;
+#ifdef INET6
+		struct sockaddr_in6 in6;
+#endif
+	}		 buf;
 	struct sockaddr	*sa;
 	int		 size, error = 0;
 
-	sa = rtable_getsource(tableid, af);
-	if (sa) {
+	NET_LOCK_SHARED();
+	if ((sa = rtable_getsource(tableid, af)) != NULL) {
 		switch (sa->sa_family) {
 		case AF_INET:
 			size = sizeof(struct sockaddr_in);
@@ -2151,11 +2177,19 @@ sysctl_source(int af, u_int tableid, struct walkarg *w)
 			break;
 #endif
 		default:
-			return (0);
+			sa = NULL;
+			break;
 		}
+
+	}
+	if (sa != NULL)
+		memcpy(&buf, sa, size);
+	NET_UNLOCK_SHARED();
+
+	if (sa != NULL) {
 		w->w_needed += size;
 		if (w->w_where && w->w_needed <= w->w_given) {
-			if ((error = copyout(sa, w->w_where, size)))
+			if ((error = copyout(&buf, w->w_where, size)))
 				return (error);
 			w->w_where += size;
 		}
@@ -2170,7 +2204,6 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 	int			 i, error = EINVAL;
 	u_char			 af;
 	struct walkarg		 w;
-	struct rt_tableinfo	 tableinfo;
 	u_int			 tableid = 0;
 
 	if (new)
@@ -2199,8 +2232,7 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 			if (af != 0 && af != i)
 				continue;
 
-			error = rtable_walk(tableid, i, NULL, sysctl_dumpentry,
-			    &w);
+			error = rtable_read(tableid, i, sysctl_dumpentry, &w);
 			if (error == EAFNOSUPPORT)
 				error = 0;
 			if (error)
@@ -2208,35 +2240,27 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 		}
 		NET_UNLOCK_SHARED();
 		break;
-
-	case NET_RT_IFLIST:
-		NET_LOCK_SHARED();
-		error = sysctl_iflist(af, &w);
-		NET_UNLOCK_SHARED();
-		break;
-
+#ifndef SMALL_KERNEL
 	case NET_RT_STATS:
 		return (sysctl_rtable_rtstat(where, given, new));
 	case NET_RT_TABLE:
 		tableid = w.w_arg;
-		if (!rtable_exists(tableid))
+		if (rtable_exists(tableid)) {
+			struct rt_tableinfo	 tableinfo;
+
+			memset(&tableinfo, 0, sizeof tableinfo);
+			tableinfo.rti_tableid = tableid;
+			tableinfo.rti_domainid = rtable_l2(tableid);
+			error = sysctl_rdstruct(where, given, new,
+			    &tableinfo, sizeof(tableinfo));
+			return (error);
+		} else
 			return (ENOENT);
-		memset(&tableinfo, 0, sizeof tableinfo);
-		tableinfo.rti_tableid = tableid;
-		tableinfo.rti_domainid = rtable_l2(tableid);
-		error = sysctl_rdstruct(where, given, new,
-		    &tableinfo, sizeof(tableinfo));
-		return (error);
-	case NET_RT_IFNAMES:
-		NET_LOCK_SHARED();
-		error = sysctl_ifnames(&w);
-		NET_UNLOCK_SHARED();
-		break;
+#endif /* SMALL_KERNEL */
 	case NET_RT_SOURCE:
 		tableid = w.w_arg;
 		if (!rtable_exists(tableid))
 			return (ENOENT);
-		NET_LOCK_SHARED();
 		for (i = 1; i <= AF_MAX; i++) {
 			if (af != 0 && af != i)
 				continue;
@@ -2247,7 +2271,15 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 			if (error)
 				break;
 		}
+		break;
+	case NET_RT_IFLIST:
+		NET_LOCK_SHARED();
+		error = sysctl_iflist(af, &w);
 		NET_UNLOCK_SHARED();
+		break;
+
+	case NET_RT_IFNAMES:
+		error = sysctl_ifnames(&w);
 		break;
 	}
 	free(w.w_tmem, M_RTABLE, w.w_tmemsize);
@@ -2262,25 +2294,6 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 		    PAGE_SIZE);
 	}
 	return (error);
-}
-
-int
-sysctl_rtable_rtstat(void *oldp, size_t *oldlenp, void *newp)
-{
-	extern struct cpumem *rtcounters;
-	uint64_t counters[rts_ncounters];
-	struct rtstat rtstat;
-	uint32_t *words = (uint32_t *)&rtstat;
-	int i;
-
-	CTASSERT(sizeof(rtstat) == (nitems(counters) * sizeof(uint32_t)));
-	memset(&rtstat, 0, sizeof rtstat);
-	counters_read(rtcounters, counters, nitems(counters), NULL);
-
-	for (i = 0; i < nitems(counters); i++)
-		words[i] = (uint32_t)counters[i];
-
-	return (sysctl_rdstruct(oldp, oldlenp, newp, &rtstat, sizeof(rtstat)));
 }
 
 int

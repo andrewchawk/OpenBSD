@@ -1,6 +1,4 @@
-#	$OpenBSD: Makefile,v 1.9 2015/11/26 19:01:47 deraadt Exp $
-
-.PATH:  ${.CURDIR}/../../usr.bin/passwd
+#	$OpenBSD: Makefile,v 1.10 2026/04/19 19:54:02 millert Exp $
 
 PROG=	login_chpass
 SRCS=	login_chpass.c
@@ -9,7 +7,7 @@ CFLAGS+=-Wall
 
 BINOWN=	root
 BINGRP=	auth
-BINMODE=4555
+BINMODE=555
 BINDIR=	/usr/libexec/auth
 
 .include <bsd.prog.mk>

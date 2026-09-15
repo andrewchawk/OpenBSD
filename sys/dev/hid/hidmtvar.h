@@ -1,4 +1,4 @@
-/* $OpenBSD: hidmtvar.h,v 1.8 2019/11/08 01:20:22 yasuoka Exp $ */
+/* $OpenBSD: hidmtvar.h,v 1.10 2025/10/28 15:36:46 jcs Exp $ */
 /*
  * Copyright (c) 2016 joshua stein <jcs@openbsd.org>
  *
@@ -16,7 +16,7 @@
  */
 
 struct hidmt_data {
-	int32_t			usage;
+	uint32_t		usage;
 	struct hid_location	loc;
 	SIMPLEQ_ENTRY(hidmt_data) entry;
 };
@@ -77,3 +77,4 @@ int	hidmt_enable(struct hidmt *);
 void	hidmt_input(struct hidmt *, uint8_t *, u_int);
 int	hidmt_ioctl(struct hidmt *, u_long, caddr_t, int, struct proc *);
 int	hidmt_setup(struct device *, struct hidmt *, void *, int);
+int	hidmt_find_winptp_reports(const void *, int, int *, int *, int *);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.10 2022/07/24 00:28:09 cheloha Exp $	*/
+/*	$OpenBSD: intr.c,v 1.13 2025/05/10 09:54:17 visa Exp $	*/
 
 /*
  * Copyright (c) 1997 Per Fogelstrom, Opsycon AB and RTMX Inc, USA.
@@ -55,11 +55,11 @@ ppc_smask_init()
         for (i = IPL_NONE; i <= IPL_HIGH; i++)  {
                 ppc_smask[i] = 0;
                 if (i < IPL_SOFTCLOCK)
-                        ppc_smask[i] |= SI_TO_IRQBIT(SI_SOFTCLOCK);
+                        ppc_smask[i] |= SI_TO_IRQBIT(SOFTINTR_CLOCK);
                 if (i < IPL_SOFTNET)
-                        ppc_smask[i] |= SI_TO_IRQBIT(SI_SOFTNET);
+                        ppc_smask[i] |= SI_TO_IRQBIT(SOFTINTR_NET);
                 if (i < IPL_SOFTTTY)
-                        ppc_smask[i] |= SI_TO_IRQBIT(SI_SOFTTTY);
+                        ppc_smask[i] |= SI_TO_IRQBIT(SOFTINTR_TTY);
         }
 }
 
@@ -168,7 +168,7 @@ splassert_check(int wantipl, const char *func)
 	if (ci->ci_cpl < wantipl)
 		splassert_fail(wantipl, ci->ci_cpl, func);
 
-	if (wantipl == IPL_NONE && ci->ci_intrdepth != -1)
-		splassert_fail(-1, ci->ci_intrdepth, func);
+	if (wantipl == IPL_NONE && ci->ci_idepth != 0)
+		splassert_fail(-1, ci->ci_idepth, func);
 }
 #endif

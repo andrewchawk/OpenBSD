@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-parse.y,v 1.51 2024/08/04 09:42:23 nicm Exp $ */
+/* $OpenBSD: cmd-parse.y,v 1.60 2026/09/08 10:20:08 nicm Exp $ */
 
 /*
  * Copyright (c) 2019 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -32,10 +32,12 @@
 
 static int			 yylex(void);
 static int			 yyparse(void);
-static int printflike(1,2)	 yyerror(const char *, ...);
+static void printflike(1,2)	 yyerror(const char *, ...);
 
 static char			*yylex_token(int);
 static char			*yylex_format(void);
+
+#define CMD_PARSE_MAX_ENVIRON_LEN 16384
 
 struct cmd_parse_scope {
 	int				 flag;
@@ -208,7 +210,7 @@ expanded	: format
 				cmd_find_from_client(&fs, c, 0);
 				fsp = &fs;
 			}
-			ft = format_create(NULL, pi->item, FORMAT_NONE, flags);
+			ft = format_create(c, pi->item, FORMAT_NONE, flags);
 			format_defaults(ft, c, fsp->s, fsp->wl, fsp->wp);
 
 			$$ = format_expand(ft, $1);
@@ -223,9 +225,20 @@ assignment	: EQUALS
 		{
 			struct cmd_parse_state	*ps = &parse_state;
 			int			 flags = ps->input->flags;
+			int			 flag = 1;
+			struct cmd_parse_scope	*scope;
 
-			if ((~flags & CMD_PARSE_PARSEONLY) &&
-			    (ps->scope == NULL || ps->scope->flag))
+			if (ps->scope != NULL) {
+				flag = ps->scope->flag;
+				TAILQ_FOREACH(scope, &ps->stack, entry)
+					flag = flag && scope->flag;
+			}
+
+			if (strlen($1) > CMD_PARSE_MAX_ENVIRON_LEN) {
+				yyerror("environment variable is too long");
+				YYABORT;
+			}
+			if ((~flags & CMD_PARSE_PARSEONLY) && flag)
 				environ_put(global_environ, $1, 0);
 			free($1);
 		}
@@ -234,9 +247,20 @@ hidden_assignment : HIDDEN EQUALS
 		{
 			struct cmd_parse_state	*ps = &parse_state;
 			int			 flags = ps->input->flags;
+			int			 flag = 1;
+			struct cmd_parse_scope	*scope;
 
-			if ((~flags & CMD_PARSE_PARSEONLY) &&
-			    (ps->scope == NULL || ps->scope->flag))
+			if (ps->scope != NULL) {
+				flag = ps->scope->flag;
+				TAILQ_FOREACH(scope, &ps->stack, entry)
+					flag = flag && scope->flag;
+			}
+
+			if (strlen($2) > CMD_PARSE_MAX_ENVIRON_LEN) {
+				yyerror("environment variable is too long");
+				YYABORT;
+			}
+			if ((~flags & CMD_PARSE_PARSEONLY) && flag)
 				environ_put(global_environ, $2, ENVIRON_HIDDEN);
 			free($2);
 		}
@@ -744,7 +768,7 @@ static int
 cmd_parse_expand_alias(struct cmd_parse_command *cmd,
     struct cmd_parse_input *pi, struct cmd_parse_result *pr)
 {
-	struct cmd_parse_argument	*arg, *arg1, *first;
+	struct cmd_parse_argument	*first;
 	struct cmd_parse_commands	*cmds;
 	struct cmd_parse_command	*last;
 	char				*alias, *name, *cause;
@@ -778,21 +802,20 @@ cmd_parse_expand_alias(struct cmd_parse_command *cmd,
 	if (last == NULL) {
 		pr->status = CMD_PARSE_SUCCESS;
 		pr->cmdlist = cmd_list_new();
+		cmd_parse_free_commands(cmds);
 		return (1);
 	}
 
 	TAILQ_REMOVE(&cmd->arguments, first, entry);
 	cmd_parse_free_argument(first);
 
-	TAILQ_FOREACH_SAFE(arg, &cmd->arguments, entry, arg1) {
-		TAILQ_REMOVE(&cmd->arguments, arg, entry);
-		TAILQ_INSERT_TAIL(&last->arguments, arg, entry);
-	}
+	TAILQ_CONCAT(&last->arguments, &cmd->arguments, entry);
 	cmd_parse_log_commands(cmds, __func__);
 
 	pi->flags |= CMD_PARSE_NOALIAS;
 	cmd_parse_build_commands(cmds, pi, pr);
 	pi->flags &= ~CMD_PARSE_NOALIAS;
+	cmd_parse_free_commands(cmds);
 	return (1);
 }
 
@@ -835,7 +858,7 @@ cmd_parse_build_command(struct cmd_parse_command *cmd,
 		count++;
 	}
 
-	add = cmd_parse(values, count, pi->file, pi->line, &cause);
+	add = cmd_parse(values, count, pi->file, pi->line, pi->flags, &cause);
 	if (add == NULL) {
 		pr->status = CMD_PARSE_ERROR;
 		pr->error = cmd_parse_get_error(pi->file, pi->line, cause);
@@ -1113,7 +1136,7 @@ cmd_parse_from_arguments(struct args_value *values, u_int count,
 	return (&pr);
 }
 
-static int printflike(1, 2)
+static void printflike(1, 2)
 yyerror(const char *fmt, ...)
 {
 	struct cmd_parse_state	*ps = &parse_state;
@@ -1122,7 +1145,7 @@ yyerror(const char *fmt, ...)
 	char			*error;
 
 	if (ps->error != NULL)
-		return (0);
+		return;
 
 	va_start(ap, fmt);
 	xvasprintf(&error, fmt, ap);
@@ -1130,7 +1153,6 @@ yyerror(const char *fmt, ...)
 
 	ps->error = cmd_parse_get_error(pi->file, pi->line, error);
 	free(error);
-	return (0);
 }
 
 static int
@@ -1594,7 +1616,9 @@ yylex_token_tilde(char **buf, size_t *len)
 
 	if (*name == '\0') {
 		envent = environ_find(global_environ, "HOME");
-		if (envent != NULL && *envent->value != '\0')
+		if (envent != NULL &&
+		    envent->value != NULL &&
+		    *envent->value != '\0')
 			home = envent->value;
 		else if ((pw = getpwuid(getuid())) != NULL)
 			home = pw->pw_dir;
@@ -1613,6 +1637,7 @@ yylex_token_tilde(char **buf, size_t *len)
 static char *
 yylex_token(int ch)
 {
+	struct cmd_parse_state	*ps = &parse_state;
 	char			*buf;
 	size_t			 len;
 	enum { START,
@@ -1636,9 +1661,12 @@ yylex_token(int ch)
 				ch = '\r';
 			}
 		}
-		if (state == NONE && ch == '\n') {
-			log_debug("%s: end at EOL", __func__);
-			break;
+		if (ch == '\n') {
+			if (state == NONE) {
+				log_debug("%s: end at EOL", __func__);
+				break;
+			}
+			ps->input->line++;
 		}
 
 		/* Whitespace or ; or } ends a token unless inside quotes. */

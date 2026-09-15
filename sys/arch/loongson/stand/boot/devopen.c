@@ -1,4 +1,4 @@
-/*	$OpenBSD: devopen.c,v 1.1 2010/02/14 22:39:33 miod Exp $	*/
+/*	$OpenBSD: devopen.c,v 1.3 2025/10/31 07:24:18 miod Exp $	*/
 
 /*-
  * Copyright (c) 2003 The NetBSD Foundation, Inc.
@@ -30,6 +30,8 @@
  */
 
 #include "libsa.h"
+
+#include <sys/disklabel.h>
 
 #define MAXDEVNAME      16
 
@@ -76,7 +78,7 @@ devparse(const char *fname, int *dev, int *unit, int *part, const char **file)
 
 		/* partition number */
 		if (i < devlen)
-			p = fname[i++] - 'a';
+			p = DL_PARTNAME2NUM(fname[i++]);
 
 		if (i != devlen)
 			return (ENXIO);

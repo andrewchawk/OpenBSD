@@ -1,4 +1,3 @@
-/*	$OpenBSD: util.c,v 1.14 2023/11/11 07:34:54 anton Exp $ */
 
 /*
  * Copyright (c) 2015 Martin Pieuchot
@@ -46,9 +45,13 @@
 
 #define _KERNEL
 #include <sys/refcnt.h>
+
+#include <stdint.h>
+#include <sys/rwlock.h>
 #undef _KERNEL
 
 #include "srp_compat.h"
+#include "smr_compat.h"
 
 #include <sys/socket.h>
 #include <sys/domain.h>
@@ -72,7 +75,7 @@
 
 #include "util.h"
 
-struct sockaddr *rt_plen2mask(struct rtentry *, struct sockaddr_in6 *);
+struct sockaddr *rt_plen2mask(const struct rtentry *, struct sockaddr_in6 *);
 
 struct domain inetdomain = {
   .dom_family		= AF_INET,
@@ -130,12 +133,12 @@ route_insert(unsigned int rid, sa_family_t af, char *string)
 
 	if ((error = rtable_insert(rid, ndst, mask, NULL, 0, rt)) != 0) {
 		inet_net_satop(af, ndst, plen, ip, sizeof(ip));
-		errx(1, "can't add route: %s, %s\n", ip, strerror(error));
+		errx(1, "can't add route: %s, %s", ip, strerror(error));
 	}
 	nrt = rtable_lookup(rid, dst, mask, NULL, RTP_ANY);
 	if (nrt != rt) {
 		inet_net_satop(af, rt_key(rt), plen, ip, sizeof(ip));
-		errx(1, "added route not found: %s\n", ip);
+		errx(1, "added route not found: %s", ip);
 	}
 	rtfree(rt);
 	rtfree(nrt);
@@ -161,7 +164,7 @@ route_delete(unsigned int rid, sa_family_t af, char *string)
 	rt = rtable_lookup(0, dst, mask, NULL, RTP_ANY);
 	if (rt == NULL) {
 		inet_net_satop(af, dst, plen, ip, sizeof(ip));
-		errx(1, "can't find route: %s\n", ip);
+		errx(1, "can't find route: %s", ip);
 	}
 
 	assert(memcmp(rt_key(rt), dst, dst->sa_len) == 0);
@@ -169,7 +172,7 @@ route_delete(unsigned int rid, sa_family_t af, char *string)
 
 	if ((error = rtable_delete(0, dst, mask, rt)) != 0) {
 		inet_net_satop(af, dst, plen, ip, sizeof(ip));
-		errx(1, "can't rm route: %s, %s\n", ip, strerror(error));
+		errx(1, "can't rm route: %s, %s", ip, strerror(error));
 	}
 
 	nrt = rtable_lookup(0, dst, mask, NULL, RTP_ANY);
@@ -207,7 +210,7 @@ route_lookup(unsigned int rid, sa_family_t af, char *string)
 	rt = rtable_lookup(0, dst, mask, NULL, RTP_ANY);
 	if (rt == NULL) {
 		inet_net_satop(af, dst, plen, ip, sizeof(ip));
-		errx(1, "%s not found\n", ip);
+		errx(1, "%s not found", ip);
 	}
 	assert(memcmp(rt_key(rt), dst, dst->sa_len) == 0);
 	assert(rt_plen(rt) == rtable_satoplen(af, mask));
@@ -225,7 +228,7 @@ do_from_file(unsigned int rid, sa_family_t af, char *filename,
 	int			 lines = 0;
 
 	if ((fp = fopen(filename, "r")) == NULL)
-		errx(1, "No such file: %s\n", filename);
+		errx(1, "No such file: %s", filename);
 
 	while ((buf = fgetln(fp, &len)) != NULL) {
 		if (buf[len - 1] == '\n')
@@ -259,14 +262,16 @@ rtentry_delete(struct rtentry *rt, void *w, unsigned int rid)
 	struct sockaddr_in6	 sa_mask;
 	struct sockaddr		*mask = rt_plen2mask(rt, &sa_mask);
 	int			 error;
+	unsigned int		 refs;
 
 	assert(rt_plen(rt) == rtable_satoplen(af, mask));
-
+	refs = refcnt_read(&rt->rt_refcnt);
+	assert(refs > 0);
 	if ((error = rtable_delete(0, rt_key(rt), mask, rt)) != 0) {
 		inet_net_satop(af, rt_key(rt), rt_plen(rt), dest, sizeof(dest));
-		errx(1, "can't rm route: %s, %s\n", dest, strerror(error));
+		errx(1, "can't rm route: %s, %s", dest, strerror(error));
 	}
-	assert(refcnt_read(&rt->rt_refcnt) == 0);
+	assert(refcnt_read(&rt->rt_refcnt) == refs - 1);
 
 	return (0);
 }
@@ -332,7 +337,7 @@ refcnt_rele(struct refcnt *r)
 }
 
 unsigned int
-refcnt_read(struct refcnt *r)
+refcnt_read(const struct refcnt *r)
 {
 	return (r->r_refs);
 }
@@ -396,7 +401,7 @@ rt_plentosa(sa_family_t af, int plen, struct sockaddr_in6 *sa_mask)
 }
 
 struct sockaddr *
-rt_plen2mask(struct rtentry *rt, struct sockaddr_in6 *sa_mask)
+rt_plen2mask(const struct rtentry *rt, struct sockaddr_in6 *sa_mask)
 {
 	return (rt_plentosa(rt_key(rt)->sa_family, rt_plen(rt), sa_mask));
 }
@@ -573,4 +578,28 @@ rt_hash(struct rtentry *rt, const struct sockaddr *dst, uint32_t *src)
 void
 rt_timer_init(void)
 {
+}
+
+/*
+ * SMR stuff
+ */
+
+unsigned int smr_crit;
+
+void
+smr_read_enter(void)
+{
+	smr_crit++;
+}
+
+void
+smr_read_leave(void)
+{
+	smr_crit--;
+}
+
+void
+SMR_ASSERT_CRITICAL(void)
+{
+	assert(smr_crit > 0);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: dwpcie.c,v 1.56 2024/07/09 08:47:10 kettenis Exp $	*/
+/*	$OpenBSD: dwpcie.c,v 1.64 2026/08/14 19:51:54 kettenis Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -63,6 +63,10 @@
 #define PCIE_MSI_INTR_ENABLE(x)	(0x828 + (x) * 12)
 #define PCIE_MSI_INTR_MASK(x)	(0x82c + (x) * 12)
 #define PCIE_MSI_INTR_STATUS(x)	(0x830 + (x) * 12)
+
+#define PCIE_GEN3_EQ_CTRL		0x8a8
+#define PCIE_GEN3_EQ_CTRL_PSET_REQ_VEC_MASK	(0xffff << 8)
+#define PCIE_GEN3_EQ_CTRL_PSET_REQ_VEC_SHIFT	8
 
 #define MISC_CONTROL_1		0x8bc
 #define  MISC_CONTROL_1_DBI_RO_WR_EN	(1 << 0)
@@ -272,6 +276,7 @@ struct dwpcie_softc {
 
 	struct machine_pci_chipset sc_pc;
 	int			sc_bus;
+	int			sc_link_down;
 
 	int			sc_num_viewport;
 	int			sc_atu_unroll;
@@ -317,11 +322,14 @@ dwpcie_match(struct device *parent, void *match, void *aux)
 	    OF_is_compatible(faa->fa_node, "fsl,imx8mm-pcie") ||
 	    OF_is_compatible(faa->fa_node, "fsl,imx8mq-pcie") ||
 	    OF_is_compatible(faa->fa_node, "marvell,armada8k-pcie") ||
+	    OF_is_compatible(faa->fa_node, "qcom,pcie-sc7280") ||
 	    OF_is_compatible(faa->fa_node, "qcom,pcie-sc8280xp") ||
 	    OF_is_compatible(faa->fa_node, "qcom,pcie-x1e80100") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3568-pcie") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3588-pcie") ||
-	    OF_is_compatible(faa->fa_node, "sifive,fu740-pcie"));
+	    OF_is_compatible(faa->fa_node, "sifive,fu740-pcie") ||
+	    OF_is_compatible(faa->fa_node, "spacemit,k1-pcie") ||
+	    OF_is_compatible(faa->fa_node, "spacemit,k3-pcie"));
 }
 
 void	dwpcie_attach_deferred(struct device *);
@@ -344,6 +352,9 @@ int	dwpcie_imx8mq_intr(void *);
 
 int	dwpcie_fu740_init(struct dwpcie_softc *);
 
+int	dwpcie_k1_init(struct dwpcie_softc *);
+int	dwpcie_k3_init(struct dwpcie_softc *);
+
 int	dwpcie_rk3568_init(struct dwpcie_softc *);
 int	dwpcie_rk3568_intr(void *);
 void	*dwpcie_rk3568_intr_establish(void *, int *, int,
@@ -351,7 +362,7 @@ void	*dwpcie_rk3568_intr_establish(void *, int *, int,
 void	dwpcie_rk3568_intr_disestablish(void *);
 void	dwpcie_rk3568_intr_barrier(void *);
 
-int	dwpcie_sc8280xp_init(struct dwpcie_softc *);
+int	dwpcie_sc7280_init(struct dwpcie_softc *);
 
 void	dwpcie_attach_hook(struct device *, struct device *,
 	    struct pcibus_attach_args *);
@@ -435,6 +446,18 @@ dwpcie_attach(struct device *parent, struct device *self, void *aux)
 		glue = OF_getindex(faa->fa_node, "apb", "reg-names");
 		if (glue < 0 || glue >= faa->fa_nreg) {
 			printf(": no glue registers\n");
+			return;
+		}
+
+		sc->sc_glue_base = faa->fa_reg[glue].addr;
+		sc->sc_glue_size = faa->fa_reg[glue].size;
+	}
+
+	if (OF_is_compatible(faa->fa_node, "spacemit,k1-pcie") ||
+	    OF_is_compatible(faa->fa_node, "spacemit,k3-pcie")) {
+		glue = OF_getindex(faa->fa_node, "link", "reg-names");
+		if (glue < 0 || glue >= faa->fa_nreg) {
+			printf(": no link registers\n");
 			return;
 		}
 
@@ -538,14 +561,19 @@ dwpcie_attach_deferred(struct device *self)
 	if (OF_is_compatible(sc->sc_node, "fsl,imx8mm-pcie") ||
 	    OF_is_compatible(sc->sc_node, "fsl,imx8mq-pcie"))
 		error = dwpcie_imx8mq_init(sc);
-	if (OF_is_compatible(sc->sc_node, "qcom,pcie-sc8280xp") ||
+	if (OF_is_compatible(sc->sc_node, "qcom,pcie-sc7280") ||
+	    OF_is_compatible(sc->sc_node, "qcom,pcie-sc8280xp") ||
 	    OF_is_compatible(sc->sc_node, "qcom,pcie-x1e80100"))
-		error = dwpcie_sc8280xp_init(sc);
+		error = dwpcie_sc7280_init(sc);
 	if (OF_is_compatible(sc->sc_node, "rockchip,rk3568-pcie") ||
 	    OF_is_compatible(sc->sc_node, "rockchip,rk3588-pcie"))
 		error = dwpcie_rk3568_init(sc);
 	if (OF_is_compatible(sc->sc_node, "sifive,fu740-pcie"))
 		error = dwpcie_fu740_init(sc);
+	if (OF_is_compatible(sc->sc_node, "spacemit,k1-pcie"))
+		error = dwpcie_k1_init(sc);
+	if (OF_is_compatible(sc->sc_node, "spacemit,k3-pcie"))
+		error = dwpcie_k3_init(sc);
 	if (error != 0) {
 		bus_space_unmap(sc->sc_iot, sc->sc_conf_ioh, sc->sc_conf_size);
 		bus_space_unmap(sc->sc_iot, sc->sc_ioh, sc->sc_ctrl_size);
@@ -658,6 +686,7 @@ dwpcie_attach_deferred(struct device *self)
 	/* Initialize memory mapped I/O window. */
 	membase = sc->sc_mem_bus_addr;
 	memlimit = membase + sc->sc_mem_size - 1;
+	membase = roundup(membase, PPB_MEM_MIN);
 	blr = memlimit & PPB_MEM_MASK;
 	blr |= (membase >> PPB_MEM_SHIFT);
 	HWRITE4(sc, PPB_REG_MEM, blr);
@@ -666,6 +695,7 @@ dwpcie_attach_deferred(struct device *self)
 	if (sc->sc_io_size > 0) {
 		iobase = sc->sc_io_bus_addr;
 		iolimit = iobase + sc->sc_io_size - 1;
+		iobase = roundup(iobase, PPB_IO_MIN);
 		blr = iolimit & PPB_IO_MASK;
 		blr |= (iobase >> PPB_IO_SHIFT);
 		HWRITE4(sc, PPB_REG_IOSTATUS, blr);
@@ -681,6 +711,7 @@ dwpcie_attach_deferred(struct device *self)
 	if (sc->sc_pmem_size > 0) {
 		pmembase = sc->sc_pmem_bus_addr;
 		pmemlimit = pmembase + sc->sc_pmem_size - 1;
+		pmembase = roundup(pmembase, PPB_MEM_MIN);
 		blr = pmemlimit & PPB_MEM_MASK;
 		blr |= ((pmembase & PPB_MEM_MASK) >> PPB_MEM_SHIFT);
 		HWRITE4(sc, PPB_REG_PREFMEM, blr);
@@ -734,22 +765,47 @@ dwpcie_attach_deferred(struct device *self)
 
 	if (OF_is_compatible(sc->sc_node, "baikal,bm1000-pcie") ||
 	    OF_is_compatible(sc->sc_node, "marvell,armada8k-pcie") ||
+	    OF_getproplen(sc->sc_node, "msi-parent") > 0 ||
 	    OF_getproplen(sc->sc_node, "msi-map") > 0 ||
 	    sc->sc_msi_addr)
 		pba.pba_flags |= PCI_FLAGS_MSI_ENABLED;
 
 	/*
-	 * Only support mutiple MSI vectors if we have enough MSI
+	 * Only support multiple MSI vectors if we have enough MSI
 	 * interrupts (or are using an external interrupt controller
-	 * that hopefully suppors plenty of MSI interripts).
+	 * that hopefully supports plenty of MSI interrupts).
 	 */
-	if (OF_getproplen(sc->sc_node, "msi-map") > 0 ||
+	if (OF_getproplen(sc->sc_node, "msi-parent") > 0 ||
+	    OF_getproplen(sc->sc_node, "msi-map") > 0 ||
 	    sc->sc_num_msi > 32)
 		pba.pba_flags |= PCI_FLAGS_MSIVEC_ENABLED;
 
 	pci_dopm = 1;
 
 	config_found(self, &pba, NULL);
+}
+
+int
+dwpcie_get_capability(struct dwpcie_softc *sc, int capid, int *offset,
+    pcireg_t *value)
+{
+	pcireg_t reg;
+	unsigned int ofs;
+
+	ofs = PCI_CAPLIST_PTR(HREAD4(sc, PCI_CAPLISTPTR_REG));
+	while (ofs != 0) {
+		reg = HREAD4(sc, ofs);
+		if (PCI_CAPLIST_CAP(reg) == capid) {
+			if (offset)
+				*offset = ofs;
+			if (value)
+				*value = reg;
+			return 1;
+		}
+		ofs = PCI_CAPLIST_NEXT(reg);
+	}
+
+	return 0;
 }
 
 void
@@ -984,8 +1040,10 @@ dwpcie_armada8k_init(struct dwpcie_softc *sc)
 			break;
 		delay(1000);
 	}
-	if (timo == 0)
-		return ETIMEDOUT;
+	if (timo == 0) {
+		sc->sc_link_down = 1;
+		return 0;
+	}
 
 	sc->sc_ih = fdt_intr_establish(sc->sc_node, IPL_AUDIO | IPL_MPSAFE,
 	    dwpcie_armada8k_intr, sc, sc->sc_dev.dv_xname);
@@ -1074,8 +1132,10 @@ dwpcie_g12a_init(struct dwpcie_softc *sc)
 			break;
 		delay(1000);
 	}
-	if (timo == 0)
-		return ETIMEDOUT;
+	if (timo == 0) {
+		sc->sc_link_down = 1;
+		return 0;
+	}
 
 	error = dwpcie_msi_init(sc);
 	if (error)
@@ -1269,7 +1329,8 @@ dwpcie_imx8mq_init(struct dwpcie_softc *sc)
 		delay(10);
 	}
 	if (timo == 0) {
-		error = ETIMEDOUT;
+		sc->sc_link_down = 1;
+		error = 0;
 		goto err;
 	}
 
@@ -1289,7 +1350,8 @@ dwpcie_imx8mq_init(struct dwpcie_softc *sc)
 			delay(10);
 		}
 		if (timo == 0) {
-			error = ETIMEDOUT;
+			sc->sc_link_down = 1;
+			error = 0;
 			goto err;
 		}
 	}
@@ -1335,6 +1397,242 @@ dwpcie_fu740_init(struct dwpcie_softc *sc)
 	return 0;
 }
 
+/* SpacemiT K1 registers */
+#define APMU_PCIE_CLK_RES_CTRL		0x0000
+#define  APMU_PCIE_DEVICE_TYPE_SEL	(1U << 31)
+#define  APMU_PCIE_APP_HOLD_PHY_RST	(1U << 30)
+#define  APMU_PCIE_RC_PERST		(1U << 12)
+#define  APMU_PCIE_SYS_AUX_PWR_DET	(1U << 9)
+#define  APMU_PCIE_LTSSM_EN		(1U << 6)
+#define APMU_PCIE_CTRL_LOGIC		0x0004
+#define  APMU_PCIE_IGNORE_PERSTN	(1U << 31)
+#define  APMU_PCIE_PERSTN_OUT		(1U << 25)
+#define  APMU_PCIE_PERSTN_OE		(1U << 24)
+#define  APMU_PCIE_SOFT_RESET		(1U << 0)
+
+#define K1_PHY_AHB_IRQ			0x0000
+#define  K1_PHY_AHB_IRQ_EN		(1U << 0)
+#define K1_PHY_AHB_IRQENABLE_MSI	0x0014
+#define  K1_PHY_AHB_IRQENABLE_MSI_EN	(1U << 11)
+
+int
+dwpcie_k1_init(struct dwpcie_softc *sc)
+{
+	struct regmap *apmu_rm;
+	uint32_t apmu[2], val;
+	int error, off, timo;
+
+	sc->sc_num_viewport = 8;
+
+	if (bus_space_map(sc->sc_iot, sc->sc_glue_base,
+	    sc->sc_glue_size, 0, &sc->sc_glue_ioh))
+		return ENOMEM;
+
+	if (OF_getpropintarray(sc->sc_node, "spacemit,apmu",
+	    apmu, sizeof(apmu)) != sizeof(apmu))
+		return EINVAL;
+
+	apmu_rm = regmap_byphandle(apmu[0]);
+	if (apmu_rm == NULL)
+		return ENXIO;
+
+	/* Hold PHY in reset until starting the link. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	val |= APMU_PCIE_APP_HOLD_PHY_RST;
+	val &= ~APMU_PCIE_LTSSM_EN;
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL, val);
+
+	/* Soft reset. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val | APMU_PCIE_SOFT_RESET);
+	regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	delay(2000);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val &= ~APMU_PCIE_SOFT_RESET);
+
+	clock_enable_all(sc->sc_node);
+	reset_deassert_all(sc->sc_node);
+
+	/* Assert PERST#. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL,
+	    val | APMU_PCIE_RC_PERST);
+	regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	delay(100000);
+
+	/* Set RC mode; indicate Vaux presence. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL,
+	    val | APMU_PCIE_DEVICE_TYPE_SEL | APMU_PCIE_SYS_AUX_PWR_DET);
+
+	phy_enable_idx(OF_child(sc->sc_node), 0);
+
+	/* Deassert PERST#. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL,
+	    val & ~APMU_PCIE_RC_PERST);
+
+	/* Set vendor ID and product ID. (*/
+	HSET4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+	HWRITE4(sc, PCI_ID_REG,
+	    PCI_VENDOR_SPACEMIT << PCI_VENDOR_SHIFT |
+	    PCI_PRODUCT_SPACEMIT_K1 << PCI_PRODUCT_SHIFT);
+	HCLR4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+
+	/* Disable ASPM L1. */
+	if (!dwpcie_get_capability(sc, PCI_CAP_PCIEXPRESS, &off, NULL))
+		return ENXIO;
+	HSET4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+	val = HREAD4(sc, off + PCI_PCIE_LCAP);
+	val &= ~PCI_PCIE_LCAP_ASPM_L1;
+	HWRITE4(sc, off + PCI_PCIE_LCAP, val);
+	HCLR4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+
+	error = dwpcie_msi_init(sc);
+	if (error)
+		return error;
+
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	val &= ~APMU_PCIE_APP_HOLD_PHY_RST;
+	val |= APMU_PCIE_LTSSM_EN;
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL, val);
+
+	val = HREAD4(sc, PCIE_LINK_WIDTH_SPEED_CTRL);
+	val |= PCIE_LINK_WIDTH_SPEED_CTRL_CHANGE;
+	HWRITE4(sc, PCIE_LINK_WIDTH_SPEED_CTRL, val);
+
+	/* Enable MSIs */
+	bus_space_write_4(sc->sc_iot, sc->sc_glue_ioh,
+	    K1_PHY_AHB_IRQENABLE_MSI, K1_PHY_AHB_IRQENABLE_MSI_EN);
+	val = bus_space_read_4(sc->sc_iot, sc->sc_glue_ioh, K1_PHY_AHB_IRQ);
+	bus_space_write_4(sc->sc_iot, sc->sc_glue_ioh, K1_PHY_AHB_IRQ,
+	    val | K1_PHY_AHB_IRQ_EN);
+
+	/* Wait for the link to come up. */
+	for (timo = 20000; timo > 0; timo--) {
+		if (dwpcie_link_up(sc))
+			break;
+		delay(10);
+	}
+	if (timo == 0)
+		sc->sc_link_down = 1;
+
+	return 0;
+}
+
+int
+dwpcie_k3_init(struct dwpcie_softc *sc)
+{
+	struct regmap *apmu_rm;
+	uint32_t apmu[2], val;
+	int off, timo;
+
+	sc->sc_num_viewport = 8;
+
+	if (bus_space_map(sc->sc_iot, sc->sc_glue_base,
+	    sc->sc_glue_size, 0, &sc->sc_glue_ioh))
+		return ENOMEM;
+
+	if (OF_getpropintarray(sc->sc_node, "spacemit,apmu",
+	    apmu, sizeof(apmu)) != sizeof(apmu))
+		return EINVAL;
+
+	apmu_rm = regmap_byphandle(apmu[0]);
+	if (apmu_rm == NULL)
+		return ENXIO;
+
+	/* Hold PHY in reset until we're ready to enable it. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	val |= APMU_PCIE_APP_HOLD_PHY_RST;
+	val &= ~APMU_PCIE_LTSSM_EN;
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL, val);
+
+	/* Soft reset. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val | APMU_PCIE_SOFT_RESET);
+	regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	delay(2000);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val &= ~APMU_PCIE_SOFT_RESET);
+
+	clock_enable_all(sc->sc_node);
+	reset_deassert_all(sc->sc_node);
+
+	/* Take PHY out of reset. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	val &= ~APMU_PCIE_APP_HOLD_PHY_RST;
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL, val);
+
+	phy_enable_idx(OF_child(sc->sc_node), -1);
+
+	/* Assert PERST#. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val | APMU_PCIE_PERSTN_OE | APMU_PCIE_PERSTN_OUT |
+	    APMU_PCIE_IGNORE_PERSTN);
+	delay(2000);
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val & ~APMU_PCIE_PERSTN_OUT);
+
+	delay(100000);
+
+	/* Set RC mode; indicate Vaux presence. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	val &= ~APMU_PCIE_DEVICE_TYPE_SEL;
+	val |= APMU_PCIE_SYS_AUX_PWR_DET;
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL, val);
+
+	/* Deassert PERST#. */
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC);
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CTRL_LOGIC,
+	    val | APMU_PCIE_PERSTN_OE | APMU_PCIE_PERSTN_OUT);
+
+	/* Tweak equalization preset. */
+	val = HREAD4(sc, PCIE_GEN3_EQ_CTRL);
+	val &= ~PCIE_GEN3_EQ_CTRL_PSET_REQ_VEC_MASK;
+	val |= ((1U << 7) << PCIE_GEN3_EQ_CTRL_PSET_REQ_VEC_SHIFT);
+	HWRITE4(sc, PCIE_GEN3_EQ_CTRL, val);
+
+	/* Set vendor ID and product ID. */
+	HSET4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+	HWRITE4(sc, PCI_ID_REG,
+	    PCI_VENDOR_SPACEMIT << PCI_VENDOR_SHIFT |
+	    PCI_PRODUCT_SPACEMIT_K3 << PCI_PRODUCT_SHIFT);
+	HCLR4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+
+	/* Disable ASPM L1. */
+	if (!dwpcie_get_capability(sc, PCI_CAP_PCIEXPRESS, &off, NULL))
+		return ENXIO;
+	HSET4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+	val = HREAD4(sc, off + PCI_PCIE_LCAP);
+	val &= ~PCI_PCIE_LCAP_ASPM_L1;
+	HWRITE4(sc, off + PCI_PCIE_LCAP, val);
+	HCLR4(sc, MISC_CONTROL_1, MISC_CONTROL_1_DBI_RO_WR_EN);
+
+	val = regmap_read_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL);
+	val &= ~APMU_PCIE_APP_HOLD_PHY_RST;
+	val |= APMU_PCIE_LTSSM_EN;
+	regmap_write_4(apmu_rm, apmu[1] + APMU_PCIE_CLK_RES_CTRL, val);
+
+	val = HREAD4(sc, PCIE_LINK_WIDTH_SPEED_CTRL);
+	val |= PCIE_LINK_WIDTH_SPEED_CTRL_CHANGE;
+	HWRITE4(sc, PCIE_LINK_WIDTH_SPEED_CTRL, val);
+
+	/* Wait for the link to come up. */
+	for (timo = 20000; timo > 0; timo--) {
+		if (dwpcie_link_up(sc))
+			break;
+		delay(10);
+	}
+	if (timo == 0)
+		sc->sc_link_down = 1;
+
+	return 0;
+}
+
 int
 dwpcie_rk3568_link_up(struct dwpcie_softc *sc)
 {
@@ -1343,8 +1641,7 @@ dwpcie_rk3568_link_up(struct dwpcie_softc *sc)
 	reg = bus_space_read_4(sc->sc_iot, sc->sc_glue_ioh,
 	    PCIE_CLIENT_LTSSM_STATUS);
 	if ((reg & PCIE_CLIENT_SMLH_LINK_UP) &&
-	    (reg & PCIE_CLIENT_RDLH_LINK_UP) &&
-	    (reg & PCIE_CLIENT_LTSSM_MASK) == PCIE_CLIENT_LTSSM_UP)
+	    (reg & PCIE_CLIENT_RDLH_LINK_UP))
 		return 1;
 	return 0;
 }
@@ -1354,7 +1651,7 @@ dwpcie_rk3568_init(struct dwpcie_softc *sc)
 {
 	uint32_t *reset_gpio;
 	ssize_t reset_gpiolen;
-	int error, idx, node;
+	int idx, node;
 	int pin, timo;
 
 	sc->sc_num_viewport = 8;
@@ -1417,8 +1714,8 @@ dwpcie_rk3568_init(struct dwpcie_softc *sc)
 		delay(10000);
 	}
 	if (timo == 0) {
-		error = ETIMEDOUT;
-		goto err;
+		sc->sc_link_down = 1;
+		goto out;
 	}
 
 	node = OF_getnodebyname(sc->sc_node, "legacy-interrupt-controller");
@@ -1440,12 +1737,11 @@ dwpcie_rk3568_init(struct dwpcie_softc *sc)
 		fdt_intr_register(&sc->sc_ic);
 	}
 
-	error = 0;
-err:
+out:
 	if (reset_gpiolen > 0)
 		free(reset_gpio, M_TEMP, reset_gpiolen);
 	
-	return error;
+	return 0;
 }
 
 int
@@ -1552,7 +1848,7 @@ dwpcie_rk3568_intr_barrier(void *cookie)
 }
 
 int
-dwpcie_sc8280xp_init(struct dwpcie_softc *sc)
+dwpcie_sc7280_init(struct dwpcie_softc *sc)
 {
 	sc->sc_num_viewport = 8;
 
@@ -1723,6 +2019,9 @@ dwpcie_conf_read(void *v, pcitag_t tag, int reg)
 		return HREAD4(sc, PCITAG_OFFSET(tag) | reg);
 	}
 
+	if (sc->sc_link_down)
+		return 0xffffffff;
+
 	if (bus == sc->sc_bus + 1) {
 		dwpcie_atu_config(sc, IATU_VIEWPORT_INDEX1,
 		    IATU_REGION_CTRL_1_TYPE_CFG0,
@@ -1759,6 +2058,9 @@ dwpcie_conf_write(void *v, pcitag_t tag, int reg, pcireg_t data)
 		HWRITE4(sc, PCITAG_OFFSET(tag) | reg, data);
 		return;
 	}
+
+	if (sc->sc_link_down)
+		return;
 
 	if (bus == sc->sc_bus + 1) {
 		dwpcie_atu_config(sc, IATU_VIEWPORT_INDEX1,
@@ -1937,7 +2239,7 @@ dwpcie_intr_establish(void *v, pci_intr_handle_t ih, int level,
 {
 	struct dwpcie_softc *sc = v;
 	struct dwpcie_intr_handle *pih;
-	void *cookie = NULL;
+	void *cookie;
 
 	KASSERT(ih.ih_type != PCI_NONE);
 
@@ -1954,6 +2256,7 @@ dwpcie_intr_establish(void *v, pci_intr_handle_t ih, int level,
 				return NULL;
 			addr = sc->sc_msi_addr;
 			data = dm->dm_vec;
+			cookie = sc->sc_msi_ih[dm->dm_vec / 32];
 		} else {
 			/*
 			 * Assume hardware passes Requester ID as

@@ -1,4 +1,4 @@
-.\"	$OpenBSD: ifconfig.8,v 1.400 2024/06/09 16:25:27 jan Exp $
+.\"	$OpenBSD: ifconfig.8,v 1.414 2026/05/28 10:52:39 kirill Exp $
 .\"	$NetBSD: ifconfig.8,v 1.11 1996/01/04 21:27:29 pk Exp $
 .\"     $FreeBSD: ifconfig.8,v 1.16 1998/02/01 07:03:29 steve Exp $
 .\"
@@ -31,7 +31,7 @@
 .\"
 .\"     @(#)ifconfig.8	8.4 (Berkeley) 6/1/94
 .\"
-.Dd $Mdocdate: June 9 2024 $
+.Dd $Mdocdate: May 28 2026 $
 .Dt IFCONFIG 8
 .Os
 .Sh NAME
@@ -227,35 +227,33 @@ existing (egress, carp, etc.) or user-defined groups.
 .Pp
 Some interfaces belong to specific groups by default:
 .Pp
-.Bl -dash -width Ds -compact
-.It
-All interfaces are members of the
-.Dq all
-interface group.
-.It
-Cloned interfaces are members of their interface family group.
-For example, a PPP interface such as
-.Dq ppp0
-is a member of the
-.Dq ppp
-interface family group.
-.It
+.Bl -tag -width netboot -compact
+.It Cm all
+All interfaces.
+.It Cm egress
+Any interfaces in the default
+.Xr rdomain 4
+to which default routes point to.
+.It Cm netboot
+Any interfaces used for network booting, e.g. via
+.Xr pxeboot 8 .
+.It Cm pppx
+All
 .Xr pppx 4
-interfaces are members of the
-.Dq pppx
-interface group.
-.It
-The interfaces the default routes point to are members of the
-.Dq egress
-interface group.
-.It
-IEEE 802.11 wireless interfaces are members of the
-.Dq wlan
-interface group.
-.It
-Any interfaces used for network booting are members of the
-.Dq netboot
-interface group.
+interfaces.
+.It Cm wlan
+All IEEE 802.11 wireless interfaces, e.g.\&
+.Xr athn 4
+or
+.Xr iwx 4 .
+.It Ar driver
+Every cloned interface is in the respective driver group, e.g.\&
+.Dq tun0
+in
+.Cm tun .
+Use
+.Fl C
+to list all possible driver groups.
 .El
 .It Cm -group Ar group-name
 Remove the interface from the given group.
@@ -492,6 +490,13 @@ and
 .Xr pf.conf 5 .
 .It Cm -rtlabel
 Clear the route label.
+.It Cm sff
+Query and display Small Form Factor pluggable module information.
+This is an alias for
+.Cm transceiver .
+.It Cm sffdump
+Query and display Small Form Factor pluggable module information,
+and dump the raw bytes from the pages requested from module.
 .It Cm staticarp
 If ARP is enabled, the host will only reply to requests for its addresses,
 and will never send any requests.
@@ -499,9 +504,8 @@ and will never send any requests.
 If ARP is enabled, the host will perform normally,
 sending out requests and listening for replies.
 .It Cm transceiver
-Query and display information and diagnostics from GBIC and SFP
-.\", or QSFP
-modules installed in an interface.
+Query and display information and diagnostics from GBIC, SFP, or QSFP
+Small Form Factor modules installed in an interface.
 It is only supported by drivers implementing the necessary functionality
 on hardware which supports it.
 .It Cm tcplro
@@ -1107,6 +1111,14 @@ flag will disable MIMO reception and transmission even if the driver
 and wireless network device support MIMO.
 This flag can be used to work around packet loss in 11n mode if the
 wireless network device has unused antenna connectors.
+.It uapsd
+The
+.Ql uapsd
+flag will enable Unscheduled Automatic Power Save Delivery
+(u-APSD) support.
+This can reduce power consumption while the interface is idle or
+carrying little traffic, but may increase latency for sparse traffic.
+This flag is disabled by default.
 .It stayauth
 The
 .Ql stayauth
@@ -1207,9 +1219,10 @@ enable WEP encryption using that
 .Ar key .
 .It Cm powersave
 Enable 802.11 power saving mode.
-Power saving is disabled by default.
-See driver specific manual pages
-to see details of the implementation relevant to that device.
+This option is generally only relevant to older devices where power
+saving is disabled by default.
+On modern hardware, drivers will ask the firmware to automatically
+enable any applicable power-saving features.
 .\" XXX
 .\" Undocumented because optional sleep period
 .\" only configurable on legacy an(4) and atw(4) devices.
@@ -1256,7 +1269,8 @@ Set the comma-separated list of allowed authentication and key management
 protocols.
 .Pp
 The supported values are
-.Dq psk
+.Dq psk ,
+.Dq sha256-psk ,
 and
 .Dq 802.1x .
 .Ar psk
@@ -1266,8 +1280,13 @@ authentication (also known as enterprise mode) is used with
 an external IEEE 802.1X authentication server,
 such as wpa_supplicant.
 The default value is
-.Dq psk .
+.Dq psk ,
+or
+.Dq psk,sha256-psk
+if the driver for the interface supports protected management frames (PMF).
 .Dq psk
+and
+.Dq sha256-psk
 can only be used if a pre-shared key is configured using the
 .Cm wpakey
 option.
@@ -1560,7 +1579,7 @@ If configured, disconnect the interface pair.
 .Nm ifconfig
 .Ar pflow-interface
 .Op Oo Fl Oc Ns Cm flowdst Ar addr : Ns Ar port
-.Op Oo Fl Oc Ns Cm flowsrc Ar addr Ns Oo : Ns Ar port Oc
+.Op Oo Fl Oc Ns Cm flowsrc Ar addr Ns Op Pf : Ar port
 .Op Cm pflowproto Ar n
 .Ek
 .nr nS 0
@@ -1581,7 +1600,7 @@ is the port number of the flow collector.
 Pflow data will be sent to this address/port.
 .It Cm -flowdst
 Unset the receiver address and stop sending pflow data.
-.It Cm flowsrc Ar addr Ns Oo : Ns Ar port Oc
+.It Cm flowsrc Ar addr Ns Op Pf : Ar port
 Set the source IP address for pflow packets.
 .Ar addr
 is the IP address used as sender of the UDP packets and may be used to
@@ -1841,6 +1860,7 @@ for a complete list of the available protocols.
 .Bk -words
 .Nm ifconfig
 .Ar tunnel-interface
+.Op Oo Fl Oc Ns Cm endpoint Ar dest_address dest_mac
 .Op Oo Fl Oc Ns Cm keepalive Ar period count
 .Op Oo Fl Oc Ns Cm parent Ar parent-interface
 .Op Cm rxprio Ar prio
@@ -1867,6 +1887,20 @@ and
 are all tunnel interfaces.
 The following options are available:
 .Bl -tag -width Ds
+.It Cm endpoint Ar dest_address dest_mac
+When
+.Xr vxlan 4
+is in endpoint mode, set the tunnel endpoint
+.Ar dest_address
+where
+.Ar dest_mac
+MAC address can be reached.
+.It Cm -endpoint Ar dest_mac
+When
+.Xr vxlan 4
+is in endpoint mode, remove the tunnel endpoint for
+.Ar dest_mac
+MAC address.
 .It Cm keepalive Ar period count
 Enable
 .Xr gre 4
@@ -2058,11 +2092,12 @@ device will try to establish a data connection with the service provider.
 .Op Cm add Ar child-iface
 .Op Cm addspan Ar child-iface
 .Op Cm del Ar child-iface
-.Op Cm deladdr Ar address
+.Op Cm deladdr Ar address Ns Op Pf @ Ar vid
 .Op Cm delspan Ar child-iface
 .Op Oo Fl Oc Ns Cm discover Ar child-iface
 .Op Cm flushrule Ar interface
 .Op Oo Fl Oc Ns Cm learn Ar child-iface
+.Op Oo Fl Oc Ns Cm locked Ar child-iface
 .Op Oo Fl Oc Ns Cm link0
 .Op Oo Fl Oc Ns Cm link1
 .Op Cm maxaddr Ar size
@@ -2070,8 +2105,22 @@ device will try to establish a data connection with the service provider.
 .Op Cm rule Ar filtering-rule
 .Op Cm rulefile Ar filename
 .Op Cm rules Ar interface
-.Op Cm static Ar interface Ar address
+.Op Cm static Ar child-iface Ar address Ns Op Pf @ Ar vid
 .Op Cm timeout Ar time
+.Op Cm tagged Ar child-iface Ar vids
+.Op Cm -tagged Ar child-iface
+.Op Cm untagged Ar child-iface Ar vid
+.Op Cm -untagged Ar child-iface
+.Op Cm pvlan Ar vid
+.Op Cm -pvlan Ar vid
+.Op Cm pvlan-isolated Ar vid Ar ivid
+.Op Cm -pvlan-isolated Ar vid Ar ivid
+.Op Cm pvlan-community Ar vid Ar cvid
+.Op Cm -pvlan-community Ar vid Ar cvid
+.Op Cm rxprio Ar prio
+.Op Cm txprio Ar prio
+.Op Cm vnetid Ar vid
+.Op Cm -vnetid
 .Op Cm up
 .Ek
 .nr nS 0
@@ -2091,10 +2140,15 @@ as a span port on the bridge.
 .It Cm del Ar child-iface
 Remove the member
 .Ar child-iface .
-.It Cm deladdr Ar address
+.It Cm deladdr Ar address Ns Op Pf @ Ar vid
 Delete
 .Ar address
+on VLAN
+.Ar vid
 from the cache.
+if
+.Ar vid
+is not specified it uses the default VLAN identifier on the bridge.
 .It Cm delspan Ar child-iface
 Delete
 .Ar child-iface
@@ -2136,6 +2190,24 @@ Mark
 .Ar child-iface
 so that the source address of packets received from interface
 are not entered into the address cache.
+.It Cm locked Ar child-iface
+Mark
+.Ar child-iface
+so that the source address of packets received from
+the interface must have an entry in the address cache that refers
+to this interface.
+This option is mutually exclusive with the
+.Cm learn
+and
+.Cm discover
+options on the same interface.
+.It Cm -locked Ar child-iface
+Mark
+.Ar child-iface
+so that the source address of packets received from the interface
+does not need an existing entry in the address cache that refers to
+this interface.
+This is the default for interfaces added to the bridge.
 .It Cm link0
 Disable the filtering of 802.1Q VLAN and QinQ SVLAN packets.
 .It Cm -link0
@@ -2229,11 +2301,19 @@ Load a set of rules from the file
 .It Cm rules Ar interface
 Display the active filtering rules in use on
 .Ar interface .
-.It Cm static Ar interface Ar address
-Add a static entry into the address cache pointing to
-.Ar interface .
-Static entries are never aged out of the cache or replaced, even if the address
-is seen on a different interface.
+.It Cm static Ar child-iface Ar address Ns Op Pf @ Ar vid
+Add a static entry for
+.Ar address
+on VLAN
+.Ar vid
+into the address cache pointing to
+.Ar child-iface .
+If
+.Ar vid
+is not specified it defaults to the VLAN used by untagged packets on
+.Ar child-iface .
+Static entries are never aged out of the cache or replaced, even
+if the address is seen on a different interface.
 .It Cm timeout Ar time
 Set the timeout, in seconds, for addresses in the cache to
 .Ar time .
@@ -2241,6 +2321,117 @@ The default is 240 seconds.
 If
 .Ar time
 is set to zero, then entries will not be expired.
+.It Cm tagged Ar child-iface Ar vids
+Modify the set of VLAN identifiers that can be sent and received
+as VLAN tagged traffic on
+.Ar child-iface
+with the specified
+.Ar vids .
+Multiple VLAN identifiers can specified as comma separated values.
+Each VLAN identifier may be specified as a range with a minimum and
+maximum value separated by a hyphen.
+If
+.Ar vids
+is prefixed with +, -, or =, the identifiers are added to, removed
+from, or replaced with the set respectively.
+Without a prefix the VLAN identifiers are added to the set.
+.\" XXX tagged all|none
+By default the set of tagged VLAN is empty.
+.It Cm -tagged Ar child-iface
+Clear all the VLAN identifiers from the set that can be sent or
+received as VLAN tagged traffic on
+.Ar child-iface .
+This effectively disables VLAN tagged packet handling by the bridge
+on the specified port.
+.It Cm untagged Ar child-iface Ar vid
+Set untagged traffic on
+.Ar child-iface
+to operate in the VLAN specified by
+.Ar vid .
+The
+.Ar vid
+can be specified as
+.Cm passthrough
+to configure the bridge to decline untagged packets on this port
+and return them to the network stack for local processing.
+By default ports are configured with the default VLAN identifier
+configured on the bridge.
+.It Cm -untagged Ar child-iface
+Block untagged traffic on
+.Ar child-iface .
+.It Cm pvlan Ar vid
+Configure a Private VLAN (PVLAN) with
+.Ar vid
+as a primary VLAN identifier.
+.It Cm -pvlan Ar vid
+Remove the Private VLAN identified by the primary VLAN identifier
+.Ar vid .
+.It Cm pvlan-isolated Ar vid Ar ivid
+Configure
+.Ar ivid
+as an isolated VLAN within the Private VLAN identified by the
+primary VLAN identifier
+.Ar vid .
+A PVLAN only supports a single isolated VLAN.
+An isolated VLAN can only be configured if the identifier is not
+in use.
+.It Cm -pvlan-isolated Ar vid Ar ivid
+Remove the isolated VLAN
+.Ar ivid
+from the Private VLAN identified by the
+primary VLAN identifier
+.Ar vid .
+An isolated VLAN can only be removed from the PVLAN if it not in
+use.
+.It Cm pvlan-community Ar vid Ar cvid
+Configure
+.Ar cvid
+as a community VLAN within the Private VLAN identified by the
+primary VLAN identifier
+.Ar vid .
+A community VLAN can only be configured if the identifier is not
+in use.
+.It Cm -pvlan-community Ar vid Ar cvid
+Remove the community VLAN
+.Ar cvid
+from the Private VLAN identified by the
+primary VLAN identifier
+.Ar vid .
+A community VLAN can only be removed from the PVLAN if it not in
+use.
+.It Cm pvptags Ar child-iface
+Configure the
+.Ar child-iface
+port so PVLANs will only use primary VLANs when sending tagged packets.
+.It Cm -pvptags Ar child-iface
+Configure the
+.Ar child-iface
+port so PVLANs will use primary and secondary VLANs when sending
+tagged packets.
+This is the default.
+.It Cm rxprio Ar prio
+Configure the handling of the VLAN priority field in received packets.
+This is compatible with the configuration of
+.Cm rxprio
+on
+.Xr vlan 4
+interfaces.
+.It Cm txprio Ar prio
+Configure the handling of the VLAN priority field in transmitted packets.
+This is compatible with the configuration of
+.Cm txprio
+on
+.Xr vlan 4
+interfaces.
+.It Cm vnetid Ar vid
+Set the default VLAN identifier for untagged packets for ports added
+to the bridge.
+The default is VLAN 1.
+.It Cm -vnetid
+Remove the default VLAN identifier for untagged packets for ports added
+to the bridge.
+Ports added to the bridge will not be able to send or receive packets
+until they are explicitly configured.
 .It Cm up
 Start forwarding packets.
 .El

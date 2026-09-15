@@ -1,6 +1,6 @@
-.\"	$OpenBSD: acpihid.4,v 1.2 2020/06/02 16:47:11 jmc Exp $
+.\"	$OpenBSD: acpihid.4,v 1.4 2026/01/10 16:20:42 kettenis Exp $
 .\"
-.\" Copyright (c) 2020 joshua stein <jcs@openbsd.org>
+.\" Copyright (c) 2025 Mark Kettenis <kettenis@openbsd.org>
 .\"
 .\" Permission to use, copy, modify, and distribute this software for any
 .\" purpose with or without fee is hereby granted, provided that the above
@@ -14,29 +14,29 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 2 2020 $
+.Dd $Mdocdate: January 10 2026 $
 .Dt ACPIHID 4
 .Os
 .Sh NAME
 .Nm acpihid
-.Nd ACPI HID event and 5-button array
+.Nd ACPI generic buttons device
 .Sh SYNOPSIS
 .Cd "acpihid* at acpi?"
 .Sh DESCRIPTION
 The
 .Nm
-driver supports ACPI HID events and 5-button array devices found on some
-tablet devices.
+driver handles events triggered by the ACPI generic buttons device.
+Currently only power button events are supported.
 .Sh SEE ALSO
 .Xr acpi 4
 .Sh HISTORY
 The
 .Nm
 driver first appeared in
-.Ox 6.8 .
+.Ox 7.9 .
 .Sh AUTHORS
 .An -nosplit
 The
 .Nm
 driver was written by
-.An joshua stein Aq Mt jcs@jcs.org .
+.An Mark Kettenis Aq Mt kettenis@openbsd.org .

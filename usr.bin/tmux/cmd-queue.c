@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-queue.c,v 1.117 2024/05/14 07:52:19 nicm Exp $ */
+/* $OpenBSD: cmd-queue.c,v 1.123 2026/08/24 20:34:26 nicm Exp $ */
 
 /*
  * Copyright (c) 2013 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -146,6 +146,13 @@ const char *
 cmdq_get_name(struct cmdq_item *item)
 {
 	return (item->name);
+}
+
+/* Get item command. */
+struct cmd *
+cmdq_get_cmd(struct cmdq_item *item)
+{
+	return (item->cmd);
 }
 
 /* Get item client. */
@@ -351,74 +358,53 @@ cmdq_insert_after(struct cmdq_item *after, struct cmdq_item *item)
 
 /* Insert a hook. */
 void
-cmdq_insert_hook(struct session *s, struct cmdq_item *item,
+cmdq_insert_hook(__unused struct session *s, struct cmdq_item *item,
     struct cmd_find_state *current, const char *fmt, ...)
 {
-	struct cmdq_state		*state = item->state;
 	struct cmd			*cmd = item->cmd;
 	struct args			*args = cmd_get_args(cmd);
 	struct args_entry		*ae;
 	struct args_value		*av;
-	struct options			*oo;
+	struct event_payload		*ep;
 	va_list				 ap;
 	char				*name, tmp[32], flag, *arguments;
 	u_int				 i;
 	const char			*value;
-	struct cmdq_item		*new_item;
-	struct cmdq_state		*new_state;
-	struct options_entry		*o;
-	struct options_array_item	*a;
-	struct cmd_list			*cmdlist;
 
 	if (item->state->flags & CMDQ_STATE_NOHOOKS)
 		return;
-	if (s == NULL)
-		oo = global_s_options;
-	else
-		oo = s->options;
 
 	va_start(ap, fmt);
 	xvasprintf(&name, fmt, ap);
 	va_end(ap);
 
-	o = options_get(oo, name);
-	if (o == NULL) {
-		free(name);
-		return;
-	}
-	log_debug("running hook %s (parent %p)", name, item);
-
-	/*
-	 * The hooks get a new state because they should not update the current
-	 * target or formats for any subsequent commands.
-	 */
-	new_state = cmdq_new_state(current, &state->event, CMDQ_STATE_NOHOOKS);
-	cmdq_add_format(new_state, "hook", "%s", name);
+	ep = event_payload_create();
+	if (current != NULL)
+		event_payload_set_target(ep, current);
+	event_payload_set_pointer(ep, "_cmdq_item", item, NULL, NULL);
 
 	arguments = args_print(args);
-	cmdq_add_format(new_state, "hook_arguments", "%s", arguments);
+	event_payload_set_string(ep, "arguments", "%s", arguments);
 	free(arguments);
 
 	for (i = 0; i < args_count(args); i++) {
-		xsnprintf(tmp, sizeof tmp, "hook_argument_%d", i);
-		cmdq_add_format(new_state, tmp, "%s", args_string(args, i));
+		xsnprintf(tmp, sizeof tmp, "argument_%u", i);
+		event_payload_set_string(ep, tmp, "%s", args_string(args, i));
 	}
 	flag = args_first(args, &ae);
 	while (flag != 0) {
 		value = args_get(args, flag);
-		if (value == NULL) {
-			xsnprintf(tmp, sizeof tmp, "hook_flag_%c", flag);
-			cmdq_add_format(new_state, tmp, "1");
-		} else {
-			xsnprintf(tmp, sizeof tmp, "hook_flag_%c", flag);
-			cmdq_add_format(new_state, tmp, "%s", value);
-		}
+		xsnprintf(tmp, sizeof tmp, "flag_%c", flag);
+		if (value == NULL)
+			event_payload_set_string(ep, tmp, "1");
+		else
+			event_payload_set_string(ep, tmp, "%s", value);
 
 		i = 0;
 		av = args_first_value(args, flag);
 		while (av != NULL) {
-			xsnprintf(tmp, sizeof tmp, "hook_flag_%c_%d", flag, i);
-			cmdq_add_format(new_state, tmp, "%s", av->string);
+			xsnprintf(tmp, sizeof tmp, "flag_%c_%u", flag, i);
+			event_payload_set_string(ep, tmp, "%s", av->string);
 			i++;
 			av = args_next_value(av);
 		}
@@ -426,20 +412,7 @@ cmdq_insert_hook(struct session *s, struct cmdq_item *item,
 		flag = args_next(&ae);
 	}
 
-	a = options_array_first(o);
-	while (a != NULL) {
-		cmdlist = options_array_item_value(a)->cmdlist;
-		if (cmdlist != NULL) {
-			new_item = cmdq_get_command(cmdlist, new_state);
-			if (item != NULL)
-				item = cmdq_insert_after(item, new_item);
-			else
-				item = cmdq_append(NULL, new_item);
-		}
-		a = options_array_next(a);
-	}
-
-	cmdq_free_state(new_state);
+	events_fire(name, ep);
 	free(name);
 }
 
@@ -830,14 +803,14 @@ cmdq_guard(struct cmdq_item *item, const char *guard, int flags)
 	u_int		 number = item->number;
 
 	if (c != NULL && (c->flags & CLIENT_CONTROL))
-		control_write(c, "%%%s %ld %u %d", guard, t, number, flags);
+		control_write_guard(c, guard, t, number, flags);
 }
 
 /* Show message from command. */
 void
-cmdq_print_data(struct cmdq_item *item, int parse, struct evbuffer *evb)
+cmdq_print_data(struct cmdq_item *item, struct evbuffer *evb)
 {
-	server_client_print(item->client, parse, evb);
+	server_client_print(item->client, 1, evb);
 }
 
 /* Show message from command. */
@@ -855,7 +828,7 @@ cmdq_print(struct cmdq_item *item, const char *fmt, ...)
 	evbuffer_add_vprintf(evb, fmt, ap);
 	va_end(ap);
 
-	cmdq_print_data(item, 0, evb);
+	cmdq_print_data(item, evb);
 	evbuffer_free(evb);
 }
 
@@ -878,7 +851,18 @@ cmdq_error(struct cmdq_item *item, const char *fmt, ...)
 
 	if (c == NULL) {
 		cmd_get_source(cmd, &file, &line);
-		cfg_add_cause("%s:%u: %s", file, line, msg);
+		if (!cfg_finished) {
+			if (file != NULL)
+				cfg_add_cause("%s:%u: %s", file, line, msg);
+			else
+				cfg_add_cause("%s", msg);
+		} else {
+			if (file != NULL) {
+				server_add_message("message: %s:%u: %s", file,
+				    line, msg);
+			} else
+				server_add_message("message: %s", msg);
+		}
 	} else if (c->session == NULL || (c->flags & CLIENT_CONTROL)) {
 		server_add_message("%s message: %s", c->name, msg);
 		if (~c->flags & CLIENT_UTF8) {
@@ -893,7 +877,7 @@ cmdq_error(struct cmdq_item *item, const char *fmt, ...)
 		c->retval = 1;
 	} else {
 		*msg = toupper((u_char) *msg);
-		status_message_set(c, -1, 1, 0, "%s", msg);
+		status_message_set(c, -1, 1, 0, 0, "%s", msg);
 	}
 
 	free(msg);

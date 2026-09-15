@@ -16,12 +16,10 @@ use Test::Tester::Delegate;
 
 require Exporter;
 
-use vars qw( @ISA @EXPORT );
+our $VERSION = '1.302210';
 
-our $VERSION = '1.302194';
-
-@EXPORT = qw( run_tests check_tests check_test cmp_results show_space );
-@ISA = qw( Exporter );
+our @EXPORT = qw( run_tests check_tests check_test cmp_results show_space );
+our @ISA = qw( Exporter );
 
 my $Test = Test::Builder->new;
 my $Capture = Test::Tester::Capture->new;
@@ -690,6 +688,6 @@ Schwern <schwern@pobox.com>.
 
 Under the same license as Perl itself
 
-See http://www.perl.com/perl/misc/Artistic.html
+See L<https://dev.perl.org/licenses/>
 
 =cut

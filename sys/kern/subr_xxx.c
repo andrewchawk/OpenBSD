@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_xxx.c,v 1.17 2019/05/17 03:53:08 visa Exp $	*/
+/*	$OpenBSD: subr_xxx.c,v 1.20 2026/04/22 01:51:37 jsg Exp $	*/
 /*	$NetBSD: subr_xxx.c,v 1.10 1996/02/04 02:16:51 christos Exp $	*/
 
 /*
@@ -63,28 +63,6 @@ enxio(void)
 }
 
 /*
- * Unsupported ioctl function.
- */
-int
-enoioctl(void)
-{
-
-	return (ENOTTY);
-}
-
-/*
- * Unsupported system function.
- * This is used for an otherwise-reasonable operation
- * that is not supported by the current system binary.
- */
-int
-enosys(void)
-{
-
-	return (ENOSYS);
-}
-
-/*
  * Return error for operation not supported
  * on a specific object or file type.
  */
@@ -109,12 +87,6 @@ struct bdevsw *
 bdevsw_lookup(dev_t dev)
 {
 	return (&bdevsw[major(dev)]);
-}
-
-struct cdevsw *
-cdevsw_lookup(dev_t dev)
-{
-	return (&cdevsw[major(dev)]);
 }
 
 /*

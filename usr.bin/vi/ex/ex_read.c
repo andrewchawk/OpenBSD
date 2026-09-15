@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_read.c,v 1.14 2017/04/18 01:45:35 deraadt Exp $	*/
+/*	$OpenBSD: ex_read.c,v 1.15 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -233,7 +233,6 @@ ex_read(SCR *sp, EXCMD *cmdp)
 		default:
 			ex_emsg(sp, cmdp->argv[0]->bp, EXM_FILECOUNT);
 			return (1);
-		
 		}
 		break;
 	default:

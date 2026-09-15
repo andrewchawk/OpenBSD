@@ -16,6 +16,24 @@ struct xpvav {
     SV**	xav_alloc;	/* pointer to beginning of C array of SVs */
 };
 
+/*
+=for apidoc_section $AV
+
+=for apidoc      Am|AV *|AvREFCNT_inc|AV *av
+=for apidoc_item   |AV *|AvREFCNT_inc_simple|AV *av
+=for apidoc_item   |AV *|AvREFCNT_inc_simple_NN|AV *av
+
+These all increment the reference count of the given SV, which must be an AV.
+They are useful when assigning the result into a typed pointer as they avoid
+the need to cast the result to the appropriate type.
+
+=cut
+*/
+
+#define AvREFCNT_inc(av)            ((AV *)SvREFCNT_inc((SV *)av))
+#define AvREFCNT_inc_simple(av)     ((AV *)SvREFCNT_inc_simple((SV *)av))
+#define AvREFCNT_inc_simple_NN(av)  ((AV *)SvREFCNT_inc_simple_NN((SV *)av))
+
 /* SV*	xav_arylen; */
 
 /* SVpav_REAL is set for all AVs whose xav_array contents are refcounted
@@ -52,9 +70,6 @@ struct xpvav {
 Null AV pointer.
 
 (deprecated - use C<(AV *)NULL> instead)
-
-=for apidoc Am|SSize_t|AvFILL|AV* av
-Same as C<L</av_top_index>> or C<L</av_tindex>>.
 
 =for apidoc Cm|SSize_t|AvFILLp|AV* av
 
@@ -93,6 +108,12 @@ If all you need is to look up an array element, then prefer C<av_fetch>.
 
 #define AvREALISH(av)	(SvFLAGS(av) & (SVpav_REAL|SVpav_REIFY))
                                           
+/*
+=for apidoc_defn ARm|SSize_t|AvFILL       |NN AV* av
+=for apidoc_defn ARm|SSize_t|av_tindex    |NN AV *av
+=for apidoc_defn ARm|SSize_t|av_top_index |NN AV *av
+=cut
+*/
 #define AvFILL(av)	((SvRMAGICAL((const SV *) (av))) \
                          ? mg_size(MUTABLE_SV(av)) : AvFILLp(av))
 #define av_top_index(av) AvFILL(av)
@@ -113,6 +134,7 @@ Note that there are both real and fake AVs; see the beginning of this file and
 'av.c'
 
 =for apidoc newAV
+=for apidoc_item newAV_mortal
 =for apidoc_item newAV_alloc_x
 =for apidoc_item newAV_alloc_xz
 
@@ -169,6 +191,11 @@ or implicitly when the first element is stored:
 
 Unused array elements are typically initialized by C<av_extend>.
 
+=item C<newAV_mortal> form
+
+This also creates the whole-array data structure, but also mortalises it.
+(That is to say, a reference to the AV is added to the C<temps> stack.)
+
 =item C<newAV_alloc_x> form
 
 This effectively does a C<newAV> followed by also allocating (uninitialized)
@@ -210,6 +237,7 @@ to fit one element without extending:
 */
 
 #define newAV()	MUTABLE_AV(newSV_type(SVt_PVAV))
+#define newAV_mortal()	MUTABLE_AV(newSV_type_mortal(SVt_PVAV))
 #define newAV_alloc_x(size)  av_new_alloc(size,0)
 #define newAV_alloc_xz(size) av_new_alloc(size,1)
 

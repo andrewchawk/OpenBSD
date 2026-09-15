@@ -1,4 +1,4 @@
-/* $OpenBSD: smmu.c,v 1.21 2022/09/11 10:28:56 patrick Exp $ */
+/* $OpenBSD: smmu.c,v 1.29 2026/01/06 11:57:33 patrick Exp $ */
 /*
  * Copyright (c) 2008-2009,2014-2016 Dale Rahn <drahn@dalerahn.com>
  * Copyright (c) 2021 Patrick Wildt <patrick@blueri.se>
@@ -72,8 +72,10 @@ void smmu_cb_write_4(struct smmu_softc *, int, bus_size_t, uint32_t);
 uint64_t smmu_cb_read_8(struct smmu_softc *, int, bus_size_t);
 void smmu_cb_write_8(struct smmu_softc *, int, bus_size_t, uint64_t);
 
-void smmu_tlb_sync_global(struct smmu_softc *);
-void smmu_tlb_sync_context(struct smmu_domain *);
+int smmu_v2_domain_create(struct smmu_domain *);
+void smmu_v2_tlbi_va(struct smmu_domain *, vaddr_t);
+void smmu_v2_tlb_sync_global(struct smmu_softc *);
+void smmu_v2_tlb_sync_context(struct smmu_domain *);
 
 struct smmu_domain *smmu_domain_lookup(struct smmu_softc *, uint32_t);
 struct smmu_domain *smmu_domain_create(struct smmu_softc *, uint32_t);
@@ -113,6 +115,22 @@ int smmu_dmamap_load_raw(bus_dma_tag_t , bus_dmamap_t,
      bus_dma_segment_t *, int, bus_size_t, int);
 void smmu_dmamap_unload(bus_dma_tag_t , bus_dmamap_t);
 
+uint32_t smmu_v3_read_4(struct smmu_softc *, bus_size_t);
+void smmu_v3_write_4(struct smmu_softc *, bus_size_t, uint32_t);
+uint64_t smmu_v3_read_8(struct smmu_softc *, bus_size_t);
+void smmu_v3_write_8(struct smmu_softc *, bus_size_t, uint64_t);
+int smmu_v3_write_ack(struct smmu_softc *, bus_size_t, bus_size_t,
+     uint32_t);
+
+int smmu_v3_domain_create(struct smmu_domain *);
+void smmu_v3_cfgi_all(struct smmu_softc *);
+void smmu_v3_cfgi_cd(struct smmu_domain *);
+void smmu_v3_cfgi_ste(struct smmu_domain *);
+void smmu_v3_tlbi_all(struct smmu_softc *, uint64_t);
+void smmu_v3_tlbi_asid(struct smmu_domain *);
+void smmu_v3_tlbi_va(struct smmu_domain *, vaddr_t);
+void smmu_v3_tlb_sync_context(struct smmu_domain *);
+
 struct cfdriver smmu_cd = {
 	NULL, "smmu", DV_DULL
 };
@@ -120,9 +138,6 @@ struct cfdriver smmu_cd = {
 int
 smmu_attach(struct smmu_softc *sc)
 {
-	uint32_t reg;
-	int i;
-
 	SIMPLEQ_INIT(&sc->sc_domains);
 
 	pool_init(&sc->sc_vp_pool, sizeof(struct smmuvp0), PAGE_SIZE, IPL_VM, 0,
@@ -131,6 +146,18 @@ smmu_attach(struct smmu_softc *sc)
 	pool_init(&sc->sc_vp3_pool, sizeof(struct smmuvp3), PAGE_SIZE, IPL_VM, 0,
 	    "smmu_vp3", NULL);
 	pool_setlowat(&sc->sc_vp3_pool, 20);
+
+	return 0;
+}
+
+int
+smmu_v2_attach(struct smmu_softc *sc)
+{
+	uint32_t reg;
+	int i;
+
+	if (smmu_attach(sc) != 0)
+		return ENXIO;
 
 	reg = smmu_gr0_read_4(sc, SMMU_IDR0);
 	if (reg & SMMU_IDR0_S1TS)
@@ -348,14 +375,17 @@ smmu_attach(struct smmu_softc *sc)
 	if (sc->sc_has_vmid16s)
 		reg |= SMMU_SCR0_VMID16EN;
 
-	smmu_tlb_sync_global(sc);
+	smmu_v2_tlb_sync_global(sc);
 	smmu_gr0_write_4(sc, SMMU_SCR0, reg);
 
+	sc->sc_domain_create = smmu_v2_domain_create;
+	sc->sc_tlbi_va = smmu_v2_tlbi_va;
+	sc->sc_tlb_sync_context = smmu_v2_tlb_sync_context;
 	return 0;
 }
 
 int
-smmu_global_irq(void *cookie)
+smmu_v2_global_irq(void *cookie)
 {
 	struct smmu_softc *sc = cookie;
 	uint32_t reg;
@@ -376,7 +406,7 @@ smmu_global_irq(void *cookie)
 }
 
 int
-smmu_context_irq(void *cookie)
+smmu_v2_context_irq(void *cookie)
 {
 	struct smmu_cb_irq *cbi = cookie;
 	struct smmu_softc *sc = cbi->cbi_sc;
@@ -398,7 +428,7 @@ smmu_context_irq(void *cookie)
 }
 
 void
-smmu_tlb_sync_global(struct smmu_softc *sc)
+smmu_v2_tlb_sync_global(struct smmu_softc *sc)
 {
 	int i;
 
@@ -414,7 +444,7 @@ smmu_tlb_sync_global(struct smmu_softc *sc)
 }
 
 void
-smmu_tlb_sync_context(struct smmu_domain *dom)
+smmu_v2_tlb_sync_context(struct smmu_domain *dom)
 {
 	struct smmu_softc *sc = dom->sd_sc;
 	int i;
@@ -535,8 +565,7 @@ smmu_device_map(void *cookie, uint32_t sid, bus_dma_tag_t dmat)
 	if (dom->sd_dmat == NULL) {
 		dom->sd_dmat = malloc(sizeof(*dom->sd_dmat),
 		    M_DEVBUF, M_WAITOK);
-		memcpy(dom->sd_dmat, sc->sc_dmat,
-		    sizeof(*dom->sd_dmat));
+		memcpy(dom->sd_dmat, dmat, sizeof(*dom->sd_dmat));
 		dom->sd_dmat->_cookie = dom;
 		dom->sd_dmat->_dmamap_create = smmu_dmamap_create;
 		dom->sd_dmat->_dmamap_destroy = smmu_dmamap_destroy;
@@ -545,7 +574,6 @@ smmu_device_map(void *cookie, uint32_t sid, bus_dma_tag_t dmat)
 		dom->sd_dmat->_dmamap_load_uio = smmu_dmamap_load_uio;
 		dom->sd_dmat->_dmamap_load_raw = smmu_dmamap_load_raw;
 		dom->sd_dmat->_dmamap_unload = smmu_dmamap_unload;
-		dom->sd_dmat->_flags |= BUS_DMA_COHERENT;
 	}
 
 	return dom->sd_dmat;
@@ -568,10 +596,6 @@ struct smmu_domain *
 smmu_domain_create(struct smmu_softc *sc, uint32_t sid)
 {
 	struct smmu_domain *dom;
-	uint32_t iovabits, reg;
-	paddr_t pa;
-	vaddr_t l0va;
-	int i, start, end;
 
 	dom = malloc(sizeof(*dom), M_DEVBUF, M_WAITOK | M_ZERO);
 	mtx_init(&dom->sd_iova_mtx, IPL_VM);
@@ -580,14 +604,38 @@ smmu_domain_create(struct smmu_softc *sc, uint32_t sid)
 	dom->sd_sid = sid;
 
 	/* Prefer stage 1 if possible! */
-	if (sc->sc_has_s1) {
+	if (sc->sc_has_s1)
+		dom->sd_stage = 1;
+	else
+		dom->sd_stage = 2;
+
+	if (sc->sc_domain_create(dom) != 0) {
+		free(dom, M_DEVBUF, sizeof(*dom));
+		return NULL;
+	}
+
+	/* Reserve first page (to catch NULL access) */
+	extent_alloc_region(dom->sd_iovamap, 0, PAGE_SIZE, EX_WAITOK);
+
+	SIMPLEQ_INSERT_TAIL(&sc->sc_domains, dom, sd_list);
+	return dom;
+}
+
+int
+smmu_v2_domain_create(struct smmu_domain *dom)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+	uint32_t iovabits, reg;
+	paddr_t pa;
+	vaddr_t l0va;
+	int i, start, end;
+
+	if (dom->sd_stage == 1) {
 		start = sc->sc_num_s2_context_banks;
 		end = sc->sc_num_context_banks;
-		dom->sd_stage = 1;
 	} else {
 		start = 0;
 		end = sc->sc_num_context_banks;
-		dom->sd_stage = 2;
 	}
 
 	for (i = start; i < end; i++) {
@@ -601,12 +649,11 @@ smmu_domain_create(struct smmu_softc *sc, uint32_t sid)
 	if (i >= end) {
 		printf("%s: out of context blocks, I/O device will fail\n",
 		    sc->sc_dev.dv_xname);
-		free(dom, M_DEVBUF, sizeof(*dom));
-		return NULL;
+		return ENXIO;
 	}
 
 	/* Stream indexing is easy */
-	dom->sd_smr_idx = sid;
+	dom->sd_smr_idx = dom->sd_sid;
 
 	/* Stream mapping is a bit more effort */
 	if (sc->sc_smr) {
@@ -614,18 +661,18 @@ smmu_domain_create(struct smmu_softc *sc, uint32_t sid)
 			/* Take over QCOM SMRs */
 			if (sc->sc_is_qcom && sc->sc_smr[i] != NULL &&
 			    sc->sc_smr[i]->ss_dom == NULL &&
-			    sc->sc_smr[i]->ss_id == sid &&
-			    sc->sc_smr[i]->ss_mask == 0) {
-				free(sc->sc_smr[i], M_DEVBUF,
-				    sizeof(struct smmu_smr));
-				sc->sc_smr[i] = NULL;
+			    !((sc->sc_smr[i]->ss_id ^ dom->sd_sid) &
+			    ~sc->sc_smr[i]->ss_mask)) {
+				sc->sc_smr[i]->ss_dom = dom;
+				dom->sd_smr_idx = i;
+				break;
 			}
 			if (sc->sc_smr[i] != NULL)
 				continue;
 			sc->sc_smr[i] = malloc(sizeof(struct smmu_smr),
 			    M_DEVBUF, M_WAITOK | M_ZERO);
 			sc->sc_smr[i]->ss_dom = dom;
-			sc->sc_smr[i]->ss_id = sid;
+			sc->sc_smr[i]->ss_id = dom->sd_sid;
 			sc->sc_smr[i]->ss_mask = 0;
 			dom->sd_smr_idx = i;
 			break;
@@ -635,10 +682,9 @@ smmu_domain_create(struct smmu_softc *sc, uint32_t sid)
 			free(sc->sc_cb[dom->sd_cb_idx], M_DEVBUF,
 			    sizeof(struct smmu_cb));
 			sc->sc_cb[dom->sd_cb_idx] = NULL;
-			free(dom, M_DEVBUF, sizeof(*dom));
 			printf("%s: out of streams, I/O device will fail\n",
 			    sc->sc_dev.dv_xname);
-			return NULL;
+			return ENXIO;
 		}
 	}
 
@@ -779,23 +825,20 @@ smmu_domain_create(struct smmu_softc *sc, uint32_t sid)
 
 	/* Map stream idx to S2CR idx */
 	if (sc->sc_smr) {
-		reg = sid;
+		reg = sc->sc_smr[dom->sd_smr_idx]->ss_id << SMMU_SMR_ID_SHIFT |
+		    sc->sc_smr[dom->sd_smr_idx]->ss_mask << SMMU_SMR_MASK_SHIFT;
 		if (!sc->sc_has_exids)
 			reg |= SMMU_SMR_VALID;
 		smmu_gr0_write_4(sc, SMMU_SMR(dom->sd_smr_idx), reg);
 	}
 
 	snprintf(dom->sd_exname, sizeof(dom->sd_exname), "%s:%x",
-	    sc->sc_dev.dv_xname, sid);
+	    sc->sc_dev.dv_xname, dom->sd_sid);
 	dom->sd_iovamap = extent_create(dom->sd_exname, 0,
 	    (1LL << iovabits) - 1, M_DEVBUF, NULL, 0, EX_WAITOK |
 	    EX_NOCOALESCE);
 
-	/* Reserve first page (to catch NULL access) */
-	extent_alloc_region(dom->sd_iovamap, 0, PAGE_SIZE, EX_WAITOK);
-
-	SIMPLEQ_INSERT_TAIL(&sc->sc_domains, dom, sd_list);
-	return dom;
+	return 0;
 }
 
 void
@@ -808,6 +851,15 @@ smmu_reserve_region(void *cookie, uint32_t sid, bus_addr_t addr,
 	dom = smmu_domain_lookup(sc, sid);
 	if (dom == NULL)
 		return;
+
+	/*
+	 * Some reserved regions, like PCI BARs, might not be inside our VA map.
+	 * If it lies outside completely: skip it; if partially: clamp it.
+	 */
+	if (addr > dom->sd_iovamap->ex_end)
+		return;
+	if (addr + size > dom->sd_iovamap->ex_end)
+		size = (dom->sd_iovamap->ex_end - addr) + 1;
 
 	extent_alloc_region(dom->sd_iovamap, addr, size,
 	    EX_WAITOK | EX_CONFLICTOK);
@@ -1210,6 +1262,14 @@ smmu_unmap(struct smmu_domain *dom, vaddr_t va)
 	/* Remove mapping from pagetable */
 	smmu_pte_remove(dom, va);
 
+	sc->sc_tlbi_va(dom, va);
+}
+
+void
+smmu_v2_tlbi_va(struct smmu_domain *dom, vaddr_t va)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+
 	/* Invalidate IOTLB */
 	if (dom->sd_stage == 1)
 		smmu_cb_write_8(sc, dom->sd_cb_idx, SMMU_CB_TLBIVAL,
@@ -1267,6 +1327,7 @@ smmu_load_map(struct smmu_domain *dom, bus_dmamap_t map)
 void
 smmu_unload_map(struct smmu_domain *dom, bus_dmamap_t map)
 {
+	struct smmu_softc *sc = dom->sd_sc;
 	struct smmu_map_state *sms = map->_dm_cookie;
 	u_long len, dva;
 
@@ -1285,7 +1346,7 @@ smmu_unload_map(struct smmu_domain *dom, bus_dmamap_t map)
 
 	sms->sms_loaded = 0;
 
-	smmu_tlb_sync_context(dom);
+	sc->sc_tlb_sync_context(dom);
 }
 
 int
@@ -1317,7 +1378,7 @@ smmu_dmamap_create(bus_dma_tag_t t, bus_size_t size, int nsegments,
 	/* Allocate IOVA, and a guard page at the end. */
 	mtx_enter(&dom->sd_iova_mtx);
 	error = extent_alloc_with_descr(dom->sd_iovamap, len + PAGE_SIZE,
-	    PAGE_SIZE, 0, 0, EX_NOWAIT, &sms->sms_er, &dva);
+	    64 * 1024, 0, 0, EX_NOWAIT, &sms->sms_er, &dva);
 	mtx_leave(&dom->sd_iova_mtx);
 	if (error) {
 		sc->sc_dmat->_dmamap_destroy(sc->sc_dmat, map);
@@ -1460,4 +1521,934 @@ smmu_dmamap_unload(bus_dma_tag_t t, bus_dmamap_t map)
 
 	smmu_unload_map(dom, map);
 	sc->sc_dmat->_dmamap_unload(sc->sc_dmat, map);
+}
+
+#define SMMU_DMA_MAP(_sdm)	((_sdm)->sdm_map)
+#define SMMU_DMA_LEN(_sdm)	((_sdm)->sdm_size)
+#define SMMU_DMA_DVA(_sdm)	((_sdm)->sdm_map->dm_segs[0].ds_addr)
+#define SMMU_DMA_KVA(_sdm)	((void *)(_sdm)->sdm_kva)
+
+struct smmu_dmamem *
+smmu_dmamem_alloc(bus_dma_tag_t dmat, bus_size_t size, bus_size_t align)
+{
+	struct smmu_dmamem *sdm;
+	int nsegs;
+
+	sdm = malloc(sizeof(*sdm), M_DEVBUF, M_WAITOK | M_ZERO);
+	sdm->sdm_size = size;
+
+	if (bus_dmamap_create(dmat, size, 1, size, 0,
+	    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &sdm->sdm_map) != 0)
+		goto sdmfree;
+
+	if (bus_dmamem_alloc(dmat, size, align, 0, &sdm->sdm_seg, 1,
+	    &nsegs, BUS_DMA_WAITOK) != 0)
+		goto destroy;
+
+	if (bus_dmamem_map(dmat, &sdm->sdm_seg, nsegs, size,
+	    &sdm->sdm_kva, BUS_DMA_WAITOK) != 0)
+		goto free;
+
+	if (bus_dmamap_load(dmat, sdm->sdm_map, sdm->sdm_kva, size,
+	    NULL, BUS_DMA_WAITOK) != 0)
+		goto unmap;
+
+	bzero(sdm->sdm_kva, size);
+	bus_dmamap_sync(dmat, sdm->sdm_map, 0, size,
+	    BUS_DMASYNC_PREWRITE);
+
+	return sdm;
+
+unmap:
+	bus_dmamem_unmap(dmat, sdm->sdm_kva, size);
+free:
+	bus_dmamem_free(dmat, &sdm->sdm_seg, 1);
+destroy:
+	bus_dmamap_destroy(dmat, sdm->sdm_map);
+sdmfree:
+	free(sdm, M_DEVBUF, sizeof(*sdm));
+
+	return NULL;
+}
+
+void
+smmu_dmamem_free(bus_dma_tag_t dmat, struct smmu_dmamem *sdm)
+{
+	bus_dmamem_unmap(dmat, sdm->sdm_kva, sdm->sdm_size);
+	bus_dmamem_free(dmat, &sdm->sdm_seg, 1);
+	bus_dmamap_destroy(dmat, sdm->sdm_map);
+	free(sdm, M_DEVBUF, sizeof(*sdm));
+}
+
+/* SMMU v3 */
+int
+smmu_v3_attach(struct smmu_softc *sc)
+{
+	uint32_t reg;
+	int i;
+
+	if (smmu_attach(sc) != 0)
+		return ENXIO;
+
+	reg = smmu_v3_read_4(sc, SMMU_V3_IDR0);
+	if (!(reg & SMMU_V3_TTF_AA64)) {
+		printf(": no support for AA64\n");
+		return ENXIO;
+	}
+	if (reg & SMMU_V3_IDR0_S1P)
+		sc->sc_has_s1 = 1;
+	if (reg & SMMU_V3_IDR0_S2P)
+		sc->sc_has_s2 = 1;
+	if (reg & SMMU_V3_IDR0_ASID16)
+		sc->v3.sc_has_asid16s = 1;
+	if (reg & SMMU_V3_IDR0_PRI)
+		sc->v3.sc_has_pri = 1;
+	if (reg & SMMU_V3_IDR0_VMID16)
+		sc->sc_has_vmid16s = 1;
+	if (reg & SMMU_V3_IDR0_CD2L)
+		sc->v3.sc_2lvl_cdtab = 1;
+	if (SMMU_V3_IDR0_ST_LEVEL(reg) == SMMU_V3_IDR0_ST_LEVEL_2)
+		sc->v3.sc_2lvl_strtab = 1;
+
+	reg = smmu_v3_read_4(sc, SMMU_V3_IDR1);
+	sc->v3.sc_cmdq.sq_size_log2 = SMMU_V3_IDR1_CMDQS(reg);
+	sc->v3.sc_eventq.sq_size_log2 = SMMU_V3_IDR1_EVENTQS(reg);
+	sc->v3.sc_priq.sq_size_log2 = SMMU_V3_IDR1_PRIQS(reg);
+	sc->v3.sc_sidsize = SMMU_V3_IDR1_SIDSIZE(reg);
+	if (sc->v3.sc_sidsize <= 8)
+		sc->v3.sc_2lvl_strtab = 0;
+
+	reg = smmu_v3_read_4(sc, SMMU_V3_IDR5);
+	switch (SMMU_V3_IDR5_OAS(reg)) {
+	case SMMU_V3_IDR5_OAS_32BIT:
+		sc->sc_pa_bits = 32;
+		break;
+	case SMMU_V3_IDR5_OAS_36BIT:
+		sc->sc_pa_bits = 36;
+		break;
+	case SMMU_V3_IDR5_OAS_40BIT:
+		sc->sc_pa_bits = 40;
+		break;
+	case SMMU_V3_IDR5_OAS_42BIT:
+		sc->sc_pa_bits = 42;
+		break;
+	case SMMU_V3_IDR5_OAS_44BIT:
+		sc->sc_pa_bits = 44;
+		break;
+	case SMMU_V3_IDR5_OAS_48BIT:
+		sc->sc_pa_bits = 48;
+		break;
+	case SMMU_V3_IDR5_OAS_52BIT:
+	default:
+		sc->sc_pa_bits = 52;
+		break;
+	}
+	sc->sc_va_bits = 48;
+#if notyet
+	if (reg & SMMU_V3_IDR5_VAX)
+		sc->sc_va_bits = 52;
+#endif
+	/* Unless there's no AA64, then it's 40. */
+	sc->sc_ipa_bits = sc->sc_pa_bits;
+
+	/* If IDR3.STT=0, maximum is 39. */
+	reg = smmu_v3_read_4(sc, SMMU_V3_IDR3);
+	if ((reg & SMMU_V3_IDR3_STT) == 0) {
+		sc->sc_va_bits = min(sc->sc_va_bits, 39);
+		sc->sc_ipa_bits = min(sc->sc_ipa_bits, 39);
+	}
+
+	mtx_init(&sc->v3.sc_cmdq_mtx, IPL_VM);
+	sc->v3.sc_cmdq.sq_sdm = smmu_dmamem_alloc(sc->sc_dmat,
+	     (1ULL << sc->v3.sc_cmdq.sq_size_log2) * 2 * sizeof(uint64_t),
+	     (1ULL << sc->v3.sc_cmdq.sq_size_log2) * 2 * sizeof(uint64_t));
+	if (sc->v3.sc_cmdq.sq_sdm == NULL) {
+		printf(": can't allocate command queue\n");
+		goto out;
+	}
+	sc->v3.sc_eventq.sq_sdm = smmu_dmamem_alloc(sc->sc_dmat,
+	     (1ULL << sc->v3.sc_eventq.sq_size_log2) * 4 * sizeof(uint64_t),
+	     (1ULL << sc->v3.sc_eventq.sq_size_log2) * 4 * sizeof(uint64_t));
+	if (sc->v3.sc_eventq.sq_sdm == NULL) {
+		printf(": can't allocate event queue\n");
+		goto free_cmdq;
+	}
+	if (sc->v3.sc_has_pri) {
+		sc->v3.sc_priq.sq_sdm = smmu_dmamem_alloc(sc->sc_dmat,
+		     (1ULL << sc->v3.sc_priq.sq_size_log2) * 2 * sizeof(uint64_t),
+		     (1ULL << sc->v3.sc_priq.sq_size_log2) * 2 * sizeof(uint64_t));
+		if (sc->v3.sc_priq.sq_sdm == NULL) {
+			printf(": can't allocate pri queue\n");
+			goto free_evtq;
+		}
+	}
+
+	/* Abort transaction if already enabled. */
+	if (smmu_v3_read_4(sc, SMMU_V3_CR0) & SMMU_V3_CR0_SMMUEN) {
+		reg = smmu_v3_read_4(sc, SMMU_V3_GBPA);
+		reg |= SMMU_V3_GBPA_ABORT;
+		smmu_v3_write_4(sc, SMMU_V3_GBPA, reg | SMMU_V3_GBPA_UPDATE);
+		for (i = 100000; i > 0; i--) {
+			if (!(smmu_v3_read_4(sc, SMMU_V3_GBPA) & SMMU_V3_GBPA_UPDATE))
+				break;
+		}
+		if (i == 0) {
+			printf(": failed waiting for update\n");
+			goto free_priq;
+		}
+	}
+
+	/* Disable SMMU */
+	smmu_v3_write_ack(sc, SMMU_V3_CR0, SMMU_V3_CR0ACK, 0);
+
+	smmu_v3_write_4(sc, SMMU_V3_CR1,
+	    SMMU_V3_CR1_TABLE_SH(SMMU_V3_CR1_SHARE_ISH) |
+	    SMMU_V3_CR1_TABLE_OC(SMMU_V3_CR1_CACHE_WB) |
+	    SMMU_V3_CR1_TABLE_IC(SMMU_V3_CR1_CACHE_WB) |
+	    SMMU_V3_CR1_QUEUE_SH(SMMU_V3_CR1_SHARE_ISH) |
+	    SMMU_V3_CR1_QUEUE_OC(SMMU_V3_CR1_CACHE_WB) |
+	    SMMU_V3_CR1_QUEUE_IC(SMMU_V3_CR1_CACHE_WB));
+	smmu_v3_write_4(sc, SMMU_V3_CR2, SMMU_V3_CR2_PTM |
+	    SMMU_V3_CR2_RECINVSID | SMMU_V3_CR2_E2H);
+
+	if (sc->v3.sc_2lvl_strtab) {
+		sc->v3.sc_strtab_l1 = smmu_dmamem_alloc(sc->sc_dmat,
+		    ((1ULL << sc->v3.sc_sidsize) / 256) * sizeof(uint64_t),
+		    ((1ULL << sc->v3.sc_sidsize) / 256) * sizeof(uint64_t));
+		if (sc->v3.sc_strtab_l1 == NULL) {
+			printf(": can't allocate strtab\n");
+			goto free_priq;
+		}
+		smmu_v3_write_8(sc, SMMU_V3_STRTAB_BASE,
+		    SMMU_V3_STRTAB_BASE_RA |
+		    SMMU_DMA_DVA(sc->v3.sc_strtab_l1));
+		smmu_v3_write_4(sc, SMMU_V3_STRTAB_BASE_CFG,
+		    SMMU_V3_STRTAB_BASE_CFG_FMT_L2 |
+		    SMMU_V3_STRTAB_BASE_CFG_SPLIT(8) |
+		    SMMU_V3_STRTAB_BASE_CFG_LOG2SIZE(sc->v3.sc_sidsize));
+		sc->v3.sc_strtab_l2 = mallocarray(
+		    ((1ULL << sc->v3.sc_sidsize) / 256), sizeof(void *),
+		    M_DEVBUF, M_WAITOK | M_ZERO);
+	} else {
+		sc->v3.sc_strtab_l1 = smmu_dmamem_alloc(sc->sc_dmat,
+		    (1ULL << sc->v3.sc_sidsize) * 8 * sizeof(uint64_t),
+		    (1ULL << sc->v3.sc_sidsize) * 8 * sizeof(uint64_t));
+		if (sc->v3.sc_strtab_l1 == NULL) {
+			printf(": can't allocate strtab\n");
+			goto free_priq;
+		}
+		smmu_v3_write_8(sc, SMMU_V3_STRTAB_BASE,
+		    SMMU_V3_STRTAB_BASE_RA |
+		    SMMU_DMA_DVA(sc->v3.sc_strtab_l1));
+		smmu_v3_write_4(sc, SMMU_V3_STRTAB_BASE_CFG,
+		    SMMU_V3_STRTAB_BASE_CFG_FMT_L1 |
+		    SMMU_V3_STRTAB_BASE_CFG_LOG2SIZE(sc->v3.sc_sidsize));
+	}
+
+	smmu_v3_write_8(sc, SMMU_V3_CMDQ_BASE,
+	    SMMU_V3_CMDQ_BASE_RA |
+	    SMMU_DMA_DVA(sc->v3.sc_cmdq.sq_sdm) |
+	    SMMU_V3_CMDQ_BASE_LOG2SIZE(sc->v3.sc_cmdq.sq_size_log2));
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, 0);
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_CONS, 0);
+	smmu_v3_write_ack(sc, SMMU_V3_CR0, SMMU_V3_CR0ACK,
+	    SMMU_V3_CR0_CMDQEN);
+
+	smmu_v3_cfgi_all(sc);
+	smmu_v3_tlbi_all(sc, SMMU_V3_CMD_TLBI_EL2_ALL);
+	smmu_v3_tlbi_all(sc, SMMU_V3_CMD_TLBI_NSNH_ALL);
+
+	smmu_v3_write_8(sc, SMMU_V3_EVENTQ_BASE,
+	    SMMU_V3_EVENTQ_BASE_WA |
+	    SMMU_DMA_DVA(sc->v3.sc_eventq.sq_sdm) |
+	    SMMU_V3_EVENTQ_BASE_LOG2SIZE(sc->v3.sc_eventq.sq_size_log2));
+	smmu_v3_write_4(sc, SMMU_V3_EVENTQ_PROD, 0);
+	smmu_v3_write_4(sc, SMMU_V3_EVENTQ_CONS, 0);
+	smmu_v3_write_ack(sc, SMMU_V3_CR0, SMMU_V3_CR0ACK,
+	    smmu_v3_read_4(sc, SMMU_V3_CR0) | SMMU_V3_CR0_EVENTQEN);
+
+	if (sc->v3.sc_has_pri) {
+		smmu_v3_write_8(sc, SMMU_V3_PRIQ_BASE,
+		    SMMU_V3_PRIQ_BASE_WA |
+		    SMMU_DMA_DVA(sc->v3.sc_priq.sq_sdm) |
+		    SMMU_V3_PRIQ_BASE_LOG2SIZE(sc->v3.sc_priq.sq_size_log2));
+		smmu_v3_write_4(sc, SMMU_V3_PRIQ_PROD, 0);
+		smmu_v3_write_4(sc, SMMU_V3_PRIQ_CONS, 0);
+		smmu_v3_write_ack(sc, SMMU_V3_CR0, SMMU_V3_CR0ACK,
+		    smmu_v3_read_4(sc, SMMU_V3_CR0) | SMMU_V3_CR0_PRIQEN);
+	}
+
+	/* Disable MSIs, use wired IRQs, re-enable IRQs. */
+	smmu_v3_write_ack(sc, SMMU_V3_IRQ_CTRL, SMMU_V3_IRQ_CTRLACK, 0);
+	smmu_v3_write_8(sc, SMMU_V3_GERROR_IRQ_CFG0, 0);
+	smmu_v3_write_8(sc, SMMU_V3_EVENTQ_IRQ_CFG0, 0);
+	if (sc->v3.sc_has_pri)
+		smmu_v3_write_8(sc, SMMU_V3_PRIQ_IRQ_CFG0, 0);
+	smmu_v3_write_ack(sc, SMMU_V3_IRQ_CTRL, SMMU_V3_IRQ_CTRLACK,
+	    SMMU_V3_IRQ_CTRL_GERROR | SMMU_V3_IRQ_CTRL_EVENTQ |
+	    (sc->v3.sc_has_pri ? SMMU_V3_IRQ_CTRL_PRIQ : 0));
+
+	smmu_v3_write_ack(sc, SMMU_V3_CR0, SMMU_V3_CR0ACK,
+	    smmu_v3_read_4(sc, SMMU_V3_CR0) | SMMU_V3_CR0_SMMUEN);
+
+	printf("\n");
+
+	sc->sc_domain_create = smmu_v3_domain_create;
+	sc->sc_tlbi_va = smmu_v3_tlbi_va;
+	sc->sc_tlb_sync_context = smmu_v3_tlb_sync_context;
+	return 0;
+
+//free_strtab:
+//	smmu_dmamem_free(sc->sc_dmat, sc->v3.sc_strtab_l1);
+free_priq:
+	if (sc->v3.sc_has_pri)
+		smmu_dmamem_free(sc->sc_dmat, sc->v3.sc_priq.sq_sdm);
+free_evtq:
+	smmu_dmamem_free(sc->sc_dmat, sc->v3.sc_eventq.sq_sdm);
+free_cmdq:
+	smmu_dmamem_free(sc->sc_dmat, sc->v3.sc_cmdq.sq_sdm);
+out:
+	return ENXIO;
+}
+
+int
+smmu_v3_event_irq(void *cookie)
+{
+	struct smmu_softc *sc = cookie;
+	struct smmu_v3_queue *sq = &sc->v3.sc_eventq;
+	uint64_t *event;
+	uint32_t cons, prod;
+	bus_size_t off;
+	int handled = 0;
+
+	for (;;) {
+		prod = smmu_v3_read_4(sc, SMMU_V3_EVENTQ_PROD);
+		if (SMMU_V3_Q_OVF(sq->sq_prod) != SMMU_V3_Q_OVF(prod))
+			printf("%s: event queue overflow\n",
+			    sc->sc_dev.dv_xname);
+		sq->sq_prod = prod;
+
+		/* Stop if empty. */
+		if (SMMU_V3_Q_IDX(sq, sq->sq_cons) ==
+		    SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+		    SMMU_V3_Q_WRP(sq, sq->sq_cons) ==
+		    SMMU_V3_Q_WRP(sq, sq->sq_prod))
+			break;
+
+		/* Print event information. */
+		off = SMMU_V3_Q_IDX(sq, sq->sq_cons) * 4 * sizeof(uint64_t);
+		bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+		    4 * sizeof(uint64_t), BUS_DMASYNC_POSTWRITE);
+		event = SMMU_DMA_KVA(sq->sq_sdm) + off;
+		printf("%s: event 0x%llx 0x%llx 0x%llx 0x%llx\n",
+		    sc->sc_dev.dv_xname, event[0], event[1], event[2], event[3]);
+
+		/* Let HW know we consumed */
+		cons = (SMMU_V3_Q_WRP(sq, sq->sq_cons) |
+		    SMMU_V3_Q_IDX(sq, sq->sq_cons)) + 1;
+		sq->sq_cons = SMMU_V3_Q_OVF(sq->sq_cons) |
+		    SMMU_V3_Q_WRP(sq, cons) |
+		    SMMU_V3_Q_IDX(sq, cons);
+		membar_sync();
+		smmu_v3_write_4(sc, SMMU_V3_EVENTQ_CONS, sq->sq_cons);
+
+		handled = 1;
+	}
+
+	/* Sync overflow flag */
+	if (SMMU_V3_Q_OVF(sq->sq_prod) != SMMU_V3_Q_OVF(sq->sq_cons)) {
+		sq->sq_cons = SMMU_V3_Q_OVF(sq->sq_prod) |
+		    SMMU_V3_Q_WRP(sq, sq->sq_cons) |
+		    SMMU_V3_Q_IDX(sq, sq->sq_cons);
+		membar_sync();
+		smmu_v3_write_4(sc, SMMU_V3_EVENTQ_CONS, sq->sq_cons);
+	}
+
+	return handled;
+}
+
+int
+smmu_v3_gerr_irq(void *cookie)
+{
+	struct smmu_softc *sc = cookie;
+	uint32_t gerror, gerrorn;
+
+	gerror = smmu_v3_read_4(sc, SMMU_V3_GERROR);
+	gerrorn = smmu_v3_read_4(sc, SMMU_V3_GERRORN);
+	smmu_v3_write_4(sc, SMMU_V3_GERRORN, gerror);
+
+	gerror = (gerror ^ gerrorn) & SMMU_V3_GERROR_MASK;
+
+	if (gerror & SMMU_V3_GERROR_CMDQ_ERR) {
+		uint32_t cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+		printf("%s: cmdq error 0x%x on cmd idx %u\n",
+		    sc->sc_dev.dv_xname, SMMU_V3_CMDQ_CONS_ERR(cons),
+		    SMMU_V3_Q_IDX(&sc->v3.sc_cmdq, cons));
+	} else {
+		printf("%s: gerror 0x%x\n", sc->sc_dev.dv_xname, gerror);
+	}
+
+	return 1;
+}
+
+int
+smmu_v3_priq_irq(void *cookie)
+{
+	struct smmu_softc *sc = cookie;
+	struct smmu_v3_queue *sq = &sc->v3.sc_priq;
+	uint64_t *pri;
+	uint32_t cons, prod;
+	int handled = 0;
+
+	for (;;) {
+		prod = smmu_v3_read_4(sc, SMMU_V3_PRIQ_PROD);
+		if (SMMU_V3_Q_OVF(sq->sq_prod) != SMMU_V3_Q_OVF(prod))
+			printf("%s: event queue overflow\n",
+			    sc->sc_dev.dv_xname);
+		sq->sq_prod = prod;
+
+		/* Stop if empty. */
+		if (SMMU_V3_Q_IDX(sq, sq->sq_cons) ==
+		    SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+		    SMMU_V3_Q_WRP(sq, sq->sq_cons) ==
+		    SMMU_V3_Q_WRP(sq, sq->sq_prod))
+			break;
+
+		/* Print pri information. */
+		bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm),
+		    SMMU_V3_Q_IDX(sq, sq->sq_cons) * 2 * sizeof(uint64_t),
+		    2 * sizeof(uint64_t),
+		    BUS_DMASYNC_POSTWRITE);
+		pri = SMMU_DMA_KVA(sq->sq_sdm) +
+		    SMMU_V3_Q_IDX(sq, sq->sq_cons) * 2 * sizeof(uint64_t);
+		printf("%s: pri 0x%llx 0x%llx\n", sc->sc_dev.dv_xname,
+		    pri[0], pri[1]);
+
+		/* Increase consumed */
+		cons = (SMMU_V3_Q_WRP(sq, sq->sq_cons) |
+		    SMMU_V3_Q_IDX(sq, sq->sq_cons)) + 1;
+		sq->sq_cons = SMMU_V3_Q_OVF(sq->sq_cons) |
+		    SMMU_V3_Q_WRP(sq, cons) |
+		    SMMU_V3_Q_IDX(sq, cons);
+		membar_sync();
+		smmu_v3_write_4(sc, SMMU_V3_PRIQ_CONS, sq->sq_cons);
+
+		handled = 1;
+	}
+
+	/* Sync overflow flag */
+	if (SMMU_V3_Q_OVF(sq->sq_prod) != SMMU_V3_Q_OVF(sq->sq_cons)) {
+		sq->sq_cons = SMMU_V3_Q_OVF(sq->sq_prod) |
+		    SMMU_V3_Q_WRP(sq, sq->sq_cons) |
+		    SMMU_V3_Q_IDX(sq, sq->sq_cons);
+		membar_sync();
+		smmu_v3_write_4(sc, SMMU_V3_PRIQ_CONS, sq->sq_cons);
+	}
+
+	return handled;
+}
+
+uint32_t
+smmu_v3_read_4(struct smmu_softc *sc, bus_size_t off)
+{
+	return bus_space_read_4(sc->sc_iot, sc->sc_ioh, off);
+}
+
+void
+smmu_v3_write_4(struct smmu_softc *sc, bus_size_t off, uint32_t val)
+{
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, off, val);
+}
+
+uint64_t
+smmu_v3_read_8(struct smmu_softc *sc, bus_size_t off)
+{
+	return bus_space_read_8(sc->sc_iot, sc->sc_ioh, off);
+}
+
+void
+smmu_v3_write_8(struct smmu_softc *sc, bus_size_t off, uint64_t val)
+{
+	bus_space_write_8(sc->sc_iot, sc->sc_ioh, off, val);
+}
+
+int
+smmu_v3_write_ack(struct smmu_softc *sc, bus_size_t off, bus_size_t ack_off,
+    uint32_t val)
+{
+	int i;
+
+	smmu_v3_write_4(sc, off, val);
+
+	for (i = 100000; i > 0; i--) {
+		if (smmu_v3_read_4(sc, ack_off) == val)
+			break;
+	}
+	if (i == 0) {
+		printf("%s: failed waiting for ack\n", sc->sc_dev.dv_xname);
+		return ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+int
+smmu_v3_domain_create(struct smmu_domain *dom)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+	uint64_t *cd, *ste;
+	paddr_t pa;
+	vaddr_t l0va;
+	uint32_t iovabits;
+
+	if (dom->sd_sid >= (1ULL << sc->v3.sc_sidsize))
+		return EINVAL;
+
+	if (dom->sd_stage != 1)
+		return EINVAL;
+
+	if (sc->v3.sc_has_asid16s) {
+		if (sc->v3.sc_next_asid == (1 << 16) - 1)
+			return EINVAL;
+	} else {
+		if (sc->v3.sc_next_asid == (1 << 8) - 1)
+			return EINVAL;
+	}
+	dom->v3.sd_asid = sc->v3.sc_next_asid++;
+
+	dom->v3.sd_cd = smmu_dmamem_alloc(sc->sc_dmat, 64, 64);
+	if (dom->v3.sd_cd == NULL) {
+		printf(": can't allocate context descriptor\n");
+		return ENOMEM;
+	}
+
+	if (dom->sd_stage == 1)
+		iovabits = sc->sc_va_bits;
+	else
+		iovabits = sc->sc_ipa_bits;
+	if (iovabits >= 40)
+		dom->sd_4level = 1;
+
+	if (dom->sd_4level) {
+		while (dom->sd_vp.l0 == NULL) {
+			dom->sd_vp.l0 = pool_get(&sc->sc_vp_pool,
+			    PR_WAITOK | PR_ZERO);
+		}
+		l0va = (vaddr_t)dom->sd_vp.l0->l0; /* top level is l0 */
+	} else {
+		while (dom->sd_vp.l1 == NULL) {
+			dom->sd_vp.l1 = pool_get(&sc->sc_vp_pool,
+			    PR_WAITOK | PR_ZERO);
+		}
+		l0va = (vaddr_t)dom->sd_vp.l1->l1; /* top level is l1 */
+	}
+	pmap_extract(pmap_kernel(), l0va, &pa);
+
+	cd = SMMU_DMA_KVA(dom->v3.sd_cd);
+	cd[0] =
+	    SMMU_V3_CD_0_TCR_T0SZ(64 - iovabits) |
+	    SMMU_V3_CD_0_TCR_TG0_4KB |
+	    SMMU_V3_CD_0_TCR_IRGN0_WBWA |
+	    SMMU_V3_CD_0_TCR_ORGN0_WBWA |
+	    SMMU_V3_CD_0_TCR_SH0_ISH |
+	    SMMU_V3_CD_0_TCR_EPD1 |
+	    SMMU_V3_CD_0_V |
+	    SMMU_V3_CD_0_TCR_IPS_48BIT |
+	    SMMU_V3_CD_0_AA64 |
+	    SMMU_V3_CD_0_R |
+	    SMMU_V3_CD_0_A |
+	    SMMU_V3_CD_0_ASET |
+	    SMMU_V3_CD_0_ASID(dom->v3.sd_asid);
+	cd[1] = pa;
+	cd[3] =
+	    SMMU_V3_CD_3_MAIR_ATTR(SMMU_V3_CD_3_MAIR_DEVICE_nGnRnE, 0) |
+	    SMMU_V3_CD_3_MAIR_ATTR(SMMU_V3_CD_3_MAIR_DEVICE_nGnRE, 1) |
+	    SMMU_V3_CD_3_MAIR_ATTR(SMMU_V3_CD_3_MAIR_DEVICE_NC, 2) |
+	    SMMU_V3_CD_3_MAIR_ATTR(SMMU_V3_CD_3_MAIR_DEVICE_WB, 3) |
+	    SMMU_V3_CD_3_MAIR_ATTR(SMMU_V3_CD_3_MAIR_DEVICE_WT, 4);
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(dom->v3.sd_cd), 0,
+	    SMMU_DMA_LEN(dom->v3.sd_cd), BUS_DMASYNC_PREWRITE);
+	smmu_v3_cfgi_cd(dom);
+
+	snprintf(dom->sd_exname, sizeof(dom->sd_exname), "%s:%x",
+	    sc->sc_dev.dv_xname, dom->sd_sid);
+	dom->sd_iovamap = extent_create(dom->sd_exname, 0,
+	    (1LL << iovabits) - 1, M_DEVBUF, NULL, 0, EX_WAITOK |
+	    EX_NOCOALESCE);
+
+	if (sc->v3.sc_2lvl_strtab) {
+		if (sc->v3.sc_strtab_l2[dom->sd_sid / 256] == NULL) {
+			sc->v3.sc_strtab_l2[dom->sd_sid / 256] =
+			    smmu_dmamem_alloc(sc->sc_dmat,
+			    256 * 8 * sizeof(uint64_t),
+			    64 * 1024);
+			if (sc->v3.sc_strtab_l2[dom->sd_sid / 256] == NULL) {
+				printf("%s: can't allocate strtab\n",
+				    sc->sc_dev.dv_xname);
+				return ENXIO;
+			}
+			ste = SMMU_DMA_KVA(sc->v3.sc_strtab_l1) +
+			    (dom->sd_sid / 256) * sizeof(uint64_t);
+			*ste = SMMU_DMA_DVA(sc->v3.sc_strtab_l2[dom->sd_sid / 256]) |
+			    (8 /* split */ + 1);
+			bus_dmamap_sync(sc->sc_dmat,
+			    SMMU_DMA_MAP(sc->v3.sc_strtab_l1),
+			    (dom->sd_sid / 256) * sizeof(uint64_t),
+			    sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+		}
+		ste = SMMU_DMA_KVA(sc->v3.sc_strtab_l2[dom->sd_sid / 256]) +
+		    (dom->sd_sid % 256) * 8 * sizeof(uint64_t);
+	} else {
+		ste = SMMU_DMA_KVA(sc->v3.sc_strtab_l1) +
+		    dom->sd_sid * 8 * sizeof(uint64_t);
+	}
+
+	ste[1] =  SMMU_V3_STE_1_S1CIR_WBRA | SMMU_V3_STE_1_S1COR_WBRA |
+	    SMMU_V3_STE_1_S1CSH_ISH | SMMU_V3_STE_1_EATS_TRANS |
+//	    SMMU_V3_STE_1_STRW_NSEL1 | SMMU_V3_STE_1_S1DSS_SSID0;
+	    SMMU_V3_STE_1_STRW_EL2 | SMMU_V3_STE_1_S1DSS_SSID0;
+	ste[0] = SMMU_V3_STE_0_V | SMMU_V3_STE_0_CFG_S1_TRANS |
+	    SMMU_V3_STE_0_S1FMT_LINEAR | SMMU_DMA_DVA(dom->v3.sd_cd);
+	if (sc->v3.sc_2lvl_strtab) {
+		bus_dmamap_sync(sc->sc_dmat,
+		    SMMU_DMA_MAP(sc->v3.sc_strtab_l2[dom->sd_sid / 256]),
+		    (dom->sd_sid % 256) * 8 * sizeof(uint64_t),
+		    8 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+	} else {
+		bus_dmamap_sync(sc->sc_dmat,
+		    SMMU_DMA_MAP(sc->v3.sc_strtab_l1),
+		    dom->sd_sid * 8 * sizeof(uint64_t),
+		    8 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+	}
+	smmu_v3_cfgi_ste(dom);
+
+	smmu_v3_tlbi_asid(dom);
+	return 0;
+}
+
+int
+smmu_v3_sync(struct smmu_softc *sc)
+{
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+	int i;
+
+	MUTEX_ASSERT_LOCKED(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		return ETIMEDOUT;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+	cmd[0] = SMMU_V3_CMD_SYNC | SMMU_V3_CMD_SYNC_0_CS_SEV;
+	cmd[1] = 0;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	/*
+	 * TODO: In a better world, where CPUs could concurrently put in commands,
+	 * TODO: we should be able to wait until it has *passed* the prod we set.
+	 */
+	for (i = 100000; i > 0; i--) {
+		/* Wait until HW processing caught up with us. */
+		sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+		if ((SMMU_V3_Q_WRP(sq, sq->sq_cons) ==
+		     SMMU_V3_Q_WRP(sq, sq->sq_prod)) &&
+		    (SMMU_V3_Q_IDX(sq, sq->sq_cons) ==
+		     SMMU_V3_Q_IDX(sq, sq->sq_prod)))
+			break;
+	}
+	if (i == 0) {
+		printf("%s: timeout waiting for SYNC\n", sc->sc_dev.dv_xname);
+		sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+		return ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+void
+smmu_v3_cfgi_all(struct smmu_softc *sc)
+{
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		mtx_leave(&sc->v3.sc_cmdq_mtx);
+		return;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+	cmd[0] = SMMU_V3_CMD_CFGI_STE_RANGE;
+	cmd[1] = SMMU_V3_CMD_CFGI_1_RANGE(31);
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	smmu_v3_sync(sc);
+
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
+}
+
+void
+smmu_v3_cfgi_cd(struct smmu_domain *dom)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		mtx_leave(&sc->v3.sc_cmdq_mtx);
+		return;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+	cmd[0] = SMMU_V3_CMD_CFGI_CD |
+	    SMMU_V3_CMD_CFGI_0_SID(dom->sd_sid);
+	cmd[1] = SMMU_V3_CMD_CFGI_1_LEAF;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	smmu_v3_sync(sc);
+
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
+}
+
+void
+smmu_v3_cfgi_ste(struct smmu_domain *dom)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		mtx_leave(&sc->v3.sc_cmdq_mtx);
+		return;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+	cmd[0] = SMMU_V3_CMD_CFGI_STE |
+	    SMMU_V3_CMD_CFGI_0_SID(dom->sd_sid);
+	cmd[1] = SMMU_V3_CMD_CFGI_1_LEAF;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	smmu_v3_sync(sc);
+
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
+}
+
+void
+smmu_v3_tlbi_all(struct smmu_softc *sc, uint64_t op)
+{
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		mtx_leave(&sc->v3.sc_cmdq_mtx);
+		return;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+	cmd[0] = op;
+	cmd[1] = 0;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	smmu_v3_sync(sc);
+
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
+}
+
+void
+smmu_v3_tlbi_asid(struct smmu_domain *dom)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		mtx_leave(&sc->v3.sc_cmdq_mtx);
+		return;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+//	cmd[0] = SMMU_V3_CMD_TLBI_NH_ASID |
+//	    SMMU_V3_CMD_TLBI_0_ASID(dom->v3.sd_asid);
+	cmd[0] = SMMU_V3_CMD_TLBI_EL2_ASID |
+	    SMMU_V3_CMD_TLBI_0_ASID(dom->v3.sd_asid);
+	cmd[1] = 0;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	smmu_v3_sync(sc);
+
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
+}
+
+void
+smmu_v3_tlbi_va(struct smmu_domain *dom, vaddr_t va)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+	struct smmu_v3_queue *sq = &sc->v3.sc_cmdq;
+	volatile uint64_t *cmd;
+	uint32_t prod;
+	bus_size_t off;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+
+	/* TODO: Handle this more properly. */
+	sq->sq_cons = smmu_v3_read_4(sc, SMMU_V3_CMDQ_CONS);
+	if (SMMU_V3_Q_IDX(sq, sq->sq_cons) == SMMU_V3_Q_IDX(sq, sq->sq_prod) &&
+	    SMMU_V3_Q_WRP(sq, sq->sq_cons) != SMMU_V3_Q_WRP(sq, sq->sq_prod)) {
+		printf("%s: CMDQ ran out of space\n", sc->sc_dev.dv_xname);
+		mtx_leave(&sc->v3.sc_cmdq_mtx);
+		return;
+	}
+
+	off = SMMU_V3_Q_IDX(sq, sq->sq_prod) * 2 * sizeof(uint64_t);
+	cmd = SMMU_DMA_KVA(sq->sq_sdm) + off;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_POSTREAD);
+//	cmd[0] = SMMU_V3_CMD_TLBI_NH_VA | SMMU_V3_CMD_TLBI_0_VMID(0) |
+//	    SMMU_V3_CMD_TLBI_0_ASID(dom->v3.sd_asid);
+//	cmd[1] = va | SMMU_V3_CMD_TLBI_1_LEAF;
+	cmd[0] = SMMU_V3_CMD_TLBI_EL2_VA | SMMU_V3_CMD_TLBI_0_VMID(0) |
+	    SMMU_V3_CMD_TLBI_0_ASID(dom->v3.sd_asid);
+	cmd[1] = va | SMMU_V3_CMD_TLBI_1_LEAF;
+	bus_dmamap_sync(sc->sc_dmat, SMMU_DMA_MAP(sq->sq_sdm), off,
+	    2 * sizeof(uint64_t), BUS_DMASYNC_PREWRITE);
+
+	/* Let HW know we produced */
+	prod = (SMMU_V3_Q_WRP(sq, sq->sq_prod) |
+	    SMMU_V3_Q_IDX(sq, sq->sq_prod)) + 1;
+	sq->sq_prod = SMMU_V3_Q_OVF(sq->sq_prod) |
+	    SMMU_V3_Q_WRP(sq, prod) | SMMU_V3_Q_IDX(sq, prod);
+	membar_sync();
+	smmu_v3_write_4(sc, SMMU_V3_CMDQ_PROD, sq->sq_prod);
+
+	/* callee is responsible for smmu_v3_tlb_sync_context() */
+
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
+}
+
+void
+smmu_v3_tlb_sync_context(struct smmu_domain *dom)
+{
+	struct smmu_softc *sc = dom->sd_sc;
+
+	mtx_enter(&sc->v3.sc_cmdq_mtx);
+	smmu_v3_sync(sc);
+	mtx_leave(&sc->v3.sc_cmdq_mtx);
 }

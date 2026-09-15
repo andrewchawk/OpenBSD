@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_ctf.c,v 1.34 2024/02/22 13:49:17 claudio Exp $	*/
+/*	$OpenBSD: db_ctf.c,v 1.36 2025/07/24 01:12:55 jsg Exp $	*/
 
 /*
  * Copyright (c) 2016-2017 Martin Pieuchot
@@ -45,7 +45,7 @@ struct ddb_ctf {
 	size_t			 rawctflen;	/* raw .SUNW_ctf section size */
 	const char		*data;		/* decompressed CTF data */
 	size_t			 dlen;		/* decompressed CTF data size */
-	char			*strtab;	/* ELF string table */
+	const char		*strtab;	/* ELF string table */
 	uint32_t		 ctf_found;
 };
 
@@ -693,7 +693,7 @@ db_ctf_decompress(const char *buf, size_t size, size_t len)
 	return data;
 
 exit:
-	free(data, M_DEVBUF, len);
+	free(data, M_TEMP, len);
 	return NULL;
 }
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: softraid.c,v 1.430 2024/02/03 18:51:58 beck Exp $ */
+/* $OpenBSD: softraid.c,v 1.438 2025/10/18 15:33:19 deraadt Exp $ */
 /*
  * Copyright (c) 2007, 2008, 2009 Marco Peereboom <marco@peereboom.us>
  * Copyright (c) 2008 Chris Kuethe <ckuethe@openbsd.org>
@@ -88,7 +88,7 @@ const struct cfattach softraid_ca = {
 };
 
 struct cfdriver softraid_cd = {
-	NULL, "softraid", DV_DULL
+	NULL, "softraid", DV_DULL, CD_COCOVM
 };
 
 /* scsi & discipline */
@@ -393,7 +393,7 @@ sr_meta_getdevname(struct sr_softc *sc, dev_t dev, char *buf, int size)
 	if (name == NULL)
 		return;
 
-	snprintf(buf, size, "%s%d%c", name, unit, part + 'a');
+	snprintf(buf, size, "%s%d%c", name, unit, DL_PARTNUM2NAME(part));
 }
 
 int
@@ -1013,7 +1013,7 @@ sr_meta_native_bootprobe(struct sr_softc *sc, dev_t devno,
     struct sr_boot_chunk_head *bch)
 {
 	struct vnode		*vn;
-	struct disklabel	label;
+	struct disklabel	*label = NULL;
 	struct sr_metadata	*md = NULL;
 	struct sr_discipline	*fake_sd = NULL;
 	struct sr_boot_chunk	*bc;
@@ -1044,8 +1044,10 @@ sr_meta_native_bootprobe(struct sr_softc *sc, dev_t devno,
 		goto done;
 	}
 
+	label = malloc(sizeof(*label), M_DEVBUF, M_WAITOK);
+
 	/* get disklabel */
-	error = VOP_IOCTL(vn, DIOCGDINFO, (caddr_t)&label, FREAD, NOCRED,
+	error = VOP_IOCTL(vn, DIOCGDINFO, (caddr_t)label, FREAD, NOCRED,
 	    curproc);
 	if (error) {
 		DNPRINTF(SR_D_META, "%s: sr_meta_native_bootprobe ioctl "
@@ -1082,7 +1084,7 @@ sr_meta_native_bootprobe(struct sr_softc *sc, dev_t devno,
 	fake_sd->sd_meta_type = SR_META_F_NATIVE;
 
 	for (i = 0; i < MAXPARTITIONS; i++) {
-		if (label.d_partitions[i].p_fstype != FS_RAID)
+		if (label->d_partitions[i].p_fstype != FS_RAID)
 			continue;
 
 		/* open partition */
@@ -1135,6 +1137,7 @@ sr_meta_native_bootprobe(struct sr_softc *sc, dev_t devno,
 	}
 
 done:
+	free(label, M_DEVBUF, sizeof(*label));
 	free(fake_sd, M_DEVBUF, sizeof(struct sr_discipline));
 	free(md, M_DEVBUF, SR_META_SIZE * DEV_BSIZE);
 
@@ -1546,7 +1549,7 @@ sr_map_root(void)
 int
 sr_meta_native_probe(struct sr_softc *sc, struct sr_chunk *ch_entry)
 {
-	struct disklabel	label;
+	struct disklabel	*label;
 	char			*devname;
 	int			error, part;
 	u_int64_t		size;
@@ -1557,26 +1560,28 @@ sr_meta_native_probe(struct sr_softc *sc, struct sr_chunk *ch_entry)
 	devname = ch_entry->src_devname;
 	part = DISKPART(ch_entry->src_dev_mm);
 
+	label = malloc(sizeof(*label), M_DEVBUF, M_WAITOK);
+
 	/* get disklabel */
-	error = VOP_IOCTL(ch_entry->src_vn, DIOCGDINFO, (caddr_t)&label, FREAD,
+	error = VOP_IOCTL(ch_entry->src_vn, DIOCGDINFO, (caddr_t)label, FREAD,
 	    NOCRED, curproc);
 	if (error) {
 		DNPRINTF(SR_D_META, "%s: %s can't obtain disklabel\n",
 		    DEVNAME(sc), devname);
 		goto unwind;
 	}
-	memcpy(ch_entry->src_duid, label.d_uid, sizeof(ch_entry->src_duid));
+	memcpy(ch_entry->src_duid, label->d_uid, sizeof(ch_entry->src_duid));
 
 	/* make sure the partition is of the right type */
-	if (label.d_partitions[part].p_fstype != FS_RAID) {
+	if (label->d_partitions[part].p_fstype != FS_RAID) {
 		DNPRINTF(SR_D_META,
 		    "%s: %s partition not of type RAID (%d)\n", DEVNAME(sc),
 		    devname,
-		    label.d_partitions[part].p_fstype);
+		    label->d_partitions[part].p_fstype);
 		goto unwind;
 	}
 
-	size = DL_SECTOBLK(&label, DL_GETPSIZE(&label.d_partitions[part]));
+	size = DL_SECTOBLK(label, DL_GETPSIZE(&label->d_partitions[part]));
 	if (size <= SR_DATA_OFFSET) {
 		DNPRINTF(SR_D_META, "%s: %s partition too small\n", DEVNAME(sc),
 		    devname);
@@ -1589,15 +1594,17 @@ sr_meta_native_probe(struct sr_softc *sc, struct sr_chunk *ch_entry)
 		goto unwind;
 	}
 	ch_entry->src_size = size;
-	ch_entry->src_secsize = label.d_secsize;
+	ch_entry->src_secsize = label->d_secsize;
 
 	DNPRINTF(SR_D_META, "%s: probe found %s size %lld\n", DEVNAME(sc),
 	    devname, (long long)size);
 
+	free(label, M_DEVBUF, sizeof(*label));
 	return (SR_META_F_NATIVE);
 unwind:
 	DNPRINTF(SR_D_META, "%s: invalid device: %s\n", DEVNAME(sc),
 	    devname ? devname : "nodev");
+	free(label, M_DEVBUF, sizeof(*label));
 	return (SR_META_F_INVALID);
 }
 
@@ -2800,7 +2807,7 @@ sr_hotspare(struct sr_softc *sc, dev_t dev)
 	struct sr_chunk_head	*cl;
 	struct sr_chunk		*chunk, *last, *hotspare = NULL;
 	struct sr_uuid		uuid;
-	struct disklabel	label;
+	struct disklabel	*label = NULL;
 	struct vnode		*vn;
 	u_int64_t		size;
 	char			devname[32];
@@ -2838,22 +2845,24 @@ sr_hotspare(struct sr_softc *sc, dev_t dev)
 	}
 	open = 1; /* close dev on error */
 
+	label = malloc(sizeof(*label), M_DEVBUF, M_WAITOK);
+
 	/* Get partition details. */
 	part = DISKPART(dev);
-	if (VOP_IOCTL(vn, DIOCGDINFO, (caddr_t)&label, FREAD,
+	if (VOP_IOCTL(vn, DIOCGDINFO, (caddr_t)label, FREAD,
 	    NOCRED, curproc)) {
 		DNPRINTF(SR_D_META, "%s: sr_hotspare ioctl failed\n",
 		    DEVNAME(sc));
 		goto fail;
 	}
-	if (label.d_partitions[part].p_fstype != FS_RAID) {
+	if (label->d_partitions[part].p_fstype != FS_RAID) {
 		sr_error(sc, "%s partition not of type RAID (%d)",
-		    devname, label.d_partitions[part].p_fstype);
+		    devname, label->d_partitions[part].p_fstype);
 		goto fail;
 	}
 
 	/* Calculate partition size. */
-	size = DL_SECTOBLK(&label, DL_GETPSIZE(&label.d_partitions[part]));
+	size = DL_SECTOBLK(label, DL_GETPSIZE(&label->d_partitions[part]));
 	if (size <= SR_DATA_OFFSET) {
 		DNPRINTF(SR_D_META, "%s: %s partition too small\n", DEVNAME(sc),
 		    devname);
@@ -2905,7 +2914,7 @@ sr_hotspare(struct sr_softc *sc, dev_t dev)
 	sm->ssdi.ssd_volid = SR_HOTSPARE_VOLID;
 	sm->ssdi.ssd_level = SR_HOTSPARE_LEVEL;
 	sm->ssdi.ssd_size = size;
-	sm->ssdi.ssd_secsize = label.d_secsize;
+	sm->ssdi.ssd_secsize = label->d_secsize;
 	strlcpy(sm->ssdi.ssd_vendor, "OPENBSD", sizeof(sm->ssdi.ssd_vendor));
 	snprintf(sm->ssdi.ssd_product, sizeof(sm->ssdi.ssd_product),
 	    "SR %s", "HOTSPARE");
@@ -2958,6 +2967,7 @@ done:
 	if (sd)
 		free(sd->sd_vol.sv_chunks, M_DEVBUF,
 		    sizeof(sd->sd_vol.sv_chunks));
+	free(label, M_DEVBUF, sizeof(*label));
 	free(sd, M_DEVBUF, sizeof(*sd));
 	free(sm, M_DEVBUF, sizeof(*sm));
 	if (open) {
@@ -3083,7 +3093,7 @@ sr_rebuild_init(struct sr_discipline *sd, dev_t dev, int hotspare)
 	struct sr_softc		*sc = sd->sd_sc;
 	struct sr_chunk		*chunk = NULL;
 	struct sr_meta_chunk	*meta;
-	struct disklabel	label;
+	struct disklabel	*label = NULL;
 	struct vnode		*vn;
 	u_int64_t		size;
 	int64_t			csize;
@@ -3152,22 +3162,24 @@ sr_rebuild_init(struct sr_discipline *sd, dev_t dev, int hotspare)
 	}
 	open = 1; /* close dev on error */
 
+	label = malloc(sizeof(*label), M_DEVBUF, M_WAITOK);
+
 	/* Get disklabel and check partition. */
 	part = DISKPART(dev);
-	if (VOP_IOCTL(vn, DIOCGDINFO, (caddr_t)&label, FREAD,
+	if (VOP_IOCTL(vn, DIOCGDINFO, (caddr_t)label, FREAD,
 	    NOCRED, curproc)) {
 		DNPRINTF(SR_D_META, "%s: sr_ioctl_setstate ioctl failed\n",
 		    DEVNAME(sc));
 		goto done;
 	}
-	if (label.d_partitions[part].p_fstype != FS_RAID) {
+	if (label->d_partitions[part].p_fstype != FS_RAID) {
 		sr_error(sc, "%s partition not of type RAID (%d)",
-		    devname, label.d_partitions[part].p_fstype);
+		    devname, label->d_partitions[part].p_fstype);
 		goto done;
 	}
 
 	/* Is the partition large enough? */
-	size = DL_SECTOBLK(&label, DL_GETPSIZE(&label.d_partitions[part]));
+	size = DL_SECTOBLK(label, DL_GETPSIZE(&label->d_partitions[part]));
 	if (size <= sd->sd_meta->ssd_data_blkno) {
 		sr_error(sc, "%s: %s partition too small", DEVNAME(sc),
 		    devname);
@@ -3186,7 +3198,7 @@ sr_rebuild_init(struct sr_discipline *sd, dev_t dev, int hotspare)
 	} else if (size > csize)
 		sr_warn(sc, "%s partition too large, wasting %lld bytes",
 		    devname, (long long)((size - csize) << DEV_BSHIFT));
-	if (label.d_secsize > sd->sd_meta->ssdi.ssd_secsize) {
+	if (label->d_secsize > sd->sd_meta->ssdi.ssd_secsize) {
 		sr_error(sc, "%s sector size too large, <= %u bytes "
 		    "required", devname, sd->sd_meta->ssdi.ssd_secsize);
 		goto done;
@@ -3206,7 +3218,7 @@ sr_rebuild_init(struct sr_discipline *sd, dev_t dev, int hotspare)
 	open = 0; /* leave dev open from here on out */
 
 	/* Fix up chunk. */
-	memcpy(chunk->src_duid, label.d_uid, sizeof(chunk->src_duid));
+	memcpy(chunk->src_duid, label->d_uid, sizeof(chunk->src_duid));
 	chunk->src_dev_mm = dev;
 	chunk->src_vn = vn;
 
@@ -3239,6 +3251,7 @@ sr_rebuild_init(struct sr_discipline *sd, dev_t dev, int hotspare)
 
 	rv = 0;
 done:
+	free(label, M_DEVBUF, sizeof(*label));
 	if (open) {
 		VOP_CLOSE(vn, FREAD | FWRITE, NOCRED, curproc);
 		vput(vn);
@@ -3435,7 +3448,7 @@ sr_ioctl_createraid(struct sr_softc *sc, struct bioc_createraid *bc,
 			goto unwind;
 		}
 
-		if (user == 0 && sd->sd_meta_flags & BIOC_SCNOAUTOASSEMBLE) {
+		if (user == 0 && (sd->sd_meta_flags & BIOC_SCNOAUTOASSEMBLE)) {
 			DNPRINTF(SR_D_META, "%s: disk not auto assembled from "
 			    "metadata\n", DEVNAME(sc));
 			goto unwind;
@@ -4862,10 +4875,25 @@ bad:
 void
 sr_sensors_delete(struct sr_discipline *sd)
 {
+	struct sr_softc		*sc = sd->sd_sc;
+
 	DNPRINTF(SR_D_STATE, "%s: sr_sensors_delete\n", DEVNAME(sd->sd_sc));
 
-	if (sd->sd_vol.sv_sensor_attached)
+	if (sd->sd_vol.sv_sensor_attached) {
 		sensor_detach(&sd->sd_sc->sc_sensordev, &sd->sd_vol.sv_sensor);
+		sd->sd_vol.sv_sensor_attached = 0;
+	}
+
+	/*
+	 * Unregister the refresh task if we detached our last sensor.
+	 */
+	TAILQ_FOREACH(sd, &sc->sc_dis_list, sd_link)
+		if (sd->sd_vol.sv_sensor_attached)
+			return;
+	if (sc->sc_sensor_task != NULL) {
+		sensor_task_unregister(sc->sc_sensor_task);
+		sc->sc_sensor_task = NULL;
+	}
 }
 
 void
@@ -5047,8 +5075,8 @@ sr_hibernate_io(dev_t dev, daddr_t blkno, vaddr_t addr, size_t size, int op, voi
 	 * We share the page with the underlying device's own
 	 * side-effect free I/O function, so we pad our data to
 	 * the end of the page. Presently this does not overlap
-	 * with either of the two other side-effect free i/o
-	 * functions (ahci/wd).
+	 * with the other side-effect free i/o functions
+	 * (ahci/wd/nvme/ufshci/sdmmc).
 	 */
 	struct {
 		char pad[3072];
@@ -5067,7 +5095,7 @@ sr_hibernate_io(dev_t dev, daddr_t blkno, vaddr_t addr, size_t size, int op, voi
 	struct device *dv;
 	daddr_t key_blkno;
 	uint32_t sub_raidoff;  /* ofs of sr part in underlying dev */
-	struct disklabel dl;
+	static struct disklabel dl;	/* XXX too big for kernel stack */
 	struct partition *pp;
 	size_t i, j;
 	u_char iv[8];
@@ -5133,7 +5161,8 @@ sr_hibernate_io(dev_t dev, daddr_t blkno, vaddr_t addr, size_t size, int op, voi
 		/* Initialize the sub-device */
 		return my->subfn(my->subdev, sub_raidoff + blkno,
 		    addr, size, op, page);
-	}
+	} else if (op == HIB_DONE)
+		return my->subfn(my->subdev, blkno, addr, size, op, page);
 
 	/* Hibernate only uses (and we only support) writes */
 	if (op != HIB_W)

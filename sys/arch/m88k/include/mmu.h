@@ -1,4 +1,4 @@
-/*	$OpenBSD: mmu.h,v 1.16 2014/03/29 18:09:29 guenther Exp $ */
+/*	$OpenBSD: mmu.h,v 1.18 2025/11/24 20:57:53 miod Exp $ */
 
 /*
  * This file bears almost no resemblance to the original m68k file,
@@ -100,8 +100,6 @@ typedef uint32_t	sdt_entry_t;
 #define	SG_SO		0x00000100
 
 #define	SDT_VALID(sdt)	(*(sdt) & SG_V)
-#define	SDT_SUP(sdt)	(*(sdt) & SG_SO)
-#define	SDT_WP(sdt)	(*(sdt) & SG_PROT)
 
 /*
  * Page table entries
@@ -123,8 +121,6 @@ typedef uint32_t	pt_entry_t;
 #define	PG_U1		0x00000800	/* U1 bit for M88110 */
 
 #define	PDT_VALID(pte)	(*(pte) & PG_V)
-#define	PDT_SUP(pte)	(*(pte) & PG_SO)
-#define	PDT_WP(pte)	(*(pte) & PG_PROT)
 
 /*
  * Number of entries in a page table.
@@ -179,17 +175,5 @@ typedef uint32_t	batc_t;
 
 #define	trunc_batc(a)	((a) & ~BATC_BLKMASK)
 #define	round_batc(a)	trunc_batc((a) + BATC_BLKBYTES - 1)
-
-static pt_entry_t invalidate_pte(pt_entry_t *);
-static __inline__ pt_entry_t
-invalidate_pte(pt_entry_t *pte)
-{
-	pt_entry_t oldpte;
-
-	oldpte = PG_NV;
-	__asm__ volatile
-	    ("xmem %0, %2, %%r0" : "+r"(oldpte), "+m"(*pte) : "r"(pte));
-	return oldpte;
-}
 
 #endif /* __M88K_MMU_H__ */

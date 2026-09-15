@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_vnode.c,v 1.133 2024/07/24 12:16:21 mpi Exp $	*/
+/*	$OpenBSD: uvm_vnode.c,v 1.151 2025/12/29 16:07:14 mpi Exp $	*/
 /*	$NetBSD: uvm_vnode.c,v 1.36 2000/11/24 20:34:01 chs Exp $	*/
 
 /*
@@ -47,6 +47,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/pool.h>
 #include <sys/proc.h>
 #include <sys/malloc.h>
 #include <sys/vnode.h>
@@ -67,7 +68,7 @@
  * we keep a list of writeable active vnode-backed VM objects for sync op.
  * we keep a simpleq of vnodes that are currently being sync'd.
  */
-
+struct pool			uvm_vnode_pool;
 LIST_HEAD(, uvm_vnode)		uvn_wlist;	/* [K] writeable uvns */
 SIMPLEQ_HEAD(, uvm_vnode)	uvn_sync_q;	/* [S] sync'ing uvns */
 struct rwlock uvn_sync_lock;			/* locks sync operation */
@@ -113,7 +114,8 @@ const struct uvm_pagerops uvm_vnodeops = {
 void
 uvn_init(void)
 {
-
+	pool_init(&uvm_vnode_pool, sizeof(struct uvm_vnode), 0, IPL_NONE,
+	    PR_WAITOK, "uvmvnodes", NULL);
 	LIST_INIT(&uvn_wlist);
 	/* note: uvn_sync_q init'd in uvm_vnp_sync() */
 	rw_init_flags(&uvn_sync_lock, "uvnsync", RWL_IS_VNODE);
@@ -129,15 +131,13 @@ uvn_init(void)
  * our pages.
  *
  * => in fact, nothing should be locked so that we can sleep here.
- * => note that uvm_object is first thing in vnode structure, so their
- *    pointers are equiv.
  */
 struct uvm_object *
 uvn_attach(struct vnode *vp, vm_prot_t accessprot)
 {
-	struct uvm_vnode *uvn = vp->v_uvm;
+	struct uvm_vnode *uvn;
 	struct vattr vattr;
-	int oldflags, result;
+	int result;
 	struct partinfo pi;
 	u_quad_t used_vnode_size = 0;
 
@@ -145,51 +145,6 @@ uvn_attach(struct vnode *vp, vm_prot_t accessprot)
 	if (vp->v_type == VBLK && bdevsw[major(vp->v_rdev)].d_type != D_DISK) {
 		return NULL;
 	}
-
-	/* first get a lock on the uvn. */
-	rw_enter(uvn->u_obj.vmobjlock, RW_WRITE);
-	while (uvn->u_flags & UVM_VNODE_BLOCKED) {
-		uvn->u_flags |= UVM_VNODE_WANTED;
-		rwsleep_nsec(uvn, uvn->u_obj.vmobjlock, PVM, "uvn_attach",
-		    INFSLP);
-	}
-
-	/*
-	 * now uvn must not be in a blocked state.
-	 * first check to see if it is already active, in which case
-	 * we can bump the reference count, check to see if we need to
-	 * add it to the writeable list, and then return.
-	 */
-	if (uvn->u_flags & UVM_VNODE_VALID) {	/* already active? */
-
-		/* regain vref if we were persisting */
-		if (uvn->u_obj.uo_refs == 0) {
-			vref(vp);
-		}
-		uvn->u_obj.uo_refs++;		/* bump uvn ref! */
-
-		/* check for new writeable uvn */
-		if ((accessprot & PROT_WRITE) != 0 &&
-		    (uvn->u_flags & UVM_VNODE_WRITEABLE) == 0) {
-			uvn->u_flags |= UVM_VNODE_WRITEABLE;
-			KERNEL_ASSERT_LOCKED();
-			LIST_INSERT_HEAD(&uvn_wlist, uvn, u_wlist);
-		}
-
-		rw_exit(uvn->u_obj.vmobjlock);
-		return (&uvn->u_obj);
-	}
-
-	/*
-	 * need to call VOP_GETATTR() to get the attributes, but that could
-	 * block (due to I/O), so we want to unlock the object before calling.
-	 * however, we want to keep anyone else from playing with the object
-	 * while it is unlocked.   to do this we set UVM_VNODE_ALOCK which
-	 * prevents anyone from attaching to the vnode until we are done with
-	 * it.
-	 */
-	uvn->u_flags = UVM_VNODE_ALOCK;
-	rw_exit(uvn->u_obj.vmobjlock);
 
 	if (vp->v_type == VBLK) {
 		/*
@@ -213,14 +168,8 @@ uvn_attach(struct vnode *vp, vm_prot_t accessprot)
 			used_vnode_size = vattr.va_size;
 	}
 
-	if (result != 0) {
-		rw_enter(uvn->u_obj.vmobjlock, RW_WRITE);
-		if (uvn->u_flags & UVM_VNODE_WANTED)
-			wakeup(uvn);
-		uvn->u_flags = 0;
-		rw_exit(uvn->u_obj.vmobjlock);
+	if (result != 0)
 		return NULL;
-	}
 
 	/*
 	 * make sure that the newsize fits within a vaddr_t
@@ -231,30 +180,64 @@ uvn_attach(struct vnode *vp, vm_prot_t accessprot)
 		printf("used_vnode_size = %llu\n", (long long)used_vnode_size);
 #endif
 
-	/* now set up the uvn. */
-	KASSERT(uvn->u_obj.uo_refs == 0);
-	uvn->u_obj.uo_refs++;
-	oldflags = uvn->u_flags;
-	uvn->u_flags = UVM_VNODE_VALID|UVM_VNODE_CANPERSIST;
-	uvn->u_nio = 0;
-	uvn->u_size = used_vnode_size;
+	if (vp->v_uvm == NULL) {
+		uvn = pool_get(&uvm_vnode_pool, PR_WAITOK | PR_ZERO);
+		KERNEL_ASSERT_LOCKED();
+		if (vp->v_uvm == NULL) {
+			uvm_obj_init(&uvn->u_obj, &uvm_vnodeops, 0);
+			uvn->u_vnode = vp;
+			vp->v_uvm = uvn;
+		} else
+			pool_put(&uvm_vnode_pool, uvn);
+	}
+
+	uvn = vp->v_uvm;
+	rw_enter(uvn->u_obj.vmobjlock, RW_WRITE);
+	while (uvn->u_flags & UVM_VNODE_BLOCKED) {
+		uvn->u_flags |= UVM_VNODE_WANTED;
+		rwsleep_nsec(uvn, uvn->u_obj.vmobjlock, PVM, "uvn_attach",
+		    INFSLP);
+	}
 
 	/*
-	 * add a reference to the vnode.   this reference will stay as long
-	 * as there is a valid mapping of the vnode.   dropped when the
-	 * reference count goes to zero [and we either free or persist].
+	 * now uvn must not be in a blocked state.
+	 * first check to see if it is already active, in which case
+	 * we can bump the reference count.
 	 */
-	vref(vp);
+	if (uvn->u_flags & UVM_VNODE_VALID) {	/* already active? */
+
+		/* regain vref if we were persisting */
+		if (uvn->u_obj.uo_refs == 0) {
+			vref(vp);
+		}
+		uvn->u_obj.uo_refs++;		/* bump uvn ref! */
+	} else {
+		/* now set up the uvn. */
+		KASSERT(uvn->u_obj.uo_refs == 0);
+		uvn->u_obj.uo_refs++;
+		uvn->u_flags = UVM_VNODE_VALID|UVM_VNODE_CANPERSIST;
+		uvn->u_nio = 0;
+		uvn->u_size = used_vnode_size;
+
+		/*
+		 * this reference will stay as long as there is a valid
+		 * mapping of the vnode.   dropped when the reference count
+		 * goes to zero [and we either free or persist].
+		 */
+		vref(vp);
+	}
 
 	/* if write access, we need to add it to the wlist */
-	if (accessprot & PROT_WRITE) {
+	if ((accessprot & PROT_WRITE) &&
+	    !(uvn->u_flags & UVM_VNODE_WRITEABLE)) {
 		uvn->u_flags |= UVM_VNODE_WRITEABLE;	/* we are on wlist! */
 		KERNEL_ASSERT_LOCKED();
 		LIST_INSERT_HEAD(&uvn_wlist, uvn, u_wlist);
 	}
 
-	if (oldflags & UVM_VNODE_WANTED)
+	if (uvn->u_flags & UVM_VNODE_WANTED)
 		wakeup(uvn);
+	rw_exit(uvn->u_obj.vmobjlock);
 
 	return &uvn->u_obj;
 }
@@ -306,15 +289,14 @@ uvn_detach(struct uvm_object *uobj)
 	struct vnode *vp;
 	int oldflags;
 
-	KERNEL_LOCK();
 	rw_enter(uobj->vmobjlock, RW_WRITE);
 	uobj->uo_refs--;			/* drop ref! */
 	if (uobj->uo_refs) {			/* still more refs */
 		rw_exit(uobj->vmobjlock);
-		KERNEL_UNLOCK();
 		return;
 	}
 
+	KERNEL_LOCK();
 	/* get other pointers ... */
 	uvn = (struct uvm_vnode *) uobj;
 	vp = uvn->u_vnode;
@@ -422,10 +404,12 @@ void
 uvm_vnp_terminate(struct vnode *vp)
 {
 	struct uvm_vnode *uvn = vp->v_uvm;
-	struct uvm_object *uobj = &uvn->u_obj;
+	struct uvm_object *uobj;
 	int oldflags;
 
-	/* check if it is valid */
+	if (uvn == NULL)
+		return;
+	uobj = &uvn->u_obj;
 	rw_enter(uobj->vmobjlock, RW_WRITE);
 	if ((uvn->u_flags & UVM_VNODE_VALID) == 0) {
 		rw_exit(uobj->vmobjlock);
@@ -434,9 +418,7 @@ uvm_vnp_terminate(struct vnode *vp)
 
 	/*
 	 * must be a valid uvn that is not already dying (because XLOCK
-	 * protects us from that).   the uvn can't in the ALOCK state
-	 * because it is valid, and uvn's that are in the ALOCK state haven't
-	 * been marked valid yet.
+	 * protects us from that).
 	 */
 #ifdef DEBUG
 	/*
@@ -603,13 +585,11 @@ uvn_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 	struct uvm_vnode *uvn = (struct uvm_vnode *) uobj;
 	struct vm_page *pp, *ptmp;
 	struct vm_page *pps[MAXBSIZE >> PAGE_SHIFT], **ppsp;
-	struct pglist dead;
 	int npages, result, lcv;
 	boolean_t retval, need_iosync, needs_clean;
 	voff_t curoff;
 
 	KASSERT(rw_write_held(uobj->vmobjlock));
-	TAILQ_INIT(&dead);
 
 	/* get init vals and determine how we are going to traverse object */
 	need_iosync = FALSE;
@@ -683,10 +663,9 @@ uvn_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 		/* if we don't need a clean, deactivate/free pages then cont. */
 		if (!needs_clean) {
 			if (flags & PGO_DEACTIVATE) {
-				if (pp->wire_count == 0) {
-					pmap_page_protect(pp, PROT_NONE);
-					uvm_pagedeactivate(pp);
-				}
+				uvm_unlock_pageq();
+				uvm_pagedeactivate(pp);
+				uvm_lock_pageq();
 			} else if (flags & PGO_FREE) {
 				if (pp->pg_flags & PG_BUSY) {
 					uvm_unlock_pageq();
@@ -698,14 +677,17 @@ uvn_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 					continue;
 				} else {
 					pmap_page_protect(pp, PROT_NONE);
-					/* removed page from object */
-					uvm_pageclean(pp);
-					TAILQ_INSERT_HEAD(&dead, pp, pageq);
+					/* dequeue to prevent lock recursion */
+					if (pp->pg_flags &
+					    (PQ_ACTIVE|PQ_INACTIVE))
+						uvm_pagedequeue(pp);
+					uvm_pagefree(pp);
 				}
 			}
 			continue;
 		}
 
+ReTry:
 		/*
 		 * pp points to a page in the object that we are
 		 * working on.  if it is !PG_CLEAN,!PG_BUSY and we asked
@@ -717,10 +699,6 @@ uvn_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 		atomic_setbits_int(&pp->pg_flags, PG_BUSY);
 		UVM_PAGE_OWN(pp, "uvn_flush");
 		pmap_page_protect(pp, PROT_READ);
-		/* if we're async, free the page in aiodoned */
-		if ((flags & (PGO_FREE|PGO_SYNCIO)) == PGO_FREE)
-			atomic_setbits_int(&pp->pg_flags, PG_RELEASED);
-ReTry:
 		ppsp = pps;
 		npages = sizeof(pps) / sizeof(struct vm_page *);
 
@@ -743,22 +721,8 @@ ReTry:
 		 * of vm space.   if this happens we drop back to sync I/O.
 		 */
 		if (result == VM_PAGER_AGAIN) {
-			/*
-			 * it is unlikely, but page could have been released
-			 * we ignore this now and retry the I/O.
-			 * we will detect and
-			 * handle the released page after the syncio I/O
-			 * completes.
-			 */
-#ifdef DIAGNOSTIC
-			if (flags & PGO_SYNCIO)
-	panic("%s: PGO_SYNCIO return 'try again' error (impossible)", __func__);
-#endif
+			KASSERT((flags & PGO_SYNCIO) == 0);
 			flags |= PGO_SYNCIO;
-			if (flags & PGO_FREE)
-				atomic_clearbits_int(&pp->pg_flags,
-				    PG_RELEASED);
-
 			goto ReTry;
 		}
 
@@ -809,10 +773,9 @@ ReTry:
 
 			/* dispose of page */
 			if (flags & PGO_DEACTIVATE) {
-				if (ptmp->wire_count == 0) {
-					pmap_page_protect(ptmp, PROT_NONE);
-					uvm_pagedeactivate(ptmp);
-				}
+				uvm_unlock_pageq();
+				uvm_pagedeactivate(ptmp);
+				uvm_lock_pageq();
 			} else if (flags & PGO_FREE &&
 			    result != VM_PAGER_PEND) {
 				if (result != VM_PAGER_OK) {
@@ -833,8 +796,10 @@ ReTry:
 					retval = FALSE;
 				}
 				pmap_page_protect(ptmp, PROT_NONE);
-				uvm_pageclean(ptmp);
-				TAILQ_INSERT_TAIL(&dead, ptmp, pageq);
+				/* dequeue first to prevent lock recursion */
+				if (ptmp->pg_flags & (PQ_ACTIVE|PQ_INACTIVE))
+					uvm_pagedequeue(ptmp);
+				uvm_pagefree(ptmp);
 			}
 
 		}		/* end of "lcv" for loop */
@@ -855,8 +820,6 @@ ReTry:
 			wakeup(&uvn->u_flags);
 		uvn->u_flags &= ~(UVM_VNODE_IOSYNC|UVM_VNODE_IOSYNCWANTED);
 	}
-
-	uvm_pglistfree(&dead);
 
 	return retval;
 }
@@ -951,8 +914,9 @@ uvn_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 	int lcv, result, gotpages;
 	boolean_t done;
 
-	KASSERT(((flags & PGO_LOCKED) != 0 && rw_lock_held(uobj->vmobjlock)) ||
-	    (flags & PGO_LOCKED) == 0);
+	KASSERT(rw_lock_held(uobj->vmobjlock));
+	KASSERT(rw_write_held(uobj->vmobjlock) ||
+	    ((flags & PGO_LOCKED) != 0 && (access_type & PROT_WRITE) == 0));
 
 	/* step 1: handled the case where fault data structures are locked. */
 	if (flags & PGO_LOCKED) {
@@ -971,7 +935,6 @@ uvn_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 
 		for (lcv = 0, current_offset = offset ; lcv < *npagesp ;
 		    lcv++, current_offset += PAGE_SIZE) {
-
 			/* do we care about this page?  if not, skip it */
 			if (pps[lcv] == PGO_DONTCARE)
 				continue;
@@ -979,12 +942,18 @@ uvn_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 			/* lookup page */
 			ptmp = uvm_pagelookup(uobj, current_offset);
 
-			/* to be useful must get a non-busy, non-released pg */
-			if (ptmp == NULL ||
-			    (ptmp->pg_flags & PG_BUSY) != 0) {
-				if (lcv == centeridx || (flags & PGO_ALLPAGES)
-				    != 0)
-					done = FALSE;	/* need to do a wait or I/O! */
+			/*
+			 * to be useful must get a non-busy page
+			 */
+			if (ptmp == NULL || (ptmp->pg_flags & PG_BUSY) != 0) {
+				if (lcv == centeridx) {
+					/* need to do a wait or I/O! */
+					done = FALSE;
+				}
+				if ((flags & PGO_ALLPAGES) != 0) {
+					done = FALSE;
+					break;
+				}
 				continue;
 			}
 
@@ -992,8 +961,6 @@ uvn_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 			 * useful page: busy it and plug it in our
 			 * result array
 			 */
-			atomic_setbits_int(&ptmp->pg_flags, PG_BUSY);
-			UVM_PAGE_OWN(ptmp, "uvn_get1");
 			pps[lcv] = ptmp;
 			gotpages++;
 
@@ -1015,12 +982,8 @@ uvn_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 		 * step 1c: now we've either done everything needed or we to
 		 * unlock and do some waiting or I/O.
 		 */
-
 		*npagesp = gotpages;		/* let caller know */
-		if (done)
-			return VM_PAGER_OK;		/* bingo! */
-		else
-			return VM_PAGER_UNLOCK;
+		return done ? VM_PAGER_OK : VM_PAGER_UNLOCK;
 	}
 
 	/*
@@ -1123,9 +1086,7 @@ uvn_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 			atomic_clearbits_int(&ptmp->pg_flags,
 			    PG_WANTED|PG_BUSY);
 			UVM_PAGE_OWN(ptmp, NULL);
-			uvm_lock_pageq();
 			uvm_pagefree(ptmp);
-			uvm_unlock_pageq();
 			rw_exit(uobj->vmobjlock);
 			return result;
 		}
@@ -1367,13 +1328,14 @@ int
 uvm_vnp_uncache(struct vnode *vp)
 {
 	struct uvm_vnode *uvn = vp->v_uvm;
-	struct uvm_object *uobj = &uvn->u_obj;
+	struct uvm_object *uobj;
 
-	/* lock uvn part of the vnode and check if we need to do anything */
-
+	if (uvn == NULL)
+		return TRUE;
+	uobj = &uvn->u_obj;
 	rw_enter(uobj->vmobjlock, RW_WRITE);
 	if ((uvn->u_flags & UVM_VNODE_VALID) == 0 ||
-			(uvn->u_flags & UVM_VNODE_BLOCKED) != 0) {
+	    (uvn->u_flags & UVM_VNODE_BLOCKED) != 0) {
 		rw_exit(uobj->vmobjlock);
 		return TRUE;
 	}
@@ -1446,13 +1408,13 @@ void
 uvm_vnp_setsize(struct vnode *vp, off_t newsize)
 {
 	struct uvm_vnode *uvn = vp->v_uvm;
-	struct uvm_object *uobj = &uvn->u_obj;
+	struct uvm_object *uobj;
 
 	KERNEL_ASSERT_LOCKED();
-
+	if (uvn == NULL)
+		return;
+	uobj = &uvn->u_obj;
 	rw_enter(uobj->vmobjlock, RW_WRITE);
-
-	/* lock uvn and check for valid object, and if valid: do it! */
 	if (uvn->u_flags & UVM_VNODE_VALID) {
 
 		/*
@@ -1505,9 +1467,6 @@ uvm_vnp_sync(struct mount *mp)
 		 * If the vnode is "blocked" it means it must be dying, which
 		 * in turn means its in the process of being flushed out so
 		 * we can safely skip it.
-		 *
-		 * note that uvn must already be valid because we found it on
-		 * the wlist (this also means it can't be ALOCK'd).
 		 */
 		if ((uvn->u_flags & UVM_VNODE_BLOCKED) != 0)
 			continue;

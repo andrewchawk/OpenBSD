@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.h,v 1.6 2021/06/29 21:27:52 kettenis Exp $	*/
+/*	$OpenBSD: intr.h,v 1.10 2025/05/19 02:13:15 jsg Exp $	*/
 
 /*
  * Copyright (c) 2001-2004 Opsycon AB  (www.opsycon.se / www.opsycon.com)
@@ -43,7 +43,6 @@
 
 /* Interrupt priority `levels'; not mutually exclusive. */
 #define	IPL_NONE	0	/* nothing */
-#define	IPL_SOFT	1	/* soft interrupts */
 #define	IPL_SOFTCLOCK	2	/* soft clock interrupts */
 #define	IPL_SOFTNET	3	/* soft network interrupts */
 #define	IPL_SOFTTTY	4	/* soft terminal interrupts */
@@ -77,13 +76,6 @@
 #define	IST_EDGE_RISING		5
 #define	IST_EDGE_BOTH		6
 
-/* RISCV interrupt mcause, from freebsd */
-#define	RISCV_NIRQ		1024
-
-#ifndef	NIRQ
-#define	NIRQ			RISCV_NIRQ
-#endif
-
 enum {
 	IRQ_SOFTWARE_USER,
 	IRQ_SOFTWARE_SUPERVISOR,
@@ -100,11 +92,14 @@ enum {
 	INTC_NIRQS
 };
 
+#define __USE_MI_SOFTINTR
+
+#include <sys/softintr.h>
+
 #ifndef _LOCORE
-#include <sys/device.h>
 #include <sys/queue.h>
 
-#include <machine/frame.h>
+void	 softintr(int);
 
 int	 splraise(int);
 int	 spllower(int);
@@ -135,7 +130,6 @@ extern struct riscv_intr_func riscv_intr_func;
 #define	spllower(cpl)		(riscv_intr_func.lower(cpl))
 #define	splx(cpl)		(riscv_intr_func.x(cpl))
 
-#define	splsoft()	splraise(IPL_SOFT)
 #define	splsoftclock()	splraise(IPL_SOFTCLOCK)
 #define	splsoftnet()	splraise(IPL_SOFTNET)
 #define	splsofttty()	splraise(IPL_SOFTTTY)
@@ -151,14 +145,10 @@ extern struct riscv_intr_func riscv_intr_func;
 
 #define	spl0()		spllower(IPL_NONE)
 
-#include <machine/riscvreg.h>
-
 void	 intr_barrier(void *);
 
 void	 riscv_init_smask(void); /* XXX */
 extern uint32_t riscv_smask[NIPL];
-
-#include <machine/softintr.h>
 
 void	riscv_clock_register(void (*)(void), void (*)(u_int), void (*)(int),
     void (*)(void));

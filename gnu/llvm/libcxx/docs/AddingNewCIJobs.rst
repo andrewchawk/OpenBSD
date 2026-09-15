@@ -28,6 +28,9 @@ An example of a job definition is:
 
   - label: "C++11"
     command: "libcxx/utils/ci/run-buildbot generic-cxx11"
+    env:
+      CC: clang
+      CXX: clang++
     artifact_paths:
       - "**/test-results.xml"
     agents:
@@ -37,7 +40,7 @@ An example of a job definition is:
       [...]
 
 If you create your own agents, put them in the ``libcxx-builders`` queue and
-use agent tags to allow targetting your agents from the Buildkite pipeline
+use agent tags to allow targeting your agents from the Buildkite pipeline
 config appropriately.
 
 We try to keep the pipeline definition file as simple as possible, and to

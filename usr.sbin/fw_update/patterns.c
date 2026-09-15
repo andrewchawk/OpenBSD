@@ -1,4 +1,4 @@
-/*	$OpenBSD: patterns.c,v 1.13 2024/05/22 12:33:07 claudio Exp $	*/
+/*	$OpenBSD: patterns.c,v 1.21 2026/08/28 04:52:43 dgl Exp $	*/
 
 /*
  * Copyright (c) 1995, 1996 Christopher G. Demetriou.  All rights reserved.
@@ -94,11 +94,16 @@ main(void)
 	print_devices("amdgpu", amdgpu_devices, nitems(amdgpu_devices));
 	printf("%s\n", "amdgpu ^vga*vendor \"ATI\", unknown product"); 
 	printf("%s\n", "amdgpu ^vendor \"ATI\", unknown product*class display");
+	printf("%s\n", "amdsev ^\"AMD*Crypto\"");
+	printf("%s\n", "amdsev ^\"AMD*PSP\"");
+	printf("%s\n", "amdsev ^ccp0");
+	printf("%s\n", "amdsev ^psp0");
 	printf("%s\n", "apple-boot ^cpu0*Apple");
 	printf("%s\n", "arm64-qcom-dtb ^qcgpio0");
 	printf("%s\n", "athn");
 	printf("%s\n", "bwfm");
 	printf("%s\n", "bwi");
+	printf("%s\n", "ice");
 	printf("%s\n", "intel");
 	printf("%s\n", "intel ^cpu0:*Intel");
 	printf("%s\n", "inteldrm");
@@ -115,11 +120,13 @@ main(void)
 	printf("%s\n", "otus");
 	printf("%s\n", "pgt");
 	printf("%s\n", "qcpas");
-	printf("%s\n", "qcpas ^ppb0*\"Qualcomm SC8280XP PCIe\"");
+	printf("%s\n", "qcpas ^ppb0*\"Qualcomm");
+	printf("%s\n", "qcpas ^cpu0*\"Qualcomm");
 	printf("%s\n", "qwx");
+	printf("%s\n", "qwz");
 	printf("%s\n", "radeondrm");
 	print_devices("radeondrm", radeon_devices, nitems(radeon_devices));
-	printf("%s\n", "rsu");
+	printf("%s\n", "riscv64-spacemit-dtb ^smtgpio0");
 	printf("%s\n", "uath");
 	printf("%s\n", "upgt");
 	printf("%s\n", "uvideo");

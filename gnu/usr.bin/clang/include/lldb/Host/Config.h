@@ -33,6 +33,8 @@
 
 #define LLDB_ENABLE_LZMA 0
 
+#define LLVM_ENABLE_CURL 0
+
 #define LLDB_ENABLE_CURSES 1
 
 #define CURSES_HAVE_NCURSES_CURSES_H 0
@@ -54,5 +56,7 @@
 #define LLDB_INSTALL_LIBDIR_BASENAME ""
 
 /* #undef LLDB_GLOBAL_INIT_DIRECTORY */
+
+#define LLDB_BUG_REPORT_URL "https://github.com/llvm/llvm-project/issues/"
 
 #endif // #ifndef LLDB_HOST_CONFIG_H

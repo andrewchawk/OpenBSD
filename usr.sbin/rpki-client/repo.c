@@ -1,4 +1,4 @@
-/*	$OpenBSD: repo.c,v 1.61 2024/07/12 09:27:32 claudio Exp $ */
+/*	$OpenBSD: repo.c,v 1.91 2026/07/28 18:58:22 claudio Exp $ */
 /*
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -16,9 +16,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 
 #include <assert.h>
@@ -62,6 +62,9 @@ struct rrdprepo {
 	struct filepath_tree	 deleted;
 	unsigned int		 id;
 	enum repo_state		 state;
+	int			 file_failed;
+	time_t			 last_reset;
+	time_t			 mtime;
 };
 static SLIST_HEAD(, rrdprepo)	rrdprepos = SLIST_HEAD_INITIALIZER(rrdprepos);
 
@@ -79,7 +82,7 @@ struct tarepo {
 	char			*descr;
 	char			*basedir;
 	char			**uri;
-	size_t			 urisz;
+	size_t			 num_uris;
 	size_t			 uriidx;
 	unsigned int		 id;
 	enum repo_state		 state;
@@ -201,7 +204,7 @@ static void
 filepath_put(struct filepath_tree *tree, struct filepath *fp)
 {
 	RB_REMOVE(filepath_tree, tree, fp);
-	free((void *)fp->file);
+	free(fp->file);
 	free(fp);
 }
 
@@ -301,6 +304,20 @@ repo_state(const struct repo *rp)
 	return REPO_DONE;
 }
 
+static const char *
+repo_state_string(const struct repo *rp)
+{
+	switch (repo_state(rp)) {
+	case REPO_LOADING:
+		return "loading";
+	case REPO_DONE:
+		return "done";
+	case REPO_FAILED:
+		return "failed";
+	}
+	return "unknown";
+}
+
 /*
  * Function called once a repository is done with the sync. Either
  * successfully or after failure.
@@ -355,14 +372,14 @@ static void
 ta_fetch(struct tarepo *tr)
 {
 	if (!rrdpon) {
-		for (; tr->uriidx < tr->urisz; tr->uriidx++) {
+		for (; tr->uriidx < tr->num_uris; tr->uriidx++) {
 			if (strncasecmp(tr->uri[tr->uriidx],
 			    RSYNC_PROTO, RSYNC_PROTO_LEN) == 0)
 				break;
 		}
 	}
 
-	if (tr->uriidx >= tr->urisz) {
+	if (tr->uriidx >= tr->num_uris) {
 		tr->state = REPO_FAILED;
 		logx("ta/%s: fallback to cache", tr->descr);
 
@@ -425,9 +442,9 @@ ta_get(struct tal *tal)
 	}
 
 	/* steal URI information from TAL */
-	tr->urisz = tal->urisz;
+	tr->num_uris = tal->num_uris;
 	tr->uri = tal->uri;
-	tal->urisz = 0;
+	tal->num_uris = 0;
 	tal->uri = NULL;
 
 	ta_fetch(tr);
@@ -464,9 +481,9 @@ static struct rsyncrepo *
 rsync_get(const char *uri, const char *validdir)
 {
 	struct rsyncrepo *rr;
-	char *repo;
+	char *repo = NULL;
 
-	if ((repo = rsync_base_uri(uri)) == NULL)
+	if (!rsync_base_uri(uri, &repo))
 		errx(1, "bad caRepository URI: %s", uri);
 
 	SLIST_FOREACH(rr, &rsyncrepos, entry)
@@ -614,12 +631,16 @@ static int
 rrdp_uri_valid(struct rrdprepo *rr, const char *uri)
 {
 	struct repo *rp;
+	size_t len;
 
 	SLIST_FOREACH(rp, &repos, entry) {
 		if (rp->rrdp != rr)
 			continue;
-		if (strncmp(uri, rp->repouri, strlen(rp->repouri)) == 0)
-			return 1;
+		len = strlen(rp->repouri);
+		if (strncmp(uri, rp->repouri, len) == 0) {
+			if (uri[len] == '/')
+				return 1;
+		}
 	}
 	return 0;
 }
@@ -651,15 +672,19 @@ repo_alloc(int talid)
  * based on that information.
  */
 static struct rrdp_session *
-rrdp_session_parse(const struct rrdprepo *rr)
+rrdp_session_parse(struct rrdprepo *rr)
 {
 	FILE *f;
 	struct rrdp_session *state;
 	int fd, ln = 0, deltacnt = 0;
 	const char *errstr;
 	char *line = NULL, *file;
-	size_t len = 0;
+	size_t i, len = 0;
 	ssize_t n;
+	time_t now, weeks;
+	struct stat st;
+
+	now = time(NULL);
 
 	if ((state = calloc(1, sizeof(*state))) == NULL)
 		err(1, NULL);
@@ -669,9 +694,13 @@ rrdp_session_parse(const struct rrdprepo *rr)
 		if (errno != ENOENT)
 			warn("%s: open state file", rr->basedir);
 		free(file);
+		rr->last_reset = now;
 		return state;
 	}
+	if (fstat(fd, &st) != 0)
+		errx(1, "fstat %s", file);
 	free(file);
+	rr->mtime = st.st_mtime;
 	f = fdopen(fd, "r");
 	if (f == NULL)
 		err(1, "fdopen");
@@ -681,23 +710,41 @@ rrdp_session_parse(const struct rrdprepo *rr)
 			line[n - 1] = '\0';
 		switch (ln) {
 		case 0:
+			if (!valid_uri(line, strlen(line), HTTPS_PROTO))
+				goto reset;
+			break;
+		case 1:
 			if ((state->session_id = strdup(line)) == NULL)
 				err(1, NULL);
 			break;
-		case 1:
-			state->serial = strtonum(line, 1, LLONG_MAX, &errstr);
-			if (errstr)
-				goto fail;
-			break;
 		case 2:
+			state->serial = strtonum(line, 1, LLONG_MAX, &errstr);
+			if (errstr) {
+				warnx("%s: state file: serial is %s: %s",
+				    rr->basedir, errstr, line);
+				goto reset;
+			}
+			break;
+		case 3:
+			rr->last_reset = strtonum(line, 1, LLONG_MAX, &errstr);
+			if (errstr) {
+				warnx("%s: state file: last_reset is %s: %s",
+				    rr->basedir, errstr, line);
+				goto reset;
+			}
+			break;
+		case 4:
 			if (strcmp(line, "-") == 0)
 				break;
 			if ((state->last_mod = strdup(line)) == NULL)
 				err(1, NULL);
 			break;
 		default:
-			if (deltacnt >= MAX_RRDP_DELTAS)
-				goto fail;
+			if (deltacnt >= MAX_RRDP_DELTAS) {
+				warnx("%s: state file: too many deltas: %d",
+				    rr->basedir, deltacnt);
+				goto reset;
+			}
 			if ((state->deltas[deltacnt++] = strdup(line)) == NULL)
 				err(1, NULL);
 			break;
@@ -705,19 +752,35 @@ rrdp_session_parse(const struct rrdprepo *rr)
 		ln++;
 	}
 
-	if (ferror(f))
-		goto fail;
+	if (ferror(f)) {
+		warn("%s: error reading state file", rr->basedir);
+		goto reset;
+	}
+
+	/* check if it's time for reinitialization */
+	weeks = (now - rr->last_reset) / (86400 * 7);
+	if (now <= rr->last_reset || weeks > RRDP_RANDOM_REINIT_MAX) {
+		warnx("%s: reinitializing", rr->notifyuri);
+		goto reset;
+	}
+	if (arc4random_uniform(1U << RRDP_RANDOM_REINIT_MAX) < (1U << weeks)) {
+		warnx("%s: reinitializing", rr->notifyuri);
+		goto reset;
+	}
+
 	fclose(f);
 	free(line);
 	return state;
 
- fail:
-	warnx("%s: troubles reading state file", rr->basedir);
+ reset:
 	fclose(f);
 	free(line);
 	free(state->session_id);
 	free(state->last_mod);
+	for (i = 0; i < sizeof(state->deltas) / sizeof(state->deltas[0]); i++)
+		free(state->deltas[i]);
 	memset(state, 0, sizeof(*state));
+	rr->last_reset = now;
 	return state;
 }
 
@@ -747,8 +810,8 @@ rrdp_session_save(unsigned int id, struct rrdp_session *state)
 		err(1, "fdopen");
 
 	/* write session state file out */
-	if (fprintf(f, "%s\n%lld\n", state->session_id,
-	    state->serial) < 0)
+	if (fprintf(f, "%s\n%s\n%lld\n%lld\n", rr->notifyuri, state->session_id,
+	    state->serial, (long long)rr->last_reset) < 0)
 		goto fail;
 
 	if (state->last_mod != NULL) {
@@ -771,6 +834,8 @@ rrdp_session_save(unsigned int id, struct rrdp_session *state)
 		warn("%s: rename %s to %s", rr->basedir, temp, file);
 		unlink(temp);
 	}
+
+	rr->mtime = time(NULL);
 
 	free(temp);
 	free(file);
@@ -809,9 +874,9 @@ rrdp_session_buffer(struct ibuf *b, const struct rrdp_session *s)
 
 	io_str_buffer(b, s->session_id);
 	io_simple_buffer(b, &s->serial, sizeof(s->serial));
-	io_str_buffer(b, s->last_mod);
+	io_opt_str_buffer(b, s->last_mod);
 	for (i = 0; i < sizeof(s->deltas) / sizeof(s->deltas[0]); i++)
-		io_str_buffer(b, s->deltas[i]);
+		io_opt_str_buffer(b, s->deltas[i]);
 }
 
 struct rrdp_session *
@@ -825,9 +890,9 @@ rrdp_session_read(struct ibuf *b)
 
 	io_read_str(b, &s->session_id);
 	io_read_buf(b, &s->serial, sizeof(s->serial));
-	io_read_str(b, &s->last_mod);
+	io_read_opt_str(b, &s->last_mod);
 	for (i = 0; i < sizeof(s->deltas) / sizeof(s->deltas[0]); i++)
-		io_read_str(b, &s->deltas[i]);
+		io_read_opt_str(b, &s->deltas[i]);
 
 	return s;
 }
@@ -888,6 +953,7 @@ rrdp_clear(unsigned int id)
 
 	/* remove rrdp repository contents */
 	remove_contents(rr->basedir);
+	rr->file_failed = 0;
 }
 
 /*
@@ -910,7 +976,7 @@ rrdp_handle_file(unsigned int id, enum publish_type pt, char *uri,
 	rr = rrdp_find(id);
 	if (rr == NULL)
 		errx(1, "non-existent rrdp repo %u", id);
-	if (rr->state == REPO_FAILED)
+	if (rr->file_failed)
 		return -1;
 
 	/* check hash of original file for updates and deletes */
@@ -980,7 +1046,7 @@ rrdp_handle_file(unsigned int id, enum publish_type pt, char *uri,
 	return 1;
 
 fail:
-	rr->state = REPO_FAILED;
+	rr->file_failed = 1;
 	if (fd != -1)
 		close(fd);
 	free(fn);
@@ -1053,8 +1119,12 @@ rrdp_finish(unsigned int id, int ok)
 	if (rr->state != REPO_LOADING)
 		return;
 
-	if (ok) {
+	if (ok && !rr->file_failed) {
 		logx("%s: loaded from network", rr->notifyuri);
+		if (time(NULL) - rr->mtime > 24 * 60 * 60) {
+			warnx("%s: notification file not modified since %s",
+			    rr->notifyuri, time2str(rr->mtime));
+		}
 		stats.rrdp_repos++;
 		rr->state = REPO_DONE;
 	} else {
@@ -1115,7 +1185,7 @@ ta_lookup(int id, struct tal *tal)
 {
 	struct repo	*rp;
 
-	if (tal->urisz == 0)
+	if (tal->num_uris == 0)
 		errx(1, "TAL %s has no URI", tal->descr);
 
 	/* Look up in repository table. (Lookup should actually fail here) */
@@ -1156,9 +1226,9 @@ struct repo *
 repo_lookup(int talid, const char *uri, const char *notify)
 {
 	struct repo	*rp;
-	char		*repouri;
+	char		*repouri = NULL;
 
-	if ((repouri = rsync_base_uri(uri)) == NULL)
+	if (!rsync_base_uri(uri, &repouri))
 		errx(1, "bad caRepository URI: %s", uri);
 
 	/* Look up in repository table. */
@@ -1224,6 +1294,21 @@ repo_byid(unsigned int id)
 
 	SLIST_FOREACH(rp, &repos, entry) {
 		if (rp->id == id)
+			return rp;
+	}
+
+	errx(1, "unknown repo with id %u", id);
+}
+
+static struct repo *
+repo_rsync_bypath(const char *path)
+{
+	struct repo	*rp;
+
+	SLIST_FOREACH(rp, &repos, entry) {
+		if (rp->rsync == NULL)
+			continue;
+		if (strcmp(rp->basedir, path) == 0)
 			return rp;
 	}
 	return NULL;
@@ -1323,7 +1408,7 @@ repo_proto(const struct repo *rp)
 
 	if (rp->ta != NULL) {
 		const struct tarepo *tr = rp->ta;
-		if (tr->uriidx < tr->urisz &&
+		if (tr->uriidx < tr->num_uris &&
 		    strncasecmp(tr->uri[tr->uriidx], RSYNC_PROTO,
 		    RSYNC_PROTO_LEN) == 0)
 			return "rsync";
@@ -1354,6 +1439,21 @@ repo_queued(struct repo *rp, struct entity *p)
 	return 0;
 }
 
+void
+repo_printinfo(size_t qlen)
+{
+	struct repo	*rp;
+
+	warnx("%zu outstanding entities", qlen);
+
+	SLIST_FOREACH(rp, &repos, entry) {
+		if (TAILQ_EMPTY(&rp->queue))
+			continue;
+		warnx("%s: queue not empty, state %s", rp->basedir,
+		    repo_state_string(rp));
+	}
+}
+
 static void
 repo_fail(struct repo *rp)
 {
@@ -1376,12 +1476,15 @@ repo_abort(struct repo *rp)
 	/* reset the alarm */
 	rp->alarm = getmonotime() + repo_timeout;
 
-	if (rp->rsync)
+	if (rp->rsync) {
+		warnx("%s: synchronisation timeout", rp->repouri);
 		rsync_abort(rp->rsync->id);
-	else if (rp->rrdp)
+	} else if (rp->rrdp) {
+		warnx("%s: synchronisation timeout", rp->notifyuri);
 		rrdp_abort(rp->rrdp->id);
-	else
-		repo_fail(rp);
+	}
+
+	repo_fail(rp);
 }
 
 int
@@ -1412,11 +1515,9 @@ repo_check_timeout(int timeout)
 	/* Look up in repository table. (Lookup should actually fail here) */
 	SLIST_FOREACH(rp, &repos, entry) {
 		if (repo_state(rp) == REPO_LOADING) {
-			if (rp->alarm <= now) {
-				warnx("%s: synchronisation timeout",
-				    rp->repouri);
+			if (rp->alarm <= now)
 				repo_abort(rp);
-			} else {
+			else {
 				diff = rp->alarm - now;
 				diff *= 1000;
 				if (timeout == INFTIM || diff < timeout)
@@ -1434,9 +1535,28 @@ repo_check_timeout(int timeout)
 void
 repostats_new_files_inc(struct repo *rp, const char *file)
 {
+	assert(rp != NULL);
+
 	if (strncmp(file, ".rsync/", strlen(".rsync/")) == 0 ||
 	    strncmp(file, ".rrdp/", strlen(".rrdp/")) == 0)
 		rp->repostats.new_files++;
+}
+
+void
+repo_stat_add_nca(struct nonfunc_ca *nca)
+{
+	struct repo *rp;
+
+	SLIST_FOREACH(rp, &repos, entry) {
+		if (rp->id == nca->repoid) {
+			rp->stats[nca->talid].certs_nonfunc++;
+
+			if (nca->defer)
+				rp->stats[nca->talid].certs_nonfunc_deferred++;
+
+			break;
+		}
+	}
 }
 
 /*
@@ -1445,8 +1565,8 @@ repostats_new_files_inc(struct repo *rp, const char *file)
 void
 repo_stat_inc(struct repo *rp, int talid, enum rtype type, enum stype subtype)
 {
-	if (rp == NULL)
-		return;
+	assert(rp != NULL);
+
 	rp->stats_used[talid] = 1;
 	switch (type) {
 	case RTYPE_CER:
@@ -1464,6 +1584,8 @@ repo_stat_inc(struct repo *rp, int talid, enum rtype type, enum stype subtype)
 			rp->stats[talid].mfts++;
 		if (subtype == STYPE_FAIL)
 			rp->stats[talid].mfts_fail++;
+		if (subtype == STYPE_SEQNUM_GAP)
+			rp->stats[talid].mfts_gap++;
 		break;
 	case RTYPE_ROA:
 		switch (subtype) {
@@ -1545,9 +1667,6 @@ repo_stat_inc(struct repo *rp, int talid, enum rtype type, enum stype subtype)
 		break;
 	case RTYPE_CRL:
 		rp->stats[talid].crls++;
-		break;
-	case RTYPE_GBR:
-		rp->stats[talid].gbrs++;
 		break;
 	case RTYPE_TAK:
 		rp->stats[talid].taks++;
@@ -1698,21 +1817,25 @@ repo_move_valid(struct filepath_tree *tree)
 		if ((fp->file = strdup(fn)) == NULL)
 			err(1, NULL);
 
- again:
 		if ((ofp = RB_INSERT(filepath_tree, tree, fp)) != NULL) {
-			if (ofp->talmask == 0) {
-				/* conflicting path is not valid, drop it */
-				filepath_put(tree, ofp);
-				goto again;
+			if (ofp->talmask != 0) {
+				/* conflicting filepath is valid, keep it */
+				if (fp->talmask != 0) {
+					warnx("%s: file already present in "
+					    "validated cache", fp->file);
+				}
+				free(fp->file);
+				free(fp);
+				free(base);
+				continue;
 			}
-			if (fp->talmask != 0) {
-				warnx("%s: file already present in "
-				    "validated cache", fp->file);
-			}
+
+			/* conflicting filepath is not valid, replace it */
+			ofp->talmask = fp->talmask;
+			ofp->mtime = fp->mtime;
 			free(fp->file);
 			free(fp);
-			free(base);
-			continue;
+			fp = ofp;
 		}
 
 		if (rename(base, fp->file) == -1)
@@ -1753,6 +1876,9 @@ repo_cleanup_entry(FTSENT *e, struct filepath_tree *tree, int cachefd)
 	path = skip_dotslash(e->fts_path);
 	switch (e->fts_info) {
 	case FTS_NSOK:
+		if (e->fts_level == 1 && fts_state.type == BASE_DIR &&
+		    strcmp(e->fts_name, NCA_HISTORY) == 0)
+			break;
 		if (filepath_exists(tree, path)) {
 			e->fts_parent->fts_number++;
 			break;
@@ -1854,7 +1980,8 @@ repo_cleanup_entry(FTSENT *e, struct filepath_tree *tree, int cachefd)
 		}
 		if (e->fts_level == 3 && fts_state.type == RSYNC_DIR) {
 			/* .rsync/rpki.example.org/repository */
-			fts_state.rp = repo_bypath(path + strlen(".rsync/"));
+			fts_state.rp = repo_rsync_bypath(path +
+			    strlen(".rsync/"));
 		}
 		break;
 	case FTS_DP:

@@ -1,4 +1,4 @@
-.\" $OpenBSD: rwlock.9,v 1.26 2021/01/16 15:02:40 mvs Exp $
+.\" $OpenBSD: rwlock.9,v 1.31 2026/09/10 01:17:22 jsg Exp $
 .\"
 .\" Copyright (c) 2006 Pedro Martelletto <pedro@ambientworks.net>
 .\" All rights reserved.
@@ -15,13 +15,14 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: January 16 2021 $
+.Dd $Mdocdate: September 10 2026 $
 .Dt RWLOCK 9
 .Os
 .Sh NAME
 .Nm rwlock ,
 .Nm rw_init ,
 .Nm rw_init_flags ,
+.Nm rw_init_flags_trace ,
 .Nm rw_enter ,
 .Nm rw_exit ,
 .Nm rw_enter_read ,
@@ -34,6 +35,7 @@
 .Nm rw_assert_unlocked ,
 .Nm rw_status ,
 .Nm RWLOCK_INITIALIZER ,
+.Nm RWLOCK_INITIALIZER_TRACE ,
 .Nm rrw_init ,
 .Nm rrw_init_flags ,
 .Nm rrw_enter ,
@@ -46,6 +48,13 @@
 .Fn rw_init "struct rwlock *rwl" "const char *name"
 .Ft void
 .Fn rw_init_flags "struct rwlock *rwl" "const char *name" "int flags"
+.Ft void
+.Fo rw_init_flags_trace
+.Fa "struct rwlock *rwl"
+.Fa "const char *name"
+.Fa "int flags"
+.Fa "int trace"
+.Fc
 .Ft int
 .Fn rw_enter "struct rwlock *rwl" "int flags"
 .Ft void
@@ -69,6 +78,7 @@
 .Ft int
 .Fn rw_status "struct rwlock *rwl"
 .Fn RWLOCK_INITIALIZER "const char *name"
+.Fn RWLOCK_INITIALIZER_TRACE "const char *name" "int trace"
 .Ft void
 .Fn rrw_init "struct rrwlock *rrwl" "const char *name"
 .Ft void
@@ -121,6 +131,10 @@ Instructs
 .Xr witness 4
 to ignore this lock.
 .El
+.Fn rw_init_flags_trace
+additionally accepts a
+.Xr dt 4
+static probe index.
 .Pp
 The
 .Fn rw_enter
@@ -139,15 +153,15 @@ Acquire an exclusive lock.
 .It Dv RW_DOWNGRADE
 Safely release an exclusive lock and acquire a shared lock without
 letting other exclusive locks in between.
+.It Dv RW_UPGRADE
+Upgrade a shared lock into an exclusive one.
+Must be combined with
+.Dv RW_NOSLEEP .
 .It Dv RW_INTR
 When waiting for a lock, allow signals to interrupt the sleep.
 .It Dv RW_NOSLEEP
 Do not wait for busy locks, fail with
-.Dv EBUSY
-instead.
-.It Dv RW_SLEEPFAIL
-Wait for busy locks, but do not obtain them, fail with
-.Dv EAGAIN
+.Er EBUSY
 instead.
 .It Dv RW_DUPOK
 Prevents
@@ -197,6 +211,10 @@ The
 .Fa name
 argument specifies the name of the lock, which is used as the wait message
 if the thread needs to sleep.
+.Fn RWLOCK_INITIALIZER_TRACE
+additionally accepts a
+.Xr dt 4
+static probe index.
 .Pp
 The
 .Nm rrwlock
@@ -205,6 +223,7 @@ They otherwise behave the same as their rwlock counterparts.
 .Sh CONTEXT
 .Fn rw_init ,
 .Fn rw_init_flags ,
+.Fn rw_init_flags_trace ,
 .Fn rrw_init
 and
 .Fn rrw_init_flags

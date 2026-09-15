@@ -1,4 +1,4 @@
-/*	$OpenBSD: output-ometric.c,v 1.10 2024/04/08 14:02:13 tb Exp $ */
+/*	$OpenBSD: output-ometric.c,v 1.17 2026/06/24 09:06:20 job Exp $ */
 /*
  * Copyright (c) 2022 Claudio Jeker <claudio@openbsd.org>
  *
@@ -42,11 +42,17 @@ set_common_stats(const struct repotalstats *in, struct ometric *metric,
 	    OKV("type", "state"), OKV("cert", "valid"), ol);
 	ometric_set_int_with_labels(metric, in->certs_fail,
 	    OKV("type", "state"), OKV("cert", "failed parse"), ol);
+	ometric_set_int_with_labels(metric, in->certs_nonfunc,
+	    OKV("type", "state"), OKV("cert", "non-functional"), ol);
+	ometric_set_int_with_labels(metric, in->certs_nonfunc_deferred,
+	    OKV("type", "state"), OKV("cert", "sync-deferred"), ol);
 
 	ometric_set_int_with_labels(metric, in->mfts,
 	    OKV("type", "state"), OKV("manifest", "valid"), ol);
 	ometric_set_int_with_labels(metric, in->mfts_fail,
 	    OKV("type", "state"), OKV("manifest", "failed parse"), ol);
+	ometric_set_int_with_labels(metric, in->mfts_gap,
+	    OKV("type", "state"), OKV("manifest", "sequence gap"), ol);
 
 	ometric_set_int_with_labels(metric, in->roas,
 	    OKV("type", "state"), OKV("roa", "valid"), ol);
@@ -66,8 +72,6 @@ set_common_stats(const struct repotalstats *in, struct ometric *metric,
 	    OKV("type", "state"), OKV("router_key", "valid"), ol);
 	ometric_set_int_with_labels(metric, in->crls,
 	    OKV("type", "state"), OKV("crl", "valid"), ol);
-	ometric_set_int_with_labels(metric, in->gbrs,
-	    OKV("type", "state"), OKV("gbr", "valid"), ol);
 	ometric_set_int_with_labels(metric, in->taks,
 	    OKV("type", "state"), OKV("tak", "valid"), ol);
 
@@ -85,12 +89,14 @@ set_common_stats(const struct repotalstats *in, struct ometric *metric,
 	ometric_set_int_with_labels(metric, in->vaps_overflowed,
 	    OKV("type", "state"), OKV("vap overflowed"), ol);
 
-	ometric_set_int_with_labels(metric, in->spls,
-	    OKV("type", "state"), OKV("spl", "valid"), ol);
-	ometric_set_int_with_labels(metric, in->spls_fail,
-	    OKV("type", "state"), OKV("spl", "failed parse"), ol);
-	ometric_set_int_with_labels(metric, in->spls_invalid,
-	    OKV("type", "state"), OKV("spl", "invalid"), ol);
+	if (experimental) {
+		ometric_set_int_with_labels(metric, in->spls,
+		    OKV("type", "state"), OKV("spl", "valid"), ol);
+		ometric_set_int_with_labels(metric, in->spls_fail,
+		    OKV("type", "state"), OKV("spl", "failed parse"), ol);
+		ometric_set_int_with_labels(metric, in->spls_invalid,
+		    OKV("type", "state"), OKV("spl", "invalid"), ol);
+	}
 
 	ometric_set_int_with_labels(metric, in->vsps,
 	    OKV("type", "state"), OKV("vsp", "total"), ol);
@@ -161,8 +167,7 @@ repo_stats(const struct repo *rp, const struct repostats *in, void *arg)
 }
 
 int
-output_ometric(FILE *out, struct vrp_tree *vrps, struct brk_tree *brks,
-    struct vap_tree *vaps, struct vsp_tree *vsps, struct stats *st)
+output_ometric(FILE *out, struct validation_data *vd, struct stats *st)
 {
 	struct olabels *ol;
 	const char *keys[4] = { "nodename", "domainname", "release", NULL };

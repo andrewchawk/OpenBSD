@@ -1,4 +1,4 @@
-/*	$OpenBSD: gs.h,v 1.18 2016/05/27 09:18:11 martijn Exp $	*/
+/*	$OpenBSD: gs.h,v 1.19 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -123,7 +123,7 @@ struct _gs {
 	} cname[MAX_FAST_KEY + 1];	/* Fast lookup table. */
 
 #define	KEY_VAL(sp, ch)							\
-	((unsigned char)(ch) <= MAX_FAST_KEY ? 				\
+	((unsigned char)(ch) <= MAX_FAST_KEY ?				\
 	    (sp)->gp->special_key[(unsigned char)(ch)] :		\
 	    (unsigned char)(ch) > (sp)->gp->max_special ? 0 :		\
 	    v_key_val((sp),(ch)))

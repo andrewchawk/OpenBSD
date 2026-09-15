@@ -1,4 +1,4 @@
-/*	$OpenBSD: msg.c,v 1.28 2022/12/26 19:16:03 jmc Exp $	*/
+/*	$OpenBSD: msg.c,v 1.29 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1991, 1993, 1994
@@ -43,7 +43,7 @@ msgq(SCR *sp, mtype_t mt, const char *fmt, ...)
 	size_t blen, len, mlen, nlen;
 	const char *p;
 	char *bp, *mp;
-        va_list ap;
+	va_list ap;
 
 	/*
 	 * !!!
@@ -149,7 +149,7 @@ retry:		FREE_SPACE(sp, bp, blen);
 	}
 
 	/* Format the arguments into the string. */
-        va_start(ap, fmt);
+	va_start(ap, fmt);
 	len = vsnprintf(mp, REM, fmt, ap);
 	va_end(ap);
 	if (len >= nlen)

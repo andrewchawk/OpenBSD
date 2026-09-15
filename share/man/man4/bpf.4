@@ -1,4 +1,4 @@
-.\"	$OpenBSD: bpf.4,v 1.46 2024/08/05 23:56:10 dlg Exp $
+.\"	$OpenBSD: bpf.4,v 1.51 2025/11/21 14:48:34 schwarze Exp $
 .\"     $NetBSD: bpf.4,v 1.7 1995/09/27 18:31:50 thorpej Exp $
 .\"
 .\" Copyright (c) 1990 The Regents of the University of California.
@@ -23,7 +23,7 @@
 .\" This document is derived in part from the enet man page (enet.4)
 .\" distributed with 4.3BSD Unix.
 .\"
-.Dd $Mdocdate: August 5 2024 $
+.Dd $Mdocdate: November 21 2025 $
 .Dt BPF 4
 .Os
 .Sh NAME
@@ -189,23 +189,11 @@ returned by
 .Dv BIOCGSTATS .
 .Pp
 .It Dv BIOCLOCK
-This ioctl is designed to prevent the security issues associated
-with an open
+Prevents further changes to the configuration of the
 .Nm
-descriptor in unprivileged programs.
-Even with dropped privileges, an open
-.Nm
-descriptor can be abused by a rogue program to listen on any interface
-on the system, send packets on these interfaces if the descriptor was
-opened read-write and send signals to arbitrary processes using the
-signaling mechanism of
-.Nm bpf .
-By allowing only
+descriptor by only permitting a set of
 .Dq known safe
-ioctls, the
-.Dv BIOCLOCK
-ioctl prevents this abuse.
-The allowable ioctls are
+ioctls:
 .Dv BIOCFLUSH ,
 .Dv BIOCGBLEN ,
 .Dv BIOCGDIRFILT ,
@@ -226,23 +214,19 @@ The allowable ioctls are
 .Dv TIOCGPGRP ,
 and
 .Dv FIONREAD .
-Use of any other ioctl is denied with error
+All other ioctl operations will be denied with
 .Er EPERM .
-Once a descriptor is locked, it is not possible to unlock it.
-A process with root privileges is not affected by the lock.
 .Pp
-A privileged program can open a
+The purpose of this mechanism is that a privileged program can open a
 .Nm
-device, drop privileges, set the interface, filters and modes on the
-descriptor, and lock it.
-Once the descriptor is locked, the system is safe
-from further abuse through the descriptor.
-Locking a descriptor does not prevent writes.
-If the application does not need to send packets through
-.Nm bpf ,
-it can open the device read-only to prevent writing.
-If sending packets is necessary, a write-filter can be set before locking the
-descriptor to prevent arbitrary packets from being sent out.
+device, drop privileges, set the interface, provide filters and modes,
+and then lock it with
+.Dv BIOCLOCK .
+If the device is opened with write,
+.Dv BIOCLOCK
+does not prevent writes, so a write filter is probably needed.
+If applied correctly, a bug in a program will not result in the ability to
+see or send unfiltered traffic to the network interface.
 .Pp
 .It Dv BIOCGETIF Fa "struct ifreq *"
 Returns the name of the hardware interface that the file is listening on.
@@ -318,6 +302,7 @@ readable.
 The maximum wait time that can be set is 5 minutes (300 seconds).
 .Pp
 .It Dv BIOCSETF Fa "struct bpf_program *"
+.It Dv BIOCSETFNR Fa "struct bpf_program *"
 Sets the filter program used by the kernel to discard uninteresting packets.
 An array of instructions and its length are passed in using the following
 structure:
@@ -335,9 +320,11 @@ field, while its length in units of
 is given by the
 .Fa bf_len
 field.
-Also, the actions of
+If
+.Dv BIOCSETF
+is used, the actions of
 .Dv BIOCFLUSH
-are performed.
+are also performed.
 .Pp
 See section
 .Sx FILTER MACHINE
@@ -350,8 +337,6 @@ network.
 See
 .Dv BIOCSETF
 for a description of the filter program.
-This ioctl also acts as
-.Dv BIOCFLUSH .
 .Pp
 Note that the filter operates on the packet data written to the descriptor.
 If the
@@ -788,6 +773,12 @@ A <- A * k
 .Sm on
 A <- A / k
 .Sm off
+.It Xo Dv BPF_ALU No + BPF_MOD No +
+.Dv BPF_K
+.Xc
+.Sm on
+A <- A % k
+.Sm off
 .It Xo Dv BPF_ALU No + BPF_AND No +
 .Dv BPF_K
 .Xc
@@ -799,6 +790,12 @@ A <- A & k
 .Xc
 .Sm on
 A <- A | k
+.Sm off
+.It Xo Dv BPF_ALU No + BPF_XOR No +
+.Dv BPF_K
+.Xc
+.Sm on
+A <- A ^ k
 .Sm off
 .It Xo Dv BPF_ALU No + BPF_LSH No +
 .Dv BPF_K
@@ -836,6 +833,12 @@ A <- A * X
 .Sm on
 A <- A / X
 .Sm off
+.It Xo Dv BPF_ALU No + BPF_MOD No +
+.Dv BPF_X
+.Xc
+.Sm on
+A <- A % X
+.Sm off
 .It Xo Dv BPF_ALU No + BPF_AND No +
 .Dv BPF_X
 .Xc
@@ -847,6 +850,12 @@ A <- A & X
 .Xc
 .Sm on
 A <- A | X
+.Sm off
+.It Xo Dv BPF_ALU No + BPF_XOR No +
+.Dv BPF_X
+.Xc
+.Sm on
+A <- A ^ X
 .Sm off
 .It Xo Dv BPF_ALU No + BPF_LSH No +
 .Dv BPF_X

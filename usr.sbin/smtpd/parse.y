@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.299 2024/02/19 21:00:19 gilles Exp $	*/
+/*	$OpenBSD: parse.y,v 1.302 2026/04/04 19:18:37 martijn Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <ifaddrs.h>
 #include <inttypes.h>
+#include <libgen.h>
 #include <resolv.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,6 +146,8 @@ static int	host_v4(struct listen_opts *);
 static int	host_v6(struct listen_opts *);
 static int	host_dns(struct listen_opts *);
 static int	interface(struct listen_opts *);
+#define TAG_MAX	32
+static const char *processor_maketag(const char *);
 
 int		 delaytonum(char *);
 int		 is_if_in_group(const char *, const char *);
@@ -450,6 +453,8 @@ PROC STRING STRING {
 	processor = xcalloc(1, sizeof *processor);
 	processor->command = $3;
 } proc_params {
+	if (!processor->tag)
+		processor->tag = processor_maketag($2);
 	dict_set(conf->sc_filter_processes_dict, $2, processor);
 	processor = NULL;
 }
@@ -480,6 +485,28 @@ USER STRING {
 		YYERROR;
 	}
 	processor->chroot = $2;
+}
+| TAG STRING {
+	size_t i;
+
+	if (processor->tag) {
+		yyerror("tag already specified for this processor");
+		free($2);
+		YYERROR;
+	}
+	for (i = 0; $2[i] != '\0'; i++) {
+		if (!isalpha($2[i])) {
+			yyerror("tag can only contain letters");
+			free($2);
+			YYERROR;
+		}
+	}
+	if (i > TAG_MAX) {
+		yyerror("tag can only be %d characters", TAG_MAX);
+		free($2);
+		YYERROR;
+	}
+	processor->tag = $2;
 }
 ;
 
@@ -1928,6 +1955,8 @@ FILTER STRING PROC_EXEC STRING {
 	filter_config->proc = xstrdup($2);
 	dict_set(conf->sc_filters_dict, $2, filter_config);
 } proc_params {
+	if (!processor->tag)
+		processor->tag = processor_maketag(filter_config->proc);
 	dict_set(conf->sc_filter_processes_dict, filter_config->proc, processor);
 	processor = NULL;
 	filter_config = NULL;
@@ -2037,6 +2066,12 @@ limits_smtp	: opt_limit_smtp limits_smtp
 
 opt_limit_smtp : STRING NUMBER {
 			if (!strcmp($1, "max-rcpt")) {
+				if ($2 < 100) {
+					yyerror("RFC5321 requires "
+					    "max-rcpt >= 100");
+					free($1);
+					YYERROR;
+				}
 				conf->sc_session_max_rcpt = $2;
 			}
 			else if (!strcmp($1, "max-mails")) {
@@ -3648,3 +3683,18 @@ config_lo_mask_source(struct listen_opts *lo) {
 	return 0;
 }
 
+/* Best effort. If it's ugly: use the tag parameter */
+static const char *
+processor_maketag(const char *name)
+{
+	char tag[TAG_MAX + 1];
+	size_t i, j;
+
+	for (i = j = 0; name[i] != '\0' && j < sizeof(tag) - 1; i++) {
+		if (isalnum(name[i]))
+			tag[j++] = name[i];
+	}
+	tag[j] = '\0';
+
+	return xstrdup(tag);
+}

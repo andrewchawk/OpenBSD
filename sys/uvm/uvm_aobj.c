@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_aobj.c,v 1.110 2024/04/13 23:44:11 jsg Exp $	*/
+/*	$OpenBSD: uvm_aobj.c,v 1.123 2026/09/06 21:01:30 kirill Exp $	*/
 /*	$NetBSD: uvm_aobj.c,v 1.39 2001/02/18 21:19:08 chs Exp $	*/
 
 /*
@@ -142,7 +142,7 @@ struct uvm_aobj {
 struct pool uvm_aobj_pool;
 
 static struct uao_swhash_elt	*uao_find_swhash_elt(struct uvm_aobj *, int,
-				     boolean_t);
+				     boolean_t, boolean_t);
 static boolean_t		 uao_flush(struct uvm_object *, voff_t,
 				     voff_t, int);
 static void			 uao_free(struct uvm_aobj *);
@@ -197,10 +197,12 @@ static struct mutex uao_list_lock = MUTEX_INITIALIZER(IPL_MPFLOOR);
  * offset.
  */
 static struct uao_swhash_elt *
-uao_find_swhash_elt(struct uvm_aobj *aobj, int pageidx, boolean_t create)
+uao_find_swhash_elt(struct uvm_aobj *aobj, int pageidx, boolean_t create,
+    boolean_t wait)
 {
 	struct uao_swhash *swhash;
 	struct uao_swhash_elt *elt;
+	int waitf = wait ? PR_WAITOK : PR_NOWAIT;
 	voff_t page_tag;
 
 	swhash = UAO_SWHASH_HASH(aobj, pageidx); /* first hash to get bucket */
@@ -220,17 +222,9 @@ uao_find_swhash_elt(struct uvm_aobj *aobj, int pageidx, boolean_t create)
 	/*
 	 * allocate a new entry for the bucket and init/insert it in
 	 */
-	elt = pool_get(&uao_swhash_elt_pool, PR_NOWAIT | PR_ZERO);
-	/*
-	 * XXX We cannot sleep here as the hash table might disappear
-	 * from under our feet.  And we run the risk of deadlocking
-	 * the pagedeamon.  In fact this code will only be called by
-	 * the pagedaemon and allocation will only fail if we
-	 * exhausted the pagedeamon reserve.  In that case we're
-	 * doomed anyway, so panic.
-	 */
+	elt = pool_get(&uao_swhash_elt_pool, waitf | PR_ZERO);
 	if (elt == NULL)
-		panic("%s: can't allocate entry", __func__);
+		return NULL;
 	LIST_INSERT_HEAD(swhash, elt, list);
 	elt->tag = page_tag;
 
@@ -258,7 +252,7 @@ uao_find_swslot(struct uvm_object *uobj, int pageidx)
 	 */
 	if (UAO_USES_SWHASH(aobj)) {
 		struct uao_swhash_elt *elt =
-		    uao_find_swhash_elt(aobj, pageidx, FALSE);
+		    uao_find_swhash_elt(aobj, pageidx, FALSE, FALSE);
 
 		if (elt)
 			return UAO_SWHASH_ELT_PAGESLOT(elt, pageidx);
@@ -284,6 +278,7 @@ int
 uao_set_swslot(struct uvm_object *uobj, int pageidx, int slot)
 {
 	struct uvm_aobj *aobj = (struct uvm_aobj *)uobj;
+	struct uao_swhash_elt *elt;
 	int oldslot;
 
 	KASSERT(rw_write_held(uobj->vmobjlock) || uobj->uo_refs == 0);
@@ -310,11 +305,9 @@ uao_set_swslot(struct uvm_object *uobj, int pageidx, int slot)
 		 * the page had not swap slot in the first place, and
 		 * we are freeing.
 		 */
-		struct uao_swhash_elt *elt =
-		    uao_find_swhash_elt(aobj, pageidx, slot ? TRUE : FALSE);
+		elt = uao_find_swhash_elt(aobj, pageidx, slot != 0, FALSE);
 		if (elt == NULL) {
-			KASSERT(slot == 0);
-			return 0;
+			return slot ? - 1 : 0;
 		}
 
 		oldslot = UAO_SWHASH_ELT_PAGESLOT(elt, pageidx);
@@ -465,7 +458,7 @@ uao_shrink_convert(struct uvm_object *uobj, int pages)
 
 	/* Convert swap slots from hash to array.  */
 	for (i = 0; i < pages; i++) {
-		elt = uao_find_swhash_elt(aobj, i, FALSE);
+		elt = uao_find_swhash_elt(aobj, i, FALSE, FALSE);
 		if (elt != NULL) {
 			new_swslots[i] = UAO_SWHASH_ELT_PAGESLOT(elt, i);
 			if (new_swslots[i] != 0)
@@ -622,12 +615,12 @@ uao_grow_convert(struct uvm_object *uobj, int pages)
 
 	/* Set these now, so we can use uao_find_swhash_elt(). */
 	old_swslots = aobj->u_swslots;
-	aobj->u_swhash = new_swhash;		
+	aobj->u_swhash = new_swhash;
 	aobj->u_swhashmask = new_hashmask;
 
 	for (i = 0; i < aobj->u_pages; i++) {
 		if (old_swslots[i] != 0) {
-			elt = uao_find_swhash_elt(aobj, i, TRUE);
+			elt = uao_find_swhash_elt(aobj, i, TRUE, TRUE);
 			elt->count++;
 			UAO_SWHASH_ELT_PAGESLOT(elt, i) = old_swslots[i];
 		}
@@ -839,9 +832,7 @@ uao_detach(struct uvm_object *uobj)
 			continue;
 		}
 		uao_dropswap(&aobj->u_obj, pg->offset >> PAGE_SHIFT);
-		uvm_lock_pageq();
 		uvm_pagefree(pg);
-		uvm_unlock_pageq();
 	}
 
 	/*
@@ -921,19 +912,10 @@ uao_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 		 * XXX in the future.
 		 */
 		case PGO_CLEANIT|PGO_FREE:
-			/* FALLTHROUGH */
 		case PGO_CLEANIT|PGO_DEACTIVATE:
-			/* FALLTHROUGH */
 		case PGO_DEACTIVATE:
  deactivate_it:
-			if (pg->wire_count != 0)
-				continue;
-
-			uvm_lock_pageq();
-			pmap_page_protect(pg, PROT_NONE);
 			uvm_pagedeactivate(pg);
-			uvm_unlock_pageq();
-
 			continue;
 		case PGO_FREE:
 			/*
@@ -958,10 +940,7 @@ uao_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 			 * because we need to update swap accounting anyway.
 			 */
 			uao_dropswap(uobj, pg->offset >> PAGE_SHIFT);
-			uvm_lock_pageq();
 			uvm_pagefree(pg);
-			uvm_unlock_pageq();
-
 			continue;
 		default:
 			panic("uao_flush: weird flags");
@@ -969,6 +948,32 @@ uao_flush(struct uvm_object *uobj, voff_t start, voff_t stop, int flags)
 	}
 
 	return TRUE;
+}
+
+/*
+ * PGO_ALLPAGES makes every requested page mandatory; otherwise only
+ * centeridx must remain within the object, because adjacent pages are
+ * fault clustering candidates rather than required fetches. Validate
+ * this distinction before allocation because pageidx directly indexes
+ * swap metadata; an out of range value can therefore access storage
+ * beyond the object's extent.
+ */
+static inline int
+uao_get_validate(struct uvm_aobj *aobj, voff_t firstpage, int maxpages,
+    int centeridx, int flags)
+{
+	if (maxpages <= 0 ||
+	    firstpage < 0 ||
+	    firstpage >= (voff_t)aobj->u_pages)
+		return 0;
+
+	if (flags & PGO_ALLPAGES)
+		return (voff_t)maxpages <=
+		    (voff_t)aobj->u_pages - firstpage;
+
+	return centeridx >= 0 &&
+	    centeridx < maxpages &&
+	    (voff_t)centeridx < (voff_t)aobj->u_pages - firstpage;
 }
 
 /*
@@ -993,18 +998,27 @@ uao_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
     int *npagesp, int centeridx, vm_prot_t access_type, int advice, int flags)
 {
 	struct uvm_aobj *aobj = (struct uvm_aobj *)uobj;
-	voff_t current_offset;
+	voff_t current_offset, firstpage;
 	vm_page_t ptmp;
 	int lcv, gotpages, maxpages, swslot, rv, pageidx;
 	boolean_t done;
 
 	KASSERT(UVM_OBJ_IS_AOBJ(uobj));
-	KASSERT(rw_write_held(uobj->vmobjlock));
+	KASSERT(rw_lock_held(uobj->vmobjlock));
+	KASSERT(rw_write_held(uobj->vmobjlock) ||
+	    ((flags & PGO_LOCKED) != 0 && (access_type & PROT_WRITE) == 0));
 
 	/*
  	 * get number of pages
  	 */
 	maxpages = *npagesp;
+	firstpage = offset >> PAGE_SHIFT;
+	if (!uao_get_validate(aobj, firstpage, maxpages, centeridx, flags)) {
+		*npagesp = 0;
+		if ((flags & PGO_LOCKED) == 0)
+			rw_exit(uobj->vmobjlock);
+		return VM_PAGER_BAD;
+	}
 
 	if (flags & PGO_LOCKED) {
 		/*
@@ -1012,7 +1026,6 @@ uao_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 		 * this if the data structures are locked (i.e. the first
 		 * time through).
  		 */
-
 		done = TRUE;	/* be optimistic */
 		gotpages = 0;	/* # of pages we got so far */
 
@@ -1022,46 +1035,29 @@ uao_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 			if (pps[lcv] == PGO_DONTCARE)
 				continue;
 
+			/* lookup page */
 			ptmp = uvm_pagelookup(uobj, current_offset);
-
-			/*
- 			 * if page is new, attempt to allocate the page,
-			 * zero-fill'd.
- 			 */
-			if (ptmp == NULL && uao_find_swslot(uobj,
-			    current_offset >> PAGE_SHIFT) == 0) {
-				ptmp = uvm_pagealloc(uobj, current_offset,
-				    NULL, UVM_PGA_ZERO);
-				if (ptmp) {
-					/* new page */
-					atomic_clearbits_int(&ptmp->pg_flags,
-					    PG_BUSY|PG_FAKE);
-					atomic_setbits_int(&ptmp->pg_flags,
-					    PQ_AOBJ);
-					UVM_PAGE_OWN(ptmp, NULL);
-				}
-			}
 
 			/*
 			 * to be useful must get a non-busy page
 			 */
-			if (ptmp == NULL ||
-			    (ptmp->pg_flags & PG_BUSY) != 0) {
-				if (lcv == centeridx ||
-				    (flags & PGO_ALLPAGES) != 0)
+			if (ptmp == NULL || (ptmp->pg_flags & PG_BUSY) != 0) {
+				if (lcv == centeridx) {
 					/* need to do a wait or I/O! */
-					done = FALSE;	
+					done = FALSE;
+				}
+				if ((flags & PGO_ALLPAGES) != 0) {
+					done = FALSE;
+					break;
+				}
 				continue;
 			}
 
 			/*
 			 * useful page: plug it in our result array
 			 */
-			atomic_setbits_int(&ptmp->pg_flags, PG_BUSY);
-			UVM_PAGE_OWN(ptmp, "uao_get1");
 			pps[lcv] = ptmp;
 			gotpages++;
-
 		}
 
 		/*
@@ -1069,12 +1065,7 @@ uao_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 		 * to unlock and do some waiting or I/O.
  		 */
 		*npagesp = gotpages;
-		if (done)
-			/* bingo! */
-			return VM_PAGER_OK;	
-		else
-			/* EEK!   Need to unlock and I/O */
-			return VM_PAGER_UNLOCK;
+		return done ? VM_PAGER_OK : VM_PAGER_UNLOCK;
 	}
 
 	/*
@@ -1091,7 +1082,7 @@ uao_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 		    (lcv != centeridx && (flags & PGO_ALLPAGES) == 0))
 			continue;
 
-		pageidx = current_offset >> PAGE_SHIFT;
+		pageidx = firstpage + lcv;
 
 		/*
  		 * we have yet to locate the current page (pps[lcv]).   we
@@ -1205,9 +1196,7 @@ uao_get(struct uvm_object *uobj, voff_t offset, struct vm_page **pps,
 				atomic_clearbits_int(&ptmp->pg_flags,
 				    PG_WANTED|PG_BUSY);
 				UVM_PAGE_OWN(ptmp, NULL);
-				uvm_lock_pageq();
 				uvm_pagefree(ptmp);
-				uvm_unlock_pageq();
 				rw_exit(uobj->vmobjlock);
 
 				return rv;
@@ -1436,10 +1425,7 @@ uao_pagein_page(struct uvm_aobj *aobj, int pageidx)
 	/*
 	 * deactivate the page (to put it on a page queue).
 	 */
-	pmap_clear_reference(pg);
-	uvm_lock_pageq();
 	uvm_pagedeactivate(pg);
-	uvm_unlock_pageq();
 
 	return FALSE;
 }
@@ -1543,7 +1529,7 @@ uao_dropswap_range(struct uvm_object *uobj, voff_t start, voff_t end)
 	 * the swap slots we've freed.
 	 */
 	if (swpgonlydelta > 0) {
-		KASSERT(uvmexp.swpgonly >= swpgonlydelta);
+		KASSERT(atomic_load_sint(&uvmexp.swpgonly) >= swpgonlydelta);
 		atomic_add_int(&uvmexp.swpgonly, -swpgonlydelta);
 	}
 }

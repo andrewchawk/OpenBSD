@@ -1,4 +1,4 @@
-/*	$OpenBSD: rfc3779.c,v 1.10 2023/12/13 07:19:37 tb Exp $ */
+/*	$OpenBSD: rfc3779.c,v 1.17 2026/06/04 12:01:55 tb Exp $ */
 /*
  * Copyright (c) 2021 Theo Buehler <tb@openbsd.org>
  *
@@ -41,9 +41,10 @@ report_hexdump(const char *func, const char *description, const char *msg,
     const unsigned char *want, size_t want_len,
     const unsigned char *got, size_t got_len)
 {
-	fprintf(stderr, "%s: \"%s\" %s\nwant:\n", func, description, msg);
+	fprintf(stderr, "%s: \"%s\" %s\nwant %zu bytes:\n",
+	    func, description, msg, want_len);
 	hexdump(want, want_len);
-	fprintf(stderr, "got:\n");
+	fprintf(stderr, "got %zu bytes:\n", got_len);
 	hexdump(got, got_len);
 }
 
@@ -216,6 +217,26 @@ const struct IPAddressOrRange_test IPAddressOrRange_test_data[] = {
 			0x0a, 0x40, 0x0f, 0xff,
 		},
 	},
+
+	/* Part of AfriNIC, first actual range in afrinic.constraints. */
+	{
+		.description = "range 196.1.7.0 - 196.1.63.255",
+		.der = {
+			0x30, 0x0c,
+			/* 192.1.7.0 */
+			0x03, 0x04, 0x00, 0xc4, 0x01, 0x07,
+			/* 192.1.63.255 */
+			0x03, 0x04, 0x06, 0xc4, 0x01, 0x00,
+		},
+		.der_len = 14,
+		.afi = IANA_AFI_IPV4,
+		.min = {
+			0xc4, 0x01, 0x07, 0x00,
+		},
+		.max = {
+			0xc4, 0x01, 0x3f, 0xff,
+		},
+	},
 };
 
 const size_t N_IPADDRESSORRANGE_TESTS =
@@ -311,8 +332,7 @@ run_IPAddressOrRange_tests(void)
 	int failed = 0;
 
 	for (i = 0; i < N_IPADDRESSORRANGE_TESTS; i++)
-		failed |=
-		    test_IPAddressOrRange(&IPAddressOrRange_test_data[i]);
+		failed |= test_IPAddressOrRange(&IPAddressOrRange_test_data[i]);
 
 	return failed;
 }
@@ -760,6 +780,41 @@ const struct build_addr_block_test_data build_addr_block_tests[] = {
 		},
 		.afi_len = 1,
 	},
+
+	/* Part of AfriNIC, first actual range in afrinic.constraints. */
+	{
+		.description = "range 196.1.7.0 - 196.1.63.255",
+		.addrs = {
+			{
+				.afi = IANA_AFI_IPV4,
+				.safi = safi_none,
+				.type = choice_range,
+				.addr.ipv4.range = {
+					.min = {
+						196, 1, 7, 0,
+					},
+					.max = {
+						196, 1, 63, 255,
+					},
+				},
+			},
+			{
+				.type = choice_last,
+			},
+		},
+		.der = {
+			0x30, 0x16, 0x30, 0x14, 0x04, 0x02, 0x00, 0x01,
+			0x30, 0x0e, 0x30, 0x0c, 0x03, 0x04, 0x00, 0xc4,
+			0x01, 0x07, 0x03, 0x04, 0x06, 0xc4, 0x01, 0x00,
+		},
+		.der_len = 24,
+		.is_canonical = 1,
+		.inherits = 0,
+		.afis = {
+			IANA_AFI_IPV4,
+		},
+		.afi_len = 1,
+	},
 };
 
 const size_t N_BUILD_ADDR_BLOCK_TESTS =
@@ -931,7 +986,7 @@ build_addr_block_test(const struct build_addr_block_test_data *test)
 			    " failed\n", __func__, test->description);
 			goto err;
 		}
-		if (test->afis[i] != afi){
+		if (test->afis[i] != afi) {
 			fprintf(stderr, "%s: \"%s\" afi[%d] mismatch. "
 			    "want: %u, got: %u\n", __func__,
 			    test->description, i, test->afis[i], afi);
@@ -1472,7 +1527,6 @@ build_asid_test(const struct ASIdentifiers_build_test *test)
 		goto err;
 	}
 
-
 	memcmp_failed = (size_t)out_len != test->der_len;
 	if (!memcmp_failed)
 		memcmp_failed = memcmp(out, test->der, test->der_len);
@@ -1951,6 +2005,188 @@ run_ASIdentifiers_subset_test(void)
 	return failed;
 }
 
+/*
+ * IPAddressFamily_cmp() is well exercised with mostly valid data via canonize
+ * and is_canonical. Squeeze invalid inheriting address families between valid
+ * ones, then sort. This would previously call memcmp() on NULL.
+ */
+
+static const uint8_t invalid_block[] = {
+	0x30, 0x26,
+	0x30, 0x04, 0x04, 0x00, 0x05, 0x00,		/* Invalid empty AF. */
+	0x30, 0x06, 0x04, 0x02, 0x00, 0x01, 0x05, 0x00, /* IPv4 */
+	0x30, 0x06, 0x04, 0x02, 0x00, 0x02, 0x05, 0x00, /* IPv6 */
+	0x30, 0x07, 0x04, 0x03, 0x00, 0x02, 0x04, 0x05, 0x00, /* IPv6 NLRI */
+	0x30, 0x05, 0x04, 0x01, 0x01, 0x05, 0x00,	/* invalid AF 0x01 */
+};
+static const size_t invalid_block_len = sizeof(invalid_block);
+
+static int
+run_IPAddressFamily_cmp_ub_test(void)
+{
+	IPAddrBlocks *addrs;
+	IPAddressFamily *af = NULL;
+	const unsigned char *p;
+	unsigned char *out = NULL;
+	int out_len = 0;
+	unsigned int nlri_safi = 4;
+	int memcmp_failed;
+	int failed = 1;
+
+	if ((addrs = IPAddrBlocks_new()) == NULL) {
+		fprintf(stderr, "%s: IPAddrBlocks_new\n", __func__);
+		goto err;
+	}
+
+	/*
+	 * Add IPv6 NLRI, inheriting
+	 */
+
+	if (!X509v3_addr_add_inherit(addrs, IANA_AFI_IPV6, &nlri_safi)) {
+		fprintf(stderr, "%s: X509v3_addr_add_inherit IPv6\n", __func__);
+		goto err;
+	}
+
+	/*
+	 * Add IPv6, inheriting
+	 */
+
+	if (!X509v3_addr_add_inherit(addrs, IANA_AFI_IPV6, NULL)) {
+		fprintf(stderr, "%s: X509v3_addr_add_inherit IPv6\n", __func__);
+		goto err;
+	}
+
+	/*
+	 * Add an inheriting IPAddressFamily with invalid empty addressFamily.
+	 */
+
+	if ((af = IPAddressFamily_new()) == NULL) {
+		fprintf(stderr, "%s: IPAddressFamily_new\n", __func__);
+		goto err;
+	}
+	if ((af->ipAddressChoice->u.inherit = ASN1_NULL_new()) == NULL) {
+		fprintf(stderr, "%s: ASN1_NULL_new()\n", __func__);
+		goto err;
+	}
+	af->ipAddressChoice->type = IPAddressChoice_inherit;
+
+	if (sk_IPAddressFamily_push(addrs, af) <= 0) {
+		fprintf(stderr, "%s: sk_IPAddressFamily_push\n", __func__);
+		goto err;
+	}
+	af = NULL;
+
+	/*
+	 * Add an inheriting IPAddressFamily with invalid addressFamily 0x01.
+	 */
+
+	if ((af = IPAddressFamily_new()) == NULL) {
+		fprintf(stderr, "%s: IPAddressFamily_new\n", __func__);
+		goto err;
+	}
+	if (!ASN1_OCTET_STRING_set(af->addressFamily, "\x01", 1)) {
+		fprintf(stderr, "%s: ASN1_OCTET_STRING_set\n", __func__);
+		goto err;
+	}
+	if ((af->ipAddressChoice->u.inherit = ASN1_NULL_new()) == NULL) {
+		fprintf(stderr, "%s: ASN1_NULL_new()\n", __func__);
+		goto err;
+	}
+	af->ipAddressChoice->type = IPAddressChoice_inherit;
+
+	if (sk_IPAddressFamily_push(addrs, af) <= 0) {
+		fprintf(stderr, "%s: sk_IPAddressFamily_push\n", __func__);
+		goto err;
+	}
+	af = NULL;
+
+	/*
+	 * Add IPv4, inheriting
+	 */
+
+	if (!X509v3_addr_add_inherit(addrs, IANA_AFI_IPV4, NULL)) {
+		fprintf(stderr, "%s: X509v3_addr_add_inherit IPv4\n", __func__);
+		goto err;
+	}
+
+	/*
+	 * Sort the thing.
+	 */
+
+	sk_IPAddressFamily_sort(addrs);
+
+	/*
+	 * Since addrs contains two invalid AFIs, X509v3_addr_is_canonical()
+	 * should reject it. Serializing works nevertheless.
+	 */
+
+	if (X509v3_addr_is_canonical(addrs)) {
+		fprintf(stderr, "%s: X509v3_addr_is_canonical\n", __func__);
+		goto err;
+	}
+
+	if ((out_len = i2d_IPAddrBlocks(addrs, &out)) <= 0) {
+		fprintf(stderr, "%s: i2d_IPAddrBlocks failed\n", __func__);
+		out_len = 0;
+		goto err;
+	}
+
+	memcmp_failed = 0;
+	if (invalid_block_len != (size_t)out_len)
+		memcmp_failed = 1;
+	if (!memcmp_failed)
+		memcmp_failed = memcmp(invalid_block, out, out_len) != 0;
+
+	if (memcmp_failed) {
+		report_hexdump(__func__, "invalid IPAddrBlock", "memcmp DER failed",
+		    invalid_block, invalid_block_len, out, out_len);
+		goto err;
+	}
+
+	/*
+	 * We can also parse this garbage.
+	 */
+
+	IPAddrBlocks_free(addrs);
+	addrs = NULL;
+
+	p = invalid_block;
+	if ((addrs = d2i_IPAddrBlocks(NULL, &p, invalid_block_len)) == NULL) {
+		fprintf(stderr, "%s: d2i_IPAddrBlocks\n", __func__);
+		goto err;
+	}
+
+	freezero(out, out_len);
+	out = NULL;
+
+	if ((out_len = i2d_IPAddrBlocks(addrs, &out)) <= 0) {
+		fprintf(stderr, "%s: i2d_IPAddrBlocks (2) failed\n", __func__);
+		out_len = 0;
+		goto err;
+	}
+
+	memcmp_failed = 0;
+	if (invalid_block_len != (size_t)out_len)
+		memcmp_failed = 1;
+	if (!memcmp_failed)
+		memcmp_failed = memcmp(invalid_block, out, out_len) != 0;
+
+	if (memcmp_failed) {
+		report_hexdump(__func__, "invalid IPAddrBlock (2)", "memcmp DER failed",
+		    invalid_block, invalid_block_len, out, out_len);
+		goto err;
+	}
+
+	failed = 0;
+
+ err:
+	IPAddrBlocks_free(addrs);
+	IPAddressFamily_free(af);
+	freezero(out, out_len);
+
+	return failed;
+}
+
 int
 main(void)
 {
@@ -1960,6 +2196,7 @@ main(void)
 	failed |= run_IPAddrBlock_tests();
 	failed |= run_ASIdentifiers_build_test();
 	failed |= run_ASIdentifiers_subset_test();
+	failed |= run_IPAddressFamily_cmp_ub_test();
 
 	return failed;
 }

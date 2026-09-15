@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_vlan.c,v 1.219 2024/06/09 16:25:28 jan Exp $	*/
+/*	$OpenBSD: if_vlan.c,v 1.224 2025/12/18 02:14:09 dlg Exp $	*/
 
 /*
  * Copyright 1998 Massachusetts Institute of Technology
@@ -48,7 +48,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/queue.h>
@@ -297,8 +296,9 @@ vlan_enqueue(struct ifnet *ifp, struct mbuf *m)
 		return (if_enqueue_ifq(ifp, m));
 
 	sc = ifp->if_softc;
-	ifp0 = if_get(sc->sc_ifidx0);
 
+	smr_read_enter();
+	ifp0 = if_get_smr(sc->sc_ifidx0);
 	if (ifp0 == NULL || !ISSET(ifp0->if_flags, IFF_RUNNING)) {
 		m_freem(m);
 		error = ENETDOWN;
@@ -307,8 +307,7 @@ vlan_enqueue(struct ifnet *ifp, struct mbuf *m)
 		    ifc_opackets, ifc_obytes, m->m_pkthdr.len);
 		vlan_transmit(sc, ifp0, m);
 	}
-
-	if_put(ifp0);
+	smr_read_leave();
 
 	return (error);
 }
@@ -321,7 +320,8 @@ vlan_start(struct ifqueue *ifq)
 	struct ifnet *ifp0;
 	struct mbuf *m;
 
-	ifp0 = if_get(sc->sc_ifidx0);
+	smr_read_enter();
+	ifp0 = if_get_smr(sc->sc_ifidx0);
 	if (ifp0 == NULL || !ISSET(ifp0->if_flags, IFF_RUNNING)) {
 		ifq_purge(ifq);
 		goto leave;
@@ -331,7 +331,7 @@ vlan_start(struct ifqueue *ifq)
 		vlan_transmit(sc, ifp0, m);
 
 leave:
-	if_put(ifp0);
+	smr_read_leave();
 }
 
 struct mbuf *
@@ -373,16 +373,48 @@ vlan_inject(struct mbuf *m, uint16_t type, uint16_t tag)
 	return (m);
 }
 
+static struct mbuf *
+vlan_vinput(struct vlan_softc *sc, uint16_t vtag, struct mbuf *m,
+    struct netstack *ns)
+{
+	struct ifnet *ifp = &sc->sc_if;
+	int rxprio;
+
+	if (!ISSET(ifp->if_flags, IFF_RUNNING)) {
+		m_freem(m);
+		return (NULL);
+	}
+
+	m = vlan_strip(m);
+
+	rxprio = sc->sc_rxprio;
+	switch (rxprio) {
+	case IF_HDRPRIO_PACKET:
+		break;
+	case IF_HDRPRIO_OUTER:
+		m->m_pkthdr.pf.prio = EVL_PRIOFTAG(vtag);
+		/* IEEE 802.1p has prio 0 and 1 swapped */
+		if (m->m_pkthdr.pf.prio <= 1)
+			m->m_pkthdr.pf.prio = !m->m_pkthdr.pf.prio;
+		break;
+	default:
+		m->m_pkthdr.pf.prio = rxprio;
+		break;
+	}
+
+	if_vinput(ifp, m, ns);
+	return (NULL);
+}
+
 struct mbuf *
-vlan_input(struct ifnet *ifp0, struct mbuf *m, unsigned int *sdelim)
+vlan_input(struct ifnet *ifp0, struct mbuf *m, unsigned int *sdelim,
+    struct netstack *ns)
 {
 	struct vlan_softc *sc;
-	struct ifnet *ifp;
 	struct ether_vlan_header *evl;
 	struct vlan_list *tagh, *list;
 	uint16_t vtag, tag;
 	uint16_t etype;
-	int rxprio;
 
 	if (m->m_flags & M_VLANTAG) {
 		vtag = m->m_pkthdr.ether_vtag;
@@ -413,17 +445,17 @@ vlan_input(struct ifnet *ifp0, struct mbuf *m, unsigned int *sdelim)
 
 	tag = EVL_VLANOFTAG(vtag);
 	list = &tagh[TAG_HASH(tag)];
+
 	smr_read_enter();
 	SMR_SLIST_FOREACH(sc, list, sc_list) {
 		if (ifp0->if_index == sc->sc_ifidx0 && tag == sc->sc_tag &&
-		    etype == sc->sc_type) {
-			refcnt_take(&sc->sc_refcnt);
+		    etype == sc->sc_type)
 			break;
-		}
 	}
-	smr_read_leave();
 
-	if (sc == NULL) {
+	if (sc != NULL)
+		m = vlan_vinput(sc, vtag, m, ns);
+	else {
 		/* VLAN 0 Priority Tagging */
 		if (tag == 0 && etype == ETHERTYPE_VLAN) {
 			struct ether_header *eh;
@@ -435,46 +467,14 @@ vlan_input(struct ifnet *ifp0, struct mbuf *m, unsigned int *sdelim)
 			if (eh->ether_type == htons(ETHERTYPE_VLAN) ||
 			    eh->ether_type == htons(ETHERTYPE_QINQ)) {
 				m_freem(m);
-				return (NULL);
+				m = NULL;
 			}
 		} else
 			*sdelim = 1;
-
-		return (m); /* decline */
 	}
+	smr_read_leave();
 
-	ifp = &sc->sc_if;
-	if (!ISSET(ifp->if_flags, IFF_RUNNING)) {
-		m_freem(m);
-		goto leave;
-	}
-
-	/*
-	 * Having found a valid vlan interface corresponding to
-	 * the given source interface and vlan tag, remove the
-	 * encapsulation.
-	 */
-	m = vlan_strip(m);
-
-	rxprio = sc->sc_rxprio;
-	switch (rxprio) {
-	case IF_HDRPRIO_PACKET:
-		break;
-	case IF_HDRPRIO_OUTER:
-		m->m_pkthdr.pf.prio = EVL_PRIOFTAG(m->m_pkthdr.ether_vtag);
-		/* IEEE 802.1p has prio 0 and 1 swapped */
-		if (m->m_pkthdr.pf.prio <= 1)
-			m->m_pkthdr.pf.prio = !m->m_pkthdr.pf.prio;
-		break;
-	default:
-		m->m_pkthdr.pf.prio = rxprio;
-		break;
-	}
-
-	if_vinput(ifp, m);
-leave:
-	refcnt_rele_wake(&sc->sc_refcnt);
-	return (NULL);
+	return (m);
 }
 
 int
@@ -698,6 +698,13 @@ vlan_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		} else {
 			if (ISSET(ifp->if_flags, IFF_RUNNING))
 				error = vlan_down(sc);
+		}
+		break;
+
+	case SIOCSIFXFLAGS:
+		if ((ifp0 = if_get(sc->sc_ifidx0)) != NULL) {
+			ifsetlro(ifp0, ISSET(ifr->ifr_flags, IFXF_LRO));
+			if_put(ifp0);
 		}
 		break;
 

@@ -1,8 +1,9 @@
-#	$OpenBSD: Makefile,v 1.31 2024/01/04 18:17:47 espie Exp $
+#	$OpenBSD: Makefile,v 1.33 2026/07/01 18:15:46 martijn Exp $
 
 PROG=		httpd
+RELINK=		"./${PROG} -n -f /etc/examples/httpd.conf 2> /dev/null"
 SRCS=		parse.y
-SRCS+=		config.c control.c httpd.c log.c logger.c proc.c
+SRCS+=		config.c httpd.c log.c logger.c proc.c
 SRCS+=		server.c server_http.c server_file.c server_fcgi.c
 MAN=		httpd.8 httpd.conf.5
 

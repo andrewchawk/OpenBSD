@@ -1,4 +1,4 @@
-.\"	$OpenBSD: dpb.1,v 1.34 2023/06/17 19:35:54 espie Exp $
+.\"	$OpenBSD: dpb.1,v 1.37 2026/04/09 01:29:59 kmos Exp $
 .\"
 .\" Copyright (c) 2010-2013 Marc Espie <espie@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 17 2023 $
+.Dd $Mdocdate: April 9 2026 $
 .Dt DPB 1
 .Os
 .Sh NAME
@@ -804,7 +804,6 @@ a progress percentage.
 .Pp
 This is followed by a host line, containing the name
 of each host used by dpb.
-Host names may be tagged with kde3 or kde4.
 They are followed by a
 .Sq `-'
 for unresponsive hosts, and the pid of the ssh master
@@ -915,16 +914,6 @@ and several build slots.
 Very large port that should be built in parallel, uses
 .Ev MAKE_JOBS
 and lots of build slots.
-.It Ar tag:kde3
-kde3 port that conflicts with kde4 ports.
-Prevent scheduling ports with
-.Ar tag:kde4
-on the same host.
-.It Ar tag:kde4
-kde4 port that conflicts with kde3 ports.
-Prevent scheduling ports with
-.Ar tag:kde3
-on the same host.
 .El
 .Sh THE SECURITY MODEL OF DPB
 When
@@ -1185,6 +1174,9 @@ Wipe out an existing lock: clean up the corresponding
 .Ar fullpkgpath
 on the appropriate host, then remove all lock and affinity info pertaining
 to the port.
+.It Cm wipe-all
+Wipe out all existing packages with an error state.
+This operates like the wipe control.
 .It Cm wipehost Ar hostname ...
 Remove all information relevant to a given host from
 .Nm ,
@@ -1656,8 +1648,7 @@ will delay that.
 .Nm
 still keeps track of attempted junks.
 .It Still tainted: <bool>
-A host may have a tag (kde3/kde4) that prevents building differently tagged
-ports.
+A host may have a tag that prevents building differently tagged ports.
 This will be cleansed by
 .Ar junk
 eventually.

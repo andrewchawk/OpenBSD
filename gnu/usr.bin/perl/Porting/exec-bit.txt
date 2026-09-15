@@ -20,6 +20,10 @@ dist/Devel-PPPort/devel/regenerate
 dist/Devel-PPPort/devel/scanprov
 dist/Devel-PPPort/devel/update_release_date.pl
 dist/Devel-PPPort/soak
+dist/ExtUtils-ParseXS/author/mksnapshot.pl
+dist/Storable/t/make_56_interwork.pl
+dist/Storable/t/make_downgrade.pl
+dist/Storable/t/make_overload.pl
 dist/Thread-Queue/examples/callback.pl
 dist/Thread-Queue/examples/queue.pl
 installperl
@@ -35,7 +39,6 @@ regen/feature.pl
 regen/keywords.pl
 regen/opcode.pl
 regen/regcharclass.pl
-regen/uconfig_h.pl
 runtests.SH
 t/TEST
 Porting/Maintainers.pl
@@ -52,6 +55,7 @@ Porting/checkcfgvar.pl
 Porting/checkpodencoding.pl
 Porting/cmpVERSION.pl
 Porting/config_h.pl
+Porting/core-cpan-diff
 Porting/corecpan.pl
 Porting/corelist-perldelta.pl
 Porting/corelist.pl
@@ -60,7 +64,6 @@ Porting/harness-timer-report.pl
 Porting/findrfuncs
 Porting/makerel
 Porting/make_dot_patch.pl
-Porting/make_snapshot.pl
 Porting/mksample
 Porting/newtests-perldelta.pl
 Porting/perlhist_calculate.pl

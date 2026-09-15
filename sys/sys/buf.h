@@ -1,4 +1,4 @@
-/*	$OpenBSD: buf.h,v 1.114 2024/02/03 18:51:58 beck Exp $	*/
+/*	$OpenBSD: buf.h,v 1.123 2026/08/03 03:27:45 jsg Exp $	*/
 /*	$NetBSD: buf.h,v 1.25 1997/04/09 21:12:17 mycroft Exp $	*/
 
 /*
@@ -84,12 +84,10 @@ struct bufq {
 };
 
 int		 bufq_init(struct bufq *, int);
-int		 bufq_switch(struct bufq *, int);
 void		 bufq_destroy(struct bufq *);
 
 void		 bufq_queue(struct bufq *, struct buf *);
 struct buf	*bufq_dequeue(struct bufq *);
-void		 bufq_requeue(struct bufq *, struct buf *);
 int		 bufq_peek(struct bufq *);
 void		 bufq_drain(struct bufq *);
 
@@ -122,7 +120,6 @@ struct buf {
 	LIST_ENTRY(buf) b_list;		/* All allocated buffers. */
 	LIST_ENTRY(buf) b_vnbufs;	/* Buffer's associated vnode. */
 	TAILQ_ENTRY(buf) b_freelist;	/* Free list position if not active. */
-	int cache;			/* which cache are we in */
 	struct  proc *b_proc;		/* Associated proc; NULL if kernel. */
 	volatile long	b_flags;	/* B_* flags. */
 	long	b_bufsize;		/* Allocated buffer size. */
@@ -165,9 +162,6 @@ struct bufcache {
 	struct bufqueue warmqueue;
 };
 
-/* Device driver compatibility definitions. */
-#define	b_active b_bcount		/* Driver queue head: drive active. */
-
 /*
  * These flags are kept in b_flags.
  */
@@ -198,13 +192,12 @@ struct bufcache {
 #define	B_WARM		0x00800000	/* buffer is or has been on the warm queue */
 #define	B_COLD		0x01000000	/* buffer is on the cold queue */
 #define	B_BC		0x02000000	/* buffer is managed by the cache */
-#define	B_DMA		0x04000000	/* buffer is DMA reachable */
 
 #define	B_BITS	"\20\001AGE\002NEEDCOMMIT\003ASYNC\004BAD\005BUSY" \
     "\006CACHE\007CALL\010DELWRI\011DONE\012EINTR\013ERROR" \
     "\014INVAL\015NOCACHE\016PHYS\017RAW\020READ" \
     "\021WANTED\022WRITEINPROG\023XXX(FORMAT)\024DEFERRED" \
-    "\025SCANNED\026DAEMON\027RELEASED\030WARM\031COLD\032BC\033DMA"
+    "\025SCANNED\026DAEMON\027RELEASED\030WARM\031COLD\032BC"
 
 /*
  * Zero out the buffer's data area.
@@ -252,7 +245,6 @@ int bread(struct vnode *, daddr_t, int, struct buf **);
 int breadn(struct vnode *, daddr_t, int, daddr_t *, int *, int,
     struct buf **);
 void	brelse(struct buf *);
-#define bremfree bufcache_take
 void	bufinit(void);
 void	buf_dirty(struct buf *);
 void    buf_undirty(struct buf *);
@@ -268,9 +260,7 @@ struct buf *incore(struct vnode *, daddr_t);
 void bufcache_take(struct buf *);
 void bufcache_release(struct buf *);
 
-int buf_flip_high(struct buf *);
-void buf_flip_dma(struct buf *);
-struct buf *bufcache_getcleanbuf(int, int);
+struct buf *bufcache_getcleanbuf(int);
 struct buf *bufcache_getdirtybuf(void);
 
 /*

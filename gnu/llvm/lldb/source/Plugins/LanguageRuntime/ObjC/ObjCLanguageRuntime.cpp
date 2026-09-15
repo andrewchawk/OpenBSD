@@ -10,10 +10,8 @@
 #include "ObjCLanguageRuntime.h"
 
 #include "Plugins/TypeSystem/Clang/TypeSystemClang.h"
-#include "lldb/Core/MappedHash.h"
 #include "lldb/Core/Module.h"
 #include "lldb/Core/PluginManager.h"
-#include "lldb/Core/ValueObject.h"
 #include "lldb/Symbol/SymbolContext.h"
 #include "lldb/Symbol/SymbolFile.h"
 #include "lldb/Symbol/Type.h"
@@ -24,6 +22,7 @@
 #include "lldb/Utility/LLDBLog.h"
 #include "lldb/Utility/Log.h"
 #include "lldb/Utility/Timer.h"
+#include "lldb/ValueObject/ValueObject.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/DJB.h"
@@ -140,17 +139,10 @@ ObjCLanguageRuntime::LookupInCompleteClassCache(ConstString &name) {
     if (!module_sp)
       return TypeSP();
 
-    const bool exact_match = true;
-    const uint32_t max_matches = UINT32_MAX;
-    TypeList types;
-
-    llvm::DenseSet<SymbolFile *> searched_symbol_files;
-    module_sp->FindTypes(name, exact_match, max_matches, searched_symbol_files,
-                         types);
-
-    for (uint32_t i = 0; i < types.GetSize(); ++i) {
-      TypeSP type_sp(types.GetTypeAtIndex(i));
-
+    TypeQuery query(name.GetStringRef(), TypeQueryOptions::e_exact_match);
+    TypeResults results;
+    module_sp->FindTypes(query, results);
+    for (const TypeSP &type_sp : results.GetTypeMap().Types()) {
       if (TypeSystemClang::IsObjCObjectOrInterfaceType(
               type_sp->GetForwardCompilerType())) {
         if (TypePayloadClang(type_sp->GetPayload()).IsCompleteObjCClass()) {
@@ -235,6 +227,22 @@ ObjCLanguageRuntime::GetDescriptorIteratorPair(bool update_if_needed) {
       m_isa_to_descriptor.begin(), m_isa_to_descriptor.end());
 }
 
+void ObjCLanguageRuntime::ReadObjCLibraryIfNeeded(
+    const ModuleList &module_list) {
+  if (!HasReadObjCLibrary()) {
+    std::lock_guard<std::recursive_mutex> guard(module_list.GetMutex());
+
+    size_t num_modules = module_list.GetSize();
+    for (size_t i = 0; i < num_modules; i++) {
+      auto mod = module_list.GetModuleAtIndex(i);
+      if (IsModuleObjCLibrary(mod)) {
+        ReadObjCLibrary(mod);
+        break;
+      }
+    }
+  }
+}
+
 ObjCLanguageRuntime::ObjCISA
 ObjCLanguageRuntime::GetParentClass(ObjCLanguageRuntime::ObjCISA isa) {
   ClassDescriptorSP objc_class_sp(GetClassDescriptorFromISA(isa));
@@ -262,7 +270,7 @@ ObjCLanguageRuntime::GetClassDescriptor(ValueObject &valobj) {
   // pointers returned by the expression parser, don't consider this a valid
   // ObjC object)
   if (valobj.GetCompilerType().IsValid()) {
-    addr_t isa_pointer = valobj.GetPointerValue();
+    addr_t isa_pointer = valobj.GetPointerValue().address;
     if (isa_pointer != LLDB_INVALID_ADDRESS) {
       ExecutionContext exe_ctx(valobj.GetExecutionContextRef());
 
@@ -342,18 +350,17 @@ ObjCLanguageRuntime::EncodingToTypeSP ObjCLanguageRuntime::GetEncodingToType() {
   return nullptr;
 }
 
-bool ObjCLanguageRuntime::GetTypeBitSize(const CompilerType &compiler_type,
-                                         uint64_t &size) {
+std::optional<uint64_t>
+ObjCLanguageRuntime::GetTypeBitSize(const CompilerType &compiler_type) {
   void *opaque_ptr = compiler_type.GetOpaqueQualType();
-  size = m_type_size_cache.Lookup(opaque_ptr);
-  // an ObjC object will at least have an ISA, so 0 is definitely not OK
-  if (size > 0)
-    return true;
+  uint64_t cached_size = m_type_size_cache.Lookup(opaque_ptr);
+  if (cached_size > 0)
+    return cached_size;
 
   ClassDescriptorSP class_descriptor_sp =
       GetClassDescriptorFromClassName(compiler_type.GetTypeName());
   if (!class_descriptor_sp)
-    return false;
+    return {};
 
   int32_t max_offset = INT32_MIN;
   uint64_t sizeof_max = 0;
@@ -369,11 +376,13 @@ bool ObjCLanguageRuntime::GetTypeBitSize(const CompilerType &compiler_type,
     }
   }
 
-  size = 8 * (max_offset + sizeof_max);
-  if (found)
+  uint64_t size = 8 * (max_offset + sizeof_max);
+  if (found && size > 0) {
     m_type_size_cache.Insert(opaque_ptr, size);
+    return size;
+  }
 
-  return found;
+  return {};
 }
 
 lldb::BreakpointPreconditionSP
@@ -409,9 +418,49 @@ Status ObjCLanguageRuntime::ObjCExceptionPrecondition::ConfigurePrecondition(
     Args &args) {
   Status error;
   if (args.GetArgumentCount() > 0)
-    error.SetErrorString(
+    error = Status::FromErrorString(
         "The ObjC Exception breakpoint doesn't support extra options.");
   return error;
+}
+
+CompilerType ObjCLanguageRuntime::LookupInModulesVendor(ConstString class_name,
+                                                        Target &target) {
+  assert(class_name);
+
+  auto *persistent_state = llvm::cast<ClangPersistentVariables>(
+      target.GetPersistentExpressionStateForLanguage(lldb::eLanguageTypeC));
+  if (!persistent_state)
+    return {};
+
+  auto clang_modules_decl_vendor_sp =
+      persistent_state->GetClangModulesDeclVendor();
+  if (!clang_modules_decl_vendor_sp)
+    return {};
+
+  auto types = clang_modules_decl_vendor_sp->FindTypes(
+      class_name, /*max_matches*/ UINT32_MAX);
+  if (types.empty())
+    return {};
+
+  return types.front();
+}
+
+CompilerType ObjCLanguageRuntime::LookupInRuntime(ConstString class_name) {
+  auto *runtime_vendor = GetDeclVendor();
+  if (!runtime_vendor)
+    return {};
+
+  std::vector<CompilerDecl> compiler_decls;
+  runtime_vendor->FindDecls(class_name, false, UINT32_MAX, compiler_decls);
+  if (compiler_decls.empty())
+    return {};
+
+  auto *ctx =
+      llvm::dyn_cast<TypeSystemClang>(compiler_decls[0].GetTypeSystem());
+  if (!ctx)
+    return {};
+
+  return ctx->GetTypeForDecl(compiler_decls[0].GetOpaqueDecl());
 }
 
 std::optional<CompilerType>
@@ -433,18 +482,21 @@ ObjCLanguageRuntime::GetRuntimeType(CompilerType base_type) {
   if (!class_name)
     return std::nullopt;
 
-  TypeSP complete_objc_class_type_sp = LookupInCompleteClassCache(class_name);
-  if (!complete_objc_class_type_sp)
-    return std::nullopt;
-
-  CompilerType complete_class(
-      complete_objc_class_type_sp->GetFullCompilerType());
-  if (complete_class.GetCompleteType()) {
-    if (is_pointer_type)
-      return complete_class.GetPointerType();
-    else
-      return complete_class;
+  if (TypeSP complete_objc_class_type_sp =
+          LookupInCompleteClassCache(class_name)) {
+    if (CompilerType complete_class =
+            complete_objc_class_type_sp->GetFullCompilerType();
+        complete_class.GetCompleteType())
+      return is_pointer_type ? complete_class.GetPointerType() : complete_class;
   }
+
+  assert(m_process);
+  if (CompilerType found =
+          LookupInModulesVendor(class_name, m_process->GetTarget()))
+    return is_pointer_type ? found.GetPointerType() : found;
+
+  if (CompilerType found = LookupInRuntime(class_name))
+    return is_pointer_type ? found.GetPointerType() : found;
 
   return std::nullopt;
 }

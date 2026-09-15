@@ -1,4 +1,4 @@
-/*	$OpenBSD: sio_sun.c,v 1.30 2022/12/27 17:10:07 jmc Exp $	*/
+/*	$OpenBSD: sio_sun.c,v 1.36 2026/03/10 06:47:41 ratchov Exp $	*/
 /*
  * Copyright (c) 2008 Alexandre Ratchov <alex@caoua.org>
  *
@@ -39,11 +39,10 @@
 struct sio_sun_hdl {
 	struct sio_hdl sio;
 	int fd;
-	int filling;
+	int prime;
 	unsigned int ibpf, obpf;	/* bytes per frame */
-	unsigned int ibytes, obytes;	/* bytes the hw transferred */
-	unsigned int ierr, oerr;	/* frames the hw dropped */
-	int idelta, odelta;		/* position reported to client */
+	unsigned int ibytes, obytes;	/* position reported to client */
+	int idelta, odelta;		/* position not reported yet */
 };
 
 static void sio_sun_close(struct sio_hdl *);
@@ -330,7 +329,7 @@ sio_sun_fdopen(int fd, unsigned int mode, int nbio)
 		return NULL;
 	}
 	hdl->fd = fd;
-	hdl->filling = 0;
+	hdl->prime = 0;
 	return (struct sio_hdl *)hdl;
 }
 
@@ -370,8 +369,6 @@ sio_sun_start(struct sio_hdl *sh)
 	hdl->ibpf = hdl->sio.par.rchan * hdl->sio.par.bps;
 	hdl->ibytes = 0;
 	hdl->obytes = 0;
-	hdl->ierr = 0;
-	hdl->oerr = 0;
 	hdl->idelta = 0;
 	hdl->odelta = 0;
 
@@ -380,7 +377,7 @@ sio_sun_start(struct sio_hdl *sh)
 		 * keep the device paused and let sio_sun_pollfd() trigger the
 		 * start later, to avoid buffer underruns
 		 */
-		hdl->filling = 1;
+		hdl->prime = hdl->sio.par.pchan * hdl->sio.par.bps * hdl->sio.par.bufsz;
 	} else {
 		/*
 		 * no play buffers to fill, start now!
@@ -400,10 +397,9 @@ sio_sun_flush(struct sio_hdl *sh)
 {
 	struct sio_sun_hdl *hdl = (struct sio_sun_hdl *)sh;
 
-	if (hdl->filling) {
-		hdl->filling = 0;
+	if (hdl->prime > 0)
 		return 1;
-	}
+
 	if (ioctl(hdl->fd, AUDIO_STOP) == -1) {
 		DPERROR("AUDIO_STOP");
 		hdl->sio.eof = 1;
@@ -512,6 +508,19 @@ sio_sun_write(struct sio_hdl *sh, const void *buf, size_t len)
 		}
 		return 0;
 	}
+
+	if (hdl->prime > 0) {
+		hdl->prime -= n;
+		if (hdl->prime <= 0) {
+			if (ioctl(hdl->fd, AUDIO_START) == -1) {
+				DPERROR("AUDIO_START");
+				hdl->sio.eof = 1;
+				return 0;
+			}
+			_sio_onmove_cb(&hdl->sio, 0);
+		}
+	}
+
 	return n;
 }
 
@@ -528,16 +537,6 @@ sio_sun_pollfd(struct sio_hdl *sh, struct pollfd *pfd, int events)
 
 	pfd->fd = hdl->fd;
 	pfd->events = events;
-	if (hdl->filling && hdl->sio.wused == hdl->sio.par.bufsz *
-		hdl->sio.par.pchan * hdl->sio.par.bps) {
-		hdl->filling = 0;
-		if (ioctl(hdl->fd, AUDIO_START) == -1) {
-			DPERROR("AUDIO_START");
-			hdl->sio.eof = 1;
-			return 0;
-		}
-		_sio_onmove_cb(&hdl->sio, 0);
-	}
 	return 1;
 }
 
@@ -546,8 +545,8 @@ sio_sun_revents(struct sio_hdl *sh, struct pollfd *pfd)
 {
 	struct sio_sun_hdl *hdl = (struct sio_sun_hdl *)sh;
 	struct audio_pos ap;
-	int dierr = 0, doerr = 0, offset, delta;
 	int revents = pfd->revents;
+	int delta;
 
 	if ((pfd->revents & POLLHUP) ||
 	    (pfd->revents & (POLLIN | POLLOUT)) == 0)
@@ -557,56 +556,38 @@ sio_sun_revents(struct sio_hdl *sh, struct pollfd *pfd)
 		hdl->sio.eof = 1;
 		return POLLHUP;
 	}
-	if (hdl->sio.mode & SIO_PLAY) {
-		delta = (ap.play_pos - hdl->obytes) / hdl->obpf;
-		doerr = (ap.play_xrun - hdl->oerr) / hdl->obpf;
-		hdl->obytes = ap.play_pos;
-		hdl->oerr = ap.play_xrun;
-		hdl->odelta += delta;
-		if (!(hdl->sio.mode & SIO_REC)) {
-			hdl->idelta += delta;
-			dierr = doerr;
+	if (ap.play_xrun > 0 || ap.rec_xrun > 0) {
+		if (!_sio_xrun(&hdl->sio))
+			return POLLHUP;
+	} else {
+		if (hdl->sio.mode & SIO_PLAY) {
+			hdl->odelta += (ap.play_pos - hdl->obytes) / hdl->obpf;
+			hdl->obytes = ap.play_pos;
 		}
-		if (doerr > 0)
-			DPRINTFN(2, "play xrun %d\n", doerr);
-	}
-	if (hdl->sio.mode & SIO_REC) {
-		delta = (ap.rec_pos - hdl->ibytes) / hdl->ibpf;
-		dierr = (ap.rec_xrun - hdl->ierr) / hdl->ibpf;
-		hdl->ibytes = ap.rec_pos;
-		hdl->ierr = ap.rec_xrun;
-		hdl->idelta += delta;
-		if (!(hdl->sio.mode & SIO_PLAY)) {
-			hdl->odelta += delta;
-			doerr = dierr;
+		if (hdl->sio.mode & SIO_REC) {
+			hdl->idelta += (ap.rec_pos - hdl->ibytes) / hdl->ibpf;
+			hdl->ibytes = ap.rec_pos;
 		}
-		if (dierr > 0)
-			DPRINTFN(2, "rec xrun %d\n", dierr);
 	}
 
-	/*
-	 * GETPOS reports positions including xruns,
-	 * so we have to subtract to get the real position
-	 */
-	hdl->idelta -= dierr;
-	hdl->odelta -= doerr;
-
-	offset = doerr - dierr;
-	if (offset > 0) {
-		hdl->sio.rdrop += offset * hdl->ibpf;
-		hdl->idelta -= offset;
-		DPRINTFN(2, "will drop %d and pause %d\n", offset, doerr);
-	} else if (offset < 0) {
-		hdl->sio.wsil += -offset * hdl->obpf;
-		hdl->odelta -= -offset;
-		DPRINTFN(2, "will insert %d and pause %d\n", -offset, dierr);
+	switch (hdl->sio.mode & (SIO_PLAY | SIO_REC)) {
+	case SIO_PLAY:
+		delta = hdl->odelta;
+		break;
+	case SIO_REC:
+		delta = hdl->idelta;
+		break;
+	default:
+		/*
+		 * Use the max of two directions
+		 */
+		delta = hdl->odelta > hdl->idelta ? hdl->odelta : hdl->idelta;
 	}
-
-	delta = (hdl->idelta > hdl->odelta) ? hdl->idelta : hdl->odelta;
-	if (delta > 0) {
-		_sio_onmove_cb(&hdl->sio, delta);
-		hdl->idelta -= delta;
+	_sio_onmove_cb(&hdl->sio, delta);
+	if (hdl->sio.mode & SIO_PLAY)
 		hdl->odelta -= delta;
-	}
+	if (hdl->sio.mode & SIO_REC)
+		hdl->idelta -= delta;
+
 	return revents;
 }

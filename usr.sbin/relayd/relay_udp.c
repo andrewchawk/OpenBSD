@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_udp.c,v 1.51 2024/05/18 06:34:46 jsg Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.55 2026/08/12 18:38:17 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -36,6 +36,7 @@
 #include <imsg.h>
 
 #include "relayd.h"
+#include "log.h"
 
 extern volatile sig_atomic_t relay_sessions;
 extern objid_t relay_conid;
@@ -44,13 +45,13 @@ static struct relayd *env = NULL;
 struct shuffle relay_shuffle;
 
 int		 relay_udp_socket(struct sockaddr_storage *, in_port_t,
-		    struct protocol *);
+    struct protocol *);
 void		 relay_udp_timeout(int, short, void *);
 
 void		 relay_dns_log(struct rsession *, u_int8_t *, size_t);
 void		*relay_dns_validate(struct rsession *,
-		    struct relay *, struct sockaddr_storage *,
-		    u_int8_t *, size_t);
+    struct relay *, struct sockaddr_storage *,
+    u_int8_t *, size_t);
 int		 relay_dns_request(struct rsession *);
 void		 relay_udp_response(int, short, void *);
 void		 relay_dns_result(struct rsession *, u_int8_t *, size_t);
@@ -195,7 +196,7 @@ relay_udp_response(int fd, short sig, void *arg)
 
 	slen = sizeof(ss);
 	if ((len = recvfrom(fd, buf, sizeof(buf), 0,
-	    (struct sockaddr*)&ss, &slen)) < 1)
+	    (struct sockaddr *)&ss, &slen)) < 1)
 		return;
 
 	/* Parse and validate the packet header */
@@ -229,7 +230,7 @@ relay_udp_server(int fd, short sig, void *arg)
 
 	slen = sizeof(ss);
 	if ((len = recvfrom(fd, buf, sizeof(buf), 0,
-	    (struct sockaddr*)&ss, &slen)) < 1)
+	    (struct sockaddr *)&ss, &slen)) < 1)
 		return;
 
 	if (proto->validate != NULL &&
@@ -315,8 +316,9 @@ relay_udp_server(int fd, short sig, void *arg)
 		cnl->proto = IPPROTO_UDP;
 		bcopy(&con->se_in.ss, &cnl->src, sizeof(cnl->src));
 		bcopy(&rlay->rl_conf.ss, &cnl->dst, sizeof(cnl->dst));
-		proc_compose(env->sc_ps, PROC_PFE,
-		    IMSG_NATLOOK, cnl, sizeof(*cnl));
+		if (proc_compose(env->sc_ps, PROC_PFE, IMSG_NATLOOK, cnl,
+		    sizeof(*cnl)) == -1)
+			log_warn("%s: proc_compose", __func__);
 
 		/* Schedule timeout */
 		evtimer_set(&con->se_ev, relay_natlook, con);
@@ -490,13 +492,13 @@ relay_dns_request(struct rsession *con)
 	    (struct sockaddr *)&con->se_out.ss, slen) == -1) {
 		if (con->se_retry) {
 			con->se_retry--;
-			log_debug("%s: session %d: "
+			log_warn("%s: session %d: "
 			    "forward failed: %s, %s", __func__,
 			    con->se_id, strerror(errno),
 			    con->se_retry ? "next retry" : "last retry");
 			goto retry;
 		}
-		log_debug("%s: session %d: forward failed: %s", __func__,
+		log_warn("%s: session %d: forward failed: %s", __func__,
 		    con->se_id, strerror(errno));
 		return (-1);
 	}

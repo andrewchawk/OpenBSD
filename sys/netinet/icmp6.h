@@ -1,4 +1,4 @@
-/*	$OpenBSD: icmp6.h,v 1.53 2024/05/13 01:15:53 jsg Exp $	*/
+/*	$OpenBSD: icmp6.h,v 1.57 2025/09/16 09:19:43 florian Exp $	*/
 /*	$KAME: icmp6.h,v 1.84 2003/04/23 10:26:51 itojun Exp $	*/
 
 /*
@@ -94,7 +94,7 @@ struct icmp6_hdr {
 
 #define ICMP6_ECHO_REQUEST		128	/* echo service */
 #define ICMP6_ECHO_REPLY		129	/* echo reply */
-#define MLD_LISTENER_QUERY		130 	/* multicast listener query */
+#define MLD_LISTENER_QUERY		130	/* multicast listener query */
 #define MLD_LISTENER_REPORT		131	/* multicast listener report */
 #define MLD_LISTENER_DONE		132	/* multicast listener done */
 
@@ -126,15 +126,15 @@ struct icmp6_hdr {
 #define ICMP6_MAXTYPE			201
 
 #define ICMP6_DST_UNREACH_NOROUTE	0	/* no route to destination */
-#define ICMP6_DST_UNREACH_ADMIN	 	1	/* administratively prohibited */
+#define ICMP6_DST_UNREACH_ADMIN		1	/* administratively prohibited */
 #define ICMP6_DST_UNREACH_BEYONDSCOPE	2	/* beyond scope of source address */
 #define ICMP6_DST_UNREACH_ADDR		3	/* address unreachable */
 #define ICMP6_DST_UNREACH_NOPORT	4	/* port unreachable */
 
-#define ICMP6_TIME_EXCEED_TRANSIT 	0	/* ttl==0 in transit */
+#define ICMP6_TIME_EXCEED_TRANSIT	0	/* ttl==0 in transit */
 #define ICMP6_TIME_EXCEED_REASSEMBLY	1	/* ttl==0 in reass */
 
-#define ICMP6_PARAMPROB_HEADER 	 	0	/* erroneous header field */
+#define ICMP6_PARAMPROB_HEADER		0	/* erroneous header field */
 #define ICMP6_PARAMPROB_NEXTHEADER	1	/* unrecognized next header */
 #define ICMP6_PARAMPROB_OPTION		2	/* unrecognized option */
 
@@ -176,7 +176,7 @@ struct mld_hdr {
  */
 
 struct nd_router_solicit {	/* router solicitation */
-	struct icmp6_hdr 	nd_rs_hdr;
+	struct icmp6_hdr	nd_rs_hdr;
 	/* could be followed by options */
 } __packed;
 
@@ -202,7 +202,7 @@ struct nd_router_advert {	/* router advertisement */
 
 #define ND_RA_FLAG_RTPREF_MASK	0x18	/* 00011000 */
 
-#define ND_RA_FLAG_RTPREF_HIGH	0x08	/* 00001000 */ 
+#define ND_RA_FLAG_RTPREF_HIGH	0x08	/* 00001000 */
 #define ND_RA_FLAG_RTPREF_MEDIUM	0x00	/* 00000000 */
 #define ND_RA_FLAG_RTPREF_LOW	0x18	/* 00011000 */
 #define ND_RA_FLAG_RTPREF_RSV	0x10	/* 00010000 */
@@ -318,7 +318,7 @@ struct nd_opt_dnssl {		/* DNSSL option */
  * icmp6 namelookup
  */
 struct icmp6_namelookup {
-	struct icmp6_hdr 	icmp6_nl_hdr;
+	struct icmp6_hdr	icmp6_nl_hdr;
 	u_int8_t	icmp6_nl_nonce[8];
 	int32_t		icmp6_nl_ttl;
 #if 0
@@ -387,7 +387,7 @@ struct icmp6_router_renum {	/* router renumbering header */
 #define rr_type		rr_hdr.icmp6_type
 #define rr_code		rr_hdr.icmp6_code
 #define rr_cksum	rr_hdr.icmp6_cksum
-#define rr_seqnum 	rr_hdr.icmp6_data32[0]
+#define rr_seqnum	rr_hdr.icmp6_data32[0]
 
 struct rr_pco_match {		/* match prefix part */
 	u_int8_t	rpm_code;
@@ -508,11 +508,9 @@ struct icmp6stat {
 #define ICMPV6CTL_ND6_QUEUED	11
 #define ICMPV6CTL_NODEINFO	13
 #define ICMPV6CTL_ERRPPSLIMIT	14	/* ICMPv6 error pps limitation */
-#define ICMPV6CTL_ND6_MAXNUDHINT	15
 #define ICMPV6CTL_MTUDISC_HIWAT	16
 #define ICMPV6CTL_MTUDISC_LOWAT	17
-#define ICMPV6CTL_ND6_DEBUG	18
-#define ICMPV6CTL_MAXID		19
+#define ICMPV6CTL_MAXID		18
 
 #define ICMPV6CTL_NAMES { \
 	{ 0, 0 }, \
@@ -530,10 +528,9 @@ struct icmp6stat {
 	{ 0, 0 }, \
 	{ 0, 0 }, \
 	{ "errppslimit", CTLTYPE_INT }, \
-	{ "nd6_maxnudhint", CTLTYPE_INT }, \
+	{ 0, 0 }, \
 	{ "mtudisc_hiwat", CTLTYPE_INT }, \
 	{ "mtudisc_lowat", CTLTYPE_INT }, \
-	{ "nd6_debug", CTLTYPE_INT }, \
 }
 
 #define RTF_PROBEMTU	RTF_PROTO1
@@ -592,7 +589,8 @@ struct	in6_multi;
 void		 icmp6_init(void);
 struct mbuf	*icmp6_do_error(struct mbuf *, int, int, int);
 void		 icmp6_error(struct mbuf *, int, int, int);
-int		 icmp6_input(struct mbuf **, int *, int, int);
+int		 icmp6_input(struct mbuf **, int *, int, int,
+		    struct netstack *);
 void		 icmp6_fasttimo(void);
 int		 icmp6_reflect(struct mbuf **, size_t, struct sockaddr *);
 void		 icmp6_redirect_input(struct mbuf *, int);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cmd_i386.c,v 1.2 2024/04/25 18:31:49 kn Exp $	*/
+/*	$OpenBSD: cmd_i386.c,v 1.4 2025/09/16 05:07:33 yasuoka Exp $	*/
 
 /*
  * Copyright (c) 1997-1999 Michael Shalayeff
@@ -65,6 +65,7 @@ const struct cmd_table cmd_machine[] = {
 #ifdef IDLE_POWEROFF
 	{ "idle",	CMDT_CMD, Xidle_efi },
 #endif
+	{ "fwsetup",	CMDT_CMD, Xfwsetup_efi },
 	{ NULL, 0 }
 };
 
@@ -94,6 +95,7 @@ Xmemory(void)
 		for (i = 1; i < cmd.argc; i++) {
 			char *p;
 			long long addr, size;
+			extern int bios_memmap_modified;
 
 			p = cmd.argv[i];
 
@@ -144,6 +146,7 @@ Xmemory(void)
 					printf("bad OP\n");
 					return 0;
 				}
+				bios_memmap_modified = 1;
 			}
 		}
 	}

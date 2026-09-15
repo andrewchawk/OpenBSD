@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.11 2023/11/11 18:35:37 robert Exp $
+# $OpenBSD: Makefile,v 1.13 2026/05/29 11:18:31 robert Exp $
 
 LIB=	LLVMPowerPCCodeGen
 NOPROFILE=
@@ -17,7 +17,6 @@ SRCS+=	PPCBoolRetToInt.cpp \
 	PPCBranchSelector.cpp \
 	PPCBranchCoalescing.cpp \
 	PPCCallingConv.cpp \
-	PPCCCState.cpp \
 	PPCCTRLoops.cpp \
 	PPCCTRLoopsVerify.cpp \
 	PPCExpandAtomicPseudoInsts.cpp \
@@ -35,6 +34,7 @@ SRCS+=	PPCBoolRetToInt.cpp \
 	PPCMacroFusion.cpp \
 	PPCMIPeephole.cpp \
 	PPCRegisterInfo.cpp \
+	PPCSelectionDAGInfo.cpp \
 	PPCReturnProtectorLowering.cpp \
 	PPCSubtarget.cpp \
 	PPCTargetMachine.cpp \
@@ -42,11 +42,10 @@ SRCS+=	PPCBoolRetToInt.cpp \
 	PPCTargetTransformInfo.cpp \
 	PPCTOCRegDeps.cpp \
 	PPCTLSDynamicCall.cpp \
-	PPCVSXCopy.cpp \
+	PPCVSXWACCCopy.cpp \
 	PPCReduceCRLogicals.cpp \
 	PPCVSXFMAMutate.cpp \
 	PPCVSXSwapRemoval.cpp \
-	PPCExpandISEL.cpp \
 	PPCPreEmitPeephole.cpp \
 	PPCLowerMASSVEntries.cpp \
 	PPCGenScalarMASSEntries.cpp

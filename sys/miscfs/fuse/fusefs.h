@@ -1,4 +1,4 @@
-/* $OpenBSD: fusefs.h,v 1.14 2020/01/20 23:21:56 claudio Exp $ */
+/* $OpenBSD: fusefs.h,v 1.17 2026/06/20 13:45:13 helg Exp $ */
 /*
  * Copyright (c) 2012-2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -33,16 +33,6 @@
 	{ "fusefs_pool_pages", CTLTYPE_INT }, \
 }
 
-struct fb_ioctl_xch {
-	uint64_t	fbxch_uuid;
-	size_t		fbxch_len;
-	uint8_t		*fbxch_data;
-};
-
-/* FUSE Device ioctls */
-#define FIOCGETFBDAT	_IOW('F', 0, struct fb_ioctl_xch)
-#define FIOCSETFBDAT	_IOW('F', 1, struct fb_ioctl_xch)
-
 #ifdef _KERNEL
 
 struct fuse_msg;
@@ -51,6 +41,7 @@ struct fusefs_mnt {
 	struct mount *mp;
 	uint32_t undef_op;
 	int max_read;
+	int max_write;
 	int sess_init;
 	int allow_other;
 	dev_t dev;
@@ -84,12 +75,13 @@ void fuse_device_cleanup(dev_t);
 void fuse_device_queue_fbuf(dev_t, struct fusebuf *);
 void fuse_device_set_fmp(struct fusefs_mnt *, int);
 
-/*
- * The root inode is the root of the file system.  Inode 0 can't be used for
- * normal purposes.
- */
-#define	FUSE_ROOTINO ((ino_t)1)
 #define VFSTOFUSEFS(mp)	((struct fusefs_mnt *)((mp)->mnt_data))
+
+#ifdef	FUSE_DEBUG
+#define	DPRINTF(fmt, arg...)	printf("%s: " fmt, "fusefs", ##arg)
+#else
+#define	DPRINTF(fmt, arg...)
+#endif
 
 #endif /* _KERNEL */
 #endif /* __FUSEFS_H__ */

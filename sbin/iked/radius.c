@@ -1,4 +1,4 @@
-/*	$OpenBSD: radius.c,v 1.8 2024/07/18 08:58:59 yasuoka Exp $	*/
+/*	$OpenBSD: radius.c,v 1.16 2026/07/08 10:57:33 hshoexer Exp $	*/
 
 /*
  * Copyright (c) 2024 Internet Initiative Japan Inc.
@@ -46,6 +46,8 @@ void	 iked_radius_request_send(struct iked *, void *);
 void	 iked_radius_fill_attributes(struct iked_sa *, RADIUS_PACKET *);
 void	 iked_radius_config(struct iked_radserver_req *, const RADIUS_PACKET *,
 	    int, uint32_t, uint8_t);
+struct iked_addr
+	*iked_radius_req_cfgaddr(struct iked_radserver_req *, int);
 void	 iked_radius_acct_request(struct iked *, struct iked_sa *, uint8_t);
 
 const struct iked_radcfgmap radius_cfgmaps[] = {
@@ -198,11 +200,8 @@ iked_radius_on_event(int fd, short ev, void *ctx)
 			log_info("%s: received an invalid RADIUS message: "
 			    "code %u", __func__, (unsigned)code);
 		}
-		timer_del(env, &req->rr_timer);
-		TAILQ_REMOVE(&server->rs_reqs, req, rr_entry);
-		req->rr_server = NULL;
-		free(req);
 		radius_delete_packet(pkt);
+		iked_radius_request_free(env, req);
 		return;
 	}
 
@@ -229,8 +228,12 @@ iked_radius_on_event(int fd, short ev, void *ctx)
 			    "state attribute", __func__);
 			goto fail;
 		}
-		if ((req->rr_state != NULL &&
-		    ibuf_set(req->rr_state, 0, attrval, attrlen) != 0) ||
+		if (req->rr_state != NULL &&
+		    ibuf_set(req->rr_state, 0, attrval, attrlen) != 0) {
+			ibuf_free(req->rr_state);
+			req->rr_state = NULL;
+		}
+		if (req->rr_state == NULL &&
 		    (req->rr_state = ibuf_new(attrval, attrlen)) == NULL) {
 			log_info("%s: ibuf_new() failed: %s", __func__,
 			    strerror(errno));
@@ -261,13 +264,23 @@ iked_radius_on_event(int fd, short ev, void *ctx)
 		    strcmp(username, req->rr_user) != 0) {
 			/*
 			 * The Access-Accept might have a User-Name.  It
-			 * should be used for Accouting (RFC 2865 5.1).
+			 * should be used for Accounting (RFC 2865 5.1).
 			 */
 			free(req->rr_user);
 			req->rr_sa->sa_eapid = strdup(username);
 		} else
 			req->rr_sa->sa_eapid = req->rr_user;
 		req->rr_user = NULL;
+
+		if (radius_get_raw_attr_ptr(pkt, RADIUS_TYPE_CLASS, &attrval,
+		    &attrlen) == 0) {
+			ibuf_free(req->rr_sa->sa_eapclass);
+			if ((req->rr_sa->sa_eapclass = ibuf_new(attrval,
+			    attrlen)) == NULL) {
+				log_info("%s: ibuf_new() failed: %s", __func__,
+				    strerror(errno));
+			}
+		}
 
 		sa_state(env, req->rr_sa, IKEV2_STATE_AUTH_SUCCESS);
 
@@ -321,6 +334,7 @@ iked_radius_on_event(int fd, short ev, void *ctx)
 	radius_delete_packet(pkt);
 	ikev2_send_ike_e(env, req->rr_sa, e, IKEV2_PAYLOAD_EAP,
 	    IKEV2_EXCHANGE_IKE_AUTH, 1);
+	ibuf_free(e);
 	/* keep request for challenge state and config parameters */
 	req->rr_reqid = -1;	/* release reqid */
 	return;
@@ -497,6 +511,8 @@ iked_radius_request_send(struct iked *env, void *ctx)
 void
 iked_radius_fill_attributes(struct iked_sa *sa, RADIUS_PACKET *pkt)
 {
+	char	port_id[16 + 1];
+
 	/* NAS Port Type = Virtual */
 	radius_put_uint32_attr(pkt,
 	    RADIUS_TYPE_NAS_PORT_TYPE, RADIUS_NAS_PORT_TYPE_VIRTUAL);
@@ -506,6 +522,10 @@ iked_radius_fill_attributes(struct iked_sa *sa, RADIUS_PACKET *pkt)
 	/* Tunnel Type = EAP */
 	radius_put_uint32_attr(pkt, RADIUS_TYPE_TUNNEL_TYPE,
 	    RADIUS_TUNNEL_TYPE_ESP);
+	/* NAS-Port-ID = ISPI */
+	snprintf(port_id, sizeof(port_id), "%016llx",
+	    (unsigned long long)sa->sa_hdr.sh_ispi);
+	radius_put_string_attr(pkt, RADIUS_TYPE_NAS_PORT_ID, port_id);
 
 	radius_put_string_attr(pkt, RADIUS_TYPE_CALLED_STATION_ID,
 	    print_addr(&sa->sa_local.addr));
@@ -529,7 +549,8 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 	for (i = 0; i < sa->sa_policy->pol_ncfg; i++) {
 		ikecfg = &sa->sa_policy->pol_cfg[i];
 		if (ikecfg->cfg_type == cfg_type &&
-		    ikecfg->cfg_type != IKEV2_CFG_INTERNAL_IP4_ADDRESS)
+		    ikecfg->cfg_type != IKEV2_CFG_INTERNAL_IP4_ADDRESS &&
+		    ikecfg->cfg_type != IKEV2_CFG_INTERNAL_IP6_ADDRESS)
 			return;	/* use config rather than radius */
 	}
 	switch (cfg_type) {
@@ -579,12 +600,9 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 				return;
 			}
 			sa->sa_rad_addr = addr;
-		} else {
-			req->rr_cfg[req->rr_ncfg].cfg_action = IKEV2_CP_REPLY;
-			req->rr_cfg[req->rr_ncfg].cfg_type = cfg_type;
-			addr = &req->rr_cfg[req->rr_ncfg].cfg.address;
-			req->rr_ncfg++;
-		}
+		} else if ((addr = iked_radius_req_cfgaddr(req, cfg_type)) ==
+		    NULL)
+			return;
 		addr->addr_af = AF_INET;
 		sin4 = (struct sockaddr_in *)&addr->addr;
 		sin4->sin_family = AF_INET;
@@ -610,14 +628,11 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 				log_warn("%s: calloc", __func__);
 				return;
 			}
-			sa->sa_rad_addr = addr;
-		} else {
-			req->rr_cfg[req->rr_ncfg].cfg_action = IKEV2_CP_REPLY;
-			req->rr_cfg[req->rr_ncfg].cfg_type = cfg_type;
-			addr = &req->rr_cfg[req->rr_ncfg].cfg.address;
-			req->rr_ncfg++;
-		}
-		addr->addr_af = AF_INET;
+			sa->sa_rad_addr6 = addr;
+		} else if ((addr = iked_radius_req_cfgaddr(req, cfg_type)) ==
+		    NULL)
+			return;
+		addr->addr_af = AF_INET6;
 		sin6 = (struct sockaddr_in6 *)&addr->addr;
 		sin6->sin6_family = AF_INET6;
 		sin6->sin6_len = sizeof(struct sockaddr_in6);
@@ -625,6 +640,25 @@ iked_radius_config(struct iked_radserver_req *req, const RADIUS_PACKET *pkt,
 		break;
 	}
 	return;
+}
+
+struct iked_addr *
+iked_radius_req_cfgaddr(struct iked_radserver_req *req, int cfg_type)
+{
+	struct iked_addr	*addr;
+
+	if (req->rr_ncfg >= IKED_CFG_MAX) {
+		log_warnx("%s: too many RADIUS configuration attributes",
+		    __func__);
+		return (NULL);
+	}
+
+	req->rr_cfg[req->rr_ncfg].cfg_action = IKEV2_CP_REPLY;
+	req->rr_cfg[req->rr_ncfg].cfg_type = cfg_type;
+	addr = &req->rr_cfg[req->rr_ncfg].cfg.address;
+	req->rr_ncfg++;
+
+	return (addr);
 }
 
 void
@@ -746,8 +780,10 @@ iked_radius_acct_request(struct iked *env, struct iked_sa *sa, uint8_t stype)
 
 	switch (stype) {
 	case RADIUS_ACCT_STATUS_TYPE_START:
-		radius_put_uint32_attr(pkt, RADIUS_TYPE_ACCT_STATUS_TYPE,
-		    RADIUS_ACCT_STATUS_TYPE_START);
+		if (req->rr_sa && req->rr_sa->sa_eapclass != NULL)
+			radius_put_raw_attr(pkt, RADIUS_TYPE_CLASS,
+			    ibuf_data(req->rr_sa->sa_eapclass),
+			    ibuf_size(req->rr_sa->sa_eapclass));
 		break;
 	case RADIUS_ACCT_STATUS_TYPE_INTERIM_UPDATE:
 	case RADIUS_ACCT_STATUS_TYPE_STOP:
@@ -841,7 +877,7 @@ iked_radius_dae_on_event(int fd, short ev, void *ctx)
 		if (code == RADIUS_CODE_COA_REQUEST) {
 			code = RADIUS_CODE_COA_NAK;
 			cause = RADIUS_ERROR_CAUSE_ADMINISTRATIVELY_PROHIBITED;
-			nakcause = "Coa-Request is not supprted";
+			nakcause = "Coa-Request is not supported";
 			goto send;
 		}
 		log_warnx("%s: received an invalid RADIUS message "

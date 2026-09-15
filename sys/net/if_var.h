@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_var.h,v 1.132 2023/12/23 10:52:54 bluhm Exp $	*/
+/*	$OpenBSD: if_var.h,v 1.149 2026/06/23 18:50:43 bluhm Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -40,13 +40,13 @@
 
 #include <sys/queue.h>
 #include <sys/mbuf.h>
-#include <sys/srp.h>
+#include <sys/smr.h>
 #include <sys/refcnt.h>
 #include <sys/task.h>
-#include <sys/time.h>
 #include <sys/timeout.h>
 
 #include <net/ifq.h>
+#include <net/route.h>
 
 /*
  * Structures defining a network interface, providing a packet
@@ -80,6 +80,8 @@
  *	c	only used in ioctl or routing socket contexts (kernel lock)
  *	K	kernel lock
  *	N	net lock
+ *	T	if_tmplist_lock
+ *	m	interface multicast rwlock if_maddrlock
  *
  *  For SRP related structures that allow lock-free reads, the write lock
  *  is indicated below.
@@ -89,6 +91,15 @@ struct rtentry;
 struct ifnet;
 struct task;
 struct cpumem;
+
+struct netstack {
+	struct mbuf_list	 ns_input;
+	struct mbuf_list	 ns_proto;
+
+	struct route		 ns_route;
+	struct mbuf_list	 ns_tcp_ml;
+	struct mbuf_list	 ns_tcp6_ml;
+};
 
 /*
  * Structure describing a `cloning' interface.
@@ -111,20 +122,41 @@ struct if_clone {
   .ifc_destroy	= destroy,						\
 }
 
+enum if_counters {
+	ifc_ipackets,		/* packets received on interface */
+	ifc_ierrors,		/* input errors on interface */
+	ifc_opackets,		/* packets sent on interface */
+	ifc_oerrors,		/* output errors on interface */
+	ifc_collisions,		/* collisions on csma interfaces */
+	ifc_ibytes,		/* total number of octets received */
+	ifc_obytes,		/* total number of octets sent */
+	ifc_imcasts,		/* packets received via multicast */
+	ifc_omcasts,		/* packets sent via multicast */
+	ifc_iqdrops,		/* dropped on input, this interface */
+	ifc_oqdrops,		/* dropped on output, this interface */
+	ifc_noproto,		/* destined for unsupported protocol */
+
+	ifc_ncounters
+};
+
 /*
  * Structure defining a queue for a network interface.
  *
  * (Would like to call this struct ``if'', but C isn't PL/1.)
  */
 TAILQ_HEAD(ifnet_head, ifnet);		/* the actual queue head */
+struct carp_softc;
+SMR_LIST_HEAD(carp_iflist, carp_softc);
 
 struct ifnet {				/* and the entries */
 	void	*if_softc;		/* [I] lower-level data for this if */
 	struct	refcnt if_refcnt;
 	TAILQ_ENTRY(ifnet) if_list;	/* [NK] all struct ifnets are chained */
+	TAILQ_ENTRY(ifnet) if_tmplist;	/* [T] temporary list */
 	TAILQ_HEAD(, ifaddr) if_addrlist; /* [N] list of addresses per if */
-	TAILQ_HEAD(, ifmaddr) if_maddrlist; /* [N] list of multicast records */
+	TAILQ_HEAD(, ifmaddr) if_maddrlist; /* [m] list of multicast records */
 	TAILQ_HEAD(, ifg_list) if_groups; /* [N] list of groups per if */
+	struct rwlock if_maddrlock;
 	struct task_list if_addrhooks;	/* [I] address change callbacks */
 	struct task_list if_linkstatehooks; /* [I] link change callbacks*/
 	struct task_list if_detachhooks; /* [I] detach callbacks */
@@ -134,13 +166,15 @@ struct ifnet {				/* and the entries */
 	int	if_pcount;		/* [N] # of promiscuous listeners */
 	unsigned int if_bridgeidx;	/* [K] used by bridge ports */
 	caddr_t	if_bpf;			/* packet filter structure */
-	caddr_t if_mcast;		/* used by multicast code */
-	caddr_t if_mcast6;		/* used by IPv6 multicast code */
+	struct	vif *if_mcast;		/* used by multicast code */
+	struct	mif6 *if_mcast6;	/* used by IPv6 multicast code */
 	caddr_t	if_pf_kif;		/* pf interface abstraction */
 	union {
-		struct srpl carp_s;	/* carp if list (used by !carp ifs) */
-		unsigned int carp_idx;	/* index of carpdev (used by carp
-						ifs) */
+		/* carp if list (used by IFT_ETHER) */
+		struct carp_iflist carp_s;
+
+		/* index of carpdev (used by IFT_CARP) */
+		unsigned int carp_idx;
 	} if_carp_ptr;
 #define if_carp		if_carp_ptr.carp_s
 #define if_carpdevidx	if_carp_ptr.carp_idx
@@ -148,7 +182,20 @@ struct ifnet {				/* and the entries */
 	short	if_timer;		/* time 'til if_watchdog called */
 	unsigned short if_flags;	/* [N] up/down, broadcast, etc. */
 	int	if_xflags;		/* [N] extra softnet flags */
-	struct	if_data if_data;	/* stats and other data about if */
+
+	/* Stats and other data about if. Should be in sync with if_data. */
+	u_char if_type;
+	u_char if_addrlen;
+	u_char if_hdrlen;
+	u_char if_link_state;
+	uint32_t if_mtu;
+	uint32_t if_metric;
+	uint64_t if_baudrate;
+	uint32_t if_capabilities;
+	uint32_t if_rdomain;
+	struct  timeval if_lastchange;	/* [c] last op. state change */
+	uint64_t if_data_counters[ifc_ncounters];
+
 	struct	cpumem *if_counters;	/* per cpu stats */
 	uint32_t if_hardmtu;		/* [d] maximum MTU device supports */
 	char	if_description[IFDESCRSIZE]; /* [c] interface description */
@@ -160,7 +207,7 @@ struct ifnet {				/* and the entries */
 	struct	task if_linkstatetask;	/* [I] task to do route updates */
 
 	/* procedure handles */
-	void	(*if_input)(struct ifnet *, struct mbuf *);
+	void	(*if_input)(struct ifnet *, struct mbuf *, struct netstack *);
 	int	(*if_bpf_mtap)(caddr_t, const struct mbuf *, u_int);
 	int	(*if_output)(struct ifnet *, struct mbuf *, struct sockaddr *,
 		     struct rtentry *);	/* output routine (enqueue) */
@@ -188,45 +235,19 @@ struct ifnet {				/* and the entries */
 
 	struct	nd_ifinfo *if_nd;	/* [I] IPv6 Neighbor Discovery info */
 };
-#define	if_mtu		if_data.ifi_mtu
-#define	if_type		if_data.ifi_type
-#define	if_addrlen	if_data.ifi_addrlen
-#define	if_hdrlen	if_data.ifi_hdrlen
-#define	if_metric	if_data.ifi_metric
-#define	if_link_state	if_data.ifi_link_state
-#define	if_baudrate	if_data.ifi_baudrate
-#define	if_ipackets	if_data.ifi_ipackets
-#define	if_ierrors	if_data.ifi_ierrors
-#define	if_opackets	if_data.ifi_opackets
-#define	if_oerrors	if_data.ifi_oerrors
-#define	if_collisions	if_data.ifi_collisions
-#define	if_ibytes	if_data.ifi_ibytes
-#define	if_obytes	if_data.ifi_obytes
-#define	if_imcasts	if_data.ifi_imcasts
-#define	if_omcasts	if_data.ifi_omcasts
-#define	if_iqdrops	if_data.ifi_iqdrops
-#define	if_oqdrops	if_data.ifi_oqdrops
-#define	if_noproto	if_data.ifi_noproto
-#define	if_lastchange	if_data.ifi_lastchange	/* [c] last op. state change */
-#define	if_capabilities	if_data.ifi_capabilities
-#define	if_rdomain	if_data.ifi_rdomain
 
-enum if_counters {
-	ifc_ipackets,		/* packets received on interface */
-	ifc_ierrors,		/* input errors on interface */
-	ifc_opackets,		/* packets sent on interface */
-	ifc_oerrors,		/* output errors on interface */
-	ifc_collisions,		/* collisions on csma interfaces */
-	ifc_ibytes,		/* total number of octets received */
-	ifc_obytes,		/* total number of octets sent */
-	ifc_imcasts,		/* packets received via multicast */
-	ifc_omcasts,		/* packets sent via multicast */
-	ifc_iqdrops,		/* dropped on input, this interface */
-	ifc_oqdrops,		/* dropped on output, this interface */
-	ifc_noproto,		/* destined for unsupported protocol */
-
-	ifc_ncounters
-};
+#define if_ipackets	if_data_counters[ifc_ipackets]
+#define if_ierrors	if_data_counters[ifc_ierrors]
+#define if_opackets	if_data_counters[ifc_opackets]
+#define if_oerrors	if_data_counters[ifc_oerrors]
+#define if_collisions	if_data_counters[ifc_collisions]
+#define if_ibytes	if_data_counters[ifc_ibytes]
+#define if_obytes	if_data_counters[ifc_obytes]
+#define if_imcasts	if_data_counters[ifc_imcasts]
+#define if_omcasts	if_data_counters[ifc_omcasts]
+#define if_iqdrops	if_data_counters[ifc_iqdrops]
+#define if_oqdrops	if_data_counters[ifc_oqdrops]
+#define if_noproto	if_data_counters[ifc_noproto]
 
 /*
  * The ifaddr structure contains information about one address
@@ -242,6 +263,7 @@ struct ifaddr {
 	struct	ifnet *ifa_ifp;		/* back-pointer to interface */
 	TAILQ_ENTRY(ifaddr) ifa_list;	/* [N] list of addresses for
 					    interface */
+	TAILQ_ENTRY(ifaddr) ifa_tmplist;/* [T] temporary list */
 	u_int	ifa_flags;		/* interface flags, see below */
 	struct	refcnt ifa_refcnt;	/* number of `rt_ifa` references */
 	int	ifa_metric;		/* cost of going out this interface */
@@ -253,10 +275,10 @@ struct ifaddr {
  * Interface multicast address.
  */
 struct ifmaddr {
-	struct sockaddr		*ifma_addr;	/* Protocol address */
-	unsigned int		 ifma_ifidx;	/* Index of the interface */
+	TAILQ_ENTRY(ifmaddr)	 ifma_list;	/* [m] Per-interface list */
+	struct sockaddr		*ifma_addr;	/* [I] Protocol address */
 	struct refcnt		 ifma_refcnt;	/* Count of references */
-	TAILQ_ENTRY(ifmaddr)	 ifma_list;	/* Per-interface list */
+	unsigned int		 ifma_ifidx;	/* [I] Index of the interface */
 };
 
 /*
@@ -270,6 +292,9 @@ struct ifg_group {
 	int			 ifg_carp_demoted; /* [K] carp demotion counter */
 	TAILQ_HEAD(, ifg_member) ifg_members; /* [N] list of members per group */
 	TAILQ_ENTRY(ifg_group)	 ifg_next;    /* [N] all groups are chained */
+
+	struct refcnt		 ifg_tmprefcnt;
+	TAILQ_ENTRY(ifg_group)	 ifg_tmplist;   /* [T] temporary list */
 };
 
 struct ifg_member {
@@ -304,27 +329,29 @@ struct	niqueue {
 #define NIQUEUE_INITIALIZER(_len, _isr) \
     { MBUF_QUEUE_INITIALIZER((_len), IPL_NET), (_isr) }
 
-void		niq_init(struct niqueue *, u_int, u_int);
 int		niq_enqueue(struct niqueue *, struct mbuf *);
-int		niq_enlist(struct niqueue *, struct mbuf_list *);
 
 #define niq_dequeue(_q)			mq_dequeue(&(_q)->ni_q)
-#define niq_dechain(_q)			mq_dechain(&(_q)->ni_q)
 #define niq_delist(_q, _ml)		mq_delist(&(_q)->ni_q, (_ml))
 #define niq_len(_q)			mq_len(&(_q)->ni_q)
 #define niq_drops(_q)			mq_drops(&(_q)->ni_q)
 #define sysctl_niq(_n, _l, _op, _olp, _np, _nl, _niq) \
     sysctl_mq((_n), (_l), (_op), (_olp), (_np), (_nl), &(_niq)->ni_q)
 
+extern struct rwlock if_tmplist_lock;
 extern struct ifnet_head ifnetlist;
 
 void	if_start(struct ifnet *);
 int	if_enqueue(struct ifnet *, struct mbuf *);
 int	if_enqueue_ifq(struct ifnet *, struct mbuf *);
 void	if_input(struct ifnet *, struct mbuf_list *);
-void	if_vinput(struct ifnet *, struct mbuf *);
-void	if_input_process(struct ifnet *, struct mbuf_list *);
-int	if_input_local(struct ifnet *, struct mbuf *, sa_family_t);
+void	if_vinput(struct ifnet *, struct mbuf *, struct netstack *);
+void	if_input_process(struct ifnet *, struct mbuf_list *, unsigned int);
+void	if_input_proto(struct ifnet *, struct mbuf *,
+	    void (*)(struct ifnet *, struct mbuf *, struct netstack *),
+	    struct netstack *);
+int	if_input_local(struct ifnet *, struct mbuf *, sa_family_t,
+	    struct netstack *);
 int	if_output_ml(struct ifnet *, struct mbuf_list *,
 	    struct sockaddr *, struct rtentry *);
 int	if_output_mq(struct ifnet *, struct mbuf_queue *, unsigned int *,
@@ -334,8 +361,17 @@ int	if_output_tso(struct ifnet *, struct mbuf **, struct sockaddr *,
 int	if_output_local(struct ifnet *, struct mbuf *, sa_family_t);
 void	if_rtrequest_dummy(struct ifnet *, int, struct rtentry *);
 void	p2p_rtrequest(struct ifnet *, int, struct rtentry *);
-void	p2p_input(struct ifnet *, struct mbuf *);
+void	p2p_input(struct ifnet *, struct mbuf *, struct netstack *);
 int	p2p_bpf_mtap(caddr_t, const struct mbuf *, u_int);
+
+/* this is a helper for if_input_process and similar functions */
+static inline void
+if_input_process_proto(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
+{
+	void (*input)(struct ifnet *, struct mbuf *, struct netstack *);
+	input = m->m_pkthdr.ph_cookie;
+	(*input)(ifp, m, ns);
+}
 
 struct	ifaddr *ifa_ifwithaddr(const struct sockaddr *, u_int);
 struct	ifaddr *ifa_ifwithdstaddr(const struct sockaddr *, u_int);

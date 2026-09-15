@@ -1,4 +1,4 @@
-/*	$OpenBSD: options.c,v 1.30 2024/02/12 16:42:42 job Exp $	*/
+/*	$OpenBSD: options.c,v 1.31 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1991, 1993, 1994
@@ -30,9 +30,9 @@
 #include "../vi/vi.h"
 #include "pathnames.h"
 
-static int	 	 opts_abbcmp(const void *, const void *);
-static int	 	 opts_cmp(const void *, const void *);
-static int	 	 opts_print(SCR *, OPTLIST const *);
+static int		 opts_abbcmp(const void *, const void *);
+static int		 opts_cmp(const void *, const void *);
+static int		 opts_print(SCR *, OPTLIST const *);
 
 /*
  * O'Reilly noted options and abbreviations are from "Learning the VI Editor",
@@ -199,8 +199,8 @@ OPTLIST const optlist[] = {
 };
 
 typedef struct abbrev {
-        char *name;
-        int offset;
+	char *name;
+	int offset;
 } OABBREV;
 
 static OABBREV const abbrev[] = {
@@ -964,7 +964,7 @@ opts_save(SCR *sp, FILE *fp)
 	return (0);
 }
 
-/* 
+/*
  * opts_search --
  *	Search for an option.
  *
@@ -989,7 +989,7 @@ opts_search(char *name)
 	if ((op = bsearch(&otmp, optlist, sizeof(optlist) / sizeof(OPTLIST) - 1,
 	    sizeof(OPTLIST), opts_cmp)) != NULL)
 		return (op);
-		
+
 	/*
 	 * Check to see if the name is the prefix of one (and only one)
 	 * option.  If so, return the option.
@@ -1009,7 +1009,7 @@ opts_search(char *name)
 	return (found);
 }
 
-/* 
+/*
  * opts_nomatch --
  *	Standard nomatch error message for options.
  *
@@ -1025,13 +1025,13 @@ opts_nomatch(SCR *sp, char *name)
 static int
 opts_abbcmp(const void *a, const void *b)
 {
-        return(strcmp(((OABBREV *)a)->name, ((OABBREV *)b)->name));
+	return(strcmp(((OABBREV *)a)->name, ((OABBREV *)b)->name));
 }
 
 static int
 opts_cmp(const void *a, const void *b)
 {
-        return(strcmp(((OPTLIST *)a)->name, ((OPTLIST *)b)->name));
+	return(strcmp(((OPTLIST *)a)->name, ((OPTLIST *)b)->name));
 }
 
 /*

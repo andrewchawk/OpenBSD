@@ -1,4 +1,4 @@
-/*	$OpenBSD: pstat.c,v 1.130 2024/07/10 13:29:23 krw Exp $	*/
+/*	$OpenBSD: pstat.c,v 1.132 2026/08/06 20:41:11 claudio Exp $	*/
 /*	$NetBSD: pstat.c,v 1.27 1996/10/23 22:50:06 cgd Exp $	*/
 
 /*-
@@ -30,6 +30,7 @@
  * SUCH DAMAGE.
  */
 
+#define __need_process
 #include <sys/param.h>	/* DEV_BSIZE */
 #include <sys/types.h>
 #include <sys/signal.h>
@@ -86,7 +87,7 @@ struct nlist vnodenl[] = {
 
 struct itty *globalitp;
 struct kinfo_file *kf;
-struct nlist *globalnl;
+struct nlist *globalnl = vnodenl;
 
 struct e_vnode {
 	struct vnode *vptr;
@@ -203,7 +204,7 @@ main(int argc, char *argv[])
 	need_nlist = dformat || vnodeflag;
 
 	if (nlistf != NULL || memf != NULL) {
-		if (fileflag || totalflag)
+		if (fileflag || totalflag || ttyflag)
 			need_nlist = 1;
 	}
 
@@ -296,27 +297,40 @@ main(int argc, char *argv[])
 		kvm_nlist(kd, nl);
 		globalnl = nl;
 		for (i = 0; i < argc; i++) {
-			uint64_t v;
+			uint64_t v = 0;
+			int bad = 0;
 
-			printf("%s ", argv[i]);
 			if (!nl[i].n_value && argv[i][0] == '0') {
 				nl[i].n_value = strtoul(argv[i], NULL, 16);
 				nl[i].n_type = N_DATA;
 			}
 			if (!nl[i].n_value) {
-				printf("not found\n");
+				printf("%s not found\n", argv[i]);
 				error++;
 				continue;
 			}
 
-			printf("at %p: ", (void *)nl[i].n_value);
 			if ((nl[i].n_type & N_TYPE) == N_DATA ||
 			    (nl[i].n_type & N_TYPE) == N_COMM) {
 				if (stringformat) {
-					KGET1(i, &buf, sizeof(buf), argv[i]);
+					if (kvm_read(kd, globalnl[i].n_value,
+					    &buf, sizeof(buf)) != sizeof buf)
+						bad = 1;
 					buf[sizeof(buf) - 1] = '\0';
-				} else
-					KGET1(i, &v, sizeof(v), argv[i]);
+				} else {
+					if (kvm_read(kd, globalnl[i].n_value,
+					    &v, sizeof(v)) != sizeof v)
+						bad = 1;
+				}
+				if (bad) {
+					warnx("cannot read %s: %s",
+					    argv[i], kvm_geterr(kd));
+					error++;
+					continue;
+				}
+
+				printf("%s at %p: ", argv[i],
+				    (void *)nl[i].n_value);
 				if (stringformat)
 					printf(format, &buf);
 				else if (longformat)
@@ -363,8 +377,6 @@ vnodemode(void)
 	struct e_vnode *e_vnodebase, *endvnode, *evp;
 	struct vnode *vp;
 	struct mount *maddr, *mp = NULL;
-
-	globalnl = vnodenl;
 
 	e_vnodebase = kinfo_vnodes();
 	if (totalflag) {
@@ -906,9 +918,16 @@ tty2itty(struct tty *tp, struct itty *itp)
 	itp->t_lowat = tp->t_lowat;
 	itp->t_column = tp->t_column;
 	itp->t_state = tp->t_state;
-	itp->t_session = tp->t_session;
+	if (tp->t_session != NULL) {
+		struct process *s_leader;
+		KGET2(&tp->t_session->s_leader, &s_leader, sizeof(s_leader),
+		    "s_leader");
+		KGET2(&s_leader->ps_pid, &itp->t_session_id,
+		    sizeof(s_leader->ps_pid), "s_leader->ps_pid");
+	}
 	if (tp->t_pgrp != NULL)
-		KGET2(&tp->t_pgrp->pg_id, &itp->t_pgrp_pg_id, sizeof(pid_t), "pgid");
+		KGET2(&tp->t_pgrp->pg_id, &itp->t_pgrp_pg_id, sizeof(pid_t),
+		    "pgid");
 	itp->t_line = tp->t_line;
 }
 
@@ -1005,8 +1024,7 @@ ttyprt(struct itty *tp)
 	if (j == 0)
 		state[j++] = '-';
 	state[j] = '\0';
-	(void)printf("%-6s %8lx", state,
-		hideroot ? 0 : (u_long)tp->t_session & 0xffffffff);
+	(void)printf("%-6s %8d", state, tp->t_session_id);
 	(void)printf("%6d ", tp->t_pgrp_pg_id);
 	switch (tp->t_line) {
 	case TTYDISC:
@@ -1029,8 +1047,6 @@ filemode(void)
 {
 	char flagbuf[16], *fbp;
 	static char *dtypes[] = { "???", "inode", "socket", "pipe", "kqueue", "???", "???" };
-
-	globalnl = vnodenl;
 
 	if (nlistf != NULL || memf != NULL) {
 		KGET(FNL_MAXFILE, maxfile);

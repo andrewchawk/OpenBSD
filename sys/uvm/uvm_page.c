@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_page.c,v 1.177 2024/05/01 12:54:27 mpi Exp $	*/
+/*	$OpenBSD: uvm_page.c,v 1.190 2026/07/11 13:13:16 kettenis Exp $	*/
 /*	$NetBSD: uvm_page.c,v 1.44 2000/11/27 08:40:04 chs Exp $	*/
 
 /*
@@ -118,7 +118,7 @@ static vaddr_t      virtual_space_end;
  */
 static void uvm_pageinsert(struct vm_page *);
 static void uvm_pageremove(struct vm_page *);
-int uvm_page_owner_locked_p(struct vm_page *);
+int uvm_page_owner_locked_p(struct vm_page *, boolean_t);
 
 /*
  * inline functions
@@ -255,6 +255,8 @@ uvm_page_init(vaddr_t *kvm_startp, vaddr_t *kvm_endp)
 		    i++, curpg++, pgno++, paddr += PAGE_SIZE) {
 			curpg->phys_addr = paddr;
 			VM_MDPAGE_INIT(curpg);
+			curpg->uobject = NULL;
+			curpg->uanon = NULL;
 			if (pgno >= seg->avail_start &&
 			    pgno < seg->avail_end) {
 				uvmexp.npages++;
@@ -279,17 +281,16 @@ uvm_page_init(vaddr_t *kvm_startp, vaddr_t *kvm_endp)
 	mtx_init(&uvm.aiodoned_lock, IPL_BIO);
 
 	/*
-	 * init reserve thresholds
-	 * XXXCDC - values may need adjusting
+	 * init reserve thresholds.
+	 *
+	 * XXX As long as some disk drivers cannot write any physical
+	 * XXX page, we need DMA reachable reserves for the pagedaemon.
+	 * XXX We cannot enforce such requirement but it should be ok
+	 * XXX in most of the cases because the pmemrange tries hard to
+	 * XXX allocate them last.
 	 */
-	uvmexp.reserve_pagedaemon = 4;
-	uvmexp.reserve_kernel = 8;
-	uvmexp.anonminpct = 10;
-	uvmexp.vnodeminpct = 10;
-	uvmexp.vtextminpct = 5;
-	uvmexp.anonmin = uvmexp.anonminpct * 256 / 100;
-	uvmexp.vnodemin = uvmexp.vnodeminpct * 256 / 100;
-	uvmexp.vtextmin = uvmexp.vtextminpct * 256 / 100;
+	uvmexp.reserve_pagedaemon = 32;
+	uvmexp.reserve_kernel = uvmexp.reserve_pagedaemon + 32;
 
 	uvm.page_init_done = TRUE;
 }
@@ -561,6 +562,8 @@ uvm_page_physload(paddr_t start, paddr_t end, paddr_t avail_start,
 		    lcv++, paddr += PAGE_SIZE) {
 			pgs[lcv].phys_addr = paddr;
 			VM_MDPAGE_INIT(&pgs[lcv]);
+			pgs[lcv].uobject = NULL;
+			pgs[lcv].uanon = NULL;
 			if (atop(paddr) >= avail_start &&
 			    atop(paddr) < avail_end) {
 				if (flags & PHYSLOAD_DEVICE) {
@@ -701,7 +704,7 @@ uvm_pagealloc_pg(struct vm_page *pg, struct uvm_object *obj, voff_t off,
 	pg->offset = off;
 	pg->uobject = obj;
 	pg->uanon = anon;
-	KASSERT(uvm_page_owner_locked_p(pg));
+	KASSERT(uvm_page_owner_locked_p(pg, TRUE));
 	if (anon) {
 		anon->an_page = pg;
 		flags |= PQ_ANON;
@@ -795,7 +798,6 @@ uvm_pglistfree(struct pglist *list)
 
 /*
  * interface used by the buffer cache to allocate a buffer at a time.
- * The pages are allocated wired in DMA accessible memory
  */
 int
 uvm_pagealloc_multi(struct uvm_object *obj, voff_t off, vsize_t size,
@@ -809,8 +811,8 @@ uvm_pagealloc_multi(struct uvm_object *obj, voff_t off, vsize_t size,
 	KERNEL_ASSERT_LOCKED();
 
 	TAILQ_INIT(&plist);
-	r = uvm_pglistalloc(size, dma_constraint.ucr_low,
-	    dma_constraint.ucr_high, 0, 0, &plist, atop(round_page(size)),
+	r = uvm_pglistalloc(size, no_constraint.ucr_low,
+	    no_constraint.ucr_high, 0, 0, &plist, atop(round_page(size)),
 	    flags);
 	if (r == 0) {
 		i = 0;
@@ -820,50 +822,6 @@ uvm_pagealloc_multi(struct uvm_object *obj, voff_t off, vsize_t size,
 			KASSERT((pg->pg_flags & PG_DEV) == 0);
 			TAILQ_REMOVE(&plist, pg, pageq);
 			uvm_pagealloc_pg(pg, obj, off + ptoa(i++), NULL);
-		}
-	}
-	return r;
-}
-
-/*
- * interface used by the buffer cache to reallocate a buffer at a time.
- * The pages are reallocated wired outside the DMA accessible region.
- *
- */
-int
-uvm_pagerealloc_multi(struct uvm_object *obj, voff_t off, vsize_t size,
-    int flags, struct uvm_constraint_range *where)
-{
-	struct pglist    plist;
-	struct vm_page  *pg, *tpg;
-	int              i, r;
-	voff_t		offset;
-
-	KASSERT(UVM_OBJ_IS_BUFCACHE(obj));
-	KERNEL_ASSERT_LOCKED();
-
-	TAILQ_INIT(&plist);
-	if (size == 0)
-		panic("size 0 uvm_pagerealloc");
-	r = uvm_pglistalloc(size, where->ucr_low, where->ucr_high, 0,
-	    0, &plist, atop(round_page(size)), flags);
-	if (r == 0) {
-		i = 0;
-		while((pg = TAILQ_FIRST(&plist)) != NULL) {
-			offset = off + ptoa(i++);
-			tpg = uvm_pagelookup(obj, offset);
-			KASSERT(tpg != NULL);
-			pg->wire_count = 1;
-			atomic_setbits_int(&pg->pg_flags, PG_CLEAN | PG_FAKE);
-			KASSERT((pg->pg_flags & PG_DEV) == 0);
-			TAILQ_REMOVE(&plist, pg, pageq);
-			uvm_pagecopy(tpg, pg);
-			KASSERT(tpg->wire_count == 1);
-			tpg->wire_count = 0;
-			uvm_lock_pageq();
-			uvm_pagefree(tpg);
-			uvm_unlock_pageq();
-			uvm_pagealloc_pg(pg, obj, offset, NULL);
 		}
 	}
 	return r;
@@ -944,17 +902,12 @@ uvm_pagerealloc(struct vm_page *pg, struct uvm_object *newobj, voff_t newoff)
  * uvm_pageclean: clean page
  *
  * => erase page's identity (i.e. remove from object)
- * => caller must lock page queues if `pg' is managed
  * => assumes all valid mappings of pg are gone
  */
 void
 uvm_pageclean(struct vm_page *pg)
 {
 	u_int flags_to_clear = 0;
-
-	if ((pg->pg_flags & (PG_TABLED|PQ_ACTIVE|PQ_INACTIVE)) &&
-	    (pg->uobject == NULL || !UVM_OBJ_IS_PMAP(pg->uobject)))
-		MUTEX_ASSERT_LOCKED(&uvm.pageqlock);
 
 #ifdef DEBUG
 	if (pg->uobject == (void *)0xdeadbeef &&
@@ -979,14 +932,18 @@ uvm_pageclean(struct vm_page *pg)
 	/*
 	 * now remove the page from the queues
 	 */
-	uvm_pagedequeue(pg);
+	if (pg->pg_flags & (PQ_ACTIVE|PQ_INACTIVE)) {
+		uvm_lock_pageq();
+		uvm_pagedequeue(pg);
+		uvm_unlock_pageq();
+	}
 
 	/*
 	 * if the page was wired, unwire it now.
 	 */
 	if (pg->wire_count) {
 		pg->wire_count = 0;
-		uvmexp.wired--;
+		atomic_dec_int(&uvmexp.wired);
 	}
 	if (pg->uanon) {
 		pg->uanon->an_page = NULL;
@@ -1041,7 +998,7 @@ uvm_page_unbusy(struct vm_page **pgs, int npgs)
 			continue;
 		}
 
-		KASSERT(uvm_page_owner_locked_p(pg));
+		KASSERT(uvm_page_owner_locked_p(pg, TRUE));
 		KASSERT(pg->pg_flags & PG_BUSY);
 
 		if (pg->pg_flags & PG_WANTED) {
@@ -1050,7 +1007,7 @@ uvm_page_unbusy(struct vm_page **pgs, int npgs)
 		if (pg->pg_flags & PG_RELEASED) {
 			KASSERT(pg->uobject != NULL ||
 			    (pg->uanon != NULL && pg->uanon->an_ref > 0));
-			atomic_clearbits_int(&pg->pg_flags, PG_RELEASED);
+			atomic_clearbits_int(&pg->pg_flags, PG_WANTED);
 			pmap_page_protect(pg, PROT_NONE);
 			uvm_pagefree(pg);
 		} else {
@@ -1073,6 +1030,7 @@ uvm_pagewait(struct vm_page *pg, struct rwlock *lock, const char *wmesg)
 {
 	KASSERT(rw_lock_held(lock));
 	KASSERT((pg->pg_flags & PG_BUSY) != 0);
+	KASSERT(uvm_page_owner_locked_p(pg, FALSE));
 
 	atomic_setbits_int(&pg->pg_flags, PG_WANTED);
 	rwsleep_nsec(pg, lock, PVM | PNORELOCK, wmesg, INFSLP);
@@ -1220,95 +1178,100 @@ uvm_pagelookup(struct uvm_object *obj, voff_t off)
 
 /*
  * uvm_pagewire: wire the page, thus removing it from the daemon's grasp
- *
- * => caller must lock page queues
  */
 void
 uvm_pagewire(struct vm_page *pg)
 {
-	KASSERT(uvm_page_owner_locked_p(pg));
-	MUTEX_ASSERT_LOCKED(&uvm.pageqlock);
+	KASSERT(uvm_page_owner_locked_p(pg, TRUE));
 
 	if (pg->wire_count == 0) {
+		uvm_lock_pageq();
 		uvm_pagedequeue(pg);
-		uvmexp.wired++;
+		uvm_unlock_pageq();
+		atomic_inc_int(&uvmexp.wired);
 	}
+	KASSERT((pg->pg_flags & (PQ_INACTIVE|PQ_ACTIVE)) == 0);
 	pg->wire_count++;
+	KASSERT(pg->wire_count > 0);	/* detect wraparound */
 }
 
 /*
  * uvm_pageunwire: unwire the page.
  *
  * => activate if wire count goes to zero.
- * => caller must lock page queues
  */
 void
 uvm_pageunwire(struct vm_page *pg)
 {
-	KASSERT(uvm_page_owner_locked_p(pg));
-	MUTEX_ASSERT_LOCKED(&uvm.pageqlock);
+	KASSERT(uvm_page_owner_locked_p(pg, TRUE));
+	KASSERT(pg->wire_count != 0);
 
 	pg->wire_count--;
 	if (pg->wire_count == 0) {
 		uvm_pageactivate(pg);
-		uvmexp.wired--;
+		atomic_dec_int(&uvmexp.wired);
 	}
 }
 
 /*
- * uvm_pagedeactivate: deactivate page -- no pmaps have access to page
+ * uvm_pagedeactivate: deactivate page (unless wired)
  *
- * => caller must lock page queues
- * => caller must check to make sure page is not wired
- * => object that page belongs to must be locked (so we can adjust pg->flags)
+ * => object that page belongs to must be locked
  */
 void
 uvm_pagedeactivate(struct vm_page *pg)
 {
-	KASSERT(uvm_page_owner_locked_p(pg));
-	MUTEX_ASSERT_LOCKED(&uvm.pageqlock);
+	KASSERT(uvm_page_owner_locked_p(pg, FALSE));
 
-	if (pg->pg_flags & PQ_ACTIVE) {
-		TAILQ_REMOVE(&uvm.page_active, pg, pageq);
-		atomic_clearbits_int(&pg->pg_flags, PQ_ACTIVE);
-		uvmexp.active--;
+	if (pg->wire_count > 0) {
+		KASSERT((pg->pg_flags & (PQ_INACTIVE|PQ_ACTIVE)) == 0);
+		return;
 	}
-	if ((pg->pg_flags & PQ_INACTIVE) == 0) {
-		KASSERT(pg->wire_count == 0);
-		TAILQ_INSERT_TAIL(&uvm.page_inactive, pg, pageq);
-		atomic_setbits_int(&pg->pg_flags, PQ_INACTIVE);
-		uvmexp.inactive++;
-		pmap_clear_reference(pg);
-		/*
-		 * update the "clean" bit.  this isn't 100%
-		 * accurate, and doesn't have to be.  we'll
-		 * re-sync it after we zap all mappings when
-		 * scanning the inactive list.
-		 */
-		if ((pg->pg_flags & PG_CLEAN) != 0 &&
-		    pmap_is_modified(pg))
-			atomic_clearbits_int(&pg->pg_flags, PG_CLEAN);
+
+	uvm_lock_pageq();
+	if (pg->pg_flags & PQ_INACTIVE) {
+		uvm_unlock_pageq();
+		return;
 	}
+
+	/* Make sure next access to this page will fault. */
+	pmap_page_protect(pg, PROT_NONE);
+
+	uvm_pagedequeue(pg);
+	TAILQ_INSERT_TAIL(&uvm.page_inactive, pg, pageq);
+	atomic_setbits_int(&pg->pg_flags, PQ_INACTIVE);
+	atomic_inc_int(&uvmexp.inactive);
+	uvm_unlock_pageq();
+
+	pmap_clear_reference(pg);
+	/*
+	 * update the "clean" bit.  this isn't 100% accurate, and
+	 * doesn't have to be.  we'll re-sync it after we zap all
+	 * mappings when scanning the inactive list.
+	 */
+	if ((pg->pg_flags & PG_CLEAN) != 0 && pmap_is_modified(pg))
+		atomic_clearbits_int(&pg->pg_flags, PG_CLEAN);
 }
 
 /*
- * uvm_pageactivate: activate page
- *
- * => caller must lock page queues
+ * uvm_pageactivate: activate page (unless wired)
  */
 void
 uvm_pageactivate(struct vm_page *pg)
 {
-	KASSERT(uvm_page_owner_locked_p(pg));
-	MUTEX_ASSERT_LOCKED(&uvm.pageqlock);
+	KASSERT(uvm_page_owner_locked_p(pg, FALSE));
 
-	uvm_pagedequeue(pg);
-	if (pg->wire_count == 0) {
-		TAILQ_INSERT_TAIL(&uvm.page_active, pg, pageq);
-		atomic_setbits_int(&pg->pg_flags, PQ_ACTIVE);
-		uvmexp.active++;
-
+	if (pg->wire_count > 0) {
+		KASSERT((pg->pg_flags & (PQ_INACTIVE|PQ_ACTIVE)) == 0);
+		return;
 	}
+
+	uvm_lock_pageq();
+	uvm_pagedequeue(pg);
+	TAILQ_INSERT_TAIL(&uvm.page_active, pg, pageq);
+	atomic_setbits_int(&pg->pg_flags, PQ_ACTIVE);
+	atomic_inc_int(&uvmexp.active);
+	uvm_unlock_pageq();
 }
 
 /*
@@ -1317,15 +1280,19 @@ uvm_pageactivate(struct vm_page *pg)
 void
 uvm_pagedequeue(struct vm_page *pg)
 {
+	KASSERT(uvm_page_owner_locked_p(pg, FALSE));
+	MUTEX_ASSERT_LOCKED(&uvm.pageqlock);
+	KASSERT(pg->wire_count == 0);
+
 	if (pg->pg_flags & PQ_ACTIVE) {
 		TAILQ_REMOVE(&uvm.page_active, pg, pageq);
 		atomic_clearbits_int(&pg->pg_flags, PQ_ACTIVE);
-		uvmexp.active--;
+		atomic_dec_int(&uvmexp.active);
 	}
 	if (pg->pg_flags & PQ_INACTIVE) {
 		TAILQ_REMOVE(&uvm.page_inactive, pg, pageq);
 		atomic_clearbits_int(&pg->pg_flags, PQ_INACTIVE);
-		uvmexp.inactive--;
+		atomic_dec_int(&uvmexp.inactive);
 	}
 }
 /*
@@ -1353,15 +1320,19 @@ uvm_pagecopy(struct vm_page *src, struct vm_page *dst)
  * locked.  this is a weak check for runtime assertions only.
  */
 int
-uvm_page_owner_locked_p(struct vm_page *pg)
+uvm_page_owner_locked_p(struct vm_page *pg, boolean_t exclusive)
 {
 	if (pg->uobject != NULL) {
 		if (UVM_OBJ_IS_DUMMY(pg->uobject))
 			return 1;
-		return rw_write_held(pg->uobject->vmobjlock);
+		return exclusive
+		    ? rw_write_held(pg->uobject->vmobjlock)
+		    : rw_lock_held(pg->uobject->vmobjlock);
 	}
 	if (pg->uanon != NULL) {
-		return rw_write_held(pg->uanon->an_lock);
+		return exclusive
+		    ? rw_write_held(pg->uanon->an_lock)
+		    : rw_lock_held(pg->uanon->an_lock);
 	}
 	return 1;
 }

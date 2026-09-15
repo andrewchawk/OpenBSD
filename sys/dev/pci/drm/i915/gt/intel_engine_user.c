@@ -38,8 +38,7 @@ intel_engine_lookup_user(struct drm_i915_private *i915, u8 class, u8 instance)
 
 void intel_engine_add_user(struct intel_engine_cs *engine)
 {
-	llist_add((struct llist_node *)&engine->uabi_node,
-		  (struct llist_head *)&engine->i915->uabi_engines);
+	llist_add(&engine->uabi_llist, &engine->i915->uabi_engines_llist);
 }
 
 #define I915_NO_UABI_CLASS ((u16)(-1))
@@ -57,9 +56,9 @@ static int engine_cmp(void *priv, const struct list_head *A,
 		      const struct list_head *B)
 {
 	const struct intel_engine_cs *a =
-		container_of((struct rb_node *)A, typeof(*a), uabi_node);
+		container_of(A, typeof(*a), uabi_list);
 	const struct intel_engine_cs *b =
-		container_of((struct rb_node *)B, typeof(*b), uabi_node);
+		container_of(B, typeof(*b), uabi_list);
 
 	if (uabi_classes[a->class] < uabi_classes[b->class])
 		return -1;
@@ -76,7 +75,7 @@ static int engine_cmp(void *priv, const struct list_head *A,
 
 static struct llist_node *get_engines(struct drm_i915_private *i915)
 {
-	return llist_del_all((struct llist_head *)&i915->uabi_engines);
+	return llist_del_all(&i915->uabi_engines_llist);
 }
 
 static void sort_engines(struct drm_i915_private *i915,
@@ -86,14 +85,12 @@ static void sort_engines(struct drm_i915_private *i915,
 
 	llist_for_each_safe(pos, next, get_engines(i915)) {
 		struct intel_engine_cs *engine =
-			container_of((struct rb_node *)pos, typeof(*engine),
-				     uabi_node);
-		list_add((struct list_head *)&engine->uabi_node, engines);
+			container_of(pos, typeof(*engine), uabi_llist);
+		list_add(&engine->uabi_list, engines);
 	}
 	list_sort(NULL, engines, engine_cmp);
 }
 
-#ifdef __linux__
 static void set_scheduler_caps(struct drm_i915_private *i915)
 {
 	static const struct {
@@ -136,51 +133,6 @@ static void set_scheduler_caps(struct drm_i915_private *i915)
 	if (!(i915->caps.scheduler & I915_SCHEDULER_CAP_ENABLED))
 		i915->caps.scheduler = 0;
 }
-#else
-/* without the pointless ilog2 -> BIT() */
-static void set_scheduler_caps(struct drm_i915_private *i915)
-{
-	static const struct {
-		u8 engine;
-		u8 sched;
-	} map[] = {
-#define MAP(x, y) { I915_ENGINE_##x, I915_SCHEDULER_CAP_##y }
-		MAP(HAS_PREEMPTION, PREEMPTION),
-		MAP(HAS_SEMAPHORES, SEMAPHORES),
-		MAP(SUPPORTS_STATS, ENGINE_BUSY_STATS),
-#undef MAP
-	};
-	struct intel_engine_cs *engine;
-	u32 enabled, disabled;
-
-	enabled = 0;
-	disabled = 0;
-	for_each_uabi_engine(engine, i915) { /* all engines must agree! */
-		int i;
-
-		if (engine->sched_engine->schedule)
-			enabled |= (I915_SCHEDULER_CAP_ENABLED |
-				    I915_SCHEDULER_CAP_PRIORITY);
-		else
-			disabled |= (I915_SCHEDULER_CAP_ENABLED |
-				     I915_SCHEDULER_CAP_PRIORITY);
-
-		if (intel_uc_uses_guc_submission(&to_gt(i915)->uc))
-			enabled |= I915_SCHEDULER_CAP_STATIC_PRIORITY_MAP;
-
-		for (i = 0; i < ARRAY_SIZE(map); i++) {
-			if (engine->flags & map[i].engine)
-				enabled |= map[i].sched;
-			else
-				disabled |= map[i].sched;
-		}
-	}
-
-	i915->caps.scheduler = enabled & ~disabled;
-	if (!(i915->caps.scheduler & I915_SCHEDULER_CAP_ENABLED))
-		i915->caps.scheduler = 0;
-}
-#endif
 
 const char *intel_engine_class_repr(u8 class)
 {
@@ -263,8 +215,7 @@ void intel_engines_driver_register(struct drm_i915_private *i915)
 	p = &i915->uabi_engines.rb_node;
 	list_for_each_safe(it, next, &engines) {
 		struct intel_engine_cs *engine =
-			container_of((struct rb_node *)it, typeof(*engine),
-				     uabi_node);
+			container_of(it, typeof(*engine), uabi_list);
 
 		if (intel_gt_has_unrecoverable_error(engine->gt))
 			continue; /* ignore incomplete engines */
@@ -306,7 +257,7 @@ void intel_engines_driver_register(struct drm_i915_private *i915)
 		p = &prev->rb_right;
 	}
 
-	if (IS_ENABLED(CONFIG_DRM_I915_SELFTESTS) &&
+	if (IS_ENABLED(CONFIG_DRM_I915_SELFTEST) &&
 	    IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)) {
 		struct intel_engine_cs *engine;
 		unsigned int isolation;

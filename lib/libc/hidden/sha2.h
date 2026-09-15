@@ -1,4 +1,4 @@
-/*	$OpenBSD: sha2.h,v 1.2 2016/09/03 16:25:03 tedu Exp $	*/
+/*	$OpenBSD: sha2.h,v 1.8 2026/08/31 15:09:14 tb Exp $	*/
 /*
  * Copyright (c) 2015 Philip Guenther <guenther@openbsd.org>
  *
@@ -14,57 +14,57 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-/*	$OpenBSD: sha2.h,v 1.2 2016/09/03 16:25:03 tedu Exp $	*/
 
 #ifndef _LIBC_SHA2_H
 #define _LIBC_SHA2_H
 
 #include_next <sha2.h>
 
+__BEGIN_HIDDEN_DECLS
+void __sha256_block(uint32_t state[8], const uint8_t *in, size_t num);
+void __sha256_block_generic(uint32_t state[8], const uint8_t *in, size_t num);
+void __sha512_block(uint64_t state[8], const uint8_t *in, size_t num);
+void __sha512_block_generic(uint64_t state[8], const uint8_t *in, size_t num);
+
+#ifdef __aarch64__
+void __sha256_block_ce(uint32_t state[8], const uint8_t *in, size_t num);
+void __sha512_block_ce(uint64_t state[8], const uint8_t *in, size_t num);
+#endif
+
+#ifdef __amd64__
+void __sha256_block_shani(uint32_t state[8], const uint8_t *in, size_t num);
+#endif
+__END_HIDDEN_DECLS
+
 PROTO_NORMAL(SHA224Data);
 PROTO_NORMAL(SHA224End);
 PROTO_NORMAL(SHA224File);
-PROTO_NORMAL(SHA224FileChunk);
 PROTO_NORMAL(SHA224Final);
 PROTO_NORMAL(SHA224Init);
-PROTO_NORMAL(SHA224Pad);
-PROTO_NORMAL(SHA224Transform);
 PROTO_NORMAL(SHA224Update);
 PROTO_NORMAL(SHA256Data);
 PROTO_NORMAL(SHA256End);
 PROTO_NORMAL(SHA256File);
-PROTO_NORMAL(SHA256FileChunk);
 PROTO_NORMAL(SHA256Final);
 PROTO_NORMAL(SHA256Init);
-PROTO_NORMAL(SHA256Pad);
-PROTO_NORMAL(SHA256Transform);
 PROTO_NORMAL(SHA256Update);
 PROTO_NORMAL(SHA384Data);
 PROTO_NORMAL(SHA384End);
 PROTO_NORMAL(SHA384File);
-PROTO_NORMAL(SHA384FileChunk);
 PROTO_NORMAL(SHA384Final);
 PROTO_NORMAL(SHA384Init);
-PROTO_NORMAL(SHA384Pad);
-PROTO_NORMAL(SHA384Transform);
 PROTO_NORMAL(SHA384Update);
 PROTO_NORMAL(SHA512Data);
 PROTO_NORMAL(SHA512End);
 PROTO_NORMAL(SHA512File);
-PROTO_NORMAL(SHA512FileChunk);
 PROTO_NORMAL(SHA512Final);
 PROTO_NORMAL(SHA512Init);
-PROTO_NORMAL(SHA512Pad);
-PROTO_NORMAL(SHA512Transform);
 PROTO_NORMAL(SHA512Update);
 PROTO_NORMAL(SHA512_256Data);
 PROTO_NORMAL(SHA512_256End);
 PROTO_NORMAL(SHA512_256File);
-PROTO_NORMAL(SHA512_256FileChunk);
 PROTO_NORMAL(SHA512_256Final);
 PROTO_NORMAL(SHA512_256Init);
-PROTO_NORMAL(SHA512_256Pad);
-PROTO_NORMAL(SHA512_256Transform);
 PROTO_NORMAL(SHA512_256Update);
 
 #endif /* _LIBC_SHA2_H */

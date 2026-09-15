@@ -1,4 +1,4 @@
-/*	$OpenBSD: scsiconf.c,v 1.253 2022/04/06 17:39:13 krw Exp $	*/
+/*	$OpenBSD: scsiconf.c,v 1.255 2025/09/16 12:18:10 hshoexer Exp $	*/
 /*	$NetBSD: scsiconf.c,v 1.57 1996/05/02 01:09:01 neil Exp $	*/
 
 /*
@@ -102,7 +102,7 @@ const struct cfattach scsibus_ca = {
 };
 
 struct cfdriver scsibus_cd = {
-	NULL, "scsibus", DV_DULL
+	NULL, "scsibus", DV_DULL, CD_COCOVM
 };
 
 struct scsi_quirk_inquiry_pattern {
@@ -524,7 +524,7 @@ scsi_probe_link(struct scsibus_softc *sb, int target, int lun, int dumbscan)
 	}
 
 	/*
-	 * If we havent been given an io pool by now then fall back to
+	 * If we haven't been given an io pool by now then fall back to
 	 * using link->openings.
 	 */
 	if (link->pool == NULL) {

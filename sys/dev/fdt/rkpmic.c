@@ -1,4 +1,4 @@
-/*	$OpenBSD: rkpmic.c,v 1.17 2024/05/26 18:06:21 kettenis Exp $	*/
+/*	$OpenBSD: rkpmic.c,v 1.21 2026/05/04 07:33:22 kettenis Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -33,6 +33,8 @@
 
 #include <dev/clock_subr.h>
 
+extern void (*powerdownfn)(void);
+
 #define RK80X_SECONDS		0x00
 #define RK80X_MINUTES		0x01
 #define RK80X_HOURS		0x02
@@ -52,10 +54,20 @@
 #define RK809_RTC_STATUS	0x0e
 #define  RK80X_RTC_STATUS_POWER_UP	0x80
 
+#define RK805_DEV_CTRL		0x4b
+#define  RK805_DEV_CTRL_DEV_OFF	0x01
+
+#define RK806_SYS_CFG3		0x72
+#define  RK806_SYS_CFG3_DEV_OFF	0x01
+
+#define RK808_DEVCTRL		0x4b
+#define  RK808_DEVCTRL_DEV_OFF_RST	0x08
+
 #define RK809_PMIC_SYS_CFG3	0xf4
 #define  RK809_PMIC_SYS_CFG3_SLP_FUN_MASK	0x18
 #define  RK809_PMIC_SYS_CFG3_SLP_FUN_NONE	0x00
 #define  RK809_PMIC_SYS_CFG3_SLP_FUN_SLEEP	0x08
+#define  RK809_PMIC_SYS_CFG3_DEV_OFF		0x01
 #define RK809_PMIC_INT_STS0	0xf8
 #define RK809_PMIC_INT_MSK0	0xf9
 #define  RK809_PMIC_INT_MSK0_PWRON_FALL_INT_IM	0x01
@@ -328,6 +340,32 @@ const struct rkpmic_regdata rk817_regdata[] = {
 	{ }
 };
 
+/*
+ * Used by RK818 for BUCK4
+ *   0-18:	1.8V-3.6V, step=100mV
+ */
+const struct rkpmic_vsel_range rk818_vsel_range1[] = {
+	{ 1800000, 100000, 0, 18 },
+	{}
+};
+
+const struct rkpmic_regdata rk818_regdata[] = {
+	{ "DCDC_REG1", 0x2f, 0x3f, 0, 0, rk808_vsel_range1 },
+	{ "DCDC_REG2", 0x33, 0x3f, 0, 0, rk808_vsel_range1 },
+	{ "DCDC_REG3", 0, 0, 0, 0, rk808_vsel_range1 },
+	{ "DCDC_REG4", 0x38, 0x1f, 0, 0, rk818_vsel_range1 },
+	{ "LDO_REG1", 0x3b, 0x1f, 0, 0, rk808_vsel_range3 },
+	{ "LDO_REG2", 0x3d, 0x1f, 0, 0, rk808_vsel_range3 },
+	{ "LDO_REG3", 0x3f, 0x1f, 0, 0, rk808_vsel_range5 },
+	{ "LDO_REG4", 0x41, 0x1f, 0, 0, rk808_vsel_range3 },
+	{ "LDO_REG5", 0x43, 0x1f, 0, 0, rk808_vsel_range3 },
+	{ "LDO_REG6", 0x45, 0x1f, 0, 0, rk808_vsel_range5 },
+	{ "LDO_REG7", 0x47, 0x1f, 0, 0, rk808_vsel_range5 },
+	{ "LDO_REG8", 0x49, 0x1f, 0, 0, rk808_vsel_range2 },
+	{ "LDO_REG9", 0x54, 0x1f, 0, 0, rk808_vsel_range2 },
+	{ }
+};
+
 struct rkpmic_softc {
 	struct device sc_dev;
 	int sc_node;
@@ -338,6 +376,8 @@ struct rkpmic_softc {
 	struct spi_config sc_spi_conf;
 
 	int sc_rtc_ctrl_reg, sc_rtc_status_reg;
+	uint8_t sc_dev_ctrl_reg, sc_dev_off_val;
+
 	struct todr_chip_handle sc_todr;
 	const struct rkpmic_regdata *sc_regdata;
 
@@ -382,15 +422,20 @@ int	rkpmic_clock_write(struct rkpmic_softc *, struct clock_ymdhms *);
 int	rkpmic_gettime(struct todr_chip_handle *, struct timeval *);
 int	rkpmic_settime(struct todr_chip_handle *, struct timeval *);
 
+struct rkpmic_softc *rkpmic_sc;
+void    rkpmic_powerdown(void);
+
 int
 rkpmic_i2c_match(struct device *parent, void *match, void *aux)
 {
 	struct i2c_attach_args *ia = aux;
 
 	return (strcmp(ia->ia_name, "rockchip,rk805") == 0 ||
+	    strcmp(ia->ia_name, "rockchip,rk806") == 0 ||
 	    strcmp(ia->ia_name, "rockchip,rk808") == 0 ||
 	    strcmp(ia->ia_name, "rockchip,rk809") == 0 ||
-	    strcmp(ia->ia_name, "rockchip,rk817") == 0);
+	    strcmp(ia->ia_name, "rockchip,rk817") == 0 ||
+	    strcmp(ia->ia_name, "rockchip,rk818") == 0);
 }
 
 void
@@ -447,24 +492,41 @@ rkpmic_attach(struct device *parent, struct device *self, void *aux)
 		chip = "RK805";
 		sc->sc_rtc_ctrl_reg = RK805_RTC_CTRL;
 		sc->sc_rtc_status_reg = RK805_RTC_STATUS;
+		sc->sc_dev_ctrl_reg = RK805_DEV_CTRL;
+		sc->sc_dev_off_val = RK805_DEV_CTRL_DEV_OFF;
 		sc->sc_regdata = rk805_regdata;
 	} else if (OF_is_compatible(sc->sc_node, "rockchip,rk806")) {
 		chip = "RK806";
+		sc->sc_dev_ctrl_reg = RK806_SYS_CFG3;
+		sc->sc_dev_off_val = RK806_SYS_CFG3_DEV_OFF;
 		sc->sc_regdata = rk806_regdata;
 	} else if (OF_is_compatible(sc->sc_node, "rockchip,rk808")) {
 		chip = "RK808";
 		sc->sc_rtc_ctrl_reg = RK808_RTC_CTRL;
 		sc->sc_rtc_status_reg = RK808_RTC_STATUS;
+		sc->sc_dev_ctrl_reg = RK808_DEVCTRL;
+		sc->sc_dev_off_val = RK808_DEVCTRL_DEV_OFF_RST;
 		sc->sc_regdata = rk808_regdata;
 	} else if (OF_is_compatible(sc->sc_node, "rockchip,rk809")) {
 		chip = "RK809";
 		sc->sc_rtc_ctrl_reg = RK809_RTC_CTRL;
 		sc->sc_rtc_status_reg = RK809_RTC_STATUS;
+		sc->sc_dev_ctrl_reg = RK809_PMIC_SYS_CFG3;
+		sc->sc_dev_off_val = RK809_PMIC_SYS_CFG3_DEV_OFF;
 		sc->sc_regdata = rk809_regdata;
+	} else if (OF_is_compatible(sc->sc_node, "rockchip,rk818")) {
+		chip = "RK818";
+		sc->sc_rtc_ctrl_reg = RK808_RTC_CTRL;
+		sc->sc_rtc_status_reg = RK808_RTC_STATUS;
+		sc->sc_dev_ctrl_reg = RK808_DEVCTRL;
+		sc->sc_dev_off_val = RK808_DEVCTRL_DEV_OFF_RST;
+		sc->sc_regdata = rk818_regdata;
 	} else {
 		chip = "RK817";
 		sc->sc_rtc_ctrl_reg = RK809_RTC_CTRL;
 		sc->sc_rtc_status_reg = RK809_RTC_STATUS;
+		sc->sc_dev_ctrl_reg = RK809_PMIC_SYS_CFG3;
+		sc->sc_dev_off_val = RK809_PMIC_SYS_CFG3_DEV_OFF;
 		sc->sc_regdata = rk817_regdata;
 	}
 	printf(": %s\n", chip);
@@ -511,6 +573,12 @@ rkpmic_attach(struct device *parent, struct device *self, void *aux)
 			device_register_wakeup(&sc->sc_dev);
 #endif
 	}
+
+	if (OF_getpropbool(sc->sc_node, "system-power-controller") ||
+	    OF_getpropbool(sc->sc_node, "rockchip,system-power-controller")) {
+		rkpmic_sc = sc;
+		powerdownfn = rkpmic_powerdown;
+	}
 }
 
 int
@@ -545,16 +613,20 @@ rkpmic_activate(struct device *self, int act)
 int
 rkpmic_intr(void *arg)
 {
-	extern int allowpowerdown;
 	struct rkpmic_softc *sc = arg;
 
-	if (allowpowerdown) {
-		allowpowerdown = 0;
-		prsignal(initprocess, SIGUSR2);
-	}
+	powerbutton_event();
 
 	rkpmic_reg_write(sc, RK809_PMIC_INT_STS0, 0xff);
 	return 1;
+}
+
+void
+rkpmic_powerdown(void)
+{
+	struct rkpmic_softc *sc = rkpmic_sc;
+	rkpmic_reg_write(sc, sc->sc_dev_ctrl_reg,
+	    rkpmic_reg_read(sc, sc->sc_dev_ctrl_reg) | sc->sc_dev_off_val);
 }
 
 struct rkpmic_regulator {

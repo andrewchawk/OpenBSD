@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_cad.c,v 1.14 2024/03/24 22:34:06 patrick Exp $	*/
+/*	$OpenBSD: if_cad.c,v 1.17 2026/06/21 14:10:10 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2021-2022 Visa Hankala
@@ -273,6 +273,7 @@ struct cad_softc {
 	int			sc_node;
 	int			sc_phy_loc;
 	enum cad_phy_mode	sc_phy_mode;
+	unsigned char		sc_hw_tx_freq;
 	unsigned char		sc_rxhang_erratum;
 	unsigned char		sc_rxdone;
 	unsigned char		sc_dma64;
@@ -396,6 +397,7 @@ cad_attach(struct device *parent, struct device *self, void *aux)
 	uint32_t val;
 	unsigned int i;
 	int node, phy;
+	int mii_flags;
 
 	if (faa->fa_nreg < 1) {
 		printf(": no registers\n");
@@ -451,7 +453,7 @@ cad_attach(struct device *parent, struct device *self, void *aux)
 	else
 		sc->sc_phy_loc = MII_PHY_ANY;
 
-	sc->sc_phy_mode = CAD_PHY_MODE_RGMII;
+	sc->sc_phy_mode = CAD_PHY_MODE_RGMII_ID;
 	OF_getprop(faa->fa_node, "phy-mode", phy_mode, sizeof(phy_mode));
 	for (i = 0; i < nitems(cad_phy_modes); i++) {
 		if (strcmp(phy_mode, cad_phy_modes[i].name) == 0) {
@@ -485,6 +487,8 @@ cad_attach(struct device *parent, struct device *self, void *aux)
 
 	if (OF_is_compatible(faa->fa_node, "cdns,zynq-gem"))
 		sc->sc_rxhang_erratum = 1;
+	if (OF_is_compatible(faa->fa_node, "raspberrypi,rp1-gem"))
+		sc->sc_hw_tx_freq = 1;
 
 	rw_init(&sc->sc_cfg_lock, "cadcfg");
 	timeout_set(&sc->sc_tick, cad_tick, sc);
@@ -532,8 +536,26 @@ cad_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_mii.mii_statchg = cad_mii_statchg;
 	ifmedia_init(&sc->sc_media, 0, cad_media_change, cad_media_status);
 
+	switch (sc->sc_phy_mode) {
+	case CAD_PHY_MODE_RGMII:
+		mii_flags = MIIF_SETDELAY;
+		break;
+	case CAD_PHY_MODE_RGMII_RXID:
+		mii_flags = MIIF_SETDELAY | MIIF_RXID;
+		break;
+	case CAD_PHY_MODE_RGMII_TXID:
+		mii_flags = MIIF_SETDELAY | MIIF_TXID;
+		break;
+	case CAD_PHY_MODE_RGMII_ID:
+		mii_flags = MIIF_SETDELAY | MIIF_RXID | MIIF_TXID;
+		break;
+	default:
+		mii_flags = 0;
+		break;
+	}
+
 	mii_attach(&sc->sc_dev, &sc->sc_mii, 0xffffffff, sc->sc_phy_loc,
-	    MII_OFFSET_ANY, MIIF_NOISOLATE);
+	    MII_OFFSET_ANY, MIIF_NOISOLATE | mii_flags);
 
 	if (LIST_EMPTY(&sc->sc_mii.mii_phys)) {
 		printf("%s: no PHY found\n", sc->sc_dev.dv_xname);
@@ -567,22 +589,10 @@ cad_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
 	struct cad_softc *sc = ifp->if_softc;
 	struct ifreq *ifr = (struct ifreq *)data;
-	int error = 0, netlock_held = 1;
+	int error = 0;
 	int s;
 
-	switch (cmd) {
-	case SIOCGIFMEDIA:
-	case SIOCSIFMEDIA:
-	case SIOCGIFSFFPAGE:
-		netlock_held = 0;
-		break;
-	}
-
-	if (netlock_held)
-		NET_UNLOCK();
 	rw_enter_write(&sc->sc_cfg_lock);
-	if (netlock_held)
-		NET_LOCK();
 	s = splnet();
 
 	switch (cmd) {
@@ -699,9 +709,6 @@ cad_up(struct cad_softc *sc)
 	uint32_t val;
 
 	rw_assert_wrlock(&sc->sc_cfg_lock);
-
-	/* Release lock for memory allocation. */
-	NET_UNLOCK();
 
 	if (sc->sc_dma64)
 		flags |= BUS_DMA_64BIT;
@@ -858,8 +865,6 @@ cad_up(struct cad_softc *sc)
 		}
 	}
 
-	NET_LOCK();
-
 	/*
 	 * Set MAC address filters.
 	 */
@@ -878,7 +883,8 @@ cad_up(struct cad_softc *sc)
 
 	cad_iff(sc);
 
-	clock_set_frequency(sc->sc_node, GEM_CLK_TX, 2500000);
+	if (!sc->sc_hw_tx_freq)
+		clock_set_frequency(sc->sc_node, GEM_CLK_TX, 2500000);
 	clock_enable(sc->sc_node, GEM_CLK_TX);
 	delay(1000);
 
@@ -962,9 +968,6 @@ cad_down(struct cad_softc *sc)
 	ifq_clr_oactive(&ifp->if_snd);
 	ifp->if_timer = 0;
 
-	/* Avoid lock order issues with barriers. */
-	NET_UNLOCK();
-
 	timeout_del_barrier(&sc->sc_tick);
 
 	/* Disable data transfer. */
@@ -988,7 +991,7 @@ cad_down(struct cad_softc *sc)
 	/* Wait for activity to cease. */
 	intr_barrier(sc->sc_ih);
 	ifq_barrier(&ifp->if_snd);
-	taskq_del_barrier(systq, &sc->sc_statchg_task);
+	task_del(systq, &sc->sc_statchg_task);
 
 	/* Disable the packet clock as it is not needed any longer. */
 	clock_disable(sc->sc_node, GEM_CLK_TX);
@@ -1036,8 +1039,6 @@ cad_down(struct cad_softc *sc)
 	cad_dmamem_free(sc, sc->sc_rxring);
 	sc->sc_rxring = NULL;
 	sc->sc_rxdesc = NULL;
-
-	NET_LOCK();
 }
 
 uint8_t
@@ -1652,15 +1653,22 @@ cad_mii_statchg(struct device *self)
 	HWRITE4(sc, GEM_NETCFG, netcfg);
 
 	/* Defer clock setting because it allocates memory with M_WAITOK. */
-	task_add(systq, &sc->sc_statchg_task);
+	if (!sc->sc_hw_tx_freq)
+		task_add(systq, &sc->sc_statchg_task);
 }
 
 void
 cad_statchg_task(void *arg)
 {
 	struct cad_softc *sc = arg;
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
 
-	clock_set_frequency(sc->sc_node, GEM_CLK_TX, sc->sc_tx_freq);
+	rw_enter_write(&sc->sc_cfg_lock);
+
+	if ((ifp->if_flags & IFF_RUNNING))
+		clock_set_frequency(sc->sc_node, GEM_CLK_TX, sc->sc_tx_freq);
+
+	rw_exit_write(&sc->sc_cfg_lock);
 }
 
 struct cad_dmamem *

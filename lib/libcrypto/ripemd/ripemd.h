@@ -1,4 +1,4 @@
-/* $OpenBSD: ripemd.h,v 1.19 2024/06/01 18:42:49 tb Exp $ */
+/* $OpenBSD: ripemd.h,v 1.21 2026/05/08 05:15:20 jsg Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -71,18 +71,7 @@
 extern "C" {
 #endif
 
-#ifdef OPENSSL_NO_RIPEMD
-#error RIPEMD is disabled.
-#endif
-
-#if defined(__LP32__)
-#define RIPEMD160_LONG unsigned long
-#elif defined(__ILP64__)
-#define RIPEMD160_LONG unsigned long
-#define RIPEMD160_LONG_LOG2 3
-#else
 #define RIPEMD160_LONG unsigned int
-#endif
 
 #define RIPEMD160_CBLOCK	64
 #define RIPEMD160_LBLOCK	(RIPEMD160_CBLOCK/4)

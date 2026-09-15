@@ -14,14 +14,20 @@
 #include <linux/wait_bit.h>
 #include <linux/err.h>
 #include <linux/sched/signal.h>	/* via percpu-rwsem.h -> rcuwait.h */
+#include <linux/sched.h> /* via dcache.h -> rculist_bl.h -> rcupdate.h */
 #include <linux/slab.h>
 
 struct address_space;
 struct seq_file;
 
 struct file_operations {
+	void *owner;
+};
+
+struct dentry {
 };
 
 #define DEFINE_SIMPLE_ATTRIBUTE(a, b, c, d)
+#define MINORBITS	8
 
 #endif

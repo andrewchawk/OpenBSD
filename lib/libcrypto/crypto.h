@@ -1,4 +1,4 @@
-/* $OpenBSD: crypto.h,v 1.74 2024/04/10 15:13:23 beck Exp $ */
+/* $OpenBSD: crypto.h,v 1.81 2026/08/30 12:19:37 kenjiro Exp $ */
 /* ====================================================================
  * Copyright (c) 1998-2006 The OpenSSL Project.  All rights reserved.
  *
@@ -182,7 +182,7 @@ extern "C" {
 #define CRYPTO_LOCK_ECDSA               32
 #define CRYPTO_LOCK_EC			33
 #define CRYPTO_LOCK_ECDH		34
-#define CRYPTO_LOCK_BN  		35
+#define CRYPTO_LOCK_BN			35
 #define CRYPTO_LOCK_EC_PRE_COMP		36
 #define CRYPTO_LOCK_STORE		37
 #define CRYPTO_LOCK_COMP		38
@@ -305,8 +305,7 @@ void CRYPTO_free_ex_data(int class_index, void *obj, CRYPTO_EX_DATA *ad);
  * (relative to the class type involved) */
 int CRYPTO_set_ex_data(CRYPTO_EX_DATA *ad, int idx, void *val);
 void *CRYPTO_get_ex_data(const CRYPTO_EX_DATA *ad, int idx);
-/* This function cleans up all "ex_data" state. It mustn't be called under
- * potential race-conditions. */
+/* Deprecated no-op retained for compatibility. */
 void CRYPTO_cleanup_all_ex_data(void);
 
 void CRYPTO_lock(int mode, int type, const char *file, int line);
@@ -349,11 +348,9 @@ struct CRYPTO_dynlock_value *(*CRYPTO_get_dynlock_create_callback(void))(const c
 void (*CRYPTO_get_dynlock_lock_callback(void))(int mode, struct CRYPTO_dynlock_value *l, const char *file, int line);
 void (*CRYPTO_get_dynlock_destroy_callback(void))(struct CRYPTO_dynlock_value *l, const char *file, int line);
 
-/* CRYPTO_set_mem_functions includes CRYPTO_set_locked_mem_functions --
- * call the latter last if you need different functions */
-int CRYPTO_set_mem_functions(void *(*m)(size_t), void *(*r)(void *, size_t), void (*f)(void *));
-int CRYPTO_set_mem_ex_functions(void *(*m)(size_t, const char *, int),
-    void *(*r)(void *, size_t, const char *, int), void (*f)(void *));
+int CRYPTO_set_mem_functions(void *(*m)(size_t, const char *, int),
+    void *(*r)(void *, size_t, const char *, int),
+    void (*f)(void *, const char *, int));
 
 void *CRYPTO_malloc(size_t num, const char *file, int line);
 char *CRYPTO_strdup(const char *str, const char *file, int line);
@@ -371,9 +368,7 @@ __declspec(noreturn)
 __attribute__((__noreturn__))
 #endif
 void OpenSSLDie(const char *file, int line, const char *assertion);
-#define OPENSSL_assert(e)       (void)((e) ? 0 : (OpenSSLDie(__FILE__, __LINE__, #e),1))
-
-uint64_t OPENSSL_cpu_caps(void);
+#define OPENSSL_assert(e)       (void)((e) ? 0 : (OpenSSLDie(OPENSSL_FILE, OPENSSL_LINE, #e),1))
 
 int FIPS_mode(void);
 int FIPS_mode_set(int r);
@@ -418,9 +413,17 @@ int CRYPTO_memcmp(const void *a, const void *b, size_t len);
 #define OPENSSL_INIT_reserved_internal		_OPENSSL_INIT_FLAG_NOOP
 #define OPENSSL_INIT_ATFORK			_OPENSSL_INIT_FLAG_NOOP
 #define OPENSSL_INIT_ENGINE_ALL_BUILTIN		_OPENSSL_INIT_FLAG_NOOP
+#define OPENSSL_INIT_NO_ATEXIT			_OPENSSL_INIT_FLAG_NOOP
 
 int OPENSSL_init_crypto(uint64_t opts, const void *settings);
 void OPENSSL_cleanup(void);
+
+/*
+ * CPU capabilities.
+ */
+#define	CRYPTO_CPU_CAPS_ACCELERATED_AES		0x00000001ULL
+
+uint64_t OPENSSL_cpu_caps(void);
 
 /*
  * OpenSSL helpfully put OPENSSL_gmtime() here because all other time related

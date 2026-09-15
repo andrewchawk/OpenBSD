@@ -2,7 +2,7 @@ package Test2::Util::HashBase;
 use strict;
 use warnings;
 
-our $VERSION = '1.302194';
+our $VERSION = '1.302210';
 
 #################################################################
 #                                                               #
@@ -443,7 +443,7 @@ determine the attribute to which each value will be paired.
 =head1 SOURCE
 
 The source code repository for HashBase can be found at
-F<http://github.com/Test-More/HashBase/>.
+L<https://github.com/Test-More/HashBase/>.
 
 =head1 MAINTAINERS
 
@@ -463,11 +463,11 @@ F<http://github.com/Test-More/HashBase/>.
 
 =head1 COPYRIGHT
 
-Copyright 2017 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+Copyright Chad Granum E<lt>exodist@cpan.orgE<gt>.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.
 
-See F<http://dev.perl.org/licenses/>
+See L<https://dev.perl.org/licenses/>
 
 =cut

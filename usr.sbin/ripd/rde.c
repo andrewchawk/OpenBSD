@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde.c,v 1.25 2023/03/08 04:43:14 guenther Exp $ */
+/*	$OpenBSD: rde.c,v 1.34 2026/08/17 08:59:53 claudio Exp $ */
 
 /*
  * Copyright (c) 2006 Michele Marchetto <mydecay@openbeer.it>
@@ -129,9 +129,11 @@ rde(struct ripd_conf *xconf, int pipe_parent2rde[2], int pipe_ripe2rde[2],
 	if ((iev_ripe = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_ripe->ibuf, pipe_ripe2rde[1]);
+	if (imsgbuf_init(&iev_ripe->ibuf, pipe_ripe2rde[1]) == -1)
+		fatal(NULL);
 	iev_ripe->handler =  rde_dispatch_imsg;
-	imsg_init(&iev_main->ibuf, pipe_parent2rde[1]);
+	if (imsgbuf_init(&iev_main->ibuf, pipe_parent2rde[1]) == -1)
+		fatal(NULL);
 	iev_main->handler = rde_dispatch_parent;
 
 	/* setup event handler */
@@ -164,9 +166,9 @@ __dead void
 rde_shutdown(void)
 {
 	/* close pipes */
-	msgbuf_clear(&iev_ripe->ibuf.w);
+	imsgbuf_clear(&iev_ripe->ibuf);
 	close(iev_ripe->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	rt_clear();
@@ -193,25 +195,26 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct rip_route	 rr;
 	struct imsg		 imsg;
-	ssize_t			 n;
-	int			 shut = 0, verbose;
+	int			 n, shut = 0, verbose;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("rde_dispatch_imsg: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("rde_dispatch_imsg: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -224,7 +227,7 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 
 			if (rde_check_route(&rr) == -1)
 				log_debug("rde_dispatch_imsg: "
-				    "packet malformed\n");
+				    "packet malformed");
 			break;
 		case IMSG_FULL_REQUEST:
 			bzero(&rr, sizeof(rr));
@@ -266,9 +269,11 @@ rde_dispatch_imsg(int fd, short event, void *bula)
 
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* already checked by ripe */
-			memcpy(&verbose, imsg.data, sizeof(verbose));
-			log_verbose(verbose);
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)) ==
+			    -1)
+				log_warn("wrong imsg len");
+			else
+				log_verbose(verbose);
 			break;
 		default:
 			log_debug("rde_dispatch_msg: unexpected imsg %d",
@@ -294,25 +299,26 @@ rde_dispatch_parent(int fd, short event, void *bula)
 	struct kroute		 kr;
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
-	ssize_t			 n;
-	int			 shut = 0;
+	int			 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("rde_dispatch_parent: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("rde_dispatch_parent: imsgbuf_get error");
 		if (n == 0)
 			break;
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kroute.c,v 1.117 2023/03/08 04:43:14 guenther Exp $ */
+/*	$OpenBSD: kroute.c,v 1.122 2026/09/10 09:10:36 claudio Exp $ */
 
 /*
  * Copyright (c) 2004 Esben Norby <norby@openbsd.org>
@@ -74,12 +74,13 @@ int	kr_redist_eval(struct kroute *, struct kroute *);
 void	kr_redistribute(struct kroute_node *);
 int	kroute_compare(struct kroute_node *, struct kroute_node *);
 int	kif_compare(struct kif_node *, struct kif_node *);
-int	kr_change_fib(struct kroute_node *, struct kroute *, int, int);
+int	kr_change_one(struct kroute_node *, struct kroute *);
+int	kr_change_fib(struct kroute_node *, struct ibuf *);
 int	kr_delete_fib(struct kroute_node *);
 
 struct kroute_node	*kroute_find(in_addr_t, u_int8_t, u_int8_t);
 struct kroute_node	*kroute_matchgw(struct kroute_node *, struct in_addr);
-int			 kroute_insert(struct kroute_node *);
+void			 kroute_insert(struct kroute_node *);
 int			 kroute_remove(struct kroute_node *);
 void			 kroute_clear(void);
 
@@ -200,37 +201,58 @@ kr_init(int fs, u_int rdomain, int redis_label_or_prefix, u_int8_t fib_prio)
 }
 
 int
-kr_change_fib(struct kroute_node *kr, struct kroute *kroute, int krcount,
-    int action)
+kr_change_one(struct kroute_node *kr, struct kroute *kroute)
 {
-	int			 i;
-	struct kroute_node	*kn, *nkn;
+	/* nexthop within 127/8 -> ignore silently */
+	if ((kroute->nexthop.s_addr & htonl(IN_CLASSA_NET)) ==
+	    htonl(INADDR_LOOPBACK & IN_CLASSA_NET))
+		return (0);
 
-	if (action == RTM_ADD) {
-		/*
-		 * First remove all stale multipath routes.
-		 * This step must be skipped when the action is RTM_CHANGE
-		 * because it is already a single path route that will be
-		 * changed.
-		 */
-		for (kn = kr; kn != NULL; kn = nkn) {
-			for (i = 0; i < krcount; i++) {
-				if (kn->r.nexthop.s_addr ==
-				    kroute[i].nexthop.s_addr)
-					break;
-			}
-			nkn = kn->next;
-			if (i == krcount) {
-				/* stale route */
-				if (kr_delete_fib(kn) == -1)
-					log_warnx("kr_delete_fib failed");
-				/*
-				 * if head element was removed we need to adjust
-				 * the head
-				 */
-				if (kr == kn)
-					kr = nkn;
-			}
+	/* send update */
+	if (send_rtmsg(kr_state.fd, RTM_CHANGE, kroute) == -1)
+		return (-1);
+
+	/* modify first and only entry */
+	kr->r.nexthop.s_addr = kroute->nexthop.s_addr;
+	kr->r.flags = kroute->flags | F_OSPFD_INSERTED;
+	kr->r.ext_tag = kroute->ext_tag;
+	rtlabel_unref(kr->r.rtlabel);
+	kr->r.rtlabel = rtlabel_tag2id(kroute->ext_tag);
+	rtlabel_ref(kr->r.rtlabel);
+
+	return (0);
+}
+
+int
+kr_change_fib(struct kroute_node *kr, struct ibuf *ibuf)
+{
+	unsigned int		 i, krcount;
+	struct kroute_node	*kn, *nkn;
+	struct kroute		*kroute;
+
+	krcount = ibuf_size(ibuf) / sizeof(*kroute);
+	kroute = ibuf_data(ibuf);
+
+	/*
+	 * First remove all stale multipath routes.
+	 */
+	for (kn = kr; kn != NULL; kn = nkn) {
+		for (i = 0; i < krcount; i++) {
+			if (kn->r.nexthop.s_addr ==
+			    kroute[i].nexthop.s_addr)
+				break;
+		}
+		nkn = kn->next;
+		if (i == krcount) {
+			/* stale route */
+			if (kr_delete_fib(kn) == -1)
+				log_warnx("kr_delete_fib failed");
+			/*
+			 * if head element was removed we need to adjust
+			 * the head
+			 */
+			if (kr == kn)
+				kr = nkn;
 		}
 	}
 
@@ -243,64 +265,83 @@ kr_change_fib(struct kroute_node *kr, struct kroute *kroute, int krcount,
 		    htonl(INADDR_LOOPBACK & IN_CLASSA_NET))
 			continue;
 
-		if (action == RTM_ADD && kr) {
-			for (kn = kr; kn != NULL; kn = kn->next) {
-				if (kn->r.nexthop.s_addr ==
-				    kroute[i].nexthop.s_addr)
-					break;
+		for (kn = kr; kn != NULL; kn = kn->next) {
+			if (kn->r.nexthop.s_addr ==
+			    kroute[i].nexthop.s_addr)
+				break;
+		}
+
+		if (kn != NULL) {
+			uint16_t label;
+
+			/* nexthop already present, just change it */
+			kn->r.flags = kroute[i].flags |
+			    F_OSPFD_INSERTED;
+			kn->r.ext_tag = kroute[i].ext_tag;
+			label = kn->r.rtlabel;
+			rtlabel_unref(kn->r.rtlabel);
+			kn->r.rtlabel = rtlabel_tag2id(kn->r.ext_tag);
+			rtlabel_ref(kn->r.rtlabel);
+
+			/* update if label changed */
+			if (kn->r.rtlabel != label) {
+				if (send_rtmsg(kr_state.fd, RTM_CHANGE,
+				    &kn->r) == -1)
+					return (-1);
 			}
+			continue;
+		}
 
-			if (kn != NULL)
-				/* nexthop already present, skip it */
-				continue;
-		} else
-			/* modify first entry */
-			kn = kr;
-
-		/* send update */
-		if (send_rtmsg(kr_state.fd, action, &kroute[i]) == -1)
-			return (-1);
-
-		/* create new entry unless we are changing the first entry */
-		if (action == RTM_ADD)
-			if ((kn = calloc(1, sizeof(*kn))) == NULL)
-				fatal(NULL);
+		/* create new entry */
+		if ((kn = calloc(1, sizeof(*kn))) == NULL)
+			fatal(NULL);
 
 		kn->r.prefix.s_addr = kroute[i].prefix.s_addr;
 		kn->r.prefixlen = kroute[i].prefixlen;
 		kn->r.nexthop.s_addr = kroute[i].nexthop.s_addr;
-		kn->r.flags = kroute[i].flags | F_OSPFD_INSERTED;
 		kn->r.priority = kr_state.fib_prio;
-		kn->r.ext_tag = kroute[i].ext_tag;
-		rtlabel_unref(kn->r.rtlabel);	/* for RTM_CHANGE */
-		kn->r.rtlabel = kroute[i].rtlabel;
 
-		if (action == RTM_ADD)
-			if (kroute_insert(kn) == -1) {
-				log_debug("kr_update_fib: cannot insert %s",
-				    inet_ntoa(kn->r.nexthop));
-				free(kn);
-			}
-		action = RTM_ADD;
+		kn->r.flags = kroute[i].flags | F_OSPFD_INSERTED;
+		kn->r.ext_tag = kroute[i].ext_tag;
+		kn->r.rtlabel = rtlabel_tag2id(kn->r.ext_tag);
+		rtlabel_ref(kn->r.rtlabel);
+
+		kroute_insert(kn);
+
+		/* send update */
+		if (send_rtmsg(kr_state.fd, RTM_ADD, &kn->r) == -1)
+			return (-1);
 	}
+
 	return  (0);
 }
 
 int
-kr_change(struct kroute *kroute, int krcount)
+kr_change(struct imsg *imsg)
 {
+	struct ibuf		 ibuf;
+	struct kroute		 kroute;
 	struct kroute_node	*kr;
-	int			 action = RTM_ADD;
 
-	kroute->rtlabel = rtlabel_tag2id(kroute->ext_tag);
+	if (imsg_get_ibuf(imsg, &ibuf) == -1)
+		fatalx("bad KROUTE_CHANGE imsg received");
 
-	kr = kroute_find(kroute->prefix.s_addr, kroute->prefixlen,
+	if (ibuf_size(&ibuf) % sizeof(kroute) != 0)
+		fatalx("bad KROUTE_CHANGE imsg received");
+
+	if (ibuf_get(&ibuf, &kroute, sizeof(kroute)) == -1)
+		fatalx("bad KROUTE_CHANGE imsg received");
+
+	kr = kroute_find(kroute.prefix.s_addr, kroute.prefixlen,
 	    kr_state.fib_prio);
-	if (kr != NULL && kr->next == NULL && krcount == 1)
-		/* single path OSPF route */
-		action = RTM_CHANGE;
 
-	return (kr_change_fib(kr, kroute, krcount, action));
+	if (kr != NULL && kr->next == NULL && ibuf_size(&ibuf) == 0) {
+		/* single path OSPF route, do inline change */
+		return (kr_change_one(kr, &kroute));
+	}
+
+	ibuf_rewind(&ibuf);
+	return (kr_change_fib(kr, &ibuf));
 }
 
 int
@@ -320,11 +361,15 @@ kr_delete_fib(struct kroute_node *kr)
 }
 
 int
-kr_delete(struct kroute *kroute)
+kr_delete(struct imsg *imsg)
 {
+	struct kroute		 kroute;
 	struct kroute_node	*kr, *nkr;
 
-	if ((kr = kroute_find(kroute->prefix.s_addr, kroute->prefixlen,
+	if (imsg_get_data(imsg, &kroute, sizeof(kroute)) == -1)
+		fatalx("bad KROUTE_DELETE imsg received");
+
+	if ((kr = kroute_find(kroute.prefix.s_addr, kroute.prefixlen,
 	    kr_state.fib_prio)) == NULL)
 		return (0);
 
@@ -470,35 +515,35 @@ kr_show_route(struct imsg *imsg)
 	struct kroute_node	*kn;
 	int			 flags;
 	struct in_addr		 addr;
+	uint32_t		 type;
+	pid_t			 pid;
 
-	switch (imsg->hdr.type) {
+	type = imsg_get_type(imsg);
+	pid = imsg_get_pid(imsg);
+	switch (type) {
 	case IMSG_CTL_KROUTE:
-		if (imsg->hdr.len != IMSG_HEADER_SIZE + sizeof(flags)) {
-			log_warnx("kr_show_route: wrong imsg len");
+		if (imsg_get_data(imsg, &flags, sizeof(flags)) == -1) {
+			log_warnx("bad CTL_KROUTE imsg received");
 			return;
 		}
-		memcpy(&flags, imsg->data, sizeof(flags));
 		RB_FOREACH(kr, kroute_tree, &krt)
 			if (!flags || kr->r.flags & flags) {
 				kn = kr;
 				do {
 					main_imsg_compose_ospfe(IMSG_CTL_KROUTE,
-					    imsg->hdr.pid,
-					    &kn->r, sizeof(kn->r));
+					    pid, &kn->r, sizeof(kn->r));
 				} while ((kn = kn->next) != NULL);
 			}
 		break;
 	case IMSG_CTL_KROUTE_ADDR:
-		if (imsg->hdr.len != IMSG_HEADER_SIZE +
-		    sizeof(struct in_addr)) {
-			log_warnx("kr_show_route: wrong imsg len");
+		if (imsg_get_data(imsg, &addr, sizeof(addr)) == -1) {
+			log_warnx("bad CTL_KROUTE_ADDR imsg received");
 			return;
 		}
-		memcpy(&addr, imsg->data, sizeof(addr));
 		kr = NULL;
 		kr = kroute_match(addr.s_addr);
 		if (kr != NULL)
-			main_imsg_compose_ospfe(IMSG_CTL_KROUTE, imsg->hdr.pid,
+			main_imsg_compose_ospfe(IMSG_CTL_KROUTE, pid,
 			    &kr->r, sizeof(kr->r));
 		break;
 	default:
@@ -506,7 +551,7 @@ kr_show_route(struct imsg *imsg)
 		break;
 	}
 
-	main_imsg_compose_ospfe(IMSG_CTL_END, imsg->hdr.pid, NULL, 0);
+	main_imsg_compose_ospfe(IMSG_CTL_END, pid, NULL, 0);
 }
 
 void
@@ -746,7 +791,7 @@ kroute_matchgw(struct kroute_node *kr, struct in_addr nh)
 	return (NULL);
 }
 
-int
+void
 kroute_insert(struct kroute_node *kr)
 {
 	struct kroute_node	*krm, *krh;
@@ -768,7 +813,7 @@ kroute_insert(struct kroute_node *kr)
 	if (!(kr->r.flags & F_KERNEL)) {
 		/* don't validate or redistribute ospf route */
 		kr->r.flags &= ~F_DOWN;
-		return (0);
+		return;
 	}
 
 	if (kif_validate(kr->r.ifindex))
@@ -777,7 +822,6 @@ kroute_insert(struct kroute_node *kr)
 		kr->r.flags |= F_DOWN;
 
 	kr_redistribute(krh);
-	return (0);
 }
 
 int
@@ -1094,8 +1138,8 @@ void
 if_newaddr(u_short ifindex, struct sockaddr_in *ifa, struct sockaddr_in *mask,
     struct sockaddr_in *brd)
 {
-	struct kif_node 	*kif;
-	struct kif_addr 	*ka;
+	struct kif_node		*kif;
+	struct kif_addr		*ka;
 	struct ifaddrchange	 ifn;
 
 	if (ifa == NULL || ifa->sin_family != AF_INET)
@@ -1129,7 +1173,7 @@ void
 if_deladdr(u_short ifindex, struct sockaddr_in *ifa, struct sockaddr_in *mask,
     struct sockaddr_in *brd)
 {
-	struct kif_node 	*kif;
+	struct kif_node		*kif;
 	struct kif_addr		*ka, *nka;
 	struct ifaddrchange	 ifc;
 
@@ -1170,7 +1214,8 @@ if_announce(void *msg)
 		break;
 	case IFAN_DEPARTURE:
 		kif = kif_find(ifan->ifan_index);
-		kif_remove(kif);
+		if (kif != NULL)
+			kif_remove(kif);
 		break;
 	}
 }

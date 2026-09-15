@@ -1,4 +1,4 @@
-/*	$OpenBSD: dtvar.h,v 1.19 2024/04/06 11:18:02 mpi Exp $ */
+/*	$OpenBSD: dtvar.h,v 1.24 2025/09/22 07:49:43 sashan Exp $ */
 
 /*
  * Copyright (c) 2019 Martin Pieuchot <mpi@openbsd.org>
@@ -22,6 +22,7 @@
 #include <sys/ioccom.h>
 #include <sys/stacktrace.h>
 #include <sys/time.h>
+#include <sys/syslimits.h>
 
 /*
  * Length of provider/probe/function names, including NUL.
@@ -109,27 +110,37 @@ struct dtioc_arg {
 
 struct dtioc_req {
 	uint32_t		 dtrq_pbn;	/* probe number */
-	uint32_t		 dtrq_rate;	/* number of ticks */
+	uint32_t		 __unused1;
 	uint64_t		 dtrq_evtflags;	/* states to record */
+	uint64_t		 dtrq_nsecs;	/* execution period */
 };
 
 struct dtioc_stat {
 	uint64_t		 dtst_readevt;	/* events read */
 	uint64_t		 dtst_dropevt;	/* events dropped */
+	uint64_t		 dtst_skiptick;	/* clock ticks skipped */
+	uint64_t		 dtst_recurevt;	/* recursive events */
 };
 
-struct dtioc_getaux {
-	pid_t			 dtga_pid;	/* process to inspect */
-	unsigned long		 dtga_auxbase;	/* AUX_base value */
+struct dtioc_rdvn {
+	pid_t			 dtrv_pid;	/* process to inspect */
+	int			 dtrv_fd;	/* where to dump data */
+	caddr_t			 dtrv_va;
+				    /* programm counter in inspected process */
+	caddr_t			 dtrv_offset;
+				    /* comes from vm_map_entry::offset */
+	caddr_t			 dtrv_start;	/* end address for section */
+	size_t			 dtrv_len;	/* the length of ELF file */
 };
 
 #define DTIOCGPLIST	_IOWR('D', 1, struct dtioc_probe)
 #define DTIOCGSTATS	_IOR('D', 2, struct dtioc_stat)
 #define DTIOCRECORD	_IOW('D', 3, int)
 #define DTIOCPRBENABLE	_IOW('D', 4, struct dtioc_req)
-#define DTIOCPRBDISABLE	 _IOW('D', 5, struct dtioc_req)
+#define DTIOCPRBDISABLE	_IOW('D', 5, struct dtioc_req)
 #define DTIOCGARGS	_IOWR('D', 6, struct dtioc_arg)
-#define DTIOCGETAUXBASE	 _IOWR('D', 7, struct dtioc_getaux)
+/* _IOWR('D', 7, struct dtioc_getaux)  was DTIOCGETAUXBASE */
+#define DTIOCRDVNODE	_IOWR('D', 8, struct dtioc_rdvn)
 
 #ifdef _KERNEL
 
@@ -163,12 +174,6 @@ struct dt_pcb {
 	SMR_SLIST_ENTRY(dt_pcb)	 dp_pnext;	/* [K,S] next PCB per probe */
 	TAILQ_ENTRY(dt_pcb)	 dp_snext;	/* [K] next PCB per softc */
 
-	/* Event states ring */
-	unsigned int		 dp_prod;	/* [m] read index */
-	unsigned int		 dp_cons;	/* [m] write index */
-	struct dt_evt		*dp_ring;	/* [m] ring of event states */
-	struct mutex		 dp_mtx;
-
 	struct dt_softc		*dp_sc;		/* [I] related softc */
 	struct dt_probe		*dp_dtp;	/* [I] related probe */
 	uint64_t		 dp_evtflags;	/* [I] event states to record */
@@ -177,9 +182,6 @@ struct dt_pcb {
 	struct clockintr	 dp_clockintr;	/* [D] profiling handle */
 	uint64_t		 dp_nsecs;	/* [I] profiling period */
 	struct cpu_info		*dp_cpu;	/* [I] on which CPU */
-
-	/* Counters */
-	uint64_t		 dp_dropevt;	/* [m] # dropped event */
 };
 
 TAILQ_HEAD(dt_pcb_list, dt_pcb);
@@ -188,6 +190,7 @@ struct dt_pcb	*dt_pcb_alloc(struct dt_probe *, struct dt_softc *);
 void		 dt_pcb_free(struct dt_pcb *);
 void		 dt_pcb_purge(struct dt_pcb_list *);
 
+void		 dt_pcb_ring_skiptick(struct dt_pcb *, unsigned int);
 struct dt_evt	*dt_pcb_ring_get(struct dt_pcb *, int);
 void		 dt_pcb_ring_consume(struct dt_pcb *, struct dt_evt *);
 
@@ -216,7 +219,11 @@ struct dt_probe {
 	const char		*dtp_argtype[DTMAXARGTYPES];
 						/* [I] type of arguments */
 	int			 dtp_nargs;	/* [I] # of arguments */
+#ifdef DDBPROF
+	int			 dtp_type;	/* [I] 'entry' or 'return' */
 	vaddr_t			 dtp_addr;	/* [I] address of breakpoint */
+	SLIST_ENTRY(dt_probe)	 dtp_knext;	/* [K] list of ELF kprobe */
+#endif
 };
 
 

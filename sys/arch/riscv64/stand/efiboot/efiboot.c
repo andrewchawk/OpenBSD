@@ -1,4 +1,4 @@
-/*	$OpenBSD: efiboot.c,v 1.11 2024/06/23 13:11:51 kettenis Exp $	*/
+/*	$OpenBSD: efiboot.c,v 1.16 2026/07/19 12:04:08 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -483,9 +483,13 @@ efi_dma_constraint(void)
 {
 	void *node;
 
-	/* StarFive JH71x0 has peripherals that only support 32-bit DMA. */
+	/*
+	 * SpacemiT K1 and StarFive JH71x0 have peripherals that only
+	 * support 32-bit DMA.
+	 */
 	node = fdt_find_node("/");
-	if (fdt_node_is_compatible(node, "starfive,jh7100") ||
+	if (fdt_node_is_compatible(node, "spacemit,k1") ||
+	    fdt_node_is_compatible(node, "starfive,jh7100") ||
 	    fdt_node_is_compatible(node, "starfive,jh7110"))
 		dma_constraint[1] = htobe64(0xffffffff);
 
@@ -853,7 +857,7 @@ devparse(const char *fname, int *dev, int *unit, int *part, const char **file)
 
 		/* partition number */
 		if (i < devlen)
-			p = fname[i++] - 'a';
+			p = DL_PARTNAME2NUM(fname[i++]);
 
 		if (i != devlen)
 			return (ENXIO);
@@ -973,14 +977,58 @@ efi_memprobe_find(UINTN pages, UINTN align, EFI_PHYSICAL_ADDRESS *addr)
 	return EFI_OUT_OF_RESOURCES;
 }
 
+#define FW_PATH "/etc/firmware/dtb/"
+
+struct fdt_dtb {
+	const char *model;
+	const char *dtb;
+} fdt_dtb[] = {
+	/* Keep the list below sorted alphabetically */
+	{ "ky x1 orangepi-rv2 board",
+	  "spacemit/k1-orangepi-rv2.dtb" },
+	{ "Milk-V Jupiter",
+	  "spacemit/k1-milkv-jupiter.dtb" },
+	{ "Milk-V(M1) Jupiter",
+	  "spacemit/k1-milkv-jupiter.dtb" },
+	{ "spacemit k1-x deb1 board",
+	  "spacemit/k1-bananapi-f3.dtb" },
+	{ "spacemit k1-x evb board",
+	  "spacemit/k1-milkv-jupiter.dtb" },
+	{ "spacemit k3-pico-itx board",
+	  "spacemit/k3-pico-itx.dtb" },
+};
+
 void *
 efi_fdt(void)
 {
+	void *node;
+	char *model = NULL;
+	size_t modellen;
+	char dtb[256];
+	int i;
+
 	/* 'mach dtb' has precedence */
 	if (fdt_override != NULL)
 		return fdt_override;
 
-	return fdt_sys;
+	node = fdt_find_node("/");
+	fdt_node_property(node, "model", &model);
+
+	/* Return system provided one */
+	if (model == NULL)
+		return fdt_sys;
+
+	for (i = 0; i < nitems(fdt_dtb); i++) {
+		modellen = strlen(fdt_dtb[i].model);
+		if (strncmp(model, fdt_dtb[i].model, modellen) == 0) {
+			snprintf(dtb, sizeof(dtb), "%s%s", FW_PATH,
+			    fdt_dtb[i].dtb);
+			fdt_load_override(dtb);
+			break;
+		}
+	}
+
+	return fdt_override ? fdt_override : fdt_sys;
 }
 
 int

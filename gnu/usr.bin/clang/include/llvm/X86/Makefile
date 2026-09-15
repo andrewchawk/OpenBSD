@@ -1,21 +1,23 @@
-# $OpenBSD: Makefile,v 1.9 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.11 2026/05/29 11:18:30 robert Exp $
 
 .include <bsd.own.mk>
 
 LLVM_SRCS=	${.CURDIR}/../../../../../llvm/llvm
 
-HDRS=	X86GenAsmMatcher.inc \
+HDRS=	X86GenFoldTables.inc \
+	X86GenAsmMatcher.inc \
 	X86GenAsmWriter.inc \
 	X86GenAsmWriter1.inc \
 	X86GenCallingConv.inc \
 	X86GenDAGISel.inc \
 	X86GenDisassemblerTables.inc \
-	X86GenEVEX2VEXTables.inc \
+	X86GenInstrMapping.inc \
 	X86GenExegesis.inc \
 	X86GenFastISel.inc \
 	X86GenGlobalISel.inc \
 	X86GenInstrInfo.inc \
 	X86GenMnemonicTables.inc \
+	X86GenPreLegalizeGICombiner.inc \
 	X86GenRegisterBank.inc \
 	X86GenRegisterInfo.inc \
 	X86GenSubtargetInfo.inc
@@ -26,7 +28,12 @@ install:
 	@# Nothing here so far ...
 
 clean cleandir:
-	rm -f ${HDRS}
+	rm -f ${HDRS} X86GenRegisterInfo*.inc
+
+X86GenFoldTables.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-x86-fold-tables -asmwriternum=1 \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/X86 \
+		-o ${.TARGET} ${.ALLSRC}
 
 X86GenAsmMatcher.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-asm-matcher \
@@ -58,8 +65,8 @@ X86GenDisassemblerTables.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/X86 \
 		-o ${.TARGET} ${.ALLSRC}
 
-X86GenEVEX2VEXTables.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
-	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-x86-EVEX2VEX-tables \
+X86GenInstrMapping.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-x86-instr-mapping \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/X86 \
 		-o ${.TARGET} ${.ALLSRC}
 
@@ -85,6 +92,12 @@ X86GenInstrInfo.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
 
 X86GenMnemonicTables.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-x86-mnemonic-tables -asmwriternum=1 \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/X86 \
+		-o ${.TARGET} ${.ALLSRC}
+
+X86GenPreLegalizeGICombiner.inc: ${LLVM_SRCS}/lib/Target/X86/X86.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-global-isel-combiner \
+		-combiners="X86PreLegalizerCombiner" \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/X86 \
 		-o ${.TARGET} ${.ALLSRC}
 

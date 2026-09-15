@@ -1,4 +1,4 @@
-/* $OpenBSD: tasn_utl.c,v 1.18 2022/12/26 07:18:51 jmc Exp $ */
+/* $OpenBSD: tasn_utl.c,v 1.20 2026/07/31 00:50:52 kenjiro Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2000.
  */
@@ -63,9 +63,10 @@
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
 #include <openssl/objects.h>
-#include <openssl/err.h>
 
+#include "asn1_local.h"
 #include "bytestring.h"
+#include "err_local.h"
 
 /* Utility functions for manipulating fields and offsets */
 

@@ -85,14 +85,11 @@ enum processor_type {
 /* External variables/functions defined in m88k.c.  */
 
 extern char m88k_volatile_code;
-
-extern int m88k_fp_offset;
-extern int m88k_stack_size;
 extern int m88k_case_index;
 
-extern struct rtx_def *m88k_compare_reg;
-extern struct rtx_def *m88k_compare_op0;
-extern struct rtx_def *m88k_compare_op1;
+extern rtx m88k_compare_reg;
+extern rtx m88k_compare_op0;
+extern rtx m88k_compare_op1;
 
 extern enum processor_type m88k_cpu;
 
@@ -103,7 +100,7 @@ extern enum processor_type m88k_cpu;
 /* If -m88100 is in effect, add -D__m88100__; similarly for -m88110.
    Here, the CPU_DEFAULT is assumed to be -m88100.  */
 #undef	CPP_SPEC
-#define	CPP_SPEC "%{!m88000:%{!m88100:%{m88110:-D__m88110__}}}		\
+#define CPP_SPEC "%{!m88000:%{!m88100:%{m88110:-D__m88110__}}}		\
 		  %{!m88000:%{!m88110:-D__m88100__}}"
 
 /*** Run-time Target Specification ***/
@@ -111,7 +108,7 @@ extern enum processor_type m88k_cpu;
 #define VERSION_INFO	"m88k"
 #define TARGET_VERSION fprintf (stderr, " (%s)", VERSION_INFO)
 
-#define TARGET_DEFAULT		(MASK_CHECK_ZERO_DIV)
+#define TARGET_DEFAULT		(MASK_CHECK_ZERO_DIV | MASK_SERIALIZE_VOLATILE)
 #define CPU_DEFAULT		MASK_88100
 
 #define OVERRIDE_OPTIONS	m88k_override_options ()
@@ -142,7 +139,7 @@ extern enum processor_type m88k_cpu;
 #define LONG_TYPE_SIZE		32
 #define LONG_LONG_TYPE_SIZE	64
 #define FLOAT_TYPE_SIZE		32
-#define	DOUBLE_TYPE_SIZE	64
+#define DOUBLE_TYPE_SIZE	64
 #define LONG_DOUBLE_TYPE_SIZE	64
 
 /* Define this if most significant bit is lowest numbered
@@ -162,6 +159,18 @@ extern enum processor_type m88k_cpu;
 
 /* Width of a word, in units (bytes).  */
 #define UNITS_PER_WORD 4
+
+/* A macro to update MODE and UNSIGNEDP when an object whose type is TYPE and
+   which has the specified mode and signedness is to be stored in a register.
+   This macro is only called when TYPE is a scalar type.  */
+#define PROMOTE_MODE(MODE,UNSIGNEDP,TYPE)				\
+do									\
+  {									\
+    if (GET_MODE_CLASS (MODE) == MODE_INT				\
+	&& GET_MODE_SIZE (MODE) < UNITS_PER_WORD)			\
+      (MODE) = SImode;							\
+  }									\
+while (0)
 
 /* Allocation boundary (in *bits*) for storing arguments in argument list.  */
 #define PARM_BOUNDARY 32
@@ -216,15 +225,24 @@ extern enum processor_type m88k_cpu;
 #undef REGISTER_PREFIX
 
 /* Number of actual hardware registers.
+
    The hardware registers are assigned numbers for the compiler
    from 0 to just below FIRST_PSEUDO_REGISTER.
    All registers that the compiler knows about must be given numbers,
    even those that are not normally considered general registers.
 
    The m88100 has a General Register File (GRF) of 32 32-bit registers.
-   The m88110 adds an Extended Register File (XRF) of 32 80-bit registers.  */
-#define FIRST_PSEUDO_REGISTER 64
+   The m88110 adds an Extended Register File (XRF) of 32 80-bit registers.
+
+   There are also two fake registers:
+   - ARG_POINTER_REGNUM abuses r0 (which is always zero and never used
+     as a working register), and will always get eliminated in favour of
+     HARD_FRAME_POINTER_REGNUM or STACK_POINTER_REGNUM.
+   - FRAME_POINTER_REGNUM, which is equivalent to the above, and thus
+     will also always get eliminated.  */
 #define FIRST_EXTENDED_REGISTER 32
+#define LAST_EXTENDED_REGISTER 63
+#define FIRST_PSEUDO_REGISTER 64
 
 /*  General notes on extended registers, their use and misuse.
 
@@ -375,8 +393,8 @@ extern enum processor_type m88k_cpu;
   {									\
     if (! TARGET_88110)							\
       {									\
-	register int i;							\
-	  for (i = FIRST_EXTENDED_REGISTER; i < FIRST_PSEUDO_REGISTER;	\
+	int i;								\
+	  for (i = FIRST_EXTENDED_REGISTER; i <= LAST_EXTENDED_REGISTER;\
 	       i++)							\
 	    {								\
 	      fixed_regs[i] = 1;					\
@@ -392,7 +410,7 @@ extern enum processor_type m88k_cpu;
 
 /* True if register is an extended register.  */
 #define XRF_REGNO_P(N)							\
-  ((N) < FIRST_PSEUDO_REGISTER && (N) >= FIRST_EXTENDED_REGISTER)
+  ((N) <= LAST_EXTENDED_REGISTER && (N) >= FIRST_EXTENDED_REGISTER)
  
 /* Return number of consecutive hard regs needed starting at reg REGNO
    to hold something of mode MODE.
@@ -441,7 +459,8 @@ extern enum processor_type m88k_cpu;
 #define STACK_POINTER_REGNUM 31
 
 /* Base register for access to local variables of the function.  */
-#define FRAME_POINTER_REGNUM 30
+#define FRAME_POINTER_REGNUM 0
+#define HARD_FRAME_POINTER_REGNUM 30
 
 /* Base register for access to arguments of the function.  */
 #define ARG_POINTER_REGNUM 0
@@ -490,14 +509,7 @@ extern enum processor_type m88k_cpu;
 
 /* Switch between the leaf and non-leaf orderings.  The purpose is to avoid
    write-over scoreboard delays between caller and callee.  */
-#define ORDER_REGS_FOR_LOCAL_ALLOC					\
-{									\
-  static const int leaf[] = REG_LEAF_ALLOC_ORDER;			\
-  static const int nonleaf[] = REG_ALLOC_ORDER;				\
-									\
-  memcpy (reg_alloc_order, regs_ever_live[1] ? nonleaf : leaf,		\
-	  FIRST_PSEUDO_REGISTER * sizeof (int));			\
-}
+#define ORDER_REGS_FOR_LOCAL_ALLOC m88k_order_regs_for_local_alloc ()
 
 /*** Register Classes ***/
 
@@ -550,8 +562,9 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    Return the class number of the smallest class containing
    reg number REGNO.  This could be a conditional expression
    or could index an array.  */
-#define REGNO_REG_CLASS(REGNO)						\
-  ((REGNO) ? ((REGNO) < 32 ? GENERAL_REGS : XRF_REGS) : AP_REG)
+extern const enum reg_class m88k_regno_reg_class[FIRST_PSEUDO_REGISTER];
+
+#define REGNO_REG_CLASS(REGNO)	m88k_regno_reg_class[(REGNO)]
 
 /* The class value for index registers, and the one for base regs.  */
 #define BASE_REG_CLASS AGRF_REGS
@@ -564,12 +577,9 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    Since they use reg_renumber, they are safe only once reg_renumber
    has been allocated, which happens in local-alloc.c.  */
 #define REGNO_OK_FOR_BASE_P(REGNO)					\
-  ((REGNO) < FIRST_EXTENDED_REGISTER					\
-   || (unsigned) reg_renumber[REGNO] < FIRST_EXTENDED_REGISTER)
+  m88k_regno_ok_for_base_p (REGNO)
 #define REGNO_OK_FOR_INDEX_P(REGNO)					\
-  (((REGNO) && (REGNO) < FIRST_EXTENDED_REGISTER)			\
-   || (reg_renumber[REGNO]						\
-       && (unsigned) reg_renumber[REGNO] < FIRST_EXTENDED_REGISTER))
+  m88k_regno_ok_for_index_p (REGNO)
 
 /* Given an rtx X being reloaded into a reg required to be
    in class CLASS, return the class of reg to actually use.
@@ -583,11 +593,7 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    into a register of class CLASS in MODE.  On the m88k, when PIC, we
    need a temporary when loading some addresses into a register.  */
 #define SECONDARY_INPUT_RELOAD_CLASS(CLASS, MODE, IN)			\
-  ((flag_pic								\
-    && GET_CODE (IN) == CONST						\
-    && GET_CODE (XEXP (IN, 0)) == PLUS					\
-    && GET_CODE (XEXP (XEXP (IN, 0), 0)) == CONST_INT			\
-    && ! SMALL_INT (XEXP (XEXP (IN, 0), 1))) ? GENERAL_REGS : NO_REGS)
+  ((flag_pic && pic_address_needs_scratch (IN)) ? GENERAL_REGS : NO_REGS)
 
 /* Return the maximum number of consecutive registers
    needed to represent mode MODE in a register of class CLASS.  */
@@ -610,14 +616,15 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
 #define STACK_GROWS_DOWNWARD
 
 /* Define this if the addresses of local variable slots are at negative
-   offsets from the frame pointer.  */
-/* #define FRAME_GROWS_DOWNWARD */
+   offsets from the (logical) frame pointer.  */
+#define FRAME_GROWS_DOWNWARD 1
 
 /* Offset from the frame pointer to the first local variable slot to be
    allocated. For the m88k, the debugger wants the return address (r1)
    stored at location r30+4, and the previous frame pointer stored at
-   location r30.  */
-#define STARTING_FRAME_OFFSET 8
+   location r30.  But since we use a logical frame pointer, these
+   details are hidden. */
+#define STARTING_FRAME_OFFSET 0
 
 /* If we generate an insn to push BYTES bytes, this says how many the
    stack pointer really advances by.  The m88k has no push instruction.  */
@@ -762,7 +769,7 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
   output_function_profiler (FILE, LABELNO, "mcount")
 
 /* Maximum length in instructions of the code output by FUNCTION_PROFILER.  */
-#define FUNCTION_PROFILER_LENGTH (5+3+1+5)
+#define FUNCTION_PROFILER_LENGTH (4*(5+3+1+5))
 
 /* EXIT_IGNORE_STACK should be nonzero if, when returning from a function,
    the stack pointer does not matter.  The value is tested only in
@@ -775,19 +782,25 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    may be accessed via the stack pointer) in functions that seem suitable.
    This is computed in `reload', in reload1.c.  */
 #define FRAME_POINTER_REQUIRED						\
-((current_function_profile || !leaf_function_p ()			\
-  || !TARGET_OMIT_LEAF_FRAME_POINTER)					\
- || (write_symbols != NO_DEBUG))
+(current_function_profile || !leaf_function_p ())
 
 /* Define registers used by the epilogue and return instruction.  */
 #define EPILOGUE_USES(REGNO)						\
 (reload_completed && ((REGNO) == 1					\
 		      || (current_function_profile			\
-			  && (REGNO) == FRAME_POINTER_REGNUM)))
+			  && (REGNO) == HARD_FRAME_POINTER_REGNUM)))
 
 /* Before the prologue, RA is in r1.  */
 #define INCOMING_RETURN_ADDR_RTX gen_rtx_REG (Pmode, 1)
 #define DWARF_FRAME_RETURN_COLUMN DWARF_FRAME_REGNUM (1)
+
+/* Where to find the lowest frame.  */
+#define INITIAL_FRAME_ADDRESS_RTX \
+  (current_function_accesses_prior_frames = 1, hard_frame_pointer_rtx)
+
+/* Where to find the return address in the given frame.  */
+#define RETURN_ADDR_RTX(COUNT, FRAME) \
+  gen_rtx_MEM (Pmode, plus_constant (FRAME, 4))
 
 /* Definitions for register eliminations.
 
@@ -801,28 +814,19 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    followed by "to".  Eliminations of the same "from" register are listed
    in order of preference.  */
 #define ELIMINABLE_REGS							\
-{{ ARG_POINTER_REGNUM, STACK_POINTER_REGNUM},				\
- { ARG_POINTER_REGNUM, FRAME_POINTER_REGNUM},				\
- { FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM}}
+{{ FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM},				\
+ { FRAME_POINTER_REGNUM, HARD_FRAME_POINTER_REGNUM}}
 
 /* Given FROM and TO register numbers, say whether this elimination
    is allowed.  */
 #define CAN_ELIMINATE(FROM, TO)						\
-  (!((FROM) == FRAME_POINTER_REGNUM && FRAME_POINTER_REQUIRED))
+  ((TO) == HARD_FRAME_POINTER_REGNUM					\
+   || (/*(TO) == STACK_POINTER_REGNUM &&*/ !frame_pointer_needed))
 
 /* Define the offset between two registers, one to be eliminated, and the other
    its replacement, at the start of a routine.  */
 #define INITIAL_ELIMINATION_OFFSET(FROM, TO, OFFSET)			\
-{ m88k_layout_frame ();							\
-  if ((FROM) == FRAME_POINTER_REGNUM && (TO) == STACK_POINTER_REGNUM)	\
-      (OFFSET) = m88k_fp_offset;					\
-  else if ((FROM) == ARG_POINTER_REGNUM && (TO) == FRAME_POINTER_REGNUM)\
-    (OFFSET) = m88k_stack_size - m88k_fp_offset;			\
-  else if ((FROM) == ARG_POINTER_REGNUM && (TO) == STACK_POINTER_REGNUM)\
-    (OFFSET) = m88k_stack_size;						\
-  else									\
-    gcc_unreachable ();							\
-}
+  ((OFFSET) = m88k_initial_elimination_offset(FROM, TO))
 
 /*** Trampolines for Nested Functions ***/
 
@@ -916,7 +920,7 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
 
 #define CONSTANT_ADDRESS_P(X)						\
   (GET_CODE (X) == LABEL_REF || GET_CODE (X) == SYMBOL_REF		\
-   || GET_CODE (X) == CONST_INT || GET_CODE (X) == HIGH			\
+   || CONST_INT_P (X) || GET_CODE (X) == HIGH				\
    || (GET_CODE (X) == CONST						\
        && ! (flag_pic && pic_address_needs_scratch (X))))
 
@@ -941,95 +945,18 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    The register elimination process should deal with the argument
    pointer and frame pointer changing to REG+SMALLINT.  */
 
-#define LEGITIMATE_INDEX_P(X, MODE)					\
-   ((GET_CODE (X) == CONST_INT						\
-     && SMALL_INT (X))							\
-    || (REG_P (X)							\
-	&& REG_OK_FOR_INDEX_P (X))					\
-    || (GET_CODE (X) == MULT						\
-	&& REG_P (XEXP (X, 0))						\
-	&& REG_OK_FOR_INDEX_P (XEXP (X, 0))				\
-	&& GET_CODE (XEXP (X, 1)) == CONST_INT				\
-	&& INTVAL (XEXP (X, 1)) == GET_MODE_SIZE (MODE)))
-
-#define RTX_OK_FOR_BASE_P(X)						\
-  ((GET_CODE (X) == REG && REG_OK_FOR_BASE_P (X))			\
-  || (GET_CODE (X) == SUBREG						\
-      && GET_CODE (SUBREG_REG (X)) == REG				\
-      && REG_OK_FOR_BASE_P (SUBREG_REG (X))))
-
-#define RTX_OK_FOR_INDEX_P(X)						\
-  ((GET_CODE (X) == REG && REG_OK_FOR_INDEX_P (X))			\
-  || (GET_CODE (X) == SUBREG						\
-      && GET_CODE (SUBREG_REG (X)) == REG				\
-      && REG_OK_FOR_INDEX_P (SUBREG_REG (X))))
-
+#ifdef REG_OK_STRICT
 #define GO_IF_LEGITIMATE_ADDRESS(MODE, X, ADDR)				\
 {									\
-  if (REG_P (X))							\
-    {									\
-      if (REG_OK_FOR_BASE_P (X))					\
-	goto ADDR;							\
-    }									\
-  else if (GET_CODE (X) == PLUS)					\
-    {									\
-      register rtx _x0 = XEXP (X, 0);					\
-      register rtx _x1 = XEXP (X, 1);					\
-      if ((flag_pic							\
-	   && _x0 == pic_offset_table_rtx				\
-	   && (flag_pic == 2						\
-	       ? RTX_OK_FOR_BASE_P (_x1)				\
-	       : (GET_CODE (_x1) == SYMBOL_REF				\
-		  || GET_CODE (_x1) == LABEL_REF)))			\
-	  || (RTX_OK_FOR_BASE_P (_x0)					\
-	      && LEGITIMATE_INDEX_P (_x1, MODE))			\
-	  || (RTX_OK_FOR_BASE_P (_x1)					\
-	      && LEGITIMATE_INDEX_P (_x0, MODE)))			\
-	goto ADDR;							\
-    }									\
-  else if (GET_CODE (X) == LO_SUM)					\
-    {									\
-      register rtx _x0 = XEXP (X, 0);					\
-      register rtx _x1 = XEXP (X, 1);					\
-      if (RTX_OK_FOR_BASE_P (_x0)					\
-	  && CONSTANT_P (_x1))						\
-	goto ADDR;							\
-    }									\
-  else if (GET_CODE (X) == CONST_INT					\
-	   && SMALL_INT (X))						\
+  if (m88k_legitimate_address_p (MODE, X, 1))				\
     goto ADDR;								\
 }
-
-/* The macros REG_OK_FOR..._P assume that the arg is a REG rtx
-   and check its validity for a certain class.
-   We have two alternate definitions for each of them.
-   The usual definition accepts all pseudo regs; the other rejects
-   them unless they have been allocated suitable hard regs.
-   The symbol REG_OK_STRICT causes the latter definition to be used.
-
-   Most source files want to accept pseudo regs in the hope that
-   they will get allocated to the class that the insn wants them to be in.
-   Source files for reload pass need to be strict.
-   After reload, it makes no difference, since pseudo regs have
-   been eliminated by then.  */
-
-#ifndef REG_OK_STRICT
-
-/* Nonzero if X is a hard reg that can be used as an index
-   or if it is a pseudo reg.  Not the argument pointer.  */
-#define REG_OK_FOR_INDEX_P(X)						\
-  (!XRF_REGNO_P(REGNO (X)))
-/* Nonzero if X is a hard reg that can be used as a base reg
-   or if it is a pseudo reg.  */
-#define REG_OK_FOR_BASE_P(X) (REG_OK_FOR_INDEX_P (X))
-
 #else
-
-/* Nonzero if X is a hard reg that can be used as an index.  */
-#define REG_OK_FOR_INDEX_P(X) REGNO_OK_FOR_INDEX_P (REGNO (X))
-/* Nonzero if X is a hard reg that can be used as a base reg.  */
-#define REG_OK_FOR_BASE_P(X) REGNO_OK_FOR_BASE_P (REGNO (X))
-
+#define GO_IF_LEGITIMATE_ADDRESS(MODE, X, ADDR)				\
+{									\
+  if (m88k_legitimate_address_p (MODE, X, 0))				\
+    goto ADDR;								\
+}
 #endif
 
 /* Try machine-dependent ways of modifying an illegitimate address
@@ -1045,31 +972,9 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    It is always safe for this macro to do nothing.  It exists to recognize
    opportunities to optimize the output.  */
 
-/* On the m88000, change REG+N into REG+REG, and REG+(X*Y) into REG+REG.  */
-
 #define LEGITIMIZE_ADDRESS(X,OLDX,MODE,WIN)				\
 {									\
-  if (GET_CODE (X) == PLUS && CONSTANT_ADDRESS_P (XEXP (X, 1)))		\
-    (X) = gen_rtx_PLUS (SImode, XEXP (X, 0),				\
-			copy_to_mode_reg (SImode, XEXP (X, 1)));	\
-  if (GET_CODE (X) == PLUS && CONSTANT_ADDRESS_P (XEXP (X, 0)))		\
-    (X) = gen_rtx_PLUS (SImode, XEXP (X, 1),				\
-			copy_to_mode_reg (SImode, XEXP (X, 0)));	\
-  if (GET_CODE (X) == PLUS && GET_CODE (XEXP (X, 0)) == MULT)		\
-    (X) = gen_rtx_PLUS (SImode, XEXP (X, 1),				\
-			force_operand (XEXP (X, 0), 0));		\
-  if (GET_CODE (X) == PLUS && GET_CODE (XEXP (X, 1)) == MULT)		\
-    (X) = gen_rtx_PLUS (SImode, XEXP (X, 0),				\
-			force_operand (XEXP (X, 1), 0));		\
-  if (GET_CODE (X) == PLUS && GET_CODE (XEXP (X, 0)) == PLUS)		\
-    (X) = gen_rtx_PLUS (Pmode, force_operand (XEXP (X, 0), NULL_RTX),	\
-			XEXP (X, 1));					\
-  if (GET_CODE (X) == PLUS && GET_CODE (XEXP (X, 1)) == PLUS)		\
-    (X) = gen_rtx_PLUS (Pmode, XEXP (X, 0),				\
-			force_operand (XEXP (X, 1), NULL_RTX));		\
-  if (GET_CODE (X) == SYMBOL_REF || GET_CODE (X) == CONST		\
-	   || GET_CODE (X) == LABEL_REF)				\
-    (X) = legitimize_address (flag_pic, X, 0, 0);			\
+  (X) = m88k_legitimize_address (X, MODE);				\
   if (memory_address_p (MODE, X))					\
     goto WIN;								\
 }
@@ -1086,7 +991,6 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
 
 /* Define this, so that when PIC, reload won't try to reload invalid
    addresses which require two reload registers.  */
-
 #define LEGITIMATE_PIC_OPERAND_P(X)  (! pic_address_needs_scratch (X))
 
 
@@ -1140,12 +1044,21 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    in one reasonably fast instruction.  */
 #define MOVE_MAX 8
 
-/* Define if normal loads of shorter-than-word items from memory clears
-   the rest of the bigs in the register.  */
-#define BYTE_LOADS_ZERO_EXTEND
-
 /* Zero if access to memory by bytes is faster.  */
 #define SLOW_BYTE_ACCESS 1
+
+/* Define if operations between registers always perform the operation
+   on the full register even if a narrower mode is specified.  */
+#define WORD_REGISTER_OPERATIONS
+
+/* Define if loading in MODE, an integral mode narrower than BITS_PER_WORD
+   will either zero-extend or sign-extend.  The value of this macro should
+   be the code that says which one of the two operations is implicitly
+   done, UNKNOWN if none.  */
+/* #define LOAD_EXTEND_OP(MODE) UNKNOWN */
+
+/* Define if loading short immediate values into registers sign extends.  */
+/* #define SHORT_IMMEDIATES_SIGN_EXTEND */
 
 /* Value is 1 if truncating an integer of INPREC bits to OUTPREC bits
    is done just by pretending it is already truncated.  */
@@ -1176,14 +1089,14 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    Account for profiling code output at NOTE_INSN_PROLOGUE_END.
    Account for block profiling code at basic block boundaries.  */
 #define ADJUST_INSN_LENGTH(RTX, LENGTH)					\
-  if (GET_CODE (RTX) == BARRIER						\
+  if (BARRIER_P (RTX)							\
       || (TARGET_SERIALIZE_VOLATILE					\
-	  && GET_CODE (RTX) == INSN					\
+	  && NONJUMP_INSN_P (RTX)					\
 	  && GET_CODE (PATTERN (RTX)) == SET				\
-	  && ((GET_CODE (SET_SRC (PATTERN (RTX))) == MEM		\
+	  && ((MEM_P (SET_SRC (PATTERN (RTX)))				\
 	       && MEM_VOLATILE_P (SET_SRC (PATTERN (RTX)))))))		\
-    (LENGTH) += 1;							\
-  else if (GET_CODE (RTX) == NOTE					\
+    (LENGTH) += 4;							\
+  else if (NOTE_P (RTX)							\
 	   && NOTE_LINE_NUMBER (RTX) == NOTE_INSN_PROLOGUE_END)		\
     {									\
       if (current_function_profile)					\
@@ -1260,7 +1173,7 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
     "x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",		\
     "x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",		\
     "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",		\
-    "x24", "x25", "x26", "x27", "x28", "x29", "x30", "x31" }
+    "x24", "x25", "x26", "x27", "x28", "x29", "x30", "x31"}
 
 /* Define additional names for use in asm clobbers and asm declarations.
 
@@ -1269,18 +1182,6 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
    be clobbered by an asm.  The carry bit in the PSR is now used.  */
 
 #define ADDITIONAL_REGISTER_NAMES	{{"psr", 0}, {"cc", 0}}
-
-/* Change to the readonly data section for a table of addresses.
-   final_scan_insn changes back to the text section.  */
-#undef	ASM_OUTPUT_BEFORE_CASE_LABEL
-#define ASM_OUTPUT_BEFORE_CASE_LABEL(FILE, PREFIX, NUM, TABLE)		\
-  do {									\
-    if (! CASE_VECTOR_INSNS)						\
-      {									\
-	switch_to_section (readonly_data_section);			\
-	ASM_OUTPUT_ALIGN ((FILE), 2);					\
-      }									\
-  } while (0);
 
 /* Epilogue for case labels.  This jump instruction is called by casesi
    to transfer to the appropriate branch instruction within the table.
@@ -1338,13 +1239,6 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
 	       reg_names[STACK_POINTER_REGNUM],				\
 	       (STACK_BOUNDARY / BITS_PER_UNIT))
 
-/* Macros for debug information */
-#define DEBUGGER_AUTO_OFFSET(X)						\
-  (m88k_debugger_offset (X, 0) + (m88k_stack_size - m88k_fp_offset))
-
-#define DEBUGGER_ARG_OFFSET(OFFSET, X)					\
-  (m88k_debugger_offset (X, OFFSET) + (m88k_stack_size - m88k_fp_offset))
-
 /* Jump tables consist of branch instructions and should be output in
    the text section.  When we use a table of addresses, we explicitly
    change to the readonly data section.  */
@@ -1360,3 +1254,24 @@ enum reg_class { NO_REGS, AP_REG, XRF_REGS, GENERAL_REGS, AGRF_REGS,
 
 /* Print a memory address as an operand to reference that memory location.  */
 #define PRINT_OPERAND_ADDRESS(FILE, ADDR) print_operand_address (FILE, ADDR)
+
+/* DWARF unwinding needs two scratch registers; we choose to use r8-r9.  */
+#define EH_RETURN_DATA_REGNO(N) \
+  ((N) < 2 ? (N) + 6 : INVALID_REGNUM)
+
+#define EH_RETURN_HANDLER_RTX \
+  RETURN_ADDR_RTX (0, hard_frame_pointer_rtx)
+
+/* Select a format to encode pointers in exception handling data.  CODE
+   is 0 for data, 1 for code labels, 2 for function pointers.  GLOBAL is
+   true if the symbol may be affected by dynamic relocations.  */
+#define ASM_PREFERRED_EH_DATA_FORMAT(CODE, GLOBAL)			\
+  ((flag_pic || GLOBAL) ? DW_EH_PE_aligned : DW_EH_PE_absptr)
+
+#define AVOID_CCMODE_COPIES
+
+/* The ctzsi2 pattern returns 31 for an input of zero.  */
+#define CTZ_DEFINED_VALUE_AT_ZERO(MODE, VALUE) ((VALUE) = 31)
+
+/* The clzsi2 pattern returns -1 for an input of zero.  */
+#define CLZ_DEFINED_VALUE_AT_ZERO(MODE, VALUE) ((VALUE) = -1)

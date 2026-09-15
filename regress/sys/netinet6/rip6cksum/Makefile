@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.6 2020/12/30 21:40:33 kn Exp $
+# $OpenBSD: Makefile,v 1.8 2025/02/27 08:06:03 anton Exp $
 
 # The following ports must be installed:
 #

@@ -1,4 +1,4 @@
-.\"	$OpenBSD: acpi.4,v 1.75 2024/08/04 16:31:02 jmc Exp $
+.\"	$OpenBSD: acpi.4,v 1.80 2026/04/13 01:09:07 jsg Exp $
 .\"
 .\" Copyright (c) 2006 Alexander Yurchenko <grange@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: August 4 2024 $
+.Dd $Mdocdate: April 13 2026 $
 .Dt ACPI 4
 .Os
 .Sh NAME
@@ -52,6 +52,8 @@ ACPI control method battery
 ACPI button
 .It Xr acpicbkbd 4
 Chromebook keyboard backlight
+.It Xr acpicmos 4
+CMOS memory manager
 .It Xr acpicpu 4
 ACPI processor power and performance state
 .It Xr acpidock 4
@@ -94,12 +96,16 @@ ACPI thermal zone
 ACPI video
 .It Xr acpivout 4
 ACPI video output
+.It Xr acpiwmi 4
+ACPI WMI interface
 .It Xr ahci 4
 Advanced Host Controller Interface for Serial ATA
 .It Xr aibs 4
 ASUSTeK AI Booster ACPI ATK0110 temperature, voltage, and fan sensor
 .It Xr amdgpio 4
 AMD GPIO controller
+.It Xr amdpmc 4
+AMD power management controller
 .It Xr ampchwm 4
 Ampere Altra fine-grained power telemetry
 .It Xr aplgpio 4
@@ -124,12 +130,18 @@ Intel Gemini Lake GPIO controller
 i.MX onboard I2C controller
 .It Xr intelpmc 4
 Intel power management controller
+.It Xr inthid 4
+Intel HID event and 5-button array devices
 .It Xr iosf 4
 Intel OnChip System Fabric device
 .It Xr ipmi 4
 Intelligent Platform Management Interface driver
+.It Xr ispi 4
+Intel LPSS SPI controller
 .It Xr pchgpio 4
 Intel PCH GPIO controller
+.It Xr pckbc 4
+Keyboard controller
 .It Xr pluart 4
 ARM PrimeCell PL011 UART
 .It Xr qcgpio 4

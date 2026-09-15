@@ -1,4 +1,4 @@
-/*	$OpenBSD: ssl.c,v 1.37 2023/06/25 08:07:39 op Exp $	*/
+/*	$OpenBSD: ssl.c,v 1.43 2026/07/20 17:41:07 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -29,6 +29,7 @@
 #include <openssl/err.h>
 
 #include "relayd.h"
+#include "log.h"
 
 int	ssl_password_cb(char *, int, int, void *);
 
@@ -37,11 +38,13 @@ ssl_password_cb(char *buf, int size, int rwflag, void *u)
 {
 	size_t	len;
 	if (u == NULL) {
-		bzero(buf, size);
+		explicit_bzero(buf, size);
 		return (0);
 	}
-	if ((len = strlcpy(buf, u, size)) >= (size_t)size)
+	if ((len = strlcpy(buf, u, size)) >= (size_t)size) {
+		explicit_bzero(buf, size);
 		return (0);
+	}
 	return (len);
 }
 
@@ -59,6 +62,8 @@ ssl_load_key(struct relayd *env, const char *name, off_t *len, char *pass)
 	 */
 	if ((fp = fopen(name, "r")) == NULL)
 		return (NULL);
+
+	ERR_clear_error();
 
 	key = PEM_read_PrivateKey(fp, NULL, ssl_password_cb, pass);
 	fclose(fp);
@@ -85,6 +90,7 @@ ssl_load_key(struct relayd *env, const char *name, off_t *len, char *pass)
 	return (buf);
 
  fail:
+	ssl_error("ssl_load_key");
 	free(buf);
 	if (bio != NULL)
 		BIO_free_all(bio);
@@ -124,12 +130,15 @@ ssl_update_certificate(const uint8_t *oldcert, size_t oldlen, EVP_PKEY *pkey,
 	    name[1], sizeof(name[1])))
 		goto done;
 
-	if ((cert = X509_dup(cert)) == NULL)
-		goto done;
-
 	/* Update certificate key and use our CA as the issuer */
-	X509_set_pubkey(cert, pkey);
-	X509_set_issuer_name(cert, X509_get_subject_name(cacert));
+	if (!X509_set_pubkey(cert, pkey)) {
+		log_warnx("%s: X509_set_pubkey failed", __func__);
+		goto done;
+	}
+	if (!X509_set_issuer_name(cert, X509_get_subject_name(cacert))) {
+		log_warnx("%s: X509_get_issuer_name failed", __func__);
+		goto done;
+	}
 
 	/* Sign with our CA */
 	if (!X509_sign(cert, capkey, EVP_sha256())) {
@@ -180,6 +189,7 @@ ssl_load_pkey(char *buf, off_t len, X509 **x509ptr, EVP_PKEY **pkeyptr)
 	X509		*x509 = NULL;
 	EVP_PKEY	*pkey = NULL;
 	RSA		*rsa = NULL;
+	EC_KEY		*eckey = NULL;
 	char		*hash = NULL;
 
 	if ((in = BIO_new_mem_buf(buf, len)) == NULL) {
@@ -195,21 +205,47 @@ ssl_load_pkey(char *buf, off_t len, X509 **x509ptr, EVP_PKEY **pkeyptr)
 		log_warnx("%s: X509_get_pubkey failed", __func__);
 		goto fail;
 	}
-	if ((rsa = EVP_PKEY_get1_RSA(pkey)) == NULL) {
-		log_warnx("%s: failed to extract RSA", __func__);
-		goto fail;
-	}
 	if ((hash = malloc(TLS_CERT_HASH_SIZE)) == NULL) {
 		log_warn("%s: allocate hash failed", __func__);
 		goto fail;
 	}
 	hash_x509(x509, hash, TLS_CERT_HASH_SIZE);
-	if (RSA_set_ex_data(rsa, 0, hash) != 1) {
-		log_warnx("%s: failed to set hash as exdata", __func__);
+
+	switch (EVP_PKEY_id(pkey)) {
+	case EVP_PKEY_RSA:
+		if ((rsa = EVP_PKEY_get1_RSA(pkey)) == NULL) {
+			log_warnx("%s: failed to extract RSA", __func__);
+			goto fail;
+		}
+		if (RSA_set_ex_data(rsa, 0, hash) != 1) {
+			log_warnx("%s: failed to set hash as exdata", __func__);
+			goto fail;
+		}
+		break;
+	case EVP_PKEY_EC:
+		if ((eckey = EVP_PKEY_get1_EC_KEY(pkey)) == NULL) {
+			log_warnx("%s: failed to set extract EC key", __func__);
+			goto fail;
+		}
+		if (EC_KEY_set_ex_data(eckey, 0, hash) == 0) {
+			log_warnx("%s: failed to set hash as exdata", __func__);
+			goto fail;
+		}
+
+		/* Reset the key to work around caching in OpenSSL 3. */
+		if (EVP_PKEY_set1_EC_KEY(pkey, eckey) == 0) {
+			log_warnx("%s: failed to set EC key", __func__);
+			goto fail;
+		}
+		break;
+	default:
+		log_warnx("%s: incorrect key type", __func__);
 		goto fail;
 	}
 
-	RSA_free(rsa); /* dereference, will be cleaned up with pkey */
+	/* dereference, will be cleaned up with pkey */
+	RSA_free(rsa);
+	EC_KEY_free(eckey);
 	*pkeyptr = pkey;
 	if (x509ptr != NULL)
 		*x509ptr = x509;
@@ -230,4 +266,16 @@ ssl_load_pkey(char *buf, off_t len, X509 **x509ptr, EVP_PKEY **pkeyptr)
 	BIO_free(in);
 
 	return (0);
+}
+
+void
+ssl_error(const char *where)
+{
+	unsigned long	code;
+	char		errbuf[128];
+
+	for (; (code = ERR_get_error()) != 0;) {
+		ERR_error_string_n(code, errbuf, sizeof(errbuf));
+		log_warnx("SSL library error: %s: %s", where, errbuf);
+	}
 }

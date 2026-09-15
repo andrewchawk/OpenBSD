@@ -1235,6 +1235,10 @@ sub run_tests {
         1 while /(a+b?)(*SKIP)(?{$count++; push @res,$1})(*FAIL)/g;
         is($count, 2, "Expect 2 with (*SKIP)");
         is("@res", "aaab aaab", "Adjacent (*SKIP) works as expected");
+
+        $_ = "dir/file.mp3";
+        my $got = m{ ( ([^/]+) (?: / (*SKIP)(*FAIL) | \z ) ) }x ? $1 : undef;
+        is($got, "file.mp3", "(*SKIP) and find_byclass() work together");
     }
 
     {   # Test the (*SKIP) pattern
@@ -2709,6 +2713,14 @@ EOF_DEBUG_OUT
         $x =~ s/^[\x{0301}\x{030C}]+//;
     }
 
+    { # GH #23388
+        fresh_perl_is(<<~'PROG', , "", {}, "Avoid trie overflow");
+            my $x = join "|", "aaa".."mzz";
+            my $y = join "|", "naa".."zzz";
+            use re 'Debug';
+            "fnord" =~ m/(?:$x)|(?:$y)/;
+            PROG
+    }
 
     # !!! NOTE that tests that aren't at all likely to crash perl should go
     # a ways above, above these last ones.  There's a comment there that, like

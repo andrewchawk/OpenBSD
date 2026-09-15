@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_prn.c,v 1.6 2023/05/08 05:30:38 tb Exp $ */
+/* $OpenBSD: x509_prn.c,v 1.11 2026/05/16 07:12:27 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 1999.
  */
@@ -55,7 +55,6 @@
  * Hudson (tjh@cryptsoft.com).
  *
  */
-/* X509 v3 extension utilities */
 
 #include <stdio.h>
 
@@ -63,13 +62,6 @@
 #include <openssl/x509v3.h>
 
 #include "x509_local.h"
-
-/* Extension printing routines */
-
-static int unknown_ext_print(BIO *out, X509_EXTENSION *ext, unsigned long flag,
-    int indent, int supported);
-
-/* Print out a name+value stack */
 
 void
 X509V3_EXT_val_prn(BIO *out, STACK_OF(CONF_VALUE) *val, int indent, int ml)
@@ -87,8 +79,9 @@ X509V3_EXT_val_prn(BIO *out, STACK_OF(CONF_VALUE) *val, int indent, int ml)
 	for (i = 0; i < sk_CONF_VALUE_num(val); i++) {
 		if (ml)
 			BIO_printf(out, "%*s", indent, "");
-		else if (i > 0) BIO_printf(out, ", ");
-			nval = sk_CONF_VALUE_value(val, i);
+		else if (i > 0)
+			BIO_printf(out, ", ");
+		nval = sk_CONF_VALUE_value(val, i);
 		if (!nval->name)
 			BIO_puts(out, nval->value);
 		else if (!nval->value)
@@ -101,7 +94,29 @@ X509V3_EXT_val_prn(BIO *out, STACK_OF(CONF_VALUE) *val, int indent, int ml)
 }
 LCRYPTO_ALIAS(X509V3_EXT_val_prn);
 
-/* Main routine: print out a general extension */
+static int
+unknown_ext_print(BIO *out, X509_EXTENSION *ext, unsigned long flag,
+    int indent, int supported)
+{
+	switch (flag & X509V3_EXT_UNKNOWN_MASK) {
+	case X509V3_EXT_DEFAULT:
+		return 0;
+	case X509V3_EXT_ERROR_UNKNOWN:
+		if (supported)
+			BIO_printf(out, "%*s<Parse Error>", indent, "");
+		else
+			BIO_printf(out, "%*s<Not Supported>", indent, "");
+		return 1;
+	case X509V3_EXT_PARSE_UNKNOWN:
+		return ASN1_parse_dump(out,
+		    ext->value->data, ext->value->length, indent, -1) > 0;
+	case X509V3_EXT_DUMP_UNKNOWN:
+		return BIO_dump_indent(out, (const char *)ext->value->data,
+		    ext->value->length, indent) > 0;
+	default:
+		return 1;
+	}
+}
 
 int
 X509V3_EXT_print(BIO *out, X509_EXTENSION *ext, unsigned long flag, int indent)
@@ -190,31 +205,6 @@ X509V3_extensions_print(BIO *bp, const char *title,
 	return 1;
 }
 LCRYPTO_ALIAS(X509V3_extensions_print);
-
-static int
-unknown_ext_print(BIO *out, X509_EXTENSION *ext, unsigned long flag,
-    int indent, int supported)
-{
-	switch (flag & X509V3_EXT_UNKNOWN_MASK) {
-	case X509V3_EXT_DEFAULT:
-		return 0;
-	case X509V3_EXT_ERROR_UNKNOWN:
-		if (supported)
-			BIO_printf(out, "%*s<Parse Error>", indent, "");
-		else
-			BIO_printf(out, "%*s<Not Supported>", indent, "");
-		return 1;
-	case X509V3_EXT_PARSE_UNKNOWN:
-		return ASN1_parse_dump(out,
-		    ext->value->data, ext->value->length, indent, -1);
-	case X509V3_EXT_DUMP_UNKNOWN:
-		return BIO_dump_indent(out, (char *)ext->value->data,
-		    ext->value->length, indent);
-	default:
-		return 1;
-	}
-}
-
 
 int
 X509V3_EXT_print_fp(FILE *fp, X509_EXTENSION *ext, int flag, int indent)

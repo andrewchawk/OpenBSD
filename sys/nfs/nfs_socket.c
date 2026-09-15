@@ -1,4 +1,4 @@
-/*	$OpenBSD: nfs_socket.c,v 1.151 2024/07/12 17:20:18 mvs Exp $	*/
+/*	$OpenBSD: nfs_socket.c,v 1.158 2026/06/09 03:20:01 jsg Exp $	*/
 /*	$NetBSD: nfs_socket.c,v 1.27 1996/04/15 20:20:00 thorpej Exp $	*/
 
 /*
@@ -281,9 +281,9 @@ nfs_connect(struct nfsmount *nmp, struct nfsreq *rep)
 		sin->sin_family = AF_INET;
 		sin->sin_addr.s_addr = INADDR_ANY;
 		sin->sin_port = htons(0);
-		solock(so);
+		solock_shared(so);
 		error = sobind(so, nam, &proc0);
-		sounlock(so);
+		sounlock_shared(so);
 		if (error)
 			goto bad;
 
@@ -305,7 +305,7 @@ nfs_connect(struct nfsmount *nmp, struct nfsreq *rep)
 			goto bad;
 		}
 	} else {
-		solock(so);
+		solock_shared(so);
 		error = soconnect(so, nmp->nm_nam);
 		if (error)
 			goto bad_locked;
@@ -330,7 +330,7 @@ nfs_connect(struct nfsmount *nmp, struct nfsreq *rep)
 			so->so_error = 0;
 			goto bad_locked;
 		}
-		sounlock(so);
+		sounlock_shared(so);
 	}
 	/*
 	 * Always set receive timeout to detect server crash and reconnect.
@@ -367,7 +367,7 @@ nfs_connect(struct nfsmount *nmp, struct nfsreq *rep)
 	} else {
 		panic("%s: nm_sotype %d", __func__, nmp->nm_sotype);
 	}
-	solock(so);
+	solock_shared(so);
 	error = soreserve(so, sndreserve, rcvreserve);
 	if (error)
 		goto bad_locked;
@@ -377,7 +377,7 @@ nfs_connect(struct nfsmount *nmp, struct nfsreq *rep)
 	mtx_enter(&so->so_snd.sb_mtx);
 	so->so_snd.sb_flags |= SB_NOINTR;
 	mtx_leave(&so->so_snd.sb_mtx);
-	sounlock(so);
+	sounlock_shared(so);
 
 	m_freem(mopt);
 	m_freem(nam);
@@ -390,7 +390,7 @@ nfs_connect(struct nfsmount *nmp, struct nfsreq *rep)
 	return (0);
 
 bad_locked:
-	sounlock(so);
+	sounlock_shared(so);
 bad:
 
 	m_freem(mopt);
@@ -996,10 +996,10 @@ tryagain:
 
 	/*
 	 * Since we only support RPCAUTH_UNIX atm we step over the
-	 * reply verifer type, and in the (error) case that there really
+	 * reply verifier type, and in the (error) case that there really
 	 * is any data in it, we advance over it.
 	 */
-	tl++;			/* Step over verifer type */
+	tl++;			/* Step over verifier type */
 	i = fxdr_unsigned(int32_t, *tl);
 	if (i > 0) {
 		/* Should not happen */
@@ -1020,6 +1020,7 @@ tryagain:
 			if ((nmp->nm_flag & NFSMNT_NFSV3) &&
 			    error == NFSERR_TRYLATER) {
 				m_freem(info.nmi_mrep);
+				info.nmi_mrep = NULL;
 				error = 0;
 				tsleep_nsec(&nowake, PSOCK, "nfsretry",
 				    SEC_TO_NSEC(trylater_delay));
@@ -1124,7 +1125,7 @@ nfs_rephead(int siz, struct nfsrv_descript *nd, struct nfssvc_sock *slp,
 				    *tl = 0;
 			}
 			break;
-		};
+		}
 	}
 
 	*mrq = mreq;
@@ -1195,7 +1196,7 @@ nfs_timer(void *arg)
 		 * Set r_rtt to -1 in case we fail to send it now.
 		 */
 		rep->r_rtt = -1;
-		if (sbspace(so, &so->so_snd) >= rep->r_mreq->m_pkthdr.len &&
+		if (sbspace(&so->so_snd) >= rep->r_mreq->m_pkthdr.len &&
 		   ((nmp->nm_flag & NFSMNT_DUMBTIMR) ||
 		    (rep->r_flags & R_SENT) ||
 		    nmp->nm_sent < nmp->nm_cwnd) &&
@@ -1449,23 +1450,18 @@ nfs_getreq(struct nfsrv_descript *nd, struct nfsd *nfsd, int has_header)
 	u_int32_t *tl;
 	u_int32_t nfsvers, auth_type;
 	int error = 0;
-	struct nfsm_info info;
 
-	info.nmi_mrep = nd->nd_mrep;
-	info.nmi_md = nd->nd_md;
-	info.nmi_dpos = nd->nd_dpos;
-	info.nmi_errorp = &error;
 	if (has_header) {
-		tl = (uint32_t *)nfsm_dissect(&info, 10 * NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nd, 10 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		nd->nd_retxid = fxdr_unsigned(u_int32_t, *tl++);
 		if (*tl++ != rpc_call) {
-			m_freem(info.nmi_mrep);
+			m_freem(nd->nd_mrep);
 			return (EBADRPC);
 		}
 	} else {
-		tl = (uint32_t *)nfsm_dissect(&info, 8 * NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nd, 8 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 	}
@@ -1505,7 +1501,7 @@ nfs_getreq(struct nfsrv_descript *nd, struct nfsd *nfsd, int has_header)
 	auth_type = *tl++;
 	len = fxdr_unsigned(int, *tl++);
 	if (len < 0 || len > RPCAUTH_MAXSIZ) {
-		m_freem(info.nmi_mrep);
+		m_freem(nd->nd_mrep);
 		return (EBADRPC);
 	}
 
@@ -1513,12 +1509,12 @@ nfs_getreq(struct nfsrv_descript *nd, struct nfsd *nfsd, int has_header)
 	if (auth_type == rpc_auth_unix) {
 		len = fxdr_unsigned(int, *++tl);
 		if (len < 0 || len > NFS_MAXNAMLEN) {
-			m_freem(info.nmi_mrep);
+			m_freem(nd->nd_mrep);
 			return (EBADRPC);
 		}
-		if (nfsm_adv(&info, nfsm_rndup(len)) != 0)
+		if (nfsd_adv(nd, nfsm_rndup(len), &error) != 0)
 			goto nfsmout;
-		tl = (uint32_t *)nfsm_dissect(&info, 3 * NFSX_UNSIGNED);
+		tl = (uint32_t *)nfsd_dissect(nd, 3 * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		memset(&nd->nd_cr, 0, sizeof (struct ucred));
@@ -1527,11 +1523,11 @@ nfs_getreq(struct nfsrv_descript *nd, struct nfsd *nfsd, int has_header)
 		nd->nd_cr.cr_gid = fxdr_unsigned(gid_t, *tl++);
 		len = fxdr_unsigned(int, *tl);
 		if (len < 0 || len > RPCAUTH_UNIXGIDS) {
-			m_freem(info.nmi_mrep);
+			m_freem(nd->nd_mrep);
 			return (EBADRPC);
 		}
 		tl = (uint32_t *)
-		    nfsm_dissect(&info, (len + 2) * NFSX_UNSIGNED);
+		    nfsd_dissect(nd, (len + 2) * NFSX_UNSIGNED, &error);
 		if (tl == NULL)
 			goto nfsmout;
 		for (i = 0; i < len; i++) {
@@ -1544,11 +1540,11 @@ nfs_getreq(struct nfsrv_descript *nd, struct nfsd *nfsd, int has_header)
 		nd->nd_cr.cr_ngroups = (len > NGROUPS_MAX) ? NGROUPS_MAX : len;
 		len = fxdr_unsigned(int, *++tl);
 		if (len < 0 || len > RPCAUTH_MAXSIZ) {
-			m_freem(info.nmi_mrep);
+			m_freem(nd->nd_mrep);
 			return (EBADRPC);
 		}
 		if (len > 0) {
-			if (nfsm_adv(&info, nfsm_rndup(len)) != 0)
+			if (nfsd_adv(nd, nfsm_rndup(len), &error) != 0)
 				goto nfsmout;
 		}
 	} else {
@@ -1557,8 +1553,6 @@ nfs_getreq(struct nfsrv_descript *nd, struct nfsd *nfsd, int has_header)
 		return (0);
 	}
 
-	nd->nd_md = info.nmi_md;
-	nd->nd_dpos = info.nmi_dpos;
 	return (0);
 nfsmout:
 	return (error);

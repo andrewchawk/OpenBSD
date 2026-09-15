@@ -1,7 +1,6 @@
-#	$OpenBSD: mime.types,v 1.5 2024/06/03 20:08:12 matthieu Exp $
+#	$OpenBSD: mime.types,v 1.7 2026/03/23 07:51:08 bentley Exp $
 
 application/atom+xml					atom
-application/font-woff					woff
 application/java-archive				jar war ear
 application/javascript					js
 application/json					json
@@ -26,7 +25,7 @@ application/vnd.oasis.opendocument.chart		odc
 application/vnd.oasis.opendocument.chart-template	otc
 application/vnd.oasis.opendocument.database		odb
 application/vnd.oasis.opendocument.formula		odf
-application/vnd.oasis.opendocument.formula-template	otf
+application/vnd.oasis.opendocument.formula-template	odft
 application/vnd.oasis.opendocument.graphics		odg
 application/vnd.oasis.opendocument.graphics-template	otg
 application/vnd.oasis.opendocument.image		odi
@@ -66,6 +65,13 @@ audio/ogg						ogg
 audio/x-m4a						m4a
 audio/x-realaudio					ra
 
+font/collection						ttc
+font/otf						otf
+font/ttf						ttf
+font/woff						woff
+font/woff2						woff2
+
+image/avif						avif
 image/gif						gif
 image/jpeg						jpeg jpg
 image/png						png

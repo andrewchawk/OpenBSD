@@ -91,7 +91,8 @@ Functions for real @ARRAYs:
      each, keys, pop, push, shift, splice, unshift, values
 
 Functions for list data:
-     grep, join, map, qw/STRING/, reverse, sort, unpack
+     all, any, grep, join, map, qw/STRING/, reverse, sort,
+     unpack
 
 Functions for real %HASHes:
      delete, each, exists, keys, values
@@ -133,8 +134,8 @@ Keywords related to Perl modules:
      do, import, no, package, require, use
 
 Keywords related to classes and object-orientation:
-     bless, class, dbmclose, dbmopen, field, method, package,
-     ref, tie, tied, untie, use
+     __CLASS__, bless, class, dbmclose, dbmopen, field, method,
+     package, ref, tie, tied, untie, use
 
 Low-level socket functions:
      accept, bind, connect, getpeername, getsockname,

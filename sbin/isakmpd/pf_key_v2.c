@@ -1,4 +1,4 @@
-/* $OpenBSD: pf_key_v2.c,v 1.205 2023/08/07 04:01:30 dlg Exp $  */
+/* $OpenBSD: pf_key_v2.c,v 1.207 2026/06/24 09:57:32 hshoexer Exp $  */
 /* $EOM: pf_key_v2.c,v 1.79 2000/12/12 00:33:19 niklas Exp $	 */
 
 /*
@@ -169,6 +169,10 @@ pf_key_v2_msg_free(struct pf_key_v2_msg *msg)
 {
 	struct pf_key_v2_node *np;
 
+	/* Zero all segments. */
+	TAILQ_FOREACH(np, msg, link)
+		explicit_bzero(np->seg, np->sz);
+
 	np = TAILQ_FIRST(msg);
 	while (np) {
 		TAILQ_REMOVE(msg, np, link);
@@ -288,8 +292,11 @@ pf_key_v2_read(u_int32_t seq)
 		    (u_int8_t *) ext - (u_int8_t *) msg <
 		    msg->sadb_msg_len * PF_KEY_V2_CHUNK;
 		    ext = (struct sadb_ext *) ((u_int8_t *) ext +
-		    ext->sadb_ext_len * PF_KEY_V2_CHUNK))
+		    ext->sadb_ext_len * PF_KEY_V2_CHUNK)) {
+			if (ext->sadb_ext_len == 0)
+				break;
 			pf_key_v2_msg_add(ret, ext, 0);
+		}
 
 		/*
 		 * If the message is not the one we are waiting for, queue it

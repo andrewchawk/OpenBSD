@@ -1,4 +1,4 @@
-/* $OpenBSD: cms_pwri.c,v 1.31 2024/01/14 18:40:24 tb Exp $ */
+/* $OpenBSD: cms_pwri.c,v 1.37 2026/06/09 12:20:34 tb Exp $ */
 /*
  * Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project.
@@ -58,13 +58,13 @@
 #include <string.h>
 
 #include <openssl/asn1.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/cms.h>
 #include <openssl/objects.h>
 #include <openssl/x509.h>
 
 #include "cms_local.h"
+#include "err_local.h"
 #include "evp_local.h"
 #include "x509_local.h"
 
@@ -232,6 +232,10 @@ kek_unwrap_key(unsigned char *out, size_t *outlen, const unsigned char *in,
 	unsigned char *tmp;
 	int outl, rv = 0;
 
+	/* Ensure inlen is large enough that tmp[6] is in bounds. */
+	if (blocklen < 4)
+		return 0;
+
 	if (inlen < 2 * blocklen) {
 		/* too small */
 		return 0;
@@ -267,7 +271,7 @@ kek_unwrap_key(unsigned char *out, size_t *outlen, const unsigned char *in,
 		/* Check byte failure */
 		goto err;
 	}
-	if (inlen < (size_t)(tmp[0] - 4)) {
+	if (inlen < 4 + (size_t)tmp[0]) {
 		/* Invalid length value */
 		goto err;
 	}
@@ -368,13 +372,13 @@ cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
 	kekcipher = EVP_get_cipherbyobj(kekalg->algorithm);
 	if (!kekcipher) {
 		CMSerror(CMS_R_UNKNOWN_CIPHER);
-		return 0;
+		goto err;
 	}
 
 	kekctx = EVP_CIPHER_CTX_new();
 	if (kekctx == NULL) {
 		CMSerror(ERR_R_MALLOC_FAILURE);
-		return 0;
+		goto err;
 	}
 	/* Fixup cipher based on AlgorithmIdentifier to set IV etc */
 	if (!EVP_CipherInit_ex(kekctx, kekcipher, NULL, NULL, NULL, en_de))
@@ -386,11 +390,15 @@ cms_RecipientInfo_pwri_crypt(CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
 	}
 
 	algtmp = pwri->keyDerivationAlgorithm;
+	if (algtmp == NULL) {
+		CMSerror(CMS_R_INVALID_KEY_ENCRYPTION_PARAMETER);
+		goto err;
+	}
 
 	/* Finish password based key derivation to setup key in "ctx" */
 
-	if (EVP_PBE_CipherInit(algtmp->algorithm, (char *)pwri->pass,
-	    pwri->passlen, algtmp->parameter, kekctx, en_de) < 0) {
+	if (!EVP_PBE_CipherInit(algtmp->algorithm, (char *)pwri->pass,
+	    pwri->passlen, algtmp->parameter, kekctx, en_de)) {
 		CMSerror(ERR_R_EVP_LIB);
 		goto err;
 	}

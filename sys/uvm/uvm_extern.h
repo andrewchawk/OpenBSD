@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_extern.h,v 1.175 2024/07/24 12:17:31 mpi Exp $	*/
+/*	$OpenBSD: uvm_extern.h,v 1.190 2026/07/24 15:03:50 kettenis Exp $	*/
 /*	$NetBSD: uvm_extern.h,v 1.57 2001/03/09 01:02:12 chs Exp $	*/
 
 /*
@@ -127,15 +127,6 @@ typedef int		vm_prot_t;
 				/* offset not known(obj) or don't care(!obj) */
 
 /*
- * the following defines are for uvm_km_kmemalloc's flags
- */
-#define UVM_KMF_NOWAIT	0x1			/* matches M_NOWAIT */
-#define UVM_KMF_VALLOC	0x2			/* allocate VA only */
-#define UVM_KMF_CANFAIL	0x4			/* caller handles failure */
-#define UVM_KMF_ZERO	0x08			/* zero pages */
-#define UVM_KMF_TRYLOCK	UVM_FLAG_TRYLOCK	/* try locking only */
-
-/*
  * flags for uvm_pagealloc()
  */
 #define UVM_PGA_USERESERVE	0x0001	/* ok to use reserve pages */
@@ -148,7 +139,6 @@ typedef int		vm_prot_t;
 #define UVM_PLA_NOWAIT		0x0002	/* can't sleep (need one of the two) */
 #define UVM_PLA_ZERO		0x0004	/* zero all pages before returning */
 #define UVM_PLA_TRYCONTIG	0x0008	/* try to allocate contig physmem */
-#define UVM_PLA_FAILOK		0x0010	/* caller can handle failure */
 #define UVM_PLA_NOWAKE		0x0020	/* don't wake page daemon on failure */
 #define UVM_PLA_USERESERVE	0x0040	/* can allocate from kernel reserve */
 
@@ -169,7 +159,6 @@ typedef int		vm_prot_t;
 
 #ifdef _KERNEL
 struct buf;
-struct mount;
 struct pglist;
 struct vmspace;
 struct pmap;
@@ -256,10 +245,6 @@ extern struct vm_map *phys_map;
 /* base of kernel virtual memory */
 extern vaddr_t vm_min_kernel_address;
 
-/* zalloc zeros memory, alloc does not */
-#define uvm_km_zalloc(MAP,SIZE) uvm_km_alloc1(MAP,SIZE,0,TRUE)
-#define uvm_km_alloc(MAP,SIZE)  uvm_km_alloc1(MAP,SIZE,0,FALSE)
-
 #define vm_resident_count(vm) (pmap_resident_count((vm)->vm_map.pmap))
 
 struct plimit;
@@ -273,6 +258,7 @@ int			uvm_fault(vm_map_t, vaddr_t, vm_fault_t, vm_prot_t);
 
 vaddr_t			uvm_uarea_alloc(void);
 void			uvm_uarea_free(struct proc *);
+void			uvm_purge(void);
 void			uvm_exit(struct process *);
 void			uvm_init_limits(struct plimit *);
 boolean_t		uvm_kernacc(caddr_t, size_t, int);
@@ -284,20 +270,12 @@ int			uvm_vslock_device(struct proc *, void *, size_t,
 			    vm_prot_t, void **);
 void			uvm_vsunlock_device(struct proc *, void *, size_t,
 			    void *);
-void			uvm_pause(void);
 void			uvm_init(void);	
 void			uvm_init_percpu(void);
 int			uvm_io(vm_map_t, struct uio *, int);
 
 #define	UVM_IO_FIXPROT	0x01
 
-vaddr_t			uvm_km_alloc1(vm_map_t, vsize_t, vsize_t, boolean_t);
-void			uvm_km_free(vm_map_t, vaddr_t, vsize_t);
-vaddr_t			uvm_km_kmemalloc_pla(struct vm_map *,
-			    struct uvm_object *, vsize_t, vsize_t, int,
-			    paddr_t, paddr_t, paddr_t, paddr_t, int);
-#define uvm_km_kmemalloc(map, obj, sz, flags)				\
-	uvm_km_kmemalloc_pla(map, obj, sz, 0, flags, 0, (paddr_t)-1, 0, 0, 0)
 struct vm_map		*uvm_km_suballoc(vm_map_t, vaddr_t *, vaddr_t *,
 			    vsize_t, int, boolean_t, vm_map_t);
 /*
@@ -379,6 +357,7 @@ extern const struct kmem_pa_mode kp_zero;
 extern const struct kmem_pa_mode kp_dma;
 extern const struct kmem_pa_mode kp_dma_contig;
 extern const struct kmem_pa_mode kp_dma_zero;
+extern const struct kmem_pa_mode kp_mbuf_contig;
 extern const struct kmem_pa_mode kp_pageable;
 extern const struct kmem_pa_mode kp_none;
 
@@ -408,10 +387,9 @@ void			uvmspace_init(struct vmspace *, struct pmap *,
 void			uvmspace_exec(struct proc *, vaddr_t, vaddr_t);
 struct vmspace		*uvmspace_fork(struct process *);
 void			uvmspace_addref(struct vmspace *);
+void			uvmspace_purge(struct vmspace *);
 void			uvmspace_free(struct vmspace *);
 struct vmspace		*uvmspace_share(struct process *);
-int			uvm_share(vm_map_t, vaddr_t, vm_prot_t,
-			    vm_map_t, vaddr_t, vsize_t);
 int			uvm_sysctl(int *, u_int, void *, size_t *, 
 			    void *, size_t, struct proc *);
 struct vm_page		*uvm_pagealloc(struct uvm_object *,
@@ -420,8 +398,6 @@ int			uvm_pagealloc_multi(struct uvm_object *, voff_t,
     			    vsize_t, int);
 void			uvm_pagerealloc(struct vm_page *, 
 			    struct uvm_object *, voff_t);
-int			uvm_pagerealloc_multi(struct uvm_object *, voff_t,
-			    vsize_t, int, struct uvm_constraint_range *);
 /* Actually, uvm_page_physload takes PF#s which need their own type */
 void			uvm_page_physload(paddr_t, paddr_t, paddr_t,
 			    paddr_t, int);
@@ -449,9 +425,6 @@ void			uvm_pagezero_thread(void *);
 void			kmeminit_nkmempages(void);
 void			kmeminit(void);
 extern u_int		nkmempages;
-
-struct vnode;
-struct uvm_object	*uvn_attach(struct vnode *, vm_prot_t);
 
 struct process;
 struct kinfo_vmentry;

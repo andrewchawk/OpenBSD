@@ -26,10 +26,11 @@
 using namespace lldb;
 using namespace lldb_private;
 
+char ClangPersistentVariables::ID;
+
 ClangPersistentVariables::ClangPersistentVariables(
     std::shared_ptr<Target> target_sp)
-    : lldb_private::PersistentExpressionState(LLVMCastKind::eKindClang),
-      m_target_sp(target_sp) {}
+    : m_target_sp(target_sp) {}
 
 ExpressionVariableSP ClangPersistentVariables::CreatePersistentVariable(
     const lldb::ValueObjectSP &valobj_sp) {
@@ -78,9 +79,11 @@ ClangPersistentVariables::GetCompilerTypeFromPersistentDecl(
   if (p.m_decl == nullptr)
     return std::nullopt;
 
+  auto ctx = std::static_pointer_cast<TypeSystemClang>(p.m_context.lock());
   if (clang::TypeDecl *tdecl = llvm::dyn_cast<clang::TypeDecl>(p.m_decl)) {
-    opaque_compiler_type_t t = static_cast<opaque_compiler_type_t>(
-        const_cast<clang::Type *>(tdecl->getTypeForDecl()));
+    opaque_compiler_type_t t =
+        static_cast<opaque_compiler_type_t>(const_cast<clang::Type *>(
+            ctx->getASTContext().getTypeDeclType(tdecl).getTypePtr()));
     return CompilerType(p.m_context, t);
   }
   return std::nullopt;

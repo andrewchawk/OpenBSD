@@ -1,4 +1,4 @@
-/*	$OpenBSD: efi_installboot.c,v 1.10 2023/04/26 18:04:21 kn Exp $	*/
+/*	$OpenBSD: efi_installboot.c,v 1.15 2025/09/17 16:12:10 deraadt Exp $	*/
 /*	$NetBSD: installboot.c,v 1.5 1995/11/17 23:23:50 gwr Exp $ */
 
 /*
@@ -69,9 +69,11 @@
 #endif
 
 static int	create_filesystem(struct disklabel *, char);
-static void	write_filesystem(struct disklabel *, char);
+static void	write_filesystem(struct disklabel *, char, int,
+		    struct gpt_partition *);
 static int	write_firmware(const char *, const char *);
-static int	findgptefisys(int, struct disklabel *);
+static int	findgptefisys(int, struct disklabel *, int *,
+		    struct gpt_partition *);
 static int	findmbrfat(int, struct disklabel *);
 
 void
@@ -102,7 +104,7 @@ md_prepareboot(int devfd, char *dev)
 	if (dl.d_type == 0)
 		warnx("disklabel type unknown");
 
-	part = findgptefisys(devfd, &dl);
+	part = findgptefisys(devfd, &dl, NULL, NULL);
 	if (part != -1) {
 		create_filesystem(&dl, (char)part);
 		return;
@@ -119,7 +121,8 @@ void
 md_installboot(int devfd, char *dev)
 {
 	struct disklabel dl;
-	int part;
+	struct gpt_partition gp;
+	int gpart, part;
 
 	/* Get and check disklabel. */
 	if (ioctl(devfd, DIOCGDINFO, &dl) == -1)
@@ -131,15 +134,15 @@ md_installboot(int devfd, char *dev)
 	if (dl.d_type == 0)
 		warnx("disklabel type unknown");
 
-	part = findgptefisys(devfd, &dl);
+	part = findgptefisys(devfd, &dl, &gpart, &gp);
 	if (part != -1) {
-		write_filesystem(&dl, (char)part);
+		write_filesystem(&dl, (char)part, gpart, &gp);
 		return;
 	}
 
 	part = findmbrfat(devfd, &dl);
 	if (part != -1) {
-		write_filesystem(&dl, (char)part);
+		write_filesystem(&dl, (char)part, 0, NULL);
 		return;
 	}
 }
@@ -189,10 +192,12 @@ create_filesystem(struct disklabel *dl, char part)
 }
 
 static void
-write_filesystem(struct disklabel *dl, char part)
+write_filesystem(struct disklabel *dl, char part, int gpart,
+    struct gpt_partition *gp)
 {
 	static const char *fsckfmt = "/sbin/fsck -t msdos %s >/dev/null";
 	struct msdosfs_args args;
+	struct statfs sf;
 	char cmd[60];
 	char dst[PATH_MAX];
 	char *src;
@@ -309,6 +314,52 @@ write_filesystem(struct disklabel *dl, char part)
 			goto umount;
 	}
 
+	/* Skip installing a 2nd copy if we have a small filesystem. */
+	if (statfs(dst, &sf) || sf.f_blocks < 2048) {
+		rslt = 0;
+		goto firmware;
+	}
+
+	/* Create "/efi/openbsd" directory in <duid>.<part>. */
+	dst[mntlen] = '\0';
+	if (strlcat(dst, "/efi/openbsd", sizeof(dst)) >= sizeof(dst)) {
+		rslt = -1;
+		warn("unable to build /efi/openbsd directory");
+		goto umount;
+	}
+	rslt = mkdir(dst, 0755);
+	if (rslt == -1 && errno != EEXIST) {
+		warn("mkdir('%s') failed", dst);
+		goto umount;
+	}
+
+	/* Copy EFI bootblocks to /efi/openbsd/. */
+	if (strlcat(dst, "/" BOOTEFI_DST, sizeof(dst)) >= sizeof(dst)) {
+		rslt = -1;
+		warn("unable to build /%s path", BOOTEFI_DST);
+		goto umount;
+	}
+	src = fileprefix(root, "/usr/mdec/" BOOTEFI_SRC);
+	if (src == NULL) {
+		rslt = -1;
+		goto umount;
+	}
+	srclen = strlen(src);
+	if (verbose)
+		fprintf(stderr, "%s %s to %s\n",
+		    (nowrite ? "would copy" : "copying"), src, dst);
+	if (!nowrite) {
+		rslt = filecopy(src, dst);
+		if (rslt == -1)
+			goto umount;
+	}
+
+#ifdef EFIBOOTMGR
+	if (config && gp)
+		efi_bootmgr_setup(gpart, gp, "\\EFI\\OPENBSD\\" BOOTEFI_DST);
+#endif
+
+firmware:
 	dst[mntlen] = '\0';
 	rslt = write_firmware(root, dst);
 	if (rslt == -1)
@@ -421,7 +472,8 @@ gpt_chk_mbr(struct dos_partition *dp, u_int64_t dsize)
 }
 
 int
-findgptefisys(int devfd, struct disklabel *dl)
+findgptefisys(int devfd, struct disklabel *dl, int *gpartp,
+    struct gpt_partition *gpp)
 {
 	struct gpt_partition	 gp[NGPTPARTITIONS];
 	struct gpt_header	 gh;
@@ -431,7 +483,7 @@ findgptefisys(int devfd, struct disklabel *dl)
 	off_t			 off;
 	ssize_t			 len;
 	u_int64_t		 start;
-	int			 i;
+	int			 part, i;
 	uint32_t		 orig_csum, new_csum;
 	uint32_t		 ghsize, ghpartsize, ghpartnum, ghpartspersec;
 	u_int8_t		*secbuf;
@@ -504,15 +556,21 @@ findgptefisys(int devfd, struct disklabel *dl)
 	start = 0;
 	for (i = 0; i < ghpartnum && start == 0; i++) {
 		if (memcmp(&gp[i].gp_type, &efisys_uuid,
-		    sizeof(struct uuid)) == 0)
+		    sizeof(struct uuid)) == 0) {
 			start = letoh64(gp[i].gp_lba_start);
+			part = i;
+		}
 	}
 
 	if (start) {
+		if (gpartp)
+			*gpartp = part;
+		if (gpp)
+			memcpy(gpp, &gp[part], sizeof(*gpp));
 		for (i = 0; i < MAXPARTITIONS; i++) {
 			if (DL_GETPSIZE(&dl->d_partitions[i]) > 0 &&
 			    DL_GETPOFFSET(&dl->d_partitions[i]) == start)
-				return ('a' + i);
+				return (DL_PARTNUM2NAME(i));
 		}
 	}
 
@@ -552,7 +610,7 @@ findmbrfat(int devfd, struct disklabel *dl)
 		for (i = 0; i < MAXPARTITIONS; i++) {
 			if (DL_GETPSIZE(&dl->d_partitions[i]) > 0 &&
 			    DL_GETPOFFSET(&dl->d_partitions[i]) == start)
-				return ('a' + i);
+				return (DL_PARTNUM2NAME(i));
 		}
 	}
 

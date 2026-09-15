@@ -1,4 +1,4 @@
-/* $OpenBSD: disksubr.c,v 1.62 2022/10/14 13:22:57 krw Exp $ */
+/* $OpenBSD: disksubr.c,v 1.67 2025/11/18 15:24:09 krw Exp $ */
 /* $NetBSD: disksubr.c,v 1.12 2002/02/19 17:09:44 wiz Exp $ */
 
 /*
@@ -76,8 +76,8 @@
  * Mach writedisklabel logic seems to fail when no BSD label is found.
  *
  * Kernel handles disklabel in this way;
- *	- searchs BSD label at offset 64
- *	- if not found, searchs UniOS/ISI label at the end of block
+ *	- searches BSD label at offset 64
+ *	- if not found, searches UniOS/ISI label at the end of block
  *	- kernel can distinguish whether it was SunOS label or UniOS/ISI
  *	  label and understand both
  *	- kernel writes UniOS/ISI label combined with BSD label to update
@@ -116,7 +116,7 @@ readdisklabel(dev_t dev, void (*strat)(struct buf *),
 	bp->b_dev = dev;
 
 	if (spoofonly)
-		goto done;
+		goto doslabel;
 
 	error = readdisksector(bp, strat, lp, DL_BLKTOSEC(lp, LABELSECTOR));
 	if (error)
@@ -130,6 +130,11 @@ readdisklabel(dev_t dev, void (*strat)(struct buf *),
 
 	error = checkdisklabel(bp->b_dev, bp->b_data + LABELOFFSET, lp, 0,
 	    DL_GETDSIZE(lp));
+	if (error == 0)
+		goto done;
+
+ doslabel:
+	error = readdoslabel(bp, strat, lp, NULL, spoofonly);
 	if (error == 0)
 		goto done;
 
@@ -275,7 +280,7 @@ disklabel_om_to_bsd(dev_t dev, struct sun_disklabel *sl, struct disklabel *lp)
 
 	lp->d_acylinders = sl->sl_acylinders;
 
-	lp->d_npartitions = MAXPARTITIONS;
+	lp->d_npartitions = MAXPARTITIONS16;
 
 	for (i = 0; i < 8; i++) {
 		spp = &sl->sl_part[i];
@@ -348,7 +353,7 @@ disklabel_om_to_bsd(dev_t dev, struct sun_disklabel *sl, struct disklabel *lp)
 			}
 		}
 		if (sl->sl_xpmag == SL_XPMAGTYP) {
-			for (i = 0; i < MAXPARTITIONS; i++) {
+			for (i = 0; i < MAXPARTITIONS16; i++) {
 				npp = &lp->d_partitions[i];
 				npp->p_fstype = sl->sl_types[i];
 				npp->p_fragblock = sl->sl_fragblock[i];
@@ -372,7 +377,7 @@ disklabel_bsd_to_om(struct disklabel *lp, struct sun_disklabel *sl)
 {
 	struct partition *npp;
 	struct sun_dkpart *spp;
-	int i, secpercyl;
+	int i;
 	u_short cksum, *sp1, *sp2;
 
 	if (lp->d_secsize != DEV_BSIZE || lp->d_nsectors == 0 ||
@@ -406,7 +411,6 @@ disklabel_bsd_to_om(struct disklabel *lp, struct sun_disklabel *sl)
 	}
 	sl->sl_magic = SUN_DKMAGIC;
 
-	secpercyl = sl->sl_nsectors * sl->sl_ntracks;
 	for (i = 0; i < SUNXPART; i++) {
 		spp = &sl->sl_xpart[i];
 		npp = &lp->d_partitions[i+8];
@@ -417,7 +421,7 @@ disklabel_bsd_to_om(struct disklabel *lp, struct sun_disklabel *sl)
 			spp->sdkp_nsectors = DL_GETPSIZE(npp);
 		}
 	}
-	for (i = 0; i < MAXPARTITIONS; i++) {
+	for (i = 0; i < MAXPARTITIONS16; i++) {
 		npp = &lp->d_partitions[i];
 		sl->sl_types[i] = npp->p_fstype;
 		sl->sl_fragblock[i] = npp->p_fragblock;

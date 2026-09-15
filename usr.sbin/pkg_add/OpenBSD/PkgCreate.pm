@@ -1,6 +1,6 @@
 #! /usr/bin/perl
 # ex:ts=8 sw=4:
-# $OpenBSD: PkgCreate.pm,v 1.197 2023/10/11 13:54:43 espie Exp $
+# $OpenBSD: PkgCreate.pm,v 1.201 2025/11/29 04:00:23 gkoehler Exp $
 #
 # Copyright (c) 2003-2014 Marc Espie <espie@openbsd.org>
 #
@@ -771,11 +771,13 @@ sub check_version($self, $state, $unsubst)
 {
 	my @l  = $self->parse($self->name);
 	if (defined $l[0]) {
-		if (!$unsubst =~ m/\$\{LIB$l[0]_VERSION\}/) {
-			$state->error(
-			    "Incorrectly versioned shared library: #1", 
-			    $unsubst);
+		my $k = "LIB$l[0]_VERSION";
+		my $r = $state->{subst}->do($unsubst, $k);
+		if ($r =~ m/\blib\Q$l[0]\E\.so\.\$\{\Q$k\E\}$/) {
+			return;
 		}
+		$state->error("Incorrectly versioned shared library: #1",
+		    $unsubst);
 	} else {
 		$state->error("Invalid shared library #1", $unsubst);
 	}
@@ -1135,8 +1137,7 @@ our @ISA = qw(OpenBSD::AddCreateDelete);
 
 sub handle_fragment($self, $state, $old, $not, $frag, $location)
 {
-	my $def = $frag;
-	if ($state->{subst}->has_fragment($state, $def, $frag, $location)) {
+	if ($state->{subst}->has_fragment($state, $frag, $location)) {
 		return undef if defined $not;
 	} else {
 		return undef unless defined $not;
@@ -1206,7 +1207,7 @@ sub read_fragments($self, $state, $plist, $filename)
 	# XXX some things, like @comment no checksum, don't produce an object
 				my $o = &$cont($s);
 				if (defined $o) {
-					$o->check_version($state, $s);
+					$o->check_version($state, $l);
 					$self->annotate($o, $l, $file);
 				}
 			}

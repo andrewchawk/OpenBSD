@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtld_machine.c,v 1.72 2022/01/08 18:30:18 deraadt Exp $ */
+/*	$OpenBSD: rtld_machine.c,v 1.74 2026/08/24 19:43:01 gkoehler Exp $ */
 
 /*
  * Copyright (c) 1999 Dale Rahn
@@ -73,9 +73,6 @@ _dl_md_reloc(elf_object_t *object, int rel, int relasz)
 
 	if (relrel > numrela)
 		_dl_die("relcount > numrel: %ld > %d", relrel, numrela);
-
-	if (object->Dyn.info[DT_PROC(DT_PPC_GOT)] == 0)
-		_dl_die("unsupported insecure BSS PLT object");
 
 	/* tight loop for leading RELATIVE relocs */
 	for (i = 0; i < relrel; i++, relas++) {
@@ -274,6 +271,9 @@ _dl_md_reloc_got(elf_object_t *object, int lazy)
 	if (object->Dyn.info[DT_PLTREL] != DT_RELA)
 		return 0;
 
+	if (object->Dyn.info[DT_PROC(DT_PPC_GOT)] == 0)
+		_dl_die("unsupported insecure BSS PLT object");
+
 	if (!lazy) {
 		fails = _dl_md_reloc(object, DT_JMPREL, DT_PLTRELSZ);
 	} else {
@@ -322,7 +322,7 @@ _dl_bind(elf_object_t *object, int reloff)
 	sr = _dl_find_symbol(symn, SYM_SEARCH_ALL|SYM_WARNNOTFOUND|SYM_PLT,
 	    sym, object);
 	if (sr.sym == NULL)
-		_dl_die("lazy binding failed!");
+		_dl_die("lazy binding failed for %s", symn);
 
 	buf.newval = sr.obj->obj_base + sr.sym->st_value;
 

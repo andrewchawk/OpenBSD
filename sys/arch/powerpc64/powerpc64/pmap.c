@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.c,v 1.62 2024/06/04 17:31:59 gkoehler Exp $ */
+/*	$OpenBSD: pmap.c,v 1.67 2026/07/18 10:14:40 kirill Exp $ */
 
 /*
  * Copyright (c) 2015 Martin Pieuchot
@@ -124,7 +124,7 @@ uint64_t pmap_ptab_mask;
 struct pate *pmap_pat;
 
 #define PATMEMSZ	(64 * 1024)
-#define PATSIZE		(ffs(PATMEMSZ) - 12)
+#define PATSIZE		(ffs(PATMEMSZ) - 1 - 12)
 
 struct pte_desc {
 	/* Linked list of phys -> virt entries */
@@ -709,6 +709,25 @@ pte_zap(struct pte *pte, struct pte_desc *pted)
 	pte_del(pte, pmap_pted2ava(pted));
 }
 
+uint64_t
+pmap_acwimgn(vm_prot_t prot, int cache)
+{
+	uint64_t acwimgn = 0;
+
+	if (!(prot & PROT_EXEC))
+		acwimgn |= PTE_N;
+
+	if (cache == PMAP_CACHE_WB)
+		acwimgn |= PTE_M;
+	else
+		acwimgn |= (PTE_M | PTE_I | PTE_G);
+
+	if ((prot & (PROT_READ | PROT_WRITE)) == 0)
+		acwimgn |= PTE_AC;
+
+	return acwimgn;
+}
+
 void
 pmap_fill_pte(pmap_t pm, vaddr_t va, paddr_t pa, struct pte_desc *pted,
     vm_prot_t prot, int cache)
@@ -732,16 +751,7 @@ pmap_fill_pte(pmap_t pm, vaddr_t va, paddr_t pa, struct pte_desc *pted,
 		pte->pte_lo |= PTE_RO;
 	if (prot & PROT_EXEC)
 		pted->pted_va |= PTED_VA_EXEC_M;
-	else
-		pte->pte_lo |= PTE_N;
-
-	if (cache == PMAP_CACHE_WB)
-		pte->pte_lo |= PTE_M;
-	else
-		pte->pte_lo |= (PTE_M | PTE_I | PTE_G);
-
-	if ((prot & (PROT_READ | PROT_WRITE)) == 0)
-		pte->pte_lo |= PTE_AC;
+	pte->pte_lo |= pmap_acwimgn(prot, cache);
 }
 
 void
@@ -816,8 +826,8 @@ pte_insert(struct pte_desc *pted)
 		pted->pted_va &= ~(PTED_VA_HID_M|PTED_VA_PTEGIDX_M);
 		pted->pted_va |= off & (PTED_VA_PTEGIDX_M|PTED_VA_HID_M);
 
-		idx ^= (PTED_HID(pted) ? pmap_ptab_mask : 0);
-		pte = pmap_ptable + (idx * 8);
+		pte = pmap_ptable;
+		pte += (idx ^ (PTED_HID(pted) ? pmap_ptab_mask : 0)) * 8;
 		pte += PTED_PTEGIDX(pted); /* increment by index into pteg */
 
 		if ((pte->pte_hi & PTE_WIRED) == 0)
@@ -838,6 +848,7 @@ pte_insert(struct pte_desc *pted)
 		vsid = avpn >> PTE_VSID_SHIFT;
 		vpn = avpn << (ADDR_VSID_SHIFT - PTE_VSID_SHIFT - PAGE_SHIFT);
 
+		idx ^= (PTED_HID(pted) ? pmap_ptab_mask : 0);
 		idx ^= ((pte->pte_hi & PTE_HID) ? pmap_ptab_mask : 0);
 		vpn |= ((idx ^ vsid) & (ADDR_PIDX >> ADDR_PIDX_SHIFT));
 
@@ -1064,6 +1075,19 @@ pmap_enter(pmap_t pm, vaddr_t va, paddr_t pa, vm_prot_t prot, int flags)
 	PMAP_VP_LOCK(pm);
 	pted = pmap_vp_lookup(pm, va);
 	if (pted && PTED_VALID(pted)) {
+		/* Check if entering a mapping that already exists. */
+		if ((pted->pted_pte.pte_lo & PTE_RPGN) == (pa & PTE_RPGN)) {
+			uint64_t old_pp = pted->pted_pte.pte_lo & PTE_PP;
+			uint64_t old_acwimgn = pted->pted_pte.pte_lo &
+			    (PTE_AC | PTE_W | PTE_I | PTE_M | PTE_G | PTE_N);
+
+			if (old_acwimgn == pmap_acwimgn(prot, cache) &&
+			    ((old_pp == PTE_RO && !(flags & PROT_WRITE)) ||
+			     (old_pp == PTE_RW && (prot & PROT_WRITE)))) {
+				PMAP_VP_UNLOCK(pm);
+				return 0;
+			}
+		}
 		pmap_remove_pted(pm, pted);
 		pted = NULL;
 	}
@@ -1600,7 +1624,7 @@ pmap_bootstrap_cpu(void)
 	/* Clear TLB. */
 	tlbia();
 
-	if (cpu_features2 & PPC_FEATURE2_ARCH_3_00) {
+	if (hwcap2 & PPC_FEATURE2_ARCH_3_00) {
 		/* Set partition table. */
 		mtptcr((paddr_t)pmap_pat | PATSIZE);
 	} else {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: pte.h,v 1.3 2024/01/23 19:51:10 kettenis Exp $	*/
+/*	$OpenBSD: pte.h,v 1.5 2026/04/05 11:48:17 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2019 Brian Bamsch <bbamsch@google.com>
@@ -19,8 +19,6 @@
 #ifndef _RISCV64_PTE_H_
 #define _RISCV64_PTE_H_
 
-#include "machine/vmparam.h"
-
 #define Lx_TABLE_ALIGN	(4096)
 
 /* Block and Page attributes */
@@ -39,6 +37,14 @@
 #define	PTE_RWX		(PTE_R | PTE_W | PTE_X)
 #define	PTE_RX		(PTE_R | PTE_X)
 #define	PTE_KERN	(PTE_V | PTE_R | PTE_W | PTE_A | PTE_D)
+
+/* Svpmbt extension */
+#define	PTE_PMA		(0ULL << 61)
+#define	PTE_NC		(1ULL << 61)
+#define	PTE_IO		(2ULL << 61)
+
+/* Svnapot extension */
+#define	PTE_N		(1ULL << 63)
 
 /* T-Head extended page attributes */
 #define	PTE_THEAD_SO	(1ULL << 63)

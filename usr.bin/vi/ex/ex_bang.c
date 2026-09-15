@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_bang.c,v 1.12 2022/04/22 15:48:29 millert Exp $	*/
+/*	$OpenBSD: ex_bang.c,v 1.14 2026/04/20 08:44:48 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -52,7 +52,6 @@ ex_bang(SCR *sp, EXCMD *cmdp)
 	EX_PRIVATE *exp;
 	MARK rm;
 	recno_t lno;
-	int rval;
 	const char *msg;
 
 	ap = cmdp->argv[0];
@@ -145,7 +144,7 @@ ex_bang(SCR *sp, EXCMD *cmdp)
 				ftype = FILTER_RBANG;
 			}
 		}
-		rval = ex_filter(sp, cmdp,
+		ex_filter(sp, cmdp,
 		    &cmdp->addr1, &cmdp->addr2, &rm, ap->bp, ftype);
 
 		/*
@@ -171,8 +170,8 @@ ex_bang(SCR *sp, EXCMD *cmdp)
 	if (!F_ISSET(sp, SC_VI) && !F_ISSET(sp, SC_EX_SILENT))
 		(void)ex_puts(sp, "!\n");
 
-	/* Apply expandtab to the new text */
-	if (O_ISSET(sp, O_EXPANDTAB))
+	/* If addresses were specified, apply expandtab to the new text. */
+	if (cmdp->addrcnt != 0 && O_ISSET(sp, O_EXPANDTAB))
 		ex_retab(sp, cmdp);
 
 	/*

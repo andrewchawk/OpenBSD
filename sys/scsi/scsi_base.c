@@ -1,4 +1,4 @@
-/*	$OpenBSD: scsi_base.c,v 1.283 2023/08/02 19:58:52 kettenis Exp $	*/
+/*	$OpenBSD: scsi_base.c,v 1.285 2026/04/22 12:28:08 claudio Exp $	*/
 /*	$NetBSD: scsi_base.c,v 1.43 1997/04/02 02:29:36 mycroft Exp $	*/
 
 /*
@@ -437,7 +437,7 @@ scsi_iopool_run(struct scsi_iopool *iopl)
 }
 
 /*
- * move an io from a runq to a proc thats waiting for an io.
+ * move an io from a runq to a proc that's waiting for an io.
  */
 
 void
@@ -1512,7 +1512,7 @@ scsi_xs_sync(struct scsi_xfer *xs)
 #endif /* DIAGNOSTIC */
 
 	/*
-	 * If we cant sleep while waiting for completion, get the adapter to
+	 * If we can't sleep while waiting for completion, get the adapter to
 	 * complete it for us.
 	 */
 	if (ISSET(xs->flags, SCSI_NOSLEEP))
@@ -1618,7 +1618,8 @@ scsi_delay(struct scsi_xfer *xs, int seconds)
 		return EIO;
 	}
 
-	ret = tsleep_nsec(&ret, PRIBIO|PCATCH, "scbusy", SEC_TO_NSEC(seconds));
+	ret = tsleep_nsec(&nowake, PRIBIO|PCATCH, "scbusy",
+	    SEC_TO_NSEC(seconds));
 
 	/* Signal == abort xs. */
 	if (ret == ERESTART || ret == EINTR)

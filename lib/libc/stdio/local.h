@@ -1,4 +1,4 @@
-/*	$OpenBSD: local.h,v 1.25 2016/05/23 00:21:48 guenther Exp $	*/
+/*	$OpenBSD: local.h,v 1.27 2025/08/08 15:58:53 yasuoka Exp $	*/
 
 /*-
  * Copyright (c) 1990, 1993
@@ -38,8 +38,6 @@
  */
 
 #include <wchar.h> 
-#include "wcio.h"
-#include "fileext.h"
 #include "thread_private.h"
 
 __BEGIN_HIDDEN_DECLS
@@ -75,6 +73,19 @@ __END_HIDDEN_DECLS
 	((((fp)->_flags & __SWR) == 0 || (fp)->_bf._base == NULL) && \
 	 __swsetup(fp))
 
+/* XXX reduce noise during the conversion */
+#define	_UB(fp)	(fp)->_ub
+
+#define	_SET_ORIENTATION(fp, mode)				\
+do {								\
+	if (((fp)->_flags & (__SONW|__SOWD)) == 0)		\
+	       (fp)->_flags |= ((mode) > 0 ? __SOWD : __SONW);	\
+} while (0)
+
+/* initializer for function-local FILEs */
+#define FILEINIT(flags) \
+    { ._flags = (flags), ._file = -1, ._lock = __RCMTX_INITIALIZER() }
+
 /*
  * Test whether the given stdio file has an active ungetc buffer;
  * release such a buffer, without restoring ordinary unread data.
@@ -97,11 +108,11 @@ __END_HIDDEN_DECLS
 
 #define FLOCKFILE(fp)							\
 	do {								\
-		if (_thread_cb.tc_flockfile != NULL)			\
-			_thread_cb.tc_flockfile(fp);			\
+		if (__isthreaded)					\
+			__rcmtx_enter(&(fp)->_lock);			\
 	} while (0)
 #define FUNLOCKFILE(fp)							\
 	do {								\
-		if (_thread_cb.tc_funlockfile != NULL)			\
-			_thread_cb.tc_funlockfile(fp);			\
+		if (__isthreaded)					\
+			__rcmtx_leave(&(fp)->_lock);			\
 	} while (0)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: rrdp_delta.c,v 1.14 2024/05/30 09:54:59 job Exp $ */
+/*	$OpenBSD: rrdp_delta.c,v 1.17 2026/08/04 18:46:18 tb Exp $ */
 /*
  * Copyright (c) 2020 Nils Fisher <nils_fisher@hotmail.com>
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
@@ -57,26 +57,24 @@ start_delta_elem(struct delta_xml *dxml, const char **attr)
 
 	if (dxml->scope != DELTA_SCOPE_NONE)
 		PARSE_FAIL(p,
-		    "parse failed - entered delta elem unexpectedely");
+		    "parse failed - entered delta elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		const char *errstr;
 		if (strcmp("xmlns", attr[i]) == 0 &&
-		    strcmp(RRDP_XMLNS, attr[i + 1]) == 0) {
-			has_xmlns = 1;
+		    strcmp(RRDP_XMLNS, attr[i + 1]) == 0 && has_xmlns++ == 0)
 			continue;
-		}
-		if (strcmp("version", attr[i]) == 0) {
+		if (strcmp("version", attr[i]) == 0 && dxml->version == 0) {
 			dxml->version = strtonum(attr[i + 1],
 			    1, MAX_VERSION, &errstr);
 			if (errstr == NULL)
 				continue;
 		}
 		if (strcmp("session_id", attr[i]) == 0 &&
-		    valid_uuid(attr[i + 1])) {
+		    valid_uuid(attr[i + 1]) && dxml->session_id == NULL) {
 			dxml->session_id = xstrdup(attr[i + 1]);
 			continue;
 		}
-		if (strcmp("serial", attr[i]) == 0) {
+		if (strcmp("serial", attr[i]) == 0 && dxml->serial == 0) {
 			dxml->serial = strtonum(attr[i + 1],
 			    1, LLONG_MAX, &errstr);
 			if (errstr == NULL)
@@ -104,7 +102,7 @@ end_delta_elem(struct delta_xml *dxml)
 		PARSE_FAIL(p, "parse failed - empty delta");
 	if (dxml->scope != DELTA_SCOPE_DELTA)
 		PARSE_FAIL(p, "parse failed - exited delta "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 	dxml->scope = DELTA_SCOPE_END;
 }
 
@@ -120,7 +118,7 @@ start_publish_withdraw_elem(struct delta_xml *dxml, const char **attr,
 	if (dxml->scope != DELTA_SCOPE_EMPTY_DELTA &&
 	    dxml->scope != DELTA_SCOPE_DELTA)
 		PARSE_FAIL(p, "parse failed - entered publish/withdraw "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 	for (i = 0; attr[i]; i += 2) {
 		if (strcmp("uri", attr[i]) == 0 && hasUri++ == 0) {
 			if (valid_uri(attr[i + 1], strlen(attr[i + 1]),
@@ -133,14 +131,19 @@ start_publish_withdraw_elem(struct delta_xml *dxml, const char **attr,
 			if (hex_decode(attr[i + 1], hash, sizeof(hash)) == 0)
 				continue;
 		}
+		free(uri);
 		PARSE_FAIL(p, "parse failed - non conforming "
 		    "attribute '%s' found in publish/withdraw elem", attr[i]);
 	}
-	if (hasUri != 1)
+	if (hasUri != 1) {
+		free(uri);
 		PARSE_FAIL(p,
 		    "parse failed - incomplete publish/withdraw attributes");
-	if (withdraw && hasHash != 1)
+	}
+	if (withdraw && hasHash != 1) {
+		free(uri);
 		PARSE_FAIL(p, "parse failed - incomplete withdraw attributes");
+	}
 
 	if (withdraw)
 		pub = PUB_DEL;
@@ -158,7 +161,7 @@ end_publish_withdraw_elem(struct delta_xml *dxml, int withdraw)
 
 	if (dxml->scope != DELTA_SCOPE_PUBLISH)
 		PARSE_FAIL(p, "parse failed - exited publish/withdraw "
-		    "elem unexpectedely");
+		    "elem unexpectedly");
 
 	if (publish_done(dxml->rrdp, dxml->pxml) != 0)
 		PARSE_FAIL(p, "parse failed - bad publish/withdraw elem");

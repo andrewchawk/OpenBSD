@@ -1,4 +1,4 @@
-/*	$OpenBSD: priv.c,v 1.24 2024/01/18 14:49:59 claudio Exp $	*/
+/*	$OpenBSD: priv.c,v 1.31 2026/07/17 13:09:18 dv Exp $	*/
 
 /*
  * Copyright (c) 2016 Reyk Floeter <reyk@openbsd.org>
@@ -17,12 +17,8 @@
  */
 
 #include <sys/types.h>
-#include <sys/queue.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/ioctl.h>
-#include <sys/tree.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
@@ -34,13 +30,10 @@
 #include <arpa/inet.h>
 
 #include <errno.h>
-#include <event.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <ctype.h>
 
 #include "proc.h"
@@ -70,11 +63,11 @@ priv_run(struct privsep *ps, struct privsep_proc *p, void *arg)
 	 */
 
 	/* Open our own socket for generic interface ioctls */
-	if ((env->vmd_fd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+	if ((env->vmd_sock_fd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
 		fatal("socket");
 
 	/* But we need a different fd for IPv6 */
-	if ((env->vmd_fd6 = socket(AF_INET6, SOCK_DGRAM, 0)) == -1)
+	if ((env->vmd_sock_fd6 = socket(AF_INET6, SOCK_DGRAM, 0)) == -1)
 		fatal("socket6");
 }
 
@@ -90,13 +83,17 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct ifgroupreq	 ifgr;
 	struct ifaliasreq	 ifra;
 	struct in6_aliasreq	 in6_ifra;
-	struct if_afreq		 ifar;
 	struct vmop_addr_req	 vareq;
 	struct vmop_addr_result	 varesult;
 	char			 type[IF_NAMESIZE];
 	int			 ifd;
+	uint32_t		 imsg_type, peer_id;
+	unsigned int		 mode;
 
-	switch (imsg->hdr.type) {
+	imsg_type = imsg_get_type(imsg);
+	peer_id = imsg_get_id(imsg);
+
+	switch (imsg_type) {
 	case IMSG_VMDOP_PRIV_IFDESCR:
 	case IMSG_VMDOP_PRIV_IFRDOMAIN:
 	case IMSG_VMDOP_PRIV_IFEXISTS:
@@ -106,8 +103,7 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_VMDOP_PRIV_IFGROUP:
 	case IMSG_VMDOP_PRIV_IFADDR:
 	case IMSG_VMDOP_PRIV_IFADDR6:
-		IMSG_SIZE_CHECK(imsg, &vfr);
-		memcpy(&vfr, imsg->data, sizeof(vfr));
+		vmop_ifreq_read(imsg, &vfr);
 
 		/* We should not get malicious requests from the parent */
 		if (priv_getiftype(vfr.vfr_name, type, NULL) == -1 ||
@@ -123,18 +119,18 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		return (-1);
 	}
 
-	switch (imsg->hdr.type) {
+	switch (imsg_type) {
 	case IMSG_VMDOP_PRIV_IFDESCR:
 		/* Set the interface description */
 		strlcpy(ifr.ifr_name, vfr.vfr_name, sizeof(ifr.ifr_name));
 		ifr.ifr_data = (caddr_t)vfr.vfr_value;
-		if (ioctl(env->vmd_fd, SIOCSIFDESCR, &ifr) == -1)
+		if (ioctl(env->vmd_sock_fd, SIOCSIFDESCR, &ifr) == -1)
 			log_warn("SIOCSIFDESCR");
 		break;
 	case IMSG_VMDOP_PRIV_IFRDOMAIN:
 		strlcpy(ifr.ifr_name, vfr.vfr_name, sizeof(ifr.ifr_name));
 		ifr.ifr_rdomainid = vfr.vfr_id;
-		if (ioctl(env->vmd_fd, SIOCSIFRDOMAIN, &ifr) == -1)
+		if (ioctl(env->vmd_sock_fd, SIOCSIFRDOMAIN, &ifr) == -1)
 			log_warn("SIOCSIFRDOMAIN");
 		break;
 	case IMSG_VMDOP_PRIV_IFADD:
@@ -147,14 +143,14 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		    sizeof(ifbr.ifbr_name));
 		strlcpy(ifbr.ifbr_ifsname, vfr.vfr_value,
 		    sizeof(ifbr.ifbr_ifsname));
-		if (ioctl(env->vmd_fd, SIOCBRDGADD, &ifbr) == -1 &&
+		if (ioctl(env->vmd_sock_fd, SIOCBRDGADD, &ifbr) == -1 &&
 		    errno != EEXIST)
 			log_warn("SIOCBRDGADD");
 		break;
 	case IMSG_VMDOP_PRIV_IFEXISTS:
 		/* Determine if bridge exists */
 		strlcpy(ifr.ifr_name, vfr.vfr_name, sizeof(ifr.ifr_name));
-		if (ioctl(env->vmd_fd, SIOCGIFFLAGS, &ifr) == -1)
+		if (ioctl(env->vmd_sock_fd, SIOCGIFFLAGS, &ifr) == -1)
 			fatalx("%s: bridge \"%s\" does not exist",
 			    __func__, vfr.vfr_name);
 		break;
@@ -162,15 +158,15 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_VMDOP_PRIV_IFDOWN:
 		/* Set the interface status */
 		strlcpy(ifr.ifr_name, vfr.vfr_name, sizeof(ifr.ifr_name));
-		if (ioctl(env->vmd_fd, SIOCGIFFLAGS, &ifr) == -1) {
+		if (ioctl(env->vmd_sock_fd, SIOCGIFFLAGS, &ifr) == -1) {
 			log_warn("SIOCGIFFLAGS");
 			break;
 		}
-		if (imsg->hdr.type == IMSG_VMDOP_PRIV_IFUP)
+		if (imsg_type == IMSG_VMDOP_PRIV_IFUP)
 			ifr.ifr_flags |= IFF_UP;
 		else
 			ifr.ifr_flags &= ~IFF_UP;
-		if (ioctl(env->vmd_fd, SIOCSIFFLAGS, &ifr) == -1)
+		if (ioctl(env->vmd_sock_fd, SIOCSIFFLAGS, &ifr) == -1)
 			log_warn("SIOCSIFFLAGS");
 		break;
 	case IMSG_VMDOP_PRIV_IFGROUP:
@@ -183,7 +179,7 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		    sizeof(ifgr.ifgr_group)) >= sizeof(ifgr.ifgr_group))
 			fatalx("%s: group name too long", __func__);
 
-		if (ioctl(env->vmd_fd, SIOCAIFGROUP, &ifgr) == -1 &&
+		if (ioctl(env->vmd_sock_fd, SIOCAIFGROUP, &ifgr) == -1 &&
 		    errno != EEXIST)
 			log_warn("SIOCAIFGROUP");
 		break;
@@ -197,60 +193,43 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		/* Set the interface address */
 		strlcpy(ifra.ifra_name, vfr.vfr_name, sizeof(ifra.ifra_name));
 
-		ifra.ifra_addr.sa_len =
-		    ifra.ifra_mask.sa_len =
-		    sizeof(struct sockaddr_in);
-
 		memcpy(&ifra.ifra_addr, &vfr.vfr_addr,
-		    ifra.ifra_addr.sa_len);
+		    sizeof(ifra.ifra_addr));
 		memcpy(&ifra.ifra_mask, &vfr.vfr_mask,
-		    ifra.ifra_mask.sa_len);
+		    sizeof(ifra.ifra_mask));
 
-		if (ioctl(env->vmd_fd, SIOCAIFADDR, &ifra) == -1)
+		if (ioctl(env->vmd_sock_fd, SIOCAIFADDR, &ifra) == -1)
 			log_warn("SIOCAIFADDR");
 		break;
 	case IMSG_VMDOP_PRIV_IFADDR6:
-		memset(&ifar, 0, sizeof(ifar));
 		memset(&in6_ifra, 0, sizeof(in6_ifra));
 
 		if (vfr.vfr_addr.ss_family != AF_INET6 ||
 		    vfr.vfr_addr.ss_family != vfr.vfr_mask.ss_family)
 			fatalx("%s: invalid address family", __func__);
 
-		/* First enable IPv6 on this interface */
-		strlcpy(ifar.ifar_name, vfr.vfr_name,
-		    sizeof(ifar.ifar_name));
-		ifar.ifar_af = AF_INET6;
-		if (ioctl(env->vmd_fd, SIOCIFAFATTACH, (caddr_t)&ifar) == -1)
-			log_warn("SIOCIFAFATTACH");
-
 		/* Set the interface address */
 		strlcpy(in6_ifra.ifra_name, vfr.vfr_name,
 		    sizeof(in6_ifra.ifra_name));
 
-		in6_ifra.ifra_addr.sin6_len =
-		    in6_ifra.ifra_prefixmask.sin6_len =
-		    sizeof(struct sockaddr_in6);
-
 		memcpy(&in6_ifra.ifra_addr, &vfr.vfr_addr,
-		    in6_ifra.ifra_addr.sin6_len);
+		    sizeof(in6_ifra.ifra_addr));
 		memcpy(&in6_ifra.ifra_prefixmask, &vfr.vfr_mask,
-		    in6_ifra.ifra_prefixmask.sin6_len);
+		    sizeof(in6_ifra.ifra_prefixmask));
 		in6_ifra.ifra_prefixmask.sin6_scope_id = 0;
 
 		in6_ifra.ifra_lifetime.ia6t_vltime = ND6_INFINITE_LIFETIME;
 		in6_ifra.ifra_lifetime.ia6t_pltime = ND6_INFINITE_LIFETIME;
 
-		if (ioctl(env->vmd_fd6, SIOCDIFADDR_IN6, &in6_ifra) == -1 &&
+		if (ioctl(env->vmd_sock_fd6, SIOCDIFADDR_IN6, &in6_ifra) == -1 &&
 		    errno != EADDRNOTAVAIL)
 			log_warn("SIOCDIFADDR_IN6");
 
-		if (ioctl(env->vmd_fd6, SIOCAIFADDR_IN6, &in6_ifra) == -1)
+		if (ioctl(env->vmd_sock_fd6, SIOCAIFADDR_IN6, &in6_ifra) == -1)
 			log_warn("SIOCAIFADDR_IN6");
 		break;
 	case IMSG_VMDOP_PRIV_GET_ADDR:
-		IMSG_SIZE_CHECK(imsg, &vareq);
-		memcpy(&vareq, imsg->data, sizeof(vareq));
+		vmop_addr_req_read(imsg, &vareq);
 
 		varesult.var_vmid = vareq.var_vmid;
 		varesult.var_nic_idx = vareq.var_nic_idx;
@@ -260,8 +239,8 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		if (ioctl(ifd, SIOCGIFADDR, &varesult.var_addr) != 0)
 			log_warn("SIOCGIFADDR");
 		else
-			proc_compose_imsg(ps, PROC_PARENT, -1,
-			    IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE, imsg->hdr.peerid,
+			proc_compose_imsg(ps, PROC_PARENT,
+			    IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE, peer_id,
 			    -1, &varesult, sizeof(varesult));
 		close(ifd);
 		break;
@@ -269,7 +248,8 @@ priv_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		config_getconfig(env, imsg);
 		break;
 	case IMSG_CTL_RESET:
-		config_getreset(env, imsg);
+		mode = imsg_uint_read(imsg);
+		config_purge(env, mode);
 		break;
 	default:
 		return (-1);
@@ -346,7 +326,6 @@ vm_priv_ifconfig(struct privsep *ps, struct vmd_vm *vm)
 {
 	char			 name[64];
 	struct vmd		*env = ps->ps_env;
-	struct vm_create_params	*vcp = &vm->vm_params.vmc_params;
 	struct vmd_if		*vif;
 	struct vmd_switch	*vsw;
 	unsigned int		 i;
@@ -367,7 +346,7 @@ vm_priv_ifconfig(struct privsep *ps, struct vmd_vm *vm)
 
 		/* Description can be truncated */
 		(void)snprintf(vfr.vfr_value, sizeof(vfr.vfr_value),
-		    "vm%u-if%u-%s", vm->vm_vmid, i, vcp->vcp_name);
+		    "vm%u-if%u-%s", vm->vm_vmid, i, vm->vm_params.vmc_name);
 
 		log_debug("%s: interface %s description %s", __func__,
 		    vfr.vfr_name, vfr.vfr_value);

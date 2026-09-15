@@ -8,7 +8,6 @@
 
 #include "llvm-c/Core.h"
 #include "llvm-c/Error.h"
-#include "llvm-c/Initialization.h"
 #include "llvm-c/LLJIT.h"
 #include "llvm-c/Support.h"
 #include "llvm-c/Target.h"
@@ -29,16 +28,17 @@ LLVMModuleRef createDemoModule(LLVMContextRef Ctx) {
 
   // Add a "sum" function":
   //  - Create the function type and function instance.
-  LLVMTypeRef ParamTypes[] = {LLVMInt32Type(), LLVMInt32Type()};
-  LLVMTypeRef SumFunctionType =
-      LLVMFunctionType(LLVMInt32Type(), ParamTypes, 2, 0);
+  LLVMTypeRef Int32Type = LLVMInt32TypeInContext(Ctx);
+  LLVMTypeRef ParamTypes[] = {Int32Type, Int32Type};
+  LLVMTypeRef SumFunctionType = LLVMFunctionType(Int32Type, ParamTypes, 2, 0);
   LLVMValueRef SumFunction = LLVMAddFunction(M, "sum", SumFunctionType);
 
   //  - Add a basic block to the function.
-  LLVMBasicBlockRef EntryBB = LLVMAppendBasicBlock(SumFunction, "entry");
+  LLVMBasicBlockRef EntryBB =
+      LLVMAppendBasicBlockInContext(Ctx, SumFunction, "entry");
 
   //  - Add an IR builder and point it at the end of the basic block.
-  LLVMBuilderRef Builder = LLVMCreateBuilder();
+  LLVMBuilderRef Builder = LLVMCreateBuilderInContext(Ctx);
   LLVMPositionBuilderAtEnd(Builder, EntryBB);
 
   //  - Get the two function arguments and use them co construct an "add"
@@ -56,13 +56,12 @@ LLVMModuleRef createDemoModule(LLVMContextRef Ctx) {
   return M;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, const char *argv[]) {
 
   int MainResult = 0;
 
   // Parse command line arguments and initialize LLVM Core.
-  LLVMParseCommandLineOptions(argc, (const char **)argv, "");
-  LLVMInitializeCore(LLVMGetGlobalPassRegistry());
+  LLVMParseCommandLineOptions(argc, argv, "");
 
   // Initialize native target codegen and asm printer.
   LLVMInitializeNativeTarget();

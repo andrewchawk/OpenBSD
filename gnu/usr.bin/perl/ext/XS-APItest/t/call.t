@@ -7,11 +7,11 @@ use warnings;
 use strict;
 
 # Test::More doesn't have fresh_perl_is() yet
-# use Test::More tests => 342;
+# use Test::More tests => 344;
 
 BEGIN {
     require '../../t/test.pl';
-    plan(538);
+    plan(547);
     use_ok('XS::APItest')
 };
 use Config;
@@ -34,6 +34,13 @@ sub i {
 }
 call_sv_C();
 is($call_sv_count, 7, "call_sv_C passes");
+
+my $did_argv;
+sub called_by_argv_cleanup {
+    $did_argv++ if @_;
+}
+ok(call_argv_cleanup(), "call_argv() cleans up temps if asked to");
+ok($did_argv, "call_argv_cleanup() did the actual call with arguments");
 
 sub d {
     die "its_dead_jim\n";
@@ -340,6 +347,23 @@ for my $fn_type (qw(eval_pv eval_sv call_sv)) {
     }
 }
 
+{
+    use feature "fc";
+    use strict;
+    # the XS eval_sv() returns the count of results
+    is(eval_sv('my $z = fc("A") eq fc("a"); 1', G_LIST), 0,
+       "don't inherit hints by default (so the eval fails)");
+    is(eval_sv('my $z = fc("A") eq fc("a"); 1', G_LIST | G_USEHINTS), 1,
+       "inherit hints when requested (so the eval succeeds)")
+      or diag($@);
+    # prevent Variable "$z" is not imported
+    no warnings 'misc';
+    is(eval_sv('$z = 1', G_LIST), 1,
+       "don't inherit hints (strict) by default, so the eval succeeds");
+    is(eval_sv('$z = 1', G_LIST | G_USEHINTS), 0,
+       "inherit hints (strict) when requested, so the eval fails");
+}
+
 # DAPM 9-Aug-04. A taint test in eval_sv() could die after setting up
 # a new jump level but before pushing an eval context, leading to
 # stack corruption
@@ -361,3 +385,13 @@ eval { my @a = sort f 2, 1;  $x++};
 print "x=$x\n";
 EOF
 }
+
+fresh_perl_like('use XS::APItest;'
+              .'XS::APItest::XSUB::test_mismatch_xs_handshake_api_ver("Dog");'
+              , qr/\QPerl API version v1.1337.0 of Dog does not match\E/);
+fresh_perl_like('use XS::APItest;'
+              .'XS::APItest::XSUB::test_mismatch_xs_handshake_bad_struct("Dog");'
+              , qr/\Q loadable library and perl binaries are mismatched (got first handshake\E/);
+fresh_perl_like('use XS::APItest;'
+              .'XS::APItest::XSUB::test_mismatch_xs_handshake_bad_struct_and_ver("Dog");'
+              , qr/\QPerl API version v1.1337.0 of APItest.xs does not match\E/);

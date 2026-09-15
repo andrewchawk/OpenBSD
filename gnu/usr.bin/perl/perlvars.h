@@ -43,6 +43,20 @@ PERLVARI(G, curinterp,	PerlInterpreter *, NULL)
                                          * useithreads) */
 #if defined(USE_ITHREADS)
 PERLVAR(G, thr_key,	perl_key)	/* key to retrieve per-thread struct */
+
+#  ifndef WIN32
+/* Used to re-send signals we receive on a non-perl thread to the main
+ * thread.  Windows uses window messages to do this so we don't need
+ * it there.
+ *
+ * If we do end up adding this for Windows it will need more complex
+ * management since we'd want to store a thread handle (a HANDLE)
+ * which needs clean up on exit.
+ */
+
+PERLVAR(G, main_thread, pthread_t)
+#  endif
+
 #endif
 
 /* XXX does anyone even use this? */
@@ -65,7 +79,6 @@ PERLVARA(G, sig_defaulting, SIG_SIZE, int)
 PERLVARI(G, sig_trapped, int,	0)
 #endif
 
-#ifndef PERL_MICRO
 /* If Perl has to ignore SIGPFE, this is its saved state.
  * See perl.h macros PERL_FPU_INIT and PERL_FPU_{PRE,POST}_EXEC. */
 PERLVAR(G, sigfpe_saved, Sighandler_t)
@@ -76,7 +89,6 @@ PERLVAR(G, sigfpe_saved, Sighandler_t)
 PERLVARI(G, csighandlerp,  Sighandler_t,  Perl_csighandler)
 PERLVARI(G, csighandler1p, Sighandler1_t, Perl_csighandler1)
 PERLVARI(G, csighandler3p, Sighandler3_t, Perl_csighandler3)
-#endif
 
 /* This is constant on most architectures, a global on OS/2 */
 #ifdef OS2
@@ -101,7 +113,7 @@ PERLVARI(G, mmap_page_size, IV, 0)
 #if defined(USE_ITHREADS)
 PERLVAR(G, hints_mutex, perl_mutex)    /* Mutex for refcounted he refcounting */
 PERLVAR(G, env_mutex, perl_RnW1_mutex_t)      /* Mutex for accessing ENV */
-PERLVAR(G, locale_mutex, perl_mutex)   /* Mutex related to locale handling */
+PERLVAR(G, locale_mutex, perl_RnW1_mutex_t)   /* Mutex related to locale handling */
 #endif
 
 #ifdef USE_POSIX_2008_LOCALE
@@ -381,6 +393,12 @@ PERLVAR(G, user_def_props_aTHX, PerlInterpreter *)  /* aTHX that user_def_props
 PERLVAR(G, user_prop_mutex, perl_mutex)    /* Mutex for manipulating
                                               PL_user_defined_properties */
 #endif
+
+/* This hook is called during system termination (PERL_SYS_TERM).
+ * This is needed for tearing down threads::shared and probably
+ * not be used for anything else.
+ */
+PERLVARI(G, shutdownhook, shutdown_proc_t, &Perl_noshutdownhook)
 
 /* these record the best way to perform certain IO operations while
  * atomically setting FD_CLOEXEC. On the first call, a probe is done

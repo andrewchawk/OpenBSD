@@ -1,4 +1,4 @@
-/*	$OpenBSD: bios.c,v 1.129 2023/03/15 08:20:52 jsg Exp $	*/
+/*	$OpenBSD: bios.c,v 1.131 2026/09/08 00:47:00 jsg Exp $	*/
 
 /*
  * Copyright (c) 1997-2001 Michael Shalayeff
@@ -81,8 +81,7 @@ int bios_print(void *, const char *);
 char *fixstring(char *);
 
 const struct cfattach bios_ca = {
-	sizeof(struct bios_softc), biosprobe, biosattach, NULL,
-	config_activate_children
+	sizeof(struct bios_softc), biosprobe, biosattach
 };
 
 struct cfdriver bios_cd = {
@@ -771,15 +770,16 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	bios_diskinfo_t *pdi;
 	int biosdev;
 
-	/* all sysctl names at this level except diskinfo are terminal */
-	if (namelen != 1 && name[0] != BIOS_DISKINFO)
-		return (ENOTDIR);		/* overloaded */
+	if (namelen < 1)
+		return (ENOTDIR);
 
 	if (!(bootapiver & BAPIV_VECTOR))
 		return EOPNOTSUPP;
 
 	switch (name[0]) {
 	case BIOS_DEV:
+		if (namelen != 1)
+			return ENOTDIR;
 		if ((pdi = bios_getdiskinfo(bootdev)) == NULL)
 			return ENXIO;
 		biosdev = pdi->bios_number;
@@ -791,6 +791,8 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 			return ENXIO;
 		return sysctl_rdstruct(oldp, oldlenp, newp, pdi, sizeof(*pdi));
 	case BIOS_CKSUMLEN:
+		if (namelen != 1)
+			return ENOTDIR;
 		return sysctl_rdint(oldp, oldlenp, newp, bios_cksumlen);
 	default:
 		return EOPNOTSUPP;

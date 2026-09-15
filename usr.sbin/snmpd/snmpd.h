@@ -1,4 +1,4 @@
-/*	$OpenBSD: snmpd.h,v 1.120 2024/05/21 05:00:48 jsg Exp $	*/
+/*	$OpenBSD: snmpd.h,v 1.125 2026/09/06 19:01:42 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2007, 2008, 2012 Reyk Floeter <reyk@openbsd.org>
@@ -22,7 +22,6 @@
 
 #include <sys/queue.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <sys/tree.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -90,8 +89,10 @@ enum imsg_type {
 	IMSG_NONE,
 	IMSG_CTL_VERBOSE,
 	IMSG_CTL_PROCFD,
+	IMSG_CTL_PROCREADY,
 	IMSG_TRAP_EXEC,
-	IMSG_AX_FD
+	IMSG_AX_FD,
+	IMSG_SENDFD_DONE
 };
 
 struct imsgev {
@@ -144,6 +145,12 @@ struct privsep {
 	struct event		 ps_evsigusr1;
 
 	void			*ps_env;
+	unsigned int		 ps_connecting;
+	void			(*ps_connected)(struct privsep *);
+	void			(*ps_run)(struct privsep *,
+				    struct privsep_proc *, void *);
+	void			*ps_arg;
+
 };
 
 struct privsep_proc {
@@ -179,6 +186,11 @@ struct privsep_fd {
 /*
  * daemon structures
  */
+
+struct engineid {
+	uint8_t			 value[SNMPD_MAXENGINEIDLEN];
+	size_t			 length;
+};
 
 #define MSG_HAS_AUTH(m)		(((m)->sm_flags & SNMP_MSGFLAG_AUTH) != 0)
 #define MSG_HAS_PRIV(m)		(((m)->sm_flags & SNMP_MSGFLAG_PRIV) != 0)
@@ -220,8 +232,7 @@ struct snmp_message {
 	long long		 sm_secmodel;
 	u_int32_t		 sm_engine_boots;
 	u_int32_t		 sm_engine_time;
-	uint8_t			 sm_ctxengineid[SNMPD_MAXENGINEIDLEN];
-	size_t			 sm_ctxengineid_len;
+	struct engineid		 sm_ctxengineid;
 	char			 sm_ctxname[SNMPD_MAXCONTEXNAMELEN+1];
 
 	/* USM */
@@ -402,15 +413,13 @@ struct snmpd {
 	const char		*sc_confpath;
 	struct addresslist	 sc_addresses;
 	struct axmasterlist	 sc_agentx_masters;
-	struct timeval		 sc_starttime;
 	u_int32_t		 sc_engine_boots;
 
 	char			 sc_rdcommunity[SNMPD_MAXCOMMUNITYLEN];
 	char			 sc_rwcommunity[SNMPD_MAXCOMMUNITYLEN];
 	char			 sc_trcommunity[SNMPD_MAXCOMMUNITYLEN];
 
-	uint8_t			 sc_engineid[SNMPD_MAXENGINEIDLEN];
-	size_t			 sc_engineid_len;
+	struct engineid		 sc_engineid;
 
 	struct snmp_stats	 sc_stats;
 	struct snmp_system	 sc_system;
@@ -445,6 +454,9 @@ extern struct snmpd *snmpd_env;
 /* parse.y */
 struct snmpd	*parse_config(const char *, u_int);
 int		 cmdline_symset(char *);
+
+/* engine.c */
+int		 engineid_cmp(struct engineid *, struct engineid *);
 
 /* snmpe.c */
 void		 snmpe(struct privsep *, struct privsep_proc *);
@@ -486,9 +498,9 @@ const struct usmuser *usm_check_mincred(int, const char **);
 enum privsep_procid
 	    proc_getid(struct privsep_proc *, unsigned int, const char *);
 void	 proc_init(struct privsep *, struct privsep_proc *, unsigned int, int,
-	    int, char **, enum privsep_procid);
+	    char *, int, char **, enum privsep_procid);
 void	 proc_kill(struct privsep *);
-void	 proc_connect(struct privsep *);
+void	 proc_connect(struct privsep *, void (*connected)(struct privsep *));
 void	 proc_dispatch(int, short event, void *);
 void	 proc_run(struct privsep *, struct privsep_proc *,
 	    struct privsep_proc *, u_int,
@@ -507,6 +519,8 @@ int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
 	    u_int16_t, u_int32_t, int, const struct iovec *, int);
 int	 proc_composev(struct privsep *, enum privsep_procid,
 	    uint16_t, const struct iovec *, int);
+void	 proc_forward_imsg(struct privsep *, struct imsg *,
+	    enum privsep_procid);
 struct imsgbuf *
 	 proc_ibuf(struct privsep *, enum privsep_procid, int);
 struct imsgev *

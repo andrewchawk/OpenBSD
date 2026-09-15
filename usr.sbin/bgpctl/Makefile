@@ -1,11 +1,11 @@
-#	$OpenBSD: Makefile,v 1.19 2023/04/20 14:01:50 claudio Exp $
+#	$OpenBSD: Makefile,v 1.22 2026/04/30 11:06:29 tb Exp $
 
 .PATH:		${.CURDIR}/../bgpd
 
 PROG=	bgpctl
-SRCS=	bgpctl.c output.c output_json.c output_ometric.c parser.c \
+SRCS=	bgpctl.c log.c output.c output_json.c output_ometric.c parser.c \
 	mrtparser.c json.c ometric.c
-SRCS+=	util.c flowspec.c
+SRCS+=	util.c flowspec.c monotime.c bgpd_imsg.c
 CFLAGS+= -Wall
 CFLAGS+= -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+= -Wmissing-declarations

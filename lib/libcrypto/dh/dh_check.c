@@ -1,4 +1,4 @@
-/* $OpenBSD: dh_check.c,v 1.28 2023/07/24 16:25:02 tb Exp $ */
+/* $OpenBSD: dh_check.c,v 1.33 2026/01/23 08:32:22 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -60,7 +60,6 @@
 
 #include <openssl/bn.h>
 #include <openssl/dh.h>
-#include <openssl/err.h>
 
 #include "bn_local.h"
 #include "dh_local.h"
@@ -68,27 +67,10 @@
 #define DH_NUMBER_ITERATIONS_FOR_PRIME 64
 
 /*
- * Check that p is odd and 1 < g < p - 1. The _ex version removes the need of
- * inspecting flags and pushes errors on the stack instead.
+ * Check that p is odd and 1 < g < p - 1.
  */
 
-int
-DH_check_params_ex(const DH *dh)
-{
-	int flags = 0;
-
-	if (!DH_check_params(dh, &flags))
-		return 0;
-
-	if ((flags & DH_CHECK_P_NOT_PRIME) != 0)
-		DHerror(DH_R_CHECK_P_NOT_PRIME);
-	if ((flags & DH_NOT_SUITABLE_GENERATOR) != 0)
-		DHerror(DH_R_NOT_SUITABLE_GENERATOR);
-
-	return flags == 0;
-}
-
-int
+static int
 DH_check_params(const DH *dh, int *flags)
 {
 	BIGNUM *max_g = NULL;
@@ -122,42 +104,72 @@ DH_check_params(const DH *dh, int *flags)
 	return ok;
 }
 
+typedef BIGNUM *(*get_p_fn)(BIGNUM *);
+
+static const get_p_fn get_well_known_p[] = {
+	BN_get_rfc2409_prime_768,
+	BN_get_rfc2409_prime_1024,
+	BN_get_rfc3526_prime_1536,
+	BN_get_rfc3526_prime_2048,
+	BN_get_rfc3526_prime_3072,
+	BN_get_rfc3526_prime_4096,
+	BN_get_rfc3526_prime_6144,
+	BN_get_rfc3526_prime_8192,
+	BN_get_rfc7919_prime_2048,
+	BN_get_rfc7919_prime_3072,
+	BN_get_rfc7919_prime_4096,
+	BN_get_rfc7919_prime_6144,
+	BN_get_rfc7919_prime_8192,
+};
+
+#define N_WELL_KNOWN_P_FN (sizeof(get_well_known_p) / sizeof(get_well_known_p[0]))
+
+/*
+ * Scapy special: on startup it now calls DH_check() on all the well-known DH
+ * primes, which is a sensible thing to do. In any case, using BN_is_prime_ex()
+ * on a standardized domain parameter is dumb, so avoid it.
+ */
+static int
+dh_is_well_known_p(const BIGNUM *p, BN_CTX *ctx, int *is_well_known)
+{
+	BIGNUM *bn;
+	size_t i;
+	int ret = 0;
+
+	*is_well_known = 0;
+
+	BN_CTX_start(ctx);
+	if ((bn = BN_CTX_get(ctx)) == NULL)
+		goto err;
+
+	for (i = 0; i < N_WELL_KNOWN_P_FN; i++) {
+		get_p_fn get_p = get_well_known_p[i];
+
+		if (get_p(bn) == NULL)
+			goto err;
+		if (BN_cmp(bn, p) == 0) {
+			*is_well_known = 1;
+			break;
+		}
+	}
+
+	ret = 1;
+
+ err:
+	BN_CTX_end(ctx);
+
+	return ret;
+}
+
 /*
  * Check that p is a safe prime and that g is a suitable generator.
- * The _ex version puts errors on the stack instead of returning flags.
  */
-
-int
-DH_check_ex(const DH *dh)
-{
-	int flags = 0;
-
-	if (!DH_check(dh, &flags))
-		return 0;
-
-	if ((flags & DH_NOT_SUITABLE_GENERATOR) != 0)
-		DHerror(DH_R_NOT_SUITABLE_GENERATOR);
-	if ((flags & DH_CHECK_Q_NOT_PRIME) != 0)
-		DHerror(DH_R_CHECK_Q_NOT_PRIME);
-	if ((flags & DH_CHECK_INVALID_Q_VALUE) != 0)
-		DHerror(DH_R_CHECK_INVALID_Q_VALUE);
-	if ((flags & DH_CHECK_INVALID_J_VALUE) != 0)
-		DHerror(DH_R_CHECK_INVALID_J_VALUE);
-	if ((flags & DH_UNABLE_TO_CHECK_GENERATOR) != 0)
-		DHerror(DH_R_UNABLE_TO_CHECK_GENERATOR);
-	if ((flags & DH_CHECK_P_NOT_PRIME) != 0)
-		DHerror(DH_R_CHECK_P_NOT_PRIME);
-	if ((flags & DH_CHECK_P_NOT_SAFE_PRIME) != 0)
-		DHerror(DH_R_CHECK_P_NOT_SAFE_PRIME);
-
-	return flags == 0;
-}
 
 int
 DH_check(const DH *dh, int *flags)
 {
 	BN_CTX *ctx = NULL;
-	int is_prime;
+	int is_prime, is_well_known;
 	int ok = 0;
 
 	*flags = 0;
@@ -171,10 +183,8 @@ DH_check(const DH *dh, int *flags)
 	BN_CTX_start(ctx);
 
 	if (dh->q != NULL) {
-		BIGNUM *quotient, *residue;
+		BIGNUM *residue;
 
-		if ((quotient = BN_CTX_get(ctx)) == NULL)
-			goto err;
 		if ((residue = BN_CTX_get(ctx)) == NULL)
 			goto err;
 		if ((*flags & DH_NOT_SUITABLE_GENERATOR) == 0) {
@@ -191,13 +201,16 @@ DH_check(const DH *dh, int *flags)
 		if (is_prime == 0)
 			*flags |= DH_CHECK_Q_NOT_PRIME;
 		/* Check p == 1 mod q, i.e., q divides p - 1 */
-		if (!BN_div_ct(quotient, residue, dh->p, dh->q, ctx))
+		if (!BN_div_ct(NULL, residue, dh->p, dh->q, ctx))
 			goto err;
 		if (!BN_is_one(residue))
 			*flags |= DH_CHECK_INVALID_Q_VALUE;
-		if (dh->j != NULL && BN_cmp(dh->j, quotient) != 0)
-			*flags |= DH_CHECK_INVALID_J_VALUE;
 	}
+
+	if (!dh_is_well_known_p(dh->p, ctx, &is_well_known))
+		goto err;
+	if (is_well_known)
+		goto done;
 
 	is_prime = BN_is_prime_ex(dh->p, DH_NUMBER_ITERATIONS_FOR_PRIME,
 	    ctx, NULL);
@@ -220,6 +233,7 @@ DH_check(const DH *dh, int *flags)
 			*flags |= DH_CHECK_P_NOT_SAFE_PRIME;
 	}
 
+ done:
 	ok = 1;
 
  err:
@@ -228,24 +242,6 @@ DH_check(const DH *dh, int *flags)
 	return ok;
 }
 LCRYPTO_ALIAS(DH_check);
-
-int
-DH_check_pub_key_ex(const DH *dh, const BIGNUM *pub_key)
-{
-	int flags = 0;
-
-	if (!DH_check_pub_key(dh, pub_key, &flags))
-		return 0;
-
-	if ((flags & DH_CHECK_PUBKEY_TOO_SMALL) != 0)
-		DHerror(DH_R_CHECK_PUBKEY_TOO_SMALL);
-	if ((flags & DH_CHECK_PUBKEY_TOO_LARGE) != 0)
-		DHerror(DH_R_CHECK_PUBKEY_TOO_LARGE);
-	if ((flags & DH_CHECK_PUBKEY_INVALID) != 0)
-		DHerror(DH_R_CHECK_PUBKEY_INVALID);
-
-	return flags == 0;
-}
 
 int
 DH_check_pub_key(const DH *dh, const BIGNUM *pub_key, int *flags)

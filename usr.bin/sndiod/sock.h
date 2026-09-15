@@ -1,4 +1,4 @@
-/*	$OpenBSD: sock.h,v 1.9 2024/05/24 15:16:09 ratchov Exp $	*/
+/*	$OpenBSD: sock.h,v 1.14 2026/08/12 08:30:22 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -50,14 +50,17 @@ struct sock {
 #define SOCK_STOP	4		/* draining rec buffers */
 	unsigned int pstate;		/* one of the above */
 	int tickpending;		/* tick waiting to be transmitted */
+	int xrunpending;		/* xrun waiting to be transmitted */
+	int xrunnotify;			/* client subscribed to xrun messages */
 	int fillpending;		/* flowctl waiting to be transmitted */
 	int stoppending;		/* last STOP ack to be sent */
 	unsigned int walign;		/* align written data to this */
 	unsigned int ralign;		/* read data is aligned to this */
 	int lastvol;			/* last volume */
+	struct midithru *midithru;	/* controlled or connected midithru */
 	struct slot *slot;		/* audio device slot number */
 	struct midi *midi;		/* midi endpoint */
-	struct port *port;		/* midi port */
+	struct opt *opt;		/* midi-controlled opt */
 	struct ctlslot *ctlslot;
 	unsigned char *ctldesc;		/* temporary buffer */
 	size_t ctl_desc_size;		/* size of client amsg_ctl_desc */

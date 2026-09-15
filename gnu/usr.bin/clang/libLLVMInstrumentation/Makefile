@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.13 2024/02/08 20:28:54 miod Exp $
+# $OpenBSD: Makefile,v 1.15 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMInstrumentation
 NOPROFILE=
@@ -6,26 +6,36 @@ NOPROFILE=
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Transforms
 
 SRCS+=	AddressSanitizer.cpp \
+	AllocToken.cpp \
 	BoundsChecking.cpp \
 	CGProfile.cpp \
 	ControlHeightReduction.cpp \
 	DataFlowSanitizer.cpp \
 	GCOVProfiling.cpp \
-	MemProfiler.cpp \
+	BlockCoverageInference.cpp \
+	MemProfInstrumentation.cpp \
+	MemProfUse.cpp \
 	MemorySanitizer.cpp \
+	NumericalStabilitySanitizer.cpp \
 	IndirectCallPromotion.cpp \
-	Instrumentation.cpp \
-	InstrOrderFile.cpp \
 	InstrProfiling.cpp \
-	KCFI.cpp \
+	InstrumentationKCFI.cpp \
+	LowerAllowCheckPass.cpp \
+	PGOCtxProfFlattening.cpp \
+	PGOCtxProfLowering.cpp \
+	PGOForceFunctionAttrs.cpp \
 	PGOInstrumentation.cpp \
 	PGOMemOPSizeOpt.cpp \
-	PoisonChecking.cpp \
 	SanitizerCoverage.cpp \
 	InstrumentationSanitizerBinaryMetadata.cpp \
 	ValueProfileCollector.cpp \
 	ThreadSanitizer.cpp \
-	HWAddressSanitizer.cpp
+	TypeSanitizer.cpp \
+	HWAddressSanitizer.cpp \
+	RealtimeSanitizer.cpp
+
+InstrumentationKCFI.cpp:
+	ln -s ${LLVM_SRCS}/lib/Transforms/Instrumentation/KCFI.cpp $@
 
 InstrumentationSanitizerBinaryMetadata.cpp:
 	ln -s ${LLVM_SRCS}/lib/Transforms/Instrumentation/SanitizerBinaryMetadata.cpp $@

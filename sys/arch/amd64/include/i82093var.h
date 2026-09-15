@@ -1,4 +1,4 @@
-/*	$OpenBSD: i82093var.h,v 1.6 2024/05/22 05:51:49 jsg Exp $	*/
+/*	$OpenBSD: i82093var.h,v 1.8 2025/09/05 16:57:48 kettenis Exp $	*/
 /* $NetBSD: i82093var.h,v 1.1 2003/02/26 21:26:10 fvdl Exp $ */
 
 /*-
@@ -37,8 +37,7 @@
 
 #include <machine/apicvar.h>
 
-struct ioapic_pin 
-{
+struct ioapic_pin {
 	struct ioapic_pin	*ip_next;	/* next pin on this vector */
 	struct mp_intr_map 	*ip_map;
 	int			ip_vector;	/* IDT vector */
@@ -54,9 +53,8 @@ struct ioapic_softc {
 	int			sc_apic_vecbase; /* global int base if ACPI */
 	int			sc_apic_sz;	/* apic size*/
 	int			sc_flags;
-	paddr_t			sc_pa;		/* PA of ioapic */
-	volatile u_int32_t	*sc_reg;	/* KVA of ioapic addr */
-	volatile u_int32_t	*sc_data;	/* KVA of ioapic data */
+	bus_space_tag_t		sc_memt;
+	bus_space_handle_t	sc_memh;
 	struct ioapic_pin	*sc_pins;	/* sc_apic_sz entries */
 };      
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: conf.h,v 1.163 2024/06/11 01:49:17 jsg Exp $	*/
+/*	$OpenBSD: conf.h,v 1.168 2025/09/08 17:25:46 helg Exp $	*/
 /*	$NetBSD: conf.h,v 1.33 1996/05/03 20:03:32 christos Exp $	*/
 
 /*-
@@ -49,7 +49,6 @@ struct buf;
 struct proc;
 struct tty;
 struct uio;
-struct vnode;
 struct knote;
 
 /*
@@ -291,13 +290,6 @@ extern struct cdevsw cdevsw[];
 	(dev_type_stop((*))) enodev, 0, \
 	(dev_type_mmap((*))) enodev }
 
-/* open, close, ioctl, mmap */
-#define	cdev_fb_init(c,n) { \
-	dev_init(c,n,open), dev_init(c,n,close), (dev_type_read((*))) enodev, \
-	(dev_type_write((*))) enodev, dev_init(c,n,ioctl), \
-	(dev_type_stop((*))) enodev, 0, \
-	dev_init(c,n,mmap) }
-
 /* open, close, read, write, ioctl, kqfilter */
 #define cdev_audio_init(c,n) { \
 	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
@@ -461,7 +453,7 @@ extern struct cdevsw cdevsw[];
 /* open, close, read, write, ioctl */
 #define cdev_fuse_init(c,n) { \
 	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
-	dev_init(c,n,write), dev_init(c,n,ioctl), \
+	dev_init(c,n,write), (dev_type_ioctl((*))) enodev, \
 	(dev_type_stop((*))) enodev, 0, \
 	(dev_type_mmap((*))) enodev, 0, D_CLONE, dev_init(c,n,kqfilter) }
 
@@ -523,26 +515,11 @@ struct linesw {
 
 #ifdef _KERNEL
 extern struct linesw linesw[];
-#endif
-
-/*
- * Swap device table
- */
-struct swdevt {
-	dev_t	sw_dev;
-	int	sw_flags;
-};
-#define	SW_FREED	0x01
-#define	SW_SEQUENTIAL	0x02
-#define	sw_freed	sw_flags	/* XXX compat */
-
-#ifdef _KERNEL
-extern struct swdevt swdevt[];
+extern dev_t swdevt[];		/* Swap device table */
 extern const int chrtoblktbl[];
 extern const int nchrtoblktbl;
 
 struct bdevsw *bdevsw_lookup(dev_t);
-struct cdevsw *cdevsw_lookup(dev_t);
 dev_t	chrtoblk(dev_t);
 dev_t	blktochr(dev_t);
 int	iskmemdev(dev_t);

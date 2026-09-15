@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd.h,v 1.686 2024/06/02 23:26:39 jsg Exp $	*/
+/*	$OpenBSD: smtpd.h,v 1.697 2026/09/11 14:43:29 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -55,7 +55,7 @@
 #define SMTPD_QUEUE_EXPIRY	 (4 * 24 * 60 * 60)
 #define SMTPD_SOCKET		 "/var/run/smtpd.sock"
 #define	SMTPD_NAME		 "OpenSMTPD"
-#define	SMTPD_VERSION		 "7.5.0"
+#define	SMTPD_VERSION		 "7.9.0"
 #define SMTPD_SESSION_TIMEOUT	 300
 #define SMTPD_BACKLOG		 5
 
@@ -70,11 +70,16 @@
 
 /*
  * RFC 5322 defines these characters as valid, some of them are
- * potentially dangerous and need to be escaped.
+ * potentially dangerous and need to be escaped. Even though we
+ * should be accepting $ ` { | } as valid characters, these are
+ * never present in legitimate envelope addresses and are often
+ * used in exploit attempts so we disallow them.
  */
-#define	MAILADDR_ALLOWED       	"!#$%&'*/?^`{|}~+-=_"
+#define	MAILADDR_ALLOWED       	"!#%&'*/?^~+-=_"
 #define	MAILADDR_ESCAPE		"!#$%&'*?`{|}~"
 
+/* filter out shell metacharacters but retain punctuation */
+#define	MAILADDR_RAW_ESCAPE     "!#$&'*?`{|}~"
 
 #define F_STARTTLS		0x01
 #define F_SMTPS			0x02
@@ -418,7 +423,6 @@ enum filter_phase {
 	FILTER_QUIT,
 	FILTER_NOOP,
 	FILTER_HELP,
-	FILTER_WIZ,
 	FILTER_COMMIT,
 	FILTER_PHASES_COUNT     /* must be last */
 };
@@ -1055,6 +1059,7 @@ struct filter_proc {
 	const char		       *user;
 	const char		       *group;
 	const char		       *chroot;
+	const char		       *tag;
 	int				errfd;
 	enum filter_subsystem		filter_subsystem;
 };
@@ -1125,6 +1130,7 @@ struct filter_config {
 
 enum filter_status {
 	FILTER_PROCEED,
+	FILTER_REPORT,
 	FILTER_REWRITE,
 	FILTER_REJECT,
 	FILTER_DISCONNECT,
@@ -1270,7 +1276,6 @@ void bounce_fd(int);
 
 /* ca.c */
 int	 ca(void);
-int	 ca_X509_verify(void *, void *, const char *, const char *, const char **);
 void	 ca_imsg(struct mproc *, struct imsg *);
 void	 ca_init(void);
 void	 ca_engine_init(void);
@@ -1353,7 +1358,7 @@ int lka(void);
 
 /* lka_proc.c */
 int lka_proc_ready(void);
-void lka_proc_forked(const char *, uint32_t, int);
+void lka_proc_forked(const char *, const char *, uint32_t, int);
 void lka_proc_errfd(const char *, int);
 struct io *lka_proc_get_io(const char *);
 
@@ -1605,10 +1610,6 @@ void smtp_session_imsg(struct mproc *, struct imsg *);
 
 /* smtpd.c */
 void imsg_dispatch(struct mproc *, struct imsg *);
-const char *proc_name(enum smtp_proc_type);
-const char *proc_title(enum smtp_proc_type);
-const char *imsg_to_str(int);
-void log_imsg(int, int, struct imsg *);
 int fork_proc_backend(const char *, const char *, const char *, int);
 
 
@@ -1723,6 +1724,10 @@ int base64_decode(char const *, unsigned char *, size_t);
 int base64_encode_rfc3548(unsigned char const *, size_t,
 		      char *, size_t);
 
+const char *proc_name(enum smtp_proc_type);
+const char *proc_title(enum smtp_proc_type);
+const char *imsg_to_str(int);
+void log_imsg(int, int, struct imsg *);
 void log_trace_verbose(int);
 void log_trace0(const char *, ...)
     __attribute__((format (printf, 1, 2)));

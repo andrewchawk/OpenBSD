@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_umb.c,v 1.58 2024/05/23 03:21:09 jsg Exp $ */
+/*	$OpenBSD: if_umb.c,v 1.67 2025/11/17 11:19:21 jsg Exp $ */
 
 /*
  * Copyright (c) 2016 genua mbH
@@ -206,6 +206,12 @@ void		 umb_intr(struct usbd_xfer *, void *, usbd_status);
 void		 umb_kstat_attach(struct umb_softc *);
 void		 umb_kstat_detach(struct umb_softc *);
 
+struct umb_kstat_service {
+	struct kstat_kv		uplink;
+	struct kstat_kv		downlink;
+	struct kstat_kv		reports;
+};
+
 struct umb_kstat_signal {
 	struct kstat_kv		rssi;
 	struct kstat_kv		error_rate;
@@ -241,7 +247,13 @@ struct umb_quirk {
 	int			 umb_match;
 };
 const struct umb_quirk umb_quirks[] = {
-	{ { USB_VENDOR_DELL, USB_PRODUCT_DELL_DW5821E },
+	{ { USB_VENDOR_DELL, USB_PRODUCT_DELL_DW5821E_1 },
+	  0,
+	  2,
+	  UMATCH_VENDOR_PRODUCT
+	},
+
+	{ { USB_VENDOR_DELL, USB_PRODUCT_DELL_DW5821E_2 },
 	  0,
 	  2,
 	  UMATCH_VENDOR_PRODUCT
@@ -353,6 +365,7 @@ umb_attach(struct device *parent, struct device *self, void *aux)
 	int	 altnum;
 	int	 s;
 	struct ifnet *ifp;
+	uint32_t maxpktlen;
 
 	sc->sc_udev = uaa->device;
 	sc->sc_ctrl_ifaceno = uaa->ifaceno;
@@ -455,10 +468,17 @@ umb_attach(struct device *parent, struct device *self, void *aux)
 				    MBIM_CTRLMSG_MAXLEN);
 				/* cont. anyway */
 			}
-			sc->sc_maxpktlen = UGETW(md->wMaxSegmentSize);
-			DPRINTFN(2, "%s: ctrl_len=%d, maxpktlen=%d, cap=0x%x\n",
-			    DEVNAM(sc), sc->sc_ctrl_len, sc->sc_maxpktlen,
-			    md->bmNetworkCapabilities);
+			maxpktlen = UGETW(md->wMaxSegmentSize);
+			if (maxpktlen > 0) {
+				sc->sc_maxpktlen = maxpktlen;
+				DPRINTFN(2, "%s: ctrl_len=%d, maxpktlen=%d, "
+				    "cap=0x%x\n", DEVNAM(sc), sc->sc_ctrl_len,
+				    sc->sc_maxpktlen,
+				    md->bmNetworkCapabilities);
+			} else {
+				DPRINTFN(2, "%s: max segment size %d out of "
+				    "range\n", DEVNAM(sc), maxpktlen);
+			}
 			break;
 		default:
 			break;
@@ -703,8 +723,8 @@ umb_ncm_setup(struct umb_softc *sc)
 	USETW(req.wLength, sizeof (np));
 	if (usbd_do_request(sc->sc_udev, &req, &np) == USBD_NORMAL_COMPLETION &&
 	    UGETW(np.wLength) == sizeof (np)) {
-		sc->sc_rx_bufsz = UGETDW(np.dwNtbInMaxSize);
-		sc->sc_tx_bufsz = UGETDW(np.dwNtbOutMaxSize);
+		sc->sc_rx_bufsz = MIN(UGETDW(np.dwNtbInMaxSize), UINT16_MAX);
+		sc->sc_tx_bufsz = MIN(UGETDW(np.dwNtbOutMaxSize), UINT16_MAX);
 		sc->sc_maxdgram = UGETW(np.wNtbOutMaxDatagrams);
 		sc->sc_align = UGETW(np.wNdpOutAlignment);
 		sc->sc_ndp_div = UGETW(np.wNdpOutDivisor);
@@ -1427,10 +1447,9 @@ umb_getinfobuf(void *in, int inlen, uint32_t offs, uint32_t sz,
 {
 	offs = letoh32(offs);
 	sz = letoh32(sz);
-	if (inlen >= offs + sz) {
-		memset(out, 0, outlen);
+	memset(out, 0, outlen);
+	if ((uint64_t)inlen >= (uint64_t)offs + (uint64_t)sz)
 		memcpy(out, in + offs, MIN(sz, outlen));
-	}
 }
 
 static inline int
@@ -1627,6 +1646,9 @@ umb_decode_packet_service(struct umb_softc *sc, void *data, int len)
 	int	 state, highestclass;
 	uint64_t up_speed, down_speed;
 	struct ifnet *ifp = GET_IFP(sc);
+#if NKSTAT > 0
+	struct kstat *ks;
+#endif
 
 	if (len < sizeof (*psi))
 		return 0;
@@ -1653,6 +1675,21 @@ umb_decode_packet_service(struct umb_softc *sc, void *data, int len)
 	sc->sc_info.highestclass = highestclass;
 	sc->sc_info.uplink_speed = up_speed;
 	sc->sc_info.downlink_speed = down_speed;
+
+#if NKSTAT > 0
+	ks = sc->sc_kstat_service;
+	if (ks != NULL) {
+		struct umb_kstat_service *uksvc = ks->ks_data;
+
+		rw_enter_write(&sc->sc_kstat_lock);
+		kstat_kv_u64(&uksvc->uplink) = up_speed;
+		kstat_kv_u64(&uksvc->downlink) = down_speed;
+		kstat_kv_u64(&uksvc->reports)++;
+
+		getnanouptime(&ks->ks_updated);
+		rw_exit_write(&sc->sc_kstat_lock);
+	}
+#endif /* NKSTAT */
 
 	if (sc->sc_info.regmode == MBIM_REGMODE_AUTOMATIC) {
 		/*
@@ -1832,7 +1869,8 @@ umb_add_inet_config(struct umb_softc *sc, struct in_addr ip, u_int prefixlen,
 	sin = &ifra.ifra_mask;
 	sin->sin_family = AF_INET;
 	sin->sin_len = sizeof (*sin);
-	in_len2mask(&sin->sin_addr, prefixlen);
+	in_len2mask(&sin->sin_addr,
+	    MIN(prefixlen, sizeof (struct in_addr) * 8));
 
 	rv = in_ioctl(SIOCAIFADDR, (caddr_t)&ifra, ifp, 1);
 	if (rv != 0) {
@@ -2401,9 +2439,8 @@ umb_decap(struct umb_softc *sc, struct usbd_xfer *xfer)
 	struct ncm_pointer16_dgram *dgram16;
 	struct ncm_pointer32_dgram *dgram32;
 	uint32_t hsig, psig;
-	int	 blen;
-	int	 ptrlen, ptroff, dgentryoff;
-	uint32_t doff, dlen;
+	uint32_t ptrlen, dgentryoff;
+	uint64_t blen, ptroff, doff, dlen;
 	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct mbuf *m;
 
@@ -2447,15 +2484,17 @@ umb_decap(struct umb_softc *sc, struct usbd_xfer *xfer)
 		goto fail;
 	}
 	if (blen != 0 && len < blen) {
-		DPRINTF("%s: bad NTB len (%d) for %d bytes of data\n",
+		DPRINTF("%s: bad NTB len (%llu) for %d bytes of data\n",
 		    DEVNAM(sc), blen, len);
 		goto fail;
 	}
 
+	if (len < ptroff)
+		goto toosmall;
 	ptr16 = (struct ncm_pointer16 *)(buf + ptroff);
 	psig = UGETDW(ptr16->dwSignature);
 	ptrlen = UGETW(ptr16->wLength);
-	if (len < ptrlen + ptroff)
+	if ((uint64_t)len < (uint64_t)ptrlen + ptroff)
 		goto toosmall;
 	if (!MBIM_NCM_NTH16_ISISG(psig) && !MBIM_NCM_NTH32_ISISG(psig)) {
 		DPRINTF("%s: unsupported NCM pointer signature (0x%08x)\n",
@@ -2502,16 +2541,16 @@ umb_decap(struct umb_softc *sc, struct usbd_xfer *xfer)
 		/* Terminating zero entry */
 		if (dlen == 0 || doff == 0)
 			break;
-		if (len < dlen + doff) {
+		if ((uint64_t)len < dlen + doff) {
 			/* Skip giant datagram but continue processing */
-			DPRINTF("%s: datagram too large (%d @ off %d)\n",
+			DPRINTF("%s: datagram too large (%llu @ off %llu)\n",
 			    DEVNAM(sc), dlen, doff);
 			continue;
 		}
 
 		dp = buf + doff;
-		DPRINTFN(3, "%s: decap %d bytes\n", DEVNAM(sc), dlen);
-		m = m_devget(dp, dlen, sizeof(uint32_t));
+		DPRINTFN(3, "%s: decap %llu bytes\n", DEVNAM(sc), dlen);
+		m = m_devget(dp, (int)dlen, sizeof(uint32_t));
 		if (m == NULL) {
 			ifp->if_iqdrops++;
 			continue;
@@ -3213,6 +3252,7 @@ umb_kstat_attach(struct umb_softc *sc)
 {
 	struct kstat *ks;
 	struct umb_kstat_signal *uks;
+	struct umb_kstat_service *uksvc;
 
 	rw_init(&sc->sc_kstat_lock, "umbkstat");
 
@@ -3233,23 +3273,55 @@ umb_kstat_attach(struct umb_softc *sc)
 	ks->ks_softc = sc;
 	sc->sc_kstat_signal = ks;
 	kstat_install(ks);
+
+	ks = kstat_create(DEVNAM(sc), 0, "mbim-service", 0, KSTAT_T_KV, 0);
+	if (ks == NULL)
+		return;
+
+	uksvc = malloc(sizeof(*uksvc), M_DEVBUF, M_WAITOK|M_ZERO);
+	kstat_kv_init(&uksvc->uplink, "uplink", KSTAT_KV_T_UINT64);
+	kstat_kv_init(&uksvc->downlink, "downlink", KSTAT_KV_T_UINT64);
+	kstat_kv_init(&uksvc->reports, "reports", KSTAT_KV_T_COUNTER64);
+
+	kstat_set_rlock(ks, &sc->sc_kstat_lock);
+	ks->ks_data = uksvc;
+	ks->ks_datalen = sizeof(*uksvc);
+	ks->ks_read = kstat_read_nop;
+
+	ks->ks_softc = sc;
+	sc->sc_kstat_service = ks;
+	kstat_install(ks);
 }
 
 void
 umb_kstat_detach(struct umb_softc *sc)
 {
 	struct kstat *ks = sc->sc_kstat_signal;
-	struct umb_kstat_signal *uks;
 
-	if (ks == NULL)
-		return;
+	ks = sc->sc_kstat_service;
+	if (ks != NULL) {
+		struct umb_kstat_service *uksvc;
 
-	kstat_remove(ks);
-	sc->sc_kstat_signal = NULL;
+		kstat_remove(ks);
+		sc->sc_kstat_service = NULL;
 
-	uks = ks->ks_data;
-	free(uks, M_DEVBUF, sizeof(*uks));
+		uksvc = ks->ks_data;
+		free(uksvc, M_DEVBUF, sizeof(*uksvc));
 
-	kstat_destroy(ks);
+		kstat_destroy(ks);
+	}
+
+	ks = sc->sc_kstat_signal;
+	if (ks != NULL) {
+		struct umb_kstat_signal *uks;
+
+		kstat_remove(ks);
+		sc->sc_kstat_signal = NULL;
+
+		uks = ks->ks_data;
+		free(uks, M_DEVBUF, sizeof(*uks));
+
+		kstat_destroy(ks);
+	}
 }
 #endif /* NKSTAT > 0 */

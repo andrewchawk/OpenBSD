@@ -17,6 +17,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/MC/MCRegister.h"
+#include "llvm/Support/Compiler.h"
 
 namespace llvm {
 class MCRegisterInfo;
@@ -48,7 +49,7 @@ enum OperandConstraint {
 /// private, all access should go through the MCOperandInfo accessors.
 /// See the accessors for a description of what these are.
 enum OperandFlags {
-  LookupPtrRegClass = 0,
+  LookupRegClassByHwMode = 0,
   Predicate,
   OptionalDef,
   BranchTarget
@@ -84,10 +85,10 @@ enum OperandType {
 /// indicating the register class for register operands, etc.
 class MCOperandInfo {
 public:
-  /// This specifies the register class enumeration of the operand
-  /// if the operand is a register.  If isLookupPtrRegClass is set, then this is
-  /// an index that is passed to TargetRegisterInfo::getPointerRegClass(x) to
-  /// get a dynamic register class.
+  /// This specifies the register class enumeration of the operand if the
+  /// operand is a register. If LookupRegClassByHwMode is set, then this is an
+  /// index into a table in TargetInstrInfo or MCInstrInfo which contains the
+  /// real register class ID.
   int16_t RegClass;
 
   /// These are flags from the MCOI::OperandFlags enum.
@@ -99,10 +100,10 @@ public:
   /// Operand constraints (see OperandConstraint enum).
   uint16_t Constraints;
 
-  /// Set if this operand is a pointer value and it requires a callback
-  /// to look up its register class.
-  bool isLookupPtrRegClass() const {
-    return Flags & (1 << MCOI::LookupPtrRegClass);
+  /// Set if this operand is a value that requires the current hwmode to look up
+  /// its register class.
+  bool isLookupRegClassByHwMode() const {
+    return Flags & (1 << MCOI::LookupRegClassByHwMode);
   }
 
   /// Set if this is one of the operands that made up of the predicate
@@ -209,10 +210,10 @@ public:
   unsigned short SchedClass;     // enum identifying instr sched class
   unsigned char NumImplicitUses; // Num of regs implicitly used
   unsigned char NumImplicitDefs; // Num of regs implicitly defined
+  unsigned short OpInfoOffset;   // Offset to info about operands
+  unsigned short ImplicitOffset; // Offset to start of implicit op list
   uint64_t Flags;                // Flags identifying machine instr class
   uint64_t TSFlags;              // Target Specific Flag values
-  const MCPhysReg *ImplicitOps;  // List of implicit uses followed by defs
-  const MCOperandInfo *OpInfo;   // 'NumOperands' entries about operands
 
   /// Returns the value of the specified operand constraint if
   /// it is present. Returns -1 if it is not present.
@@ -236,13 +237,9 @@ public:
   /// well.
   unsigned getNumOperands() const { return NumOperands; }
 
-  using const_opInfo_iterator = const MCOperandInfo *;
-
-  const_opInfo_iterator opInfo_begin() const { return OpInfo; }
-  const_opInfo_iterator opInfo_end() const { return OpInfo + NumOperands; }
-
   ArrayRef<MCOperandInfo> operands() const {
-    return ArrayRef(OpInfo, NumOperands);
+    auto OpInfo = reinterpret_cast<const MCOperandInfo *>(this + Opcode + 1);
+    return ArrayRef(OpInfo + OpInfoOffset, NumOperands);
   }
 
   /// Return the number of MachineOperands that are register
@@ -333,7 +330,8 @@ public:
   /// Return true if this is a branch or an instruction which directly
   /// writes to the program counter. Considered 'may' affect rather than
   /// 'does' affect as things like predication are not taken into account.
-  bool mayAffectControlFlow(const MCInst &MI, const MCRegisterInfo &RI) const;
+  LLVM_ABI bool mayAffectControlFlow(const MCInst &MI,
+                                     const MCRegisterInfo &RI) const;
 
   /// Return true if this instruction has a predicate operand
   /// that controls execution. It may be set to 'always', or may be set to other
@@ -523,9 +521,8 @@ public:
   /// Returns true if this instruction is a candidate for remat. This
   /// flag is only used in TargetInstrInfo method isTriviallyRematerializable.
   ///
-  /// If this flag is set, the isReallyTriviallyReMaterializable()
-  /// or isReallyTriviallyReMaterializableGeneric methods are called to verify
-  /// the instruction is really rematable.
+  /// If this flag is set, the isReMaterializableImpl() method is
+  /// called to verify the instruction is really rematerializable.
   bool isRematerializable() const {
     return Flags & (1ULL << MCID::Rematerializable);
   }
@@ -568,6 +565,8 @@ public:
   /// reading the flags.  Likewise, the variable shift instruction on X86 is
   /// marked as implicitly reading the 'CL' register, which it always does.
   ArrayRef<MCPhysReg> implicit_uses() const {
+    auto ImplicitOps =
+        reinterpret_cast<const MCPhysReg *>(this + Opcode + 1) + ImplicitOffset;
     return {ImplicitOps, NumImplicitUses};
   }
 
@@ -580,19 +579,22 @@ public:
   /// registers.  For that instruction, this will return a list containing the
   /// EAX/EDX/EFLAGS registers.
   ArrayRef<MCPhysReg> implicit_defs() const {
+    auto ImplicitOps =
+        reinterpret_cast<const MCPhysReg *>(this + Opcode + 1) + ImplicitOffset;
     return {ImplicitOps + NumImplicitUses, NumImplicitDefs};
   }
 
   /// Return true if this instruction implicitly
   /// uses the specified physical register.
-  bool hasImplicitUseOfPhysReg(unsigned Reg) const {
+  bool hasImplicitUseOfPhysReg(MCRegister Reg) const {
     return is_contained(implicit_uses(), Reg);
   }
 
   /// Return true if this instruction implicitly
   /// defines the specified physical register.
-  bool hasImplicitDefOfPhysReg(unsigned Reg,
-                               const MCRegisterInfo *MRI = nullptr) const;
+  LLVM_ABI bool
+  hasImplicitDefOfPhysReg(MCRegister Reg,
+                          const MCRegisterInfo *MRI = nullptr) const;
 
   /// Return the scheduling class for this instruction.  The
   /// scheduling class is an index into the InstrItineraryData table.  This
@@ -618,8 +620,8 @@ public:
 
   /// Return true if this instruction defines the specified physical
   /// register, either explicitly or implicitly.
-  bool hasDefOfPhysReg(const MCInst &MI, unsigned Reg,
-                       const MCRegisterInfo &RI) const;
+  LLVM_ABI bool hasDefOfPhysReg(const MCInst &MI, MCRegister Reg,
+                                const MCRegisterInfo &RI) const;
 };
 
 } // end namespace llvm

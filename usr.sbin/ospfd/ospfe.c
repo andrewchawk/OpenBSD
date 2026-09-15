@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfe.c,v 1.114 2023/12/13 15:34:27 claudio Exp $ */
+/*	$OpenBSD: ospfe.c,v 1.124 2026/09/03 13:07:50 claudio Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -155,9 +155,12 @@ ospfe(struct ospfd_conf *xconf, int pipe_parent2ospfe[2], int pipe_ospfe2rde[2],
 	if ((iev_rde = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_rde->ibuf, pipe_ospfe2rde[0]);
+	if (imsgbuf_init(&iev_rde->ibuf, pipe_ospfe2rde[0]) == -1)
+		fatal(NULL);
 	iev_rde->handler = ospfe_dispatch_rde;
-	imsg_init(&iev_main->ibuf, pipe_parent2ospfe[1]);
+	if (imsgbuf_init(&iev_main->ibuf, pipe_parent2ospfe[1]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = ospfe_dispatch_main;
 
 	/* setup event handler */
@@ -209,14 +212,6 @@ ospfe_shutdown(void)
 	struct area	*area;
 	struct iface	*iface;
 
-	/* close pipes */
-	msgbuf_write(&iev_rde->ibuf.w);
-	msgbuf_clear(&iev_rde->ibuf.w);
-	close(iev_rde->ibuf.fd);
-	msgbuf_write(&iev_main->ibuf.w);
-	msgbuf_clear(&iev_main->ibuf.w);
-	close(iev_main->ibuf.fd);
-
 	/* stop all interfaces and remove all areas */
 	while ((area = LIST_FIRST(&oeconf->area_list)) != NULL) {
 		LIST_FOREACH(iface, &area->iface_list, entry) {
@@ -231,6 +226,14 @@ ospfe_shutdown(void)
 
 	nbr_del(nbr_find_peerid(NBR_IDSELF));
 	close(oeconf->ospf_socket);
+
+	/* close pipes */
+	imsgbuf_write(&iev_rde->ibuf);
+	imsgbuf_clear(&iev_rde->ibuf);
+	close(iev_rde->ibuf.fd);
+	imsgbuf_write(&iev_main->ibuf);
+	imsgbuf_clear(&iev_main->ibuf);
+	close(iev_main->ibuf.fd);
 
 	/* clean up */
 	free(iev_rde);
@@ -272,21 +275,23 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 	int		 n, link_ok, stub_changed, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("ospfe_dispatch_main: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("ospfe_dispatch_main: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -431,8 +436,13 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 			LIST_INSERT_HEAD(&narea->iface_list, niface, entry);
 			break;
 		case IMSG_RECONF_AUTHMD:
-			memcpy(&md, imsg.data, sizeof(struct auth_md));
-			md_list_add(&niface->auth_md_list, md.keyid, md.key);
+			if (imsg_get_data(&imsg, md.key, sizeof(md.key)) == -1)
+				fatalx(
+				    "%s IMSG_RECONF_AUTHMD could not get key",
+				    __func__);
+			md.keyid = imsg_get_id(&imsg);
+			md_list_add(&niface->auth_md_list,
+			    md.keyid, md.key);
 			break;
 		case IMSG_RECONF_END:
 			if ((oeconf->flags & OSPFD_FLAG_STUB_ROUTER) !=
@@ -479,6 +489,7 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 void
 ospfe_dispatch_rde(int fd, short event, void *bula)
 {
+	struct ibuf		 buf;
 	struct lsa_hdr		 lsa_hdr;
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf = &iev->ibuf;
@@ -491,24 +502,26 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 	struct imsg		 imsg;
 	struct abr_rtr		 ar;
 	int			 n, noack = 0, shut = 0;
-	u_int16_t		 l, age;
+	u_int16_t		 age;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* connection closed */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* connection closed */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* connection closed */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("ospfe_dispatch_rde: imsg_get error");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("ospfe_dispatch_rde: imsgbuf_get error");
 		if (n == 0)
 			break;
 
@@ -589,15 +602,12 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 			if (nbr == NULL)
 				break;
 
-			l = imsg.hdr.len - IMSG_HEADER_SIZE;
-			if (l < sizeof(lsa_hdr))
-				fatalx("ospfe_dispatch_rde: "
-				    "bad imsg size");
-			memcpy(&lsa_hdr, imsg.data, sizeof(lsa_hdr));
+			if (imsg_get_ibuf(&imsg, &buf) == -1)
+				fatalx("bad LS_FLOOD imsg received");
 
-			ref = lsa_cache_add(imsg.data, l);
+			ref = lsa_cache_add(&buf);
 
-			if (lsa_hdr.type == LSA_TYPE_EXTERNAL) {
+			if (ref->hdr.type == LSA_TYPE_EXTERNAL) {
 				/*
 				 * flood on all areas but stub areas and
 				 * virtual links
@@ -607,16 +617,14 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 					    continue;
 				    LIST_FOREACH(iface, &area->iface_list,
 					entry) {
-					    noack += lsa_flood(iface, nbr,
-						&lsa_hdr, imsg.data);
+					    noack += lsa_flood(iface, nbr, ref);
 				    }
 				}
-			} else if (lsa_hdr.type == LSA_TYPE_LINK_OPAQ) {
+			} else if (ref->hdr.type == LSA_TYPE_LINK_OPAQ) {
 				/*
 				 * Flood on interface only
 				 */
-				noack += lsa_flood(nbr->iface, nbr,
-				    &lsa_hdr, imsg.data);
+				noack += lsa_flood(nbr->iface, nbr, ref);
 			} else {
 				/*
 				 * Flood on all area interfaces. For
@@ -624,14 +632,13 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 				 */
 				area = nbr->iface->area;
 				LIST_FOREACH(iface, &area->iface_list, entry) {
-					noack += lsa_flood(iface, nbr,
-					    &lsa_hdr, imsg.data);
+					noack += lsa_flood(iface, nbr, ref);
 				}
 				/* XXX virtual links */
 			}
 
 			/* remove from ls_req_list */
-			le = ls_req_list_get(nbr, &lsa_hdr);
+			le = ls_req_list_get(nbr, &ref->hdr);
 			if (!(nbr->state & NBR_STA_FULL) && le != NULL) {
 				ls_req_list_free(nbr, le);
 				/*
@@ -648,7 +655,7 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 				    nbr->iface->dr == nbr) {
 					/* delayed ack */
 					lhp = lsa_hdr_new();
-					memcpy(lhp, &lsa_hdr, sizeof(*lhp));
+					memcpy(lhp, &ref->hdr, sizeof(*lhp));
 					ls_ack_list_add(nbr->iface, lhp);
 				}
 			}
@@ -665,10 +672,8 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 			 * IMSG_LS_SNAP is used in one case:
 			 *    in EXSTART when the LSA has age MaxAge
 			 */
-			l = imsg.hdr.len - IMSG_HEADER_SIZE;
-			if (l < sizeof(lsa_hdr))
-				fatalx("ospfe_dispatch_rde: "
-				    "bad imsg size");
+			if (imsg_get_ibuf(&imsg, &buf) == -1)
+				fatalx("bad LS_UPD/SNAP imsg received");
 
 			nbr = nbr_find_peerid(imsg.hdr.peerid);
 			if (nbr == NULL)
@@ -681,13 +686,14 @@ ospfe_dispatch_rde(int fd, short event, void *bula)
 			    nbr->state != NBR_STA_SNAP)
 				break;
 
-			memcpy(&age, imsg.data, sizeof(age));
-			ref = lsa_cache_add(imsg.data, l);
+			ref = lsa_cache_add(&buf);
+			age = ref->hdr.age;
+
 			if (ntohs(age) >= MAX_AGE)
 				/* add to retransmit list */
-				ls_retrans_list_add(nbr, imsg.data, 0, 0);
+				ls_retrans_list_add(nbr, ref, 0, 0);
 			else
-				ls_retrans_list_add(nbr, imsg.data, 0, 1);
+				ls_retrans_list_add(nbr, ref, 0, 1);
 
 			lsa_cache_put(ref, nbr);
 			break;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: stp4020.c,v 1.23 2023/04/11 00:45:09 jsg Exp $	*/
+/*	$OpenBSD: stp4020.c,v 1.25 2026/05/13 06:24:20 jsg Exp $	*/
 /*	$NetBSD: stp4020.c,v 1.23 2002/06/01 23:51:03 lukem Exp $	*/
 
 /*-
@@ -507,7 +507,7 @@ stp4020_iointr(void *arg)
 			}
 			/* Call card handler, if any */
 			if (h->softint != NULL) {
-				softintr_schedule(h->softint);
+				softintr_schedule_raw(h->softint);
 
 				/*
 				 * Disable this sbus interrupt, until the
@@ -794,13 +794,13 @@ stp4020_chip_intr_establish(pcmcia_chipset_handle_t pch,
 	struct stp4020_socket *h = (struct stp4020_socket *)pch;
 
 	/*
-	 * Note that this code relies on softintr_establish() to be
-	 * used with real, hardware ipl values. All platforms with
+	 * Note that this code uses softintr_establish_raw() in order
+	 * to use real (hardware) ipl values. All platforms with
 	 * SBus support this.
 	 */
 	h->intrhandler = handler;
 	h->intrarg = arg;
-	h->softint = softintr_establish(ipl, stp4020_intr_dispatch, h);
+	h->softint = softintr_establish_raw(ipl, stp4020_intr_dispatch, h);
 
 	return h->softint != NULL ? h : NULL;
 }
@@ -811,7 +811,7 @@ stp4020_chip_intr_disestablish(pcmcia_chipset_handle_t pch, void *ih)
 	struct stp4020_socket *h = (struct stp4020_socket *)pch;
 
 	if (h->softint != NULL) {
-		softintr_disestablish(h->softint);
+		softintr_disestablish_raw(h->softint);
 		h->softint = NULL;
 	}
 	h->intrhandler = NULL;
@@ -834,8 +834,6 @@ stp4020_chip_intr_string(pcmcia_chipset_handle_t pch, void *ih)
 void
 stp4020_delay(unsigned int usecs)
 {
-	int chan;
-
 	if (cold || usecs < tick) {
 		delay(usecs);
 		return;
@@ -845,7 +843,7 @@ stp4020_delay(unsigned int usecs)
 	if (USEC_TO_NSEC(usecs) > SEC_TO_NSEC(60))
 		panic("stp4020: preposterous delay: %uus", usecs);
 #endif
-	tsleep_nsec(&chan, 0, "stp4020_delay", USEC_TO_NSEC(usecs));
+	tsleep_nsec(&nowake, 0, "stp4020_delay", USEC_TO_NSEC(usecs));
 }
 
 #ifdef STP4020_DEBUG

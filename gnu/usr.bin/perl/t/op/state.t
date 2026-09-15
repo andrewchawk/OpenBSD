@@ -9,7 +9,7 @@ BEGIN {
 
 use strict;
 
-plan tests => 164;
+plan tests => 170;
 
 # Before loading feature.pm, test it with CORE::
 ok eval 'CORE::state $x = 1;', 'CORE::state outside of feature.pm scope';
@@ -501,6 +501,32 @@ ok(rt_123029(), "state variables don't surprisingly disappear when accessed");
 for (1,2) {
     state $s = "-$_-";
     is($s, "-1-", "state with multiconcat pass $_");
+}
+
+# This caused 'Attempt to free unreferenced scalar' because the SV holding
+# the value of the const state sub wasn't having its ref count incremented
+# when the sub was cloned.
+
+{
+    my @warnings;
+    local $SIG{__WARN__} = sub { push @warnings, @_ };
+    my $e = eval 'my $s = sub { state sub FOO () { 42 } }; 1;';
+    is($e, 1, "const state sub ran ok");
+    ok(!@warnings, "no 'Attempt to free unreferenced scalar'")
+        or diag "got these warnings:\n@warnings";
+}
+
+#  [GH #18630] Returning state hash-assign risks "Bizarre copy of HASH in subroutine exit"
+{
+    sub gh_18630H {state %h=(a=>1)}
+    my $res = join '', gh_18630H, gh_18630H;
+    is($res, "a1a1", 'HASH copied successfully in subroutine exit');
+    is(scalar gh_18630H, 1, 'gh_18630H scalar call returns key count');
+
+    sub gh_18630A {state @a = qw(b 2)}
+    $res = join '', gh_18630A , gh_18630A;
+    is($res, "b2b2", 'ARRAY copied successfully in subroutine exit');
+    is(scalar gh_18630A, 2, 'gh_18630A scalar call returns element count');
 }
 
 __DATA__

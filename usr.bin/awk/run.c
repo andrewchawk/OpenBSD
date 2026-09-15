@@ -1,4 +1,4 @@
-/*	$OpenBSD: run.c,v 1.88 2024/06/04 14:40:46 millert Exp $	*/
+/*	$OpenBSD: run.c,v 1.90 2026/05/09 02:13:21 millert Exp $	*/
 /****************************************************************
 Copyright (C) Lucent Technologies 1997
 All Rights Reserved
@@ -36,6 +36,7 @@ THIS SOFTWARE.
 #include <stdlib.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include "awk.h"
 #include "awkgram.tab.h"
@@ -956,16 +957,12 @@ Cell *indirect(Node **a, int n)	/* $( a[0] ) */
 	Awkfloat val;
 	Cell *x;
 	int m;
-	char *s;
 
 	x = execute(a[0]);
 	val = getfval(x);	/* freebsd: defend against super large field numbers */
 	if ((Awkfloat)INT_MAX < val)
 		FATAL("trying to access out of range field %s", x->nval);
 	m = (int) val;
-	if (m == 0 && !is_number(s = getsval(x), NULL))	/* suspicion! */
-		FATAL("illegal field $(%s), name \"%s\"", s, x->nval);
-		/* BUG: can x->nval ever be null??? */
 	tempfree(x);
 	x = fieldadr(m);
 	x->ctype = OCELL;	/* BUG?  why are these needed? */
@@ -1752,7 +1749,9 @@ Cell *split(Node **a, int nnn)	/* split(a[0], a[1], a[2]); a[3] is type */
 		pfa = NULL;
 
 	} else if (a[2] == NULL && CSV) {	/* CSV only if no explicit separator */
-		char *newt = (char *) malloc(strlen(s)); /* for building new string; reuse for each field */
+		char *newt = (char *) malloc(strlen(s) + 1); /* for building new string; reuse for each field */
+		if (newt == NULL)
+			FATAL("out of space in split");
 		for (;;) {
 			char *fr = newt;
 			n++;
@@ -2370,9 +2369,11 @@ FILE *openfile(int a, const char *us, bool *pnewflag)
 	size_t i;
 	int m;
 	FILE *fp = NULL;
+	struct stat sbuf;
 
 	if (*s == '\0')
 		FATAL("null file name in print or getline");
+
 	for (i = 0; i < nfiles; i++)
 		if (files[i].fname && strcmp(s, files[i].fname) == 0 &&
 		    (a == files[i].mode || (a==APPEND && files[i].mode==GT) ||
@@ -2383,7 +2384,6 @@ FILE *openfile(int a, const char *us, bool *pnewflag)
 		}
 	if (a == FFLUSH)	/* didn't find it, so don't create it! */
 		return NULL;
-
 	for (i = 0; i < nfiles; i++)
 		if (files[i].fp == NULL)
 			break;
@@ -2397,7 +2397,14 @@ FILE *openfile(int a, const char *us, bool *pnewflag)
 		nfiles = nnf;
 		files = nf;
 	}
+
 	fflush(stdout);	/* force a semblance of order */
+
+	/* don't try to read or write a directory */
+	if (a == LT || a == GT || a == APPEND)
+		if (stat(s, &sbuf) == 0 && S_ISDIR(sbuf.st_mode))
+				return NULL;
+
 	m = a;
 	if (a == GT) {
 		fp = fopen(s, "w");

@@ -1,4 +1,4 @@
-/* $OpenBSD: acpibtn.c,v 1.53 2024/08/06 17:38:56 kettenis Exp $ */
+/* $OpenBSD: acpibtn.c,v 1.56 2025/10/31 23:30:02 jan Exp $ */
 /*
  * Copyright (c) 2005 Marco Peereboom <marco@openbsd.org>
  *
@@ -229,9 +229,11 @@ acpibtn_notify(struct aml_node *node, int notify_type, void *arg)
 	dnprintf(10, "acpibtn_notify: %.2x %s\n", notify_type,
 	    sc->sc_devnode->name);
 
+#ifdef SUSPEND
 	/* Ignore button events if we're resuming. */
-	if (acpi_resuming(sc->sc_acpi))
+	if (resuming())
 		return (0);
+#endif
 
 	switch (sc->sc_btn_type) {
 	case ACPIBTN_LID:
@@ -254,6 +256,7 @@ acpibtn_notify(struct aml_node *node, int notify_type, void *arg)
 
 		switch (lid_action) {
 		case 1:
+		case -1:
 			goto sleep;
 #ifdef HIBERNATE
 		case 2:
@@ -290,8 +293,7 @@ sleep:
 			case 0:
 				break;
 			case 1:
-				acpi_addtask(sc->sc_acpi, acpi_powerdown_task,
-				    sc->sc_acpi, 0);
+				powerbutton_event();
 				break;
 #ifndef SMALL_KERNEL
 			case 2:

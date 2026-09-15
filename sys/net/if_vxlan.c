@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_vxlan.c,v 1.99 2023/12/23 10:52:54 bluhm Exp $ */
+/*	$OpenBSD: if_vxlan.c,v 1.107 2026/06/22 06:32:47 deraadt Exp $ */
 
 /*
  * Copyright (c) 2021 David Gwynne <dlg@openbsd.org>
@@ -21,11 +21,9 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/kernel.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <sys/timeout.h>
 #include <sys/pool.h>
 #include <sys/tree.h>
 #include <sys/refcnt.h>
@@ -35,10 +33,6 @@
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/if_dl.h>
-#include <net/if_media.h>
-#include <net/if_types.h>
-#include <net/route.h>
 #include <net/rtable.h>
 
 #include <netinet/in.h>
@@ -173,8 +167,8 @@ static int	vxlan_addmulti(struct vxlan_softc *, struct ifnet *);
 static void	vxlan_delmulti(struct vxlan_softc *);
 
 static struct mbuf *
-		vxlan_input(void *, struct mbuf *,
-		    struct ip *, struct ip6_hdr *, void *, int);
+		vxlan_input(void *, struct mbuf *, struct ip *,
+		    struct ip6_hdr *, void *, int, struct netstack *);
 
 static int	vxlan_set_rdomain(struct vxlan_softc *, const struct ifreq *);
 static int	vxlan_get_rdomain(struct vxlan_softc *, struct ifreq *);
@@ -342,7 +336,7 @@ vxlan_encap(struct vxlan_softc *sc, struct mbuf *m,
 
 		smr_read_enter();
 		endpoint = etherbridge_resolve_ea(&sc->sc_eb,
-		    (struct ether_addr *)eh->ether_dhost);
+		    0, (struct ether_addr *)eh->ether_dhost);
 		if (endpoint != NULL) {
 			gateway = *endpoint;
 			endpoint = &gateway;
@@ -514,16 +508,19 @@ vxlan_send_ipv4(struct vxlan_softc *sc, struct mbuf_list *ml)
 	struct mbuf *m;
 	uint64_t oerrors = 0;
 
+	if (ml_empty(ml))
+		return (0);
+
+	memset(&imo, 0, sizeof(struct ip_moptions));
 	imo.imo_ifidx = sc->sc_if_index0;
 	imo.imo_ttl = sc->sc_ttl;
-	imo.imo_loop = 0;
 
-	NET_LOCK();
+	NET_LOCK_SHARED();
 	while ((m = ml_dequeue(ml)) != NULL) {
 		if (ip_output(m, NULL, NULL, IP_RAWOUTPUT, &imo, NULL, 0) != 0)
 			oerrors++;
 	}
-	NET_UNLOCK();
+	NET_UNLOCK_SHARED();
 
 	return (oerrors);
 }
@@ -536,16 +533,19 @@ vxlan_send_ipv6(struct vxlan_softc *sc, struct mbuf_list *ml)
 	struct mbuf *m;
 	uint64_t oerrors = 0;
 
+	if (ml_empty(ml))
+		return (0);
+
+	memset(&im6o, 0, sizeof(struct ip6_moptions));
 	im6o.im6o_ifidx = sc->sc_if_index0;
 	im6o.im6o_hlim = sc->sc_ttl;
-	im6o.im6o_loop = 0;
 
-	NET_LOCK();
+	NET_LOCK_SHARED();
 	while ((m = ml_dequeue(ml)) != NULL) {
 		if (ip6_output(m, NULL, NULL, 0, &im6o, NULL) != 0)
 			oerrors++;
 	}
-	NET_UNLOCK();
+	NET_UNLOCK_SHARED();
 
 	return (oerrors);
 }
@@ -602,7 +602,7 @@ vxlan_send(void *arg)
 
 static struct mbuf *
 vxlan_input(void *arg, struct mbuf *m, struct ip *ip, struct ip6_hdr *ip6,
-    void *uhp, int hlen)
+    void *uhp, int hlen, struct netstack *ns)
 {
 	struct vxlan_tep *vt = arg;
 	union vxlan_addr addr;
@@ -694,7 +694,7 @@ vxlan_input(void *arg, struct mbuf *m, struct ip *ip, struct ip6_hdr *ip6,
 
 	if (sc->sc_mode == VXLAN_TMODE_LEARNING) {
 		eh = mtod(m, struct ether_header *);
-		etherbridge_map_ea(&sc->sc_eb, &addr,
+		etherbridge_map_ea(&sc->sc_eb, &addr, 0, 0,
 		    (struct ether_addr *)eh->ether_shost);
 	}
 
@@ -708,10 +708,10 @@ vxlan_input(void *arg, struct mbuf *m, struct ip *ip, struct ip6_hdr *ip6,
 		break;
 	default:
 		m->m_pkthdr.pf.prio = rxhprio;
-		break;                                                  \
-        }                                                               \
+		break;
+        }
 
-	if_vinput(ifp, m);
+	if_vinput(ifp, m, ns);
 rele:
 	vxlan_rele(sc);
 	return (NULL);
@@ -729,6 +729,7 @@ vxlan_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	struct vxlan_softc *sc = ifp->if_softc;
 	struct ifreq *ifr = (struct ifreq *)data;
 	struct ifbrparam *bparam = (struct ifbrparam *)data;
+	struct ifnet *ifp0;
 	int error = 0;
 
 	switch (cmd) {
@@ -743,6 +744,13 @@ vxlan_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		} else {
 			if (ISSET(ifp->if_flags, IFF_RUNNING))
 				error = vxlan_down(sc);
+		}
+		break;
+
+	case SIOCSIFXFLAGS:
+		if ((ifp0 = if_get(sc->sc_if_index0)) != NULL) {
+			ifsetlro(ifp0, ISSET(ifr->ifr_flags, IFXF_LRO));
+			if_put(ifp0);
 		}
 		break;
 
@@ -932,10 +940,10 @@ vxlan_tep_add_addr(struct vxlan_softc *sc, const union vxlan_addr *addr,
 	if (error != 0)
 		goto free;
 
-	solock(so);
+	solock_shared(so);
 	sotoinpcb(so)->inp_upcall = vxlan_input;
 	sotoinpcb(so)->inp_upcall_arg = vt;
-	sounlock(so);
+	sounlock_shared(so);
 
 	m_inithdr(&m);
 	m.m_len = sizeof(vt->vt_rdomain);
@@ -972,9 +980,9 @@ vxlan_tep_add_addr(struct vxlan_softc *sc, const union vxlan_addr *addr,
 		unhandled_af(vt->vt_af);
 	}
 
-	solock(so);
+	solock_shared(so);
 	error = sobind(so, &m, curproc);
-	sounlock(so);
+	sounlock_shared(so);
 	if (error != 0)
 		goto close;
 
@@ -1053,7 +1061,7 @@ vxlan_tep_up(struct vxlan_softc *sc)
 	mp->p_sc = vxlan_take(sc);
 
 	/* destination address is a multicast group we want to join */
-	error = vxlan_tep_add_addr(sc, &sc->sc_dst, up);
+	error = vxlan_tep_add_addr(sc, &sc->sc_dst, mp);
 	if (error != 0)
 		goto freemp;
 
@@ -1713,13 +1721,13 @@ vxlan_add_addr(struct vxlan_softc *sc, const struct ifbareq *ifba)
 	}
 
 	return (etherbridge_add_addr(&sc->sc_eb, &endpoint,
-	    &ifba->ifba_dst, type));
+	    0, 0, &ifba->ifba_dst, type));
 }
 
 static int
 vxlan_del_addr(struct vxlan_softc *sc, const struct ifbareq *ifba)
 {
-	return (etherbridge_del_addr(&sc->sc_eb, &ifba->ifba_dst));
+	return (etherbridge_del_addr(&sc->sc_eb, 0, &ifba->ifba_dst));
 }
 
 void

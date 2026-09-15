@@ -1,4 +1,4 @@
-/*	$OpenBSD: bus.h,v 1.6 2024/03/27 23:10:18 kettenis Exp $	*/
+/*	$OpenBSD: bus.h,v 1.10 2026/06/22 21:12:12 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2003-2004 Opsycon AB Sweden.  All rights reserved.
@@ -133,6 +133,8 @@ struct bus_space {
 #define BUS_SPACE_MAP_CACHEABLE		0x01
 #define BUS_SPACE_MAP_LINEAR		0x02
 #define BUS_SPACE_MAP_PREFETCHABLE	0x04
+
+extern bus_space_t riscv64_bs_tag;
 
 #define	bus_space_vaddr(t, h)	(*(t)->_space_vaddr)((t), (h))
 #define	bus_space_mmap(t, a, o, p, f) \
@@ -369,6 +371,7 @@ struct machine_bus_dma_segment {
 
 	paddr_t		_ds_paddr;	/* CPU address */
 	vaddr_t		_ds_vaddr;	/* CPU address */
+	vaddr_t		_ds_bounce_va;	/* mapped bounced data */
 	int		_ds_coherent;	/* Coherently mapped */
 };
 typedef struct machine_bus_dma_segment	bus_dma_segment_t;
@@ -383,6 +386,8 @@ typedef struct machine_bus_dma_segment	bus_dma_segment_t;
 struct machine_bus_dma_tag {
 	void	*_cookie;		/* cookie used in the guts */
 	int	_flags;			/* misc. flags */
+	paddr_t	_low;			/* lowest DMA-reachable address */
+	paddr_t _high;			/* highest DMA-reachable address */
 
 	/*
 	 * DMA mapping methods.
@@ -399,7 +404,8 @@ struct machine_bus_dma_tag {
 	int	(*_dmamap_load_raw)(bus_dma_tag_t , bus_dmamap_t,
 		    bus_dma_segment_t *, int, bus_size_t, int);
 	int	(*_dmamap_load_buffer)(bus_dma_tag_t, bus_dmamap_t, void *,
-		    bus_size_t, struct proc *, int, paddr_t *, int *, int);
+		    bus_size_t, struct proc *, int, paddr_t *, int *,
+		    int *, int *, int);
 	void	(*_dmamap_unload)(bus_dma_tag_t , bus_dmamap_t);
 	void	(*_dmamap_sync)(bus_dma_tag_t , bus_dmamap_t,
 		    bus_addr_t, bus_size_t, int);
@@ -409,6 +415,9 @@ struct machine_bus_dma_tag {
 	 */
 	int	(*_dmamem_alloc)(bus_dma_tag_t, bus_size_t, bus_size_t,
 		    bus_size_t, bus_dma_segment_t *, int, int *, int);
+	int	(*_dmamem_alloc_range)(bus_dma_tag_t, bus_size_t, bus_size_t,
+		    bus_size_t, bus_dma_segment_t *, int, int *, int,
+		    paddr_t, paddr_t);
 	void	(*_dmamem_free)(bus_dma_tag_t, bus_dma_segment_t *, int);
 	int	(*_dmamem_map)(bus_dma_tag_t, bus_dma_segment_t *,
 		    int, size_t, caddr_t *, int);
@@ -442,6 +451,9 @@ struct machine_bus_dma_tag {
 
 #define	bus_dmamem_alloc(t, s, a, b, sg, n, r, f)		\
 	(*(t)->_dmamem_alloc)((t), (s), (a), (b), (sg), (n), (r), (f))
+#define bus_dmamem_alloc_range(t, s, a, b, sg, n, r, f, l, h)	\
+	(*(t)->_dmamem_alloc_range)((t), (s), (a), (b), (sg),	\
+	    (n), (r), (f), (l), (h))
 #define	bus_dmamem_free(t, sg, n)				\
 	(*(t)->_dmamem_free)((t), (sg), (n))
 #define	bus_dmamem_map(t, sg, n, s, k, f)			\
@@ -450,6 +462,8 @@ struct machine_bus_dma_tag {
 	(*(t)->_dmamem_unmap)((t), (k), (s))
 #define	bus_dmamem_mmap(t, sg, n, o, p, f)			\
 	(*(t)->_dmamem_mmap)((t), (sg), (n), (o), (p), (f))
+
+void	bus_dma_init(void);
 
 int	_dmamap_create(bus_dma_tag_t, bus_size_t, int,
 	    bus_size_t, bus_size_t, int, bus_dmamap_t *);
@@ -461,7 +475,8 @@ int	_dmamap_load_uio(bus_dma_tag_t, bus_dmamap_t, struct uio *, int);
 int	_dmamap_load_raw(bus_dma_tag_t, bus_dmamap_t,
 	    bus_dma_segment_t *, int, bus_size_t, int);
 int	_dmamap_load_buffer(bus_dma_tag_t, bus_dmamap_t, void *,
-	    bus_size_t, struct proc *, int, paddr_t *, int *, int);
+	    bus_size_t, struct proc *, int, paddr_t *, int *, int *,
+	    int *, int);
 void	_dmamap_unload(bus_dma_tag_t, bus_dmamap_t);
 void	_dmamap_sync(bus_dma_tag_t, bus_dmamap_t, bus_addr_t,
 	    bus_size_t, int);
@@ -492,6 +507,13 @@ struct machine_bus_dmamap {
 	int		_dm_flags;	/* misc. flags */
 
 	void		*_dm_cookie;	/* cookie for bus-specific functions */
+
+	struct vm_page **_dm_pages;	/* replacement pages */
+	vaddr_t		_dm_pgva;	/* those above -- mapped */
+	int		_dm_npages;	/* number of pages allocated */
+	int		_dm_nused;	/* number of pages replaced */
+	paddr_t		_dm_low;	/* lowest DMA-reachable address */
+	paddr_t		_dm_high;	/* highest DMA-reachable address */
 
 	/*
 	 * PUBLIC MEMBERS: these are used by machine-independent code.

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_input.c,v 1.254 2024/05/23 11:19:13 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_input.c,v 1.263 2026/05/28 10:50:47 kirill Exp $	*/
 /*	$NetBSD: ieee80211_input.c,v 1.24 2004/05/31 11:12:24 dyoung Exp $	*/
 
 /*-
@@ -87,6 +87,7 @@ int	ieee80211_parse_edca_params_body(struct ieee80211com *,
 	    const u_int8_t *);
 int	ieee80211_parse_edca_params(struct ieee80211com *, const u_int8_t *);
 int	ieee80211_parse_wmm_params(struct ieee80211com *, const u_int8_t *);
+int	ieee80211_parse_wmm_qosinfo(const u_int8_t *, u_int8_t *);
 enum	ieee80211_cipher ieee80211_parse_rsn_cipher(const u_int8_t *);
 enum	ieee80211_akm ieee80211_parse_rsn_akm(const u_int8_t *);
 int	ieee80211_parse_rsn_body(struct ieee80211com *, const u_int8_t *,
@@ -424,7 +425,9 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
 		*orxseq = nrxseq;
 	}
 	if (ic->ic_state > IEEE80211_S_SCAN) {
-		ni->ni_rssi = rxi->rxi_rssi;
+		/* Only update RSSI if driver provided a valid value. */
+		if (rxi->rxi_rssi != 0)
+			ni->ni_rssi = rxi->rxi_rssi;
 		ni->ni_rstamp = rxi->rxi_tstamp;
 		ni->ni_inact = 0;
 
@@ -637,26 +640,39 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
 		}
 
 		if (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT) {
+			int is_multicast, is_protected;
+
+			is_multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+			is_protected = (wh->i_fc[1] & IEEE80211_FC1_PROTECTED);
+
 			/* MMPDU protection is on for Rx */
 			if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
 			    subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
 			    subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
-				if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-				    !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+				if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+					m = ieee80211_input_hwdecrypt(ic, ni,
+					    m, rxi);
+					if (m == NULL)
+						goto out;
+				} else if (!is_multicast && !is_protected) {
 					/* unicast mgmt not encrypted */
+					ic->ic_stats.is_rx_unencrypted++;
 					goto out;
-				}
-				/* do software decryption */
-				m = ieee80211_decrypt(ic, m, ni);
-				if (m == NULL) {
-					/* XXX stats */
-					goto out;
+				} else {
+					/* do software decryption */
+					m = ieee80211_decrypt(ic, m, ni);
+					if (m == NULL) {
+						ic->ic_stats.is_rx_wepfail++;
+						goto out;
+					}
 				}
 				wh = mtod(m, struct ieee80211_frame *);
 			}
 		} else if ((ic->ic_flags & IEEE80211_F_RSNON) &&
-		    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+		    ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) ||
+		    (rxi->rxi_flags & IEEE80211_RXI_HWDEC))) {
 			/* encrypted but MMPDU Rx protection off for TA */
+			ic->ic_stats.is_rx_nowep++;
 			goto out;
 		}
 
@@ -1295,6 +1311,7 @@ ieee80211_amsdu_decap(struct ieee80211com *ic, struct mbuf *m,
 			/* stop processing A-MSDU subframes */
 			ic->ic_stats.is_rx_decap++;
 			ml_purge(&subframes);
+			m_freem(n);
 			m_freem(m);
 			return;
 		}
@@ -1372,6 +1389,32 @@ ieee80211_parse_wmm_params(struct ieee80211com *ic, const u_int8_t *frm)
 	return ieee80211_parse_edca_params_body(ic, frm + 8);
 }
 
+int
+ieee80211_parse_wmm_qosinfo(const u_int8_t *frm, u_int8_t *qosinfo)
+{
+	if (frm[1] < 7)
+		return IEEE80211_REASON_IE_INVALID;
+
+	*qosinfo = frm[8];
+	return 0;
+}
+
+void
+ieee80211_setup_uapsd(struct ieee80211com *ic, struct ieee80211_node *ni,
+    int peer_uapsd)
+{
+	if (peer_uapsd && (ic->ic_userflags & IEEE80211_F_UAPSD) &&
+	    (ni->ni_flags & IEEE80211_NODE_QOS)) {
+		ni->ni_flags |= IEEE80211_NODE_UAPSD;
+		ni->ni_uapsd_ac = ic->ic_uapsd_ac;
+		ni->ni_uapsd_maxsp = ic->ic_uapsd_maxsp;
+	} else {
+		ni->ni_flags &= ~IEEE80211_NODE_UAPSD;
+		ni->ni_uapsd_ac = 0;
+		ni->ni_uapsd_maxsp = 0;
+	}
+}
+
 enum ieee80211_cipher
 ieee80211_parse_rsn_cipher(const u_int8_t selector[4])
 {
@@ -1429,6 +1472,8 @@ ieee80211_parse_rsn_akm(const u_int8_t selector[4])
 			return IEEE80211_AKM_SHA256_8021X;
 		case 6:	/* PSK with SHA256 KDF */
 			return IEEE80211_AKM_SHA256_PSK;
+		case 8:	/* SAE */
+			return IEEE80211_AKM_SAE;
 		}
 	}
 	return IEEE80211_AKM_NONE;	/* ignore unknown AKMs */
@@ -1606,11 +1651,12 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 {
 	struct ieee80211_node *ni;
 	const struct ieee80211_frame *wh;
-	const u_int8_t *frm, *efrm;
+	const u_int8_t *frm, *efrm, *csa, *xcsa;
 	const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie, *tim;
-	const u_int8_t *rsnie, *wpaie, *htcaps, *htop, *vhtcaps, *vhtop;
+	const u_int8_t *rsnie, *wpaie, *htcaps, *htop, *vhtcaps, *vhtop, *hecaps, *heop;
 	u_int16_t capinfo, bintval;
-	u_int8_t chan, bchan, erp;
+	u_int8_t chan, bchan, erp, wmm_qosinfo;
+	int has_wmm_qosinfo = 0;
 	int is_new;
 
 	/*
@@ -1649,7 +1695,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 	capinfo = LE_READ_2(frm); frm += 2;
 
 	ssid = rates = xrates = edcaie = wmmie = rsnie = wpaie = tim = NULL;
-	htcaps = htop = vhtcaps = vhtop = NULL;
+	htcaps = htop = vhtcaps = vhtop = hecaps = heop = csa = xcsa = NULL;
 	if (rxi->rxi_chan)
 		bchan = rxi->rxi_chan;
 	else
@@ -1685,6 +1731,20 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			}
 			erp = frm[2];
 			break;
+		case IEEE80211_ELEMID_CSA:
+			if (frm[1] < 3) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			csa = frm;
+			break;
+		case IEEE80211_ELEMID_XCSA:
+			if (frm[1] < 4) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			xcsa = frm;
+			break;
 		case IEEE80211_ELEMID_RSN:
 			rsnie = frm;
 			break;
@@ -1707,6 +1767,20 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTOP:
 			vhtop = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			switch (frm[2]) {
+			case IEEE80211_ELEMID_EXT_HECAPS:
+				hecaps = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_HEOP:
+				heop = frm;
+				break;
+			}
 			break;
 		case IEEE80211_ELEMID_TIM:
 			if (frm[1] < 4) {
@@ -1771,12 +1845,20 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 		return;
 	}
 
+	if ((ni = ieee80211_find_node(ic, wh->i_addr2)) == NULL) {
+		ni = ieee80211_alloc_node(ic, wh->i_addr2);
+		if (ni == NULL)
+			return;
+		is_new = 1;
+	} else
+		is_new = 0;
+
 #ifdef IEEE80211_DEBUG
 	if (ieee80211_debug > 1 &&
-	    (ni == NULL || ic->ic_state == IEEE80211_S_SCAN ||
+	    (is_new || ic->ic_state == IEEE80211_S_SCAN ||
 	    (ic->ic_flags & IEEE80211_F_BGSCAN))) {
 		printf("%s: %s%s on chan %u (bss chan %u) ",
-		    __func__, (ni == NULL ? "new " : ""),
+		    __func__, (is_new ? "new " : ""),
 		    isprobe ? "probe response" : "beacon",
 		    chan, bchan);
 		ieee80211_print_essid(ssid + 2, ssid[1]);
@@ -1786,15 +1868,10 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 	}
 #endif
 
-	if ((ni = ieee80211_find_node(ic, wh->i_addr2)) == NULL) {
-		ni = ieee80211_alloc_node(ic, wh->i_addr2);
-		if (ni == NULL)
-			return;
-		is_new = 1;
-	} else
-		is_new = 0;
-
 	ni->ni_chan = &ic->ic_channels[chan];
+	ni->ni_flags &= ~IEEE80211_NODE_CSA;
+	if (csa != NULL || xcsa != NULL)
+		ni->ni_flags |= IEEE80211_NODE_CSA;
 
 	if (htcaps)
 		ieee80211_setup_htcaps(ni, htcaps + 2, htcaps[1]);
@@ -1805,11 +1882,18 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 		if (vhtop && !ieee80211_setup_vhtop(ni, vhtop + 2, vhtop[1], 1))
 			vhtop = NULL; /* invalid VHTOP */
 	}
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	if (heop && !ieee80211_setup_heop(ni, heop + 3, heop[1] - 1, 1))
+		heop = NULL; /* invalid HEOP */
 
 	if (tim) {
 		ni->ni_dtimcount = tim[2];
 		ni->ni_dtimperiod = tim[3];
 	}
+	if (wmmie != NULL &&
+	    ieee80211_parse_wmm_qosinfo(wmmie, &wmm_qosinfo) == 0)
+		has_wmm_qosinfo = 1;
 
 	/*
 	 * When operating in station mode, check for state updates
@@ -1827,8 +1911,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			    ether_sprintf((u_int8_t *)wh->i_addr2),
 			    ni->ni_erp, erp));
 			if ((ic->ic_curmode == IEEE80211_MODE_11G ||
-			    (ic->ic_curmode == IEEE80211_MODE_11N &&
-			    IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
+			    ((ic->ic_curmode == IEEE80211_MODE_11N ||
+			      ic->ic_curmode == IEEE80211_MODE_11AX) &&
+			     IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
 			    (erp & IEEE80211_ERP_USE_PROTECTION))
 				ic->ic_flags |= IEEE80211_F_USEPROT;
 			else
@@ -1919,10 +2004,17 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 		else
 			ni->ni_flags &= ~IEEE80211_NODE_QOS;
 	}
+	ieee80211_setup_uapsd(ic, ni, has_wmm_qosinfo &&
+	    (wmm_qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD));
 
 	if (ic->ic_state == IEEE80211_S_SCAN ||
 	    (ic->ic_flags & IEEE80211_F_BGSCAN)) {
 		struct ieee80211_rsnparams rsn, wpa;
+
+		if (edcaie != NULL || wmmie != NULL)
+			ni->ni_flags |= IEEE80211_NODE_QOS;
+		else
+			ni->ni_flags &= ~IEEE80211_NODE_QOS;
 
 		ni->ni_rsnprotos = IEEE80211_PROTO_NONE;
 		ni->ni_supported_rsnprotos = IEEE80211_PROTO_NONE;
@@ -1943,6 +2035,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			ni->ni_supported_rsnprotos |= IEEE80211_PROTO_WPA;
 			ni->ni_supported_rsnakms |= wpa.rsn_akms;
 		}
+
+		ieee80211_setup_uapsd(ic, ni, has_wmm_qosinfo &&
+		    (wmm_qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD));
 
 		/*
 		 * If the AP advertises both WPA and RSN IEs (WPA1+WPA2),
@@ -2045,7 +2140,7 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 {
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
-	const u_int8_t *ssid, *rates, *xrates, *htcaps, *vhtcaps;
+	const u_int8_t *ssid, *rates, *xrates, *htcaps, *vhtcaps, *hecaps;
 	u_int8_t rate;
 
 	if (ic->ic_opmode == IEEE80211_M_STA ||
@@ -2056,7 +2151,7 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 	frm = (const u_int8_t *)&wh[1];
 	efrm = mtod(m, u_int8_t *) + m->m_len;
 
-	ssid = rates = xrates = htcaps = vhtcaps = NULL;
+	ssid = rates = xrates = htcaps = vhtcaps = hecaps = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm) {
 			ic->ic_stats.is_rx_elem_toosmall++;
@@ -2077,6 +2172,14 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTCAPS:
 			vhtcaps = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			if (frm[2] == IEEE80211_ELEMID_EXT_HECAPS)
+				hecaps = frm;
 			break;
 		}
 		frm += 2 + frm[1];
@@ -2132,6 +2235,10 @@ ieee80211_recv_probe_req(struct ieee80211com *ic, struct mbuf *m,
 		ieee80211_setup_vhtcaps(ni, vhtcaps + 2, vhtcaps[1]);
 	else
 		ieee80211_clear_vhtcaps(ni);
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	else
+		ieee80211_clear_hecaps(ni);
 	IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_PROBE_RESP, 0);
 }
 #endif	/* IEEE80211_STA_ONLY */
@@ -2202,7 +2309,7 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
 	const u_int8_t *ssid, *rates, *xrates, *rsnie, *wpaie, *wmeie;
-	const u_int8_t *htcaps, *vhtcaps;
+	const u_int8_t *htcaps, *vhtcaps, *hecaps;
 	u_int16_t capinfo, bintval;
 	int resp, status = 0;
 	struct ieee80211_rsnparams rsn;
@@ -2236,7 +2343,7 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 	} else
 		resp = IEEE80211_FC0_SUBTYPE_ASSOC_RESP;
 
-	ssid = rates = xrates = rsnie = wpaie = wmeie = htcaps = vhtcaps = NULL;
+	ssid = rates = xrates = rsnie = wpaie = wmeie = htcaps = vhtcaps = hecaps = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm) {
 			ic->ic_stats.is_rx_elem_toosmall++;
@@ -2262,6 +2369,14 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_VHTCAPS:
 			vhtcaps = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			if (frm[2] == IEEE80211_ELEMID_EXT_HECAPS)
+				hecaps = frm;
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (frm[1] < 4) {
@@ -2518,6 +2633,10 @@ ieee80211_recv_assoc_req(struct ieee80211com *ic, struct mbuf *m,
 		ieee80211_setup_vhtcaps(ni, vhtcaps + 2, vhtcaps[1]);
 	else
 		ieee80211_clear_vhtcaps(ni);
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	else
+		ieee80211_clear_hecaps(ni);
  end:
 	if (status != 0) {
 		IEEE80211_SEND_MGMT(ic, ni, resp, status);
@@ -2546,9 +2665,10 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	const struct ieee80211_frame *wh;
 	const u_int8_t *frm, *efrm;
 	const u_int8_t *rates, *xrates, *edcaie, *wmmie, *htcaps, *htop;
-	const u_int8_t *vhtcaps, *vhtop;
+	const u_int8_t *vhtcaps, *vhtop, *hecaps, *heop;
 	u_int16_t capinfo, status, associd;
-	u_int8_t rate;
+	u_int8_t rate, wmm_qosinfo;
+	int has_wmm_qosinfo = 0;
 
 	if (ic->ic_opmode != IEEE80211_M_STA ||
 	    ic->ic_state != IEEE80211_S_ASSOC) {
@@ -2581,7 +2701,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	associd = LE_READ_2(frm); frm += 2;
 
 	rates = xrates = edcaie = wmmie = htcaps = htop = NULL;
-	vhtcaps = vhtop = NULL;
+	vhtcaps = vhtop = hecaps = heop = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm) {
 			ic->ic_stats.is_rx_elem_toosmall++;
@@ -2609,6 +2729,20 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 		case IEEE80211_ELEMID_VHTOP:
 			vhtop = frm;
 			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1) {
+				ic->ic_stats.is_rx_elem_toosmall++;
+				break;
+			}
+			switch (frm[2]) {
+			case IEEE80211_ELEMID_EXT_HECAPS:
+				hecaps = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_HEOP:
+				heop = frm;
+				break;
+			}
+			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (frm[1] < 4) {
 				ic->ic_stats.is_rx_elem_toosmall++;
@@ -2622,6 +2756,9 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 		}
 		frm += 2 + frm[1];
 	}
+	if (wmmie != NULL &&
+	    ieee80211_parse_wmm_qosinfo(wmmie, &wmm_qosinfo) == 0)
+		has_wmm_qosinfo = 1;
 	/* supported rates element is mandatory */
 	if (rates == NULL || rates[1] > IEEE80211_RATE_MAXSIZE) {
 		DPRINTF(("invalid supported rates element\n"));
@@ -2650,6 +2787,8 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 		else	/* for Reassociation */
 			ni->ni_flags &= ~IEEE80211_NODE_QOS;
 	}
+	ieee80211_setup_uapsd(ic, ni, has_wmm_qosinfo &&
+	    (wmm_qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD));
 	if (htcaps)
 		ieee80211_setup_htcaps(ni, htcaps + 2, htcaps[1]);
 	if (htop)
@@ -2662,14 +2801,21 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 			vhtop = NULL; /* invalid VHTOP */
 	}
 	ieee80211_vht_negotiate(ic, ni);
+	if (hecaps)
+		ieee80211_setup_hecaps(ni, hecaps + 3, hecaps[1] - 1);
+	if (heop && !ieee80211_setup_heop(ni, heop + 3, heop[1] - 1, 0))
+		heop = NULL; /* invalid HEOP */
+	ieee80211_he_negotiate(ic, ni);
 
-	/* Hop into 11n/11ac modes after associating to a HT/VHT AP. */
-	if (ni->ni_flags & IEEE80211_NODE_VHT)
+	/* Hop into 11n/11ac/11ax modes after associating to a HT/VHT/HE AP. */
+	if (ni->ni_flags & IEEE80211_NODE_HE)
+		ieee80211_setmode(ic, IEEE80211_MODE_11AX);
+	else if (ni->ni_flags & IEEE80211_NODE_VHT)
 		ieee80211_setmode(ic, IEEE80211_MODE_11AC);
 	else if (ni->ni_flags & IEEE80211_NODE_HT)
 		ieee80211_setmode(ic, IEEE80211_MODE_11N);
 	else
-		ieee80211_setmode(ic, ieee80211_chan2mode(ic, ni->ni_chan));
+		ieee80211_setmode(ic, ieee80211_node_abg_mode(ic, ni));
 	/*
 	 * Reset the erp state (mostly the slot time) now that
 	 * our operating mode has been nailed down.
@@ -2692,8 +2838,9 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, struct mbuf *m,
 	 * Honor ERP protection.
 	 */
 	if ((ic->ic_curmode == IEEE80211_MODE_11G ||
-	    (ic->ic_curmode == IEEE80211_MODE_11N &&
-	    IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
+	    ((ic->ic_curmode == IEEE80211_MODE_11N ||
+	      ic->ic_curmode == IEEE80211_MODE_11AX) &&
+	     IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))) &&
 	    (ni->ni_erp & IEEE80211_ERP_USE_PROTECTION))
 		ic->ic_flags |= IEEE80211_F_USEPROT;
 	else

@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_glue.h,v 1.9 2014/07/11 16:35:40 jsg Exp $	*/
+/*	$OpenBSD: uvm_glue.h,v 1.11 2025/06/02 18:49:04 claudio Exp $	*/
 /*	$NetBSD: uvm_glue.h,v 1.6 1999/06/21 17:25:11 thorpej Exp $	*/
 
 /*
@@ -36,8 +36,6 @@
 /*
  * uvm_glue.h
  */
-
-void uvm_swapout_threads(void);
 
 struct vm_page	*uvm_atopg(vaddr_t);
 

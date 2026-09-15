@@ -1,4 +1,4 @@
-/*	$OpenBSD: iked.h,v 1.231 2024/07/13 12:22:46 yasuoka Exp $	*/
+/*	$OpenBSD: iked.h,v 1.236 2026/09/10 15:06:22 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -250,16 +250,17 @@ struct iked_policy {
 #define IKED_SKIP_COUNT			 4
 	struct iked_policy		*pol_skip[IKED_SKIP_COUNT];
 
-	uint8_t				 pol_flags;
-#define IKED_POLICY_PASSIVE		 0x00
-#define IKED_POLICY_DEFAULT		 0x01
-#define IKED_POLICY_ACTIVE		 0x02
-#define IKED_POLICY_REFCNT		 0x04
-#define IKED_POLICY_QUICK		 0x08
-#define IKED_POLICY_SKIP		 0x10
-#define IKED_POLICY_IPCOMP		 0x20
-#define IKED_POLICY_TRANSPORT		 0x40
-#define IKED_POLICY_ROUTING		 0x80
+	unsigned int			 pol_flags;
+#define IKED_POLICY_PASSIVE		 0x000
+#define IKED_POLICY_DEFAULT		 0x001
+#define IKED_POLICY_ACTIVE		 0x002
+#define IKED_POLICY_REFCNT		 0x004
+#define IKED_POLICY_QUICK		 0x008
+#define IKED_POLICY_SKIP		 0x010
+#define IKED_POLICY_IPCOMP		 0x020
+#define IKED_POLICY_TRANSPORT		 0x040
+#define IKED_POLICY_ROUTING		 0x080
+#define IKED_POLICY_NATT_FORCE		 0x100
 
 	int				 pol_refcnt;
 
@@ -491,6 +492,7 @@ struct iked_sa {
 	char				*sa_eapid;	/* EAP identity */
 	struct iked_id			 sa_eap;	/* EAP challenge */
 	struct ibuf			*sa_eapmsk;	/* EAK session key */
+	struct ibuf			*sa_eapclass;	/* EAP/RADIUS class */
 
 	struct iked_proposals		 sa_proposals;	/* SA proposals */
 	struct iked_childsas		 sa_childsas;	/* IPsec Child SAs */
@@ -838,6 +840,12 @@ struct privsep_fd {
 
 #define PROC_PARENT_SOCK_FILENO 3
 #define PROC_MAX_INSTANCES      32
+
+#if DEBUG
+#define DPRINTF		log_debug
+#else
+#define DPRINTF(x...)	do {} while(0)
+#endif
 
 struct iked_ocsp_entry {
 	TAILQ_ENTRY(iked_ocsp_entry) ioe_entry;	/* next request */
@@ -1311,7 +1319,7 @@ void	 timer_del(struct iked *, struct iked_timer *);
 
 /* proc.c */
 void	 proc_init(struct privsep *, struct privsep_proc *, unsigned int, int,
-	    int, char **, enum privsep_procid);
+	    char *, int, char **, enum privsep_procid);
 void	 proc_kill(struct privsep *);
 void	 proc_connect(struct privsep *, void (*)(struct privsep *));
 void	 proc_dispatch(int, short event, void *);
@@ -1331,8 +1339,8 @@ int	 proc_composev_imsg(struct privsep *, enum privsep_procid, int,
 	    uint16_t, uint32_t, int, const struct iovec *, int);
 int	 proc_composev(struct privsep *, enum privsep_procid,
 	    uint16_t, const struct iovec *, int);
-int	 proc_forward_imsg(struct privsep *, struct imsg *,
-	    enum privsep_procid, int);
+void	 proc_forward_imsg(struct privsep *, struct imsg *,
+	    enum privsep_procid);
 struct imsgbuf *
 	 proc_ibuf(struct privsep *, enum privsep_procid, int);
 struct imsgev *

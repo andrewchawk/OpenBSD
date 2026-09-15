@@ -1,4 +1,4 @@
-/*	$OpenBSD: utvfu.c,v 1.20 2024/05/23 03:21:09 jsg Exp $ */
+/*	$OpenBSD: utvfu.c,v 1.23 2025/02/25 22:10:39 kirill Exp $ */
 /*
  * Copyright (c) 2013 Lubomir Rintel
  * Copyright (c) 2013 Federico Simoncelli
@@ -50,23 +50,21 @@
 #include <sys/kthread.h>
 #include <sys/malloc.h>
 #include <sys/device.h>
-#include <sys/audioio.h>
-#include <sys/videoio.h>
 
 #include <uvm/uvm_extern.h>
 
 #include <machine/bus.h>
 
-#include <dev/audio_if.h>
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdivar.h>
 #include <dev/usb/usb_mem.h>
 #include <dev/usb/usbdi_util.h>
 #include <dev/usb/usbdevs.h>
-#include <dev/video_if.h>
+#include <dev/usb/utvfu.h>
 
-#include "utvfu.h"
+#include <dev/audio_if.h>
+#include <dev/video_if.h>
 
 #ifdef UTVFU_DEBUG
 int utvfu_debug = 1;
@@ -1380,7 +1378,12 @@ utvfu_mmap_queue(struct utvfu_softc *sc, uint8_t *buf, int len)
 	sc->sc_mmap[i].v4l2_buf.bytesused = len;
 
 	/* timestamp it */
-	getmicrotime(&sc->sc_mmap[i].v4l2_buf.timestamp);
+	getmicrouptime(&sc->sc_mmap[i].v4l2_buf.timestamp);
+	sc->sc_mmap[i].v4l2_buf.flags &= ~V4L2_BUF_FLAG_TIMESTAMP_MASK;
+	sc->sc_mmap[i].v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	sc->sc_mmap[i].v4l2_buf.flags &= ~V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
+	sc->sc_mmap[i].v4l2_buf.flags |= V4L2_BUF_FLAG_TSTAMP_SRC_EOF;
+	sc->sc_mmap[i].v4l2_buf.flags &= ~V4L2_BUF_FLAG_TIMECODE;
 
 	/* appropriately set/clear flags */
 	sc->sc_mmap[i].v4l2_buf.flags &= ~V4L2_BUF_FLAG_QUEUED;
@@ -1694,6 +1697,8 @@ utvfu_reqbufs(void *v, struct v4l2_requestbuffers *rb)
 
 	/* tell how many buffers we have really allocated */
 	rb->count = sc->sc_mmap_count;
+
+	rb->capabilities = V4L2_BUF_CAP_SUPPORTS_MMAP;
 
 	return (0);
 }

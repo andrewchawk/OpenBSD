@@ -1,4 +1,4 @@
-/*	$OpenBSD: library.c,v 1.96 2024/04/05 13:51:47 deraadt Exp $ */
+/*	$OpenBSD: library.c,v 1.99 2026/05/10 09:10:02 kettenis Exp $ */
 
 /*
  * Copyright (c) 2002 Dale Rahn
@@ -106,6 +106,7 @@ _dl_tryload_shlib(const char *libname, int type, int flags, int nodelete)
 	Elf_Addr relro_addr = 0, relro_size = 0;
 	elf_object_t *object;
 	char	hbuf[4096], *exec_start = 0;
+	ssize_t hsize;
 	size_t exec_size = 0;
 	Elf_Dyn *dynp = NULL;
 	Elf_Ehdr *ehdr;
@@ -141,7 +142,12 @@ _dl_tryload_shlib(const char *libname, int type, int flags, int nodelete)
 		return NULL;
 	}
 
-	_dl_read(libfile, hbuf, sizeof(hbuf));
+	hsize = _dl_read(libfile, hbuf, sizeof(hbuf));
+	if (hsize < sizeof(Elf_Ehdr)) {
+		_dl_close(libfile);
+		_dl_errno = DL_NOT_ELF;
+		return NULL;
+	}
 	ehdr = (Elf_Ehdr *)hbuf;
 	if (ehdr->e_ident[0] != ELFMAG0  || ehdr->e_ident[1] != ELFMAG1 ||
 	    ehdr->e_ident[2] != ELFMAG2 || ehdr->e_ident[3] != ELFMAG3 ||
@@ -149,6 +155,14 @@ _dl_tryload_shlib(const char *libname, int type, int flags, int nodelete)
 		_dl_close(libfile);
 		_dl_errno = DL_NOT_ELF;
 		return(0);
+	}
+	if (ehdr->e_phentsize != sizeof(Elf_Phdr) || ehdr->e_phoff > hsize ||
+	    ehdr->e_phnum > (hsize - ehdr->e_phoff) / sizeof(Elf_Phdr)) {
+		_dl_printf("%s: ld.so invalid ELF input %s.\n",
+		    __progname, libname);
+		_dl_close(libfile);
+		_dl_errno = DL_CANT_LOAD_OBJ;
+		return NULL;
 	}
 
 	_dl_memset(&mut, 0, sizeof mut);
@@ -199,6 +213,20 @@ _dl_tryload_shlib(const char *libname, int type, int flags, int nodelete)
 			break;
 		}
 	}
+
+	if (minva == ELF_NO_ADDR) {
+		/*
+		 * No PT_LOAD segments.  While technicaly this is
+		 * allowed by the ELF standard, it just doesn't make
+		 * sense for a shared library.
+		 */
+		DL_DEB(("%s: no PT_LOAD segments in %s\n",
+		    __func__, libname));
+		_dl_close(libfile);
+		_dl_errno = DL_CANT_LOAD_OBJ;
+		return NULL;
+	}
+
 	minva = TRUNC_PG(minva);
 	maxva = ROUND_PG(maxva);
 
@@ -224,7 +252,7 @@ _dl_tryload_shlib(const char *libname, int type, int flags, int nodelete)
 	phdp = (Elf_Phdr *)(hbuf + ehdr->e_phoff);
 
 	/* Entire mapping can become immutable, minus exceptions chosen later */
-	_dl_push_range_size(&imut, loff, maxva - minva);
+	_dl_push_range_size(&imut, libaddr, maxva - minva);
 
 	for (i = 0; i < ehdr->e_phnum; i++, phdp++) {
 		switch (phdp->p_type) {

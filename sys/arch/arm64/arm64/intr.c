@@ -1,4 +1,4 @@
-/* $OpenBSD: intr.c,v 1.29 2024/08/04 12:01:18 kettenis Exp $ */
+/* $OpenBSD: intr.c,v 1.39 2026/03/09 06:38:02 tb Exp $ */
 /*
  * Copyright (c) 2011 Dale Rahn <drahn@openbsd.org>
  *
@@ -15,16 +15,23 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "xcall.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/atomic.h>
 #include <sys/timetc.h>
 #include <sys/malloc.h>
+
+#include <uvm/uvm_extern.h>
 
 #include <dev/clock_subr.h>
 #include <machine/cpu.h>
 #include <machine/intr.h>
 
 #include <dev/ofw/openfirm.h>
+
+CTASSERT(SOFTINTR_XCALL < 32);
 
 int arm_intr_get_parent(int);
 uint32_t arm_intr_map_msi(int, uint64_t *);
@@ -74,6 +81,7 @@ arm_cpu_irq(void *frame)
 {
 	struct cpu_info	*ci = curcpu();
 
+	atomic_inc_int(&uvmexp.intrs);
 	ci->ci_idepth++;
 	(*arm_irq_dispatch)(frame);
 	ci->ci_idepth--;
@@ -86,6 +94,7 @@ arm_cpu_fiq(void *frame)
 {
 	struct cpu_info	*ci = curcpu();
 
+	atomic_inc_int(&uvmexp.intrs);
 	ci->ci_idepth++;
 	(*arm_fiq_dispatch)(frame);
 	ci->ci_idepth--;
@@ -237,10 +246,10 @@ arm_intr_prereg_disestablish_fdt(void *cookie)
 	struct intr_prereg *ip = cookie;
 	struct interrupt_controller *ic = ip->ip_ic;
 
-	if (ip->ip_ic != NULL && ip->ip_ih != NULL)
+	if (ic != NULL && ip->ip_ih != NULL)
 		ic->ic_disestablish(ip->ip_ih);
 
-	if (ip->ip_ic != NULL)
+	if (ic == NULL)
 		LIST_REMOVE(ip, ip_list);
 
 	free(ip, M_DEVBUF, sizeof(*ip));
@@ -252,8 +261,20 @@ arm_intr_prereg_barrier_fdt(void *cookie)
 	struct intr_prereg *ip = cookie;
 	struct interrupt_controller *ic = ip->ip_ic;
 
-	if (ip->ip_ic != NULL && ip->ip_ih != NULL)
+	if (ic != NULL && ip->ip_ih != NULL)
 		ic->ic_barrier(ip->ip_ih);
+}
+
+void
+arm_intr_prereg_set_wakeup_fdt(void *cookie)
+{
+	struct intr_prereg *ip = cookie;
+	struct interrupt_controller *ic = ip->ip_ic;
+
+	if (ic != NULL && ip->ip_ih != NULL && ic->ic_set_wakeup)
+		ic->ic_set_wakeup(ip->ip_ih);
+
+	ip->ip_level |= IPL_WAKEUP;
 }
 
 void
@@ -269,6 +290,7 @@ arm_intr_init_fdt_recurse(int node)
 		ic->ic_establish = arm_intr_prereg_establish_fdt;
 		ic->ic_disestablish = arm_intr_prereg_disestablish_fdt;
 		ic->ic_barrier = arm_intr_prereg_barrier_fdt;
+		ic->ic_set_wakeup = arm_intr_prereg_set_wakeup_fdt;
 		arm_intr_register_fdt(ic);
 	}
 
@@ -523,6 +545,8 @@ arm_intr_establish_fdt_msi_cpu(int node, uint64_t *addr, uint64_t *data,
 
 	val = ic->ic_establish_msi(ic->ic_cookie, addr, data,
 	    level, ci, func, cookie, name);
+	if (val == NULL)
+		return NULL;
 
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK);
 	ih->ih_ic = ic;
@@ -676,12 +700,12 @@ arm_do_pending_intr(int pcpl)
 {
 	struct cpu_info *ci = curcpu();
 	u_long oldirqstate;
+	uint32_t ipending;
 
 	oldirqstate = intr_disable();
 
 #define DO_SOFTINT(si, ipl) \
-	if ((ci->ci_ipending & arm_smask[pcpl]) &	\
-	    SI_TO_IRQBIT(si)) {				\
+	if (ipending & SI_TO_IRQBIT(si)) {		\
 		ci->ci_ipending &= ~SI_TO_IRQBIT(si);	\
 		arm_intr_func.setipl(ipl);		\
 		intr_restore(oldirqstate);		\
@@ -690,10 +714,22 @@ arm_do_pending_intr(int pcpl)
 	}
 
 	do {
-		DO_SOFTINT(SIR_TTY, IPL_SOFTTTY);
-		DO_SOFTINT(SIR_NET, IPL_SOFTNET);
-		DO_SOFTINT(SIR_CLOCK, IPL_SOFTCLOCK);
-		DO_SOFTINT(SIR_SOFT, IPL_SOFT);
+		ipending = ci->ci_ipending & arm_smask[pcpl];
+		DO_SOFTINT(SOFTINTR_TTY, IPL_SOFTTTY);
+		DO_SOFTINT(SOFTINTR_NET, IPL_SOFTNET);
+		DO_SOFTINT(SOFTINTR_CLOCK, IPL_SOFTCLOCK);
+
+#ifdef MULTIPROCESSOR
+#if NXCALL > 0
+		if (ISSET(ipending, SI_TO_IRQBIT(SOFTINTR_XCALL))) {
+			CLR(ci->ci_ipending, SI_TO_IRQBIT(SOFTINTR_XCALL));
+			arm_intr_func.setipl(IPL_SOFTCLOCK);
+			intr_restore(oldirqstate);
+			cpu_xcall_dispatch(ci);
+			oldirqstate = intr_disable();
+		}
+#endif
+#endif
 	} while (ci->ci_ipending & arm_smask[pcpl]);
 
 	/* Don't use splx... we are here already! */
@@ -732,14 +768,18 @@ arm_init_smask(void)
 
 	for (i = IPL_NONE; i <= IPL_HIGH; i++)  {
 		arm_smask[i] = 0;
-		if (i < IPL_SOFT)
-			arm_smask[i] |= SI_TO_IRQBIT(SIR_SOFT);
-		if (i < IPL_SOFTCLOCK)
-			arm_smask[i] |= SI_TO_IRQBIT(SIR_CLOCK);
+		if (i < IPL_SOFTCLOCK) {
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_CLOCK);
+#ifdef MULTIPROCESSOR
+#if NXCALL > 0
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_XCALL);
+#endif
+#endif
+		}
 		if (i < IPL_SOFTNET)
-			arm_smask[i] |= SI_TO_IRQBIT(SIR_NET);
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_NET);
 		if (i < IPL_SOFTTTY)
-			arm_smask[i] |= SI_TO_IRQBIT(SIR_TTY);
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_TTY);
 	}
 }
 
@@ -772,6 +812,11 @@ splx(int ipl)
 	arm_intr_func.x(ipl);
 }
 
+void
+softintr(int si)
+{
+	curcpu()->ci_ipending |= SI_TO_IRQBIT(si);
+}
 
 #ifdef DIAGNOSTIC
 void
@@ -900,6 +945,7 @@ intr_disable_wakeup(void)
 		arm_intr_func.disable_wakeup();
 }
 
+#ifdef MULTIPROCESSOR
 /*
  * IPI implementation
  */
@@ -918,3 +964,4 @@ arm_no_send_ipi(struct cpu_info *ci, int id)
 {
 	panic("arm_send_ipi() called: no ipi function");
 }
+#endif /* MULTIPROCESSOR */

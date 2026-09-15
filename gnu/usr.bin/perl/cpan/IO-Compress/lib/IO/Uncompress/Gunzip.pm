@@ -9,12 +9,12 @@ use strict ;
 use warnings;
 use bytes;
 
-use IO::Uncompress::RawInflate 2.204 ;
+use IO::Uncompress::RawInflate 2.223 ;
 
-use Compress::Raw::Zlib 2.204 () ;
-use IO::Compress::Base::Common 2.204 qw(:Status );
-use IO::Compress::Gzip::Constants 2.204 ;
-use IO::Compress::Zlib::Extra 2.204 ;
+use Compress::Raw::Zlib 2.222 () ;
+use IO::Compress::Base::Common 2.223 qw(:Status );
+use IO::Compress::Gzip::Constants 2.223 ;
+use IO::Compress::Zlib::Extra 2.223 ;
 
 require Exporter ;
 
@@ -23,12 +23,12 @@ our ($VERSION, @ISA, @EXPORT_OK, %EXPORT_TAGS, $GunzipError);
 @ISA = qw(IO::Uncompress::RawInflate Exporter);
 @EXPORT_OK = qw( $GunzipError gunzip );
 %EXPORT_TAGS = %IO::Uncompress::RawInflate::DEFLATE_CONSTANTS ;
-push @{ $EXPORT_TAGS{all} }, @EXPORT_OK ;
+$EXPORT_TAGS{all} = [ defined $EXPORT_TAGS{all} ? @{ $EXPORT_TAGS{all} } : (), @EXPORT_OK ] ;
 Exporter::export_ok_tags('all');
 
 $GunzipError = '';
 
-$VERSION = '2.204';
+$VERSION = '2.223';
 
 sub new
 {
@@ -557,7 +557,7 @@ C<InputLength> option.
 
 =back
 
-=head2 Examples
+=head2 OneShot Examples
 
 To read the contents of the file C<file1.txt.gz> and write the
 uncompressed data to the file C<file1.txt>.
@@ -617,6 +617,9 @@ The format of the constructor for IO::Uncompress::Gunzip is shown below
     my $z = IO::Uncompress::Gunzip->new( $input [OPTS] )
         or die "IO::Uncompress::Gunzip failed: $GunzipError\n";
 
+The constructor takes one mandatory parameter, C<$input>, defined below, and
+zero or more C<OPTS>, defined in L<Constructor Options>.
+
 Returns an C<IO::Uncompress::Gunzip> object on success and undef on failure.
 The variable C<$GunzipError> will contain an error message on failure.
 
@@ -628,6 +631,20 @@ use either of these forms
 
     $line = $z->getline();
     $line = <$z>;
+
+Below is a simple exaple of using the OO interface to read the compressed file
+C<myfile.gz> and write its contents to stdout.
+
+    my $filename = "myfile.gz";
+    my $z = IO::Uncompress::Gunzip->new($filename)
+        or die "IO::Uncompress::Gunzip failed: $GunzipError\n";
+
+    while (<$z>) {
+        print $_;
+    }
+    $z->close();
+
+See L</EXAMPLES> for further examples
 
 The mandatory parameter C<$input> is used to determine the source of the
 compressed data. This parameter can take one of three forms.
@@ -796,10 +813,6 @@ If the C<Strict> is on it will automatically enable this option.
 Defaults to 0.
 
 =back
-
-=head2 Examples
-
-TODO
 
 =head1 Methods
 
@@ -1125,7 +1138,7 @@ See the Changes file.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (c) 2005-2023 Paul Marquess. All rights reserved.
+Copyright (c) 2005-2026 Paul Marquess. All rights reserved.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.

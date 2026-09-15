@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf_if.c,v 1.111 2023/06/30 09:58:30 mvs Exp $ */
+/*	$OpenBSD: pf_if.c,v 1.114 2026/09/08 18:42:14 bluhm Exp $ */
 
 /*
  * Copyright 2005 Henning Brauer <henning@openbsd.org>
@@ -35,11 +35,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/mbuf.h>
-#include <sys/filio.h>
 #include <sys/socket.h>
-#include <sys/socketvar.h>
-#include <sys/kernel.h>
-#include <sys/device.h>
 #include <sys/time.h>
 #include <sys/pool.h>
 #include <sys/syslog.h>
@@ -49,7 +45,6 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
 
 #include <net/pfvar.h>
 
@@ -794,8 +789,9 @@ pfi_get_ifaces(const char *name, struct pfi_kif *buf, int *size)
 	RB_FOREACH(p, pfi_ifhead, &pfi_ifs) {
 		if (pfi_skip_if(name, p))
 			continue;
-		if (*size <= ++n)
+		if (n >= *size)
 			break;
+		n++;
 		if (!p->pfik_tzero)
 			p->pfik_tzero = gettime();
 		memcpy(buf++, p, sizeof(*buf));
@@ -859,8 +855,22 @@ pfi_set_flags(const char *name, int flags)
 			} else
 				panic("%s pfi_kif_get() returned NULL\n",
 				    __func__);
-		} else
+		} else {
+			/*
+			 * pf.conf may accidentally contain two set skip on ...
+			 * statements. For example:
+			 *     set skip lo
+			 *     set skip lo
+			 * We need to grab reference only when skip flag is
+			 * set to avoid tripping assert pfi_clear_flags()
+			 */
+			if (ISSET(flags, PFI_IFLAG_SKIP) &&
+			    !ISSET(p->pfik_flags_new, PFI_IFLAG_SKIP) &&
+			    !ISSET(p->pfik_flags, PFI_IFLAG_SKIP))
+				pfi_kif_ref(p, PFI_KIF_REF_FLAG);
+
 			p->pfik_flags_new = p->pfik_flags | flags;
+		}
 	} else {
 		RB_FOREACH(p, pfi_ifhead, &pfi_ifs)
 			p->pfik_flags_new = p->pfik_flags | flags;

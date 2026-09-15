@@ -21,6 +21,9 @@
 /* Pathname to the NSD configuration file */
 #undef CONFIGFILE
 
+/* Pathname to the NSD cookies secrets file. */
+#undef COOKIESECRETSFILE
+
 /* number of arguments for CPU_OR is three */
 #undef CPU_OR_THREE_ARGS
 
@@ -57,6 +60,9 @@
 
 /* Define to 1 if you have the <arpa/inet.h> header file. */
 #undef HAVE_ARPA_INET_H
+
+/* Define to 1 if you have the `ASN1_STRING_get0_data' function. */
+#undef HAVE_ASN1_STRING_GET0_DATA
 
 /* Whether the C compiler accepts the "format" attribute */
 #undef HAVE_ATTR_FORMAT
@@ -148,6 +154,9 @@
 /* Define to 1 if you have the <event.h> header file. */
 #undef HAVE_EVENT_H
 
+/* Define to 1 if you have the `evhttp_free' function. */
+#undef HAVE_EVHTTP_FREE
+
 /* Define to 1 if you have the `EVP_cleanup' function. */
 #undef HAVE_EVP_CLEANUP
 
@@ -159,6 +168,9 @@
 
 /* Define to 1 if you have the `EVP_MAC_CTX_set_params' function. */
 #undef HAVE_EVP_MAC_CTX_SET_PARAMS
+
+/* Define to 1 if you have the `EVP_PKEY_get0_type_name' function. */
+#undef HAVE_EVP_PKEY_GET0_TYPE_NAME
 
 /* Define to 1 if you have the `ev_default_loop' function. */
 #undef HAVE_EV_DEFAULT_LOOP
@@ -180,6 +192,9 @@
 
 /* Define to 1 if fseeko (and presumably ftello) exists and is declared. */
 #undef HAVE_FSEEKO
+
+/* Define to 1 if you have the `fstrm_tcp_writer_options_init' function. */
+#undef HAVE_FSTRM_TCP_WRITER_OPTIONS_INIT
 
 /* Define to 1 if you have the `gai_strerror' function. */
 #undef HAVE_GAI_STRERROR
@@ -301,6 +316,9 @@
 
 /* Define to 1 if you have the <openssl/ssl.h> header file. */
 #undef HAVE_OPENSSL_SSL_H
+
+/* Define to 1 if you have the <openssl/x509v3.h> header file. */
+#undef HAVE_OPENSSL_X509V3_H
 
 /* Define to 1 if you have the `ppoll' function. */
 #undef HAVE_PPOLL
@@ -552,6 +570,9 @@
 /* Define to nsd-control proto version. */
 #undef NSD_CONTROL_VERSION
 
+/* Define the default metrics HTTP endpoint port. */
+#undef NSD_METRICS_PORT
+
 /* Pathname to start nsd from nsd-control */
 #undef NSD_START_PATH
 
@@ -594,6 +615,9 @@
 /* Return type of signal handlers, but autoconf 2.70 says 'your code may
    safely assume C89 semantics that RETSIGTYPE is void.' */
 #undef RETSIGTYPE
+
+/* NSD shared files dir */
+#undef SHAREDFILESDIR
 
 /* The size of `off_t', as computed by sizeof. */
 #undef SIZEOF_OFF_T
@@ -642,6 +666,10 @@
 /* Define this to show the role of processes in the logfile for debugging
    purposes. */
 #undef USE_LOG_PROCESS_ROLE
+
+/* Define this to expose NSD statistics via a prometheus metrics HTTP
+   endpoint. */
+#undef USE_METRICS
 
 /* Define if you want to use internal select based events */
 #undef USE_MINI_EVENT
@@ -742,6 +770,9 @@
 
 /* Define this to enable TCP fast open. */
 #undef USE_TCP_FASTOPEN
+
+/* Define this to enable the use of AF_XDP sockets. */
+#undef USE_XDP
 
 /* Define this to enable per-zone statistics gathering. */
 #undef USE_ZONE_STATS

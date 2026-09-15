@@ -1,10 +1,9 @@
 #!/usr/bin/perl
 
-use v5;
-use strict;
+use v5.14;
 use warnings;
 
-use Test::More;
+use Test2::V0;
 
 use IO::Socket::IP;
 
@@ -30,7 +29,7 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
       LocalHost => "127.0.0.1",
       Type      => Socket->$socktype,
       Proto     => ( $socktype eq "SOCK_STREAM" ? "tcp" : "udp" ), # Because IO::Socket::INET is stupid and always presumes tcp
-   ) or die "Cannot listen on PF_INET - $@";
+   ) or die "Cannot listen on PF_INET - $IO::Socket::errstr";
 
    my $socket = IO::Socket::IP->new(
       PeerHost    => "127.0.0.1",
@@ -39,7 +38,7 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
    );
 
    ok( defined $socket, "IO::Socket::IP->new constructs a $socktype socket" ) or
-      diag( "  error was $@" );
+      diag( "  error was $IO::Socket::errstr" );
 
    is( $socket->sockdomain, AF_INET,           "\$socket->sockdomain for $socktype" );
    is( $socket->socktype,   Socket->$socktype, "\$socket->socktype for $socktype" );
@@ -53,13 +52,13 @@ foreach my $socktype (qw( SOCK_STREAM SOCK_DGRAM )) {
    ok( $socket->connected, "\$socket is connected for $socktype" );
    ok( $socket->blocking, "\$socket is in blocking mode after connect for $socktype" );
 
-   is_deeply( [ unpack_sockaddr_in $socket->sockname ],
-              [ unpack_sockaddr_in $testclient->peername ],
-              "\$socket->sockname for $socktype" );
+   is( [ unpack_sockaddr_in $socket->sockname ],
+       [ unpack_sockaddr_in $testclient->peername ],
+       "\$socket->sockname for $socktype" );
 
-   is_deeply( [ unpack_sockaddr_in $socket->peername ],
-              [ unpack_sockaddr_in $testclient->sockname ],
-              "\$socket->peername for $socktype" );
+   is( [ unpack_sockaddr_in $socket->peername ],
+       [ unpack_sockaddr_in $testclient->sockname ],
+       "\$socket->peername for $socktype" );
 
    is( $socket->peerhost, $INADDR_LOOPBACK_HOST, "\$socket->peerhost for $socktype" );
    is( $socket->peerport, $testserver->sockport, "\$socket->peerport for $socktype" );

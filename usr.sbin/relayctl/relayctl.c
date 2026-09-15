@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayctl.c,v 1.58 2017/11/29 15:24:50 benno Exp $	*/
+/*	$OpenBSD: relayctl.c,v 1.68 2026/09/07 09:29:27 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -49,7 +49,8 @@ char		*print_rdr_status(int);
 char		*print_host_status(int, int);
 char		*print_table_status(int, int);
 char		*print_relay_status(int);
-void		 print_statistics(struct ctl_stats[PROC_MAX_INSTANCES + 1]);
+void		 print_statistics(struct ctl_stats [PROC_MAX_INSTANCES+1]);
+void		 print_imsg(struct imsg *, const char *);
 
 struct imsgname {
 	int type;
@@ -57,13 +58,13 @@ struct imsgname {
 	void (*func)(struct imsg *);
 };
 
-struct imsgname *monitor_lookup(u_int8_t);
+struct imsgname	*monitor_lookup(u_int8_t);
 void		 monitor_host_status(struct imsg *);
 void		 monitor_id(struct imsg *);
 int		 monitor(struct imsg *);
 
 struct imsgname imsgs[] = {
-	{ IMSG_HOST_STATUS,		"host_status",	monitor_host_status },
+	{ IMSG_HOST_STATUS,		"host_status",		monitor_host_status },
 	{ IMSG_CTL_RDR_DISABLE,		"ctl_rdr_disable",	monitor_id },
 	{ IMSG_CTL_RDR_ENABLE,		"ctl_rdr_enable",	monitor_id },
 	{ IMSG_CTL_TABLE_DISABLE,	"ctl_table_disable",	monitor_id },
@@ -81,14 +82,15 @@ struct imsgname imsgunknown = {
 };
 
 struct imsgbuf	*ibuf;
-int error = 0;
+int		 error = 0;
+int		 verbose = 0;
 
 __dead void
 usage(void)
 {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-s socket] command [argument ...]\n",
+	fprintf(stderr, "usage: %s [-v] [-s socket] command [argument ...]\n",
 	    __progname);
 	exit(1);
 }
@@ -101,15 +103,18 @@ main(int argc, char *argv[])
 	struct imsg		 imsg;
 	int			 ctl_sock;
 	int			 done = 0;
-	int			 n, verbose = 0;
+	int			 n, relayd_log_level = 0;
 	int			 ch;
 	const char		*sockname;
 
 	sockname = RELAYD_SOCKET;
-	while ((ch = getopt(argc, argv, "s:")) != -1) {
+	while ((ch = getopt(argc, argv, "vs:")) != -1) {
 		switch (ch) {
 		case 's':
 			sockname = optarg;
+			break;
+		case 'v':
+			verbose++;
 			break;
 		default:
 			usage();
@@ -148,7 +153,8 @@ main(int argc, char *argv[])
 
 	if ((ibuf = malloc(sizeof(struct imsgbuf))) == NULL)
 		err(1, NULL);
-	imsg_init(ibuf, ctl_sock);
+	if (imsgbuf_init(ibuf, ctl_sock) == -1)
+		err(1, NULL);
 	done = 0;
 
 	/* process user request */
@@ -162,8 +168,8 @@ main(int argc, char *argv[])
 	case SHOW_RELAYS:
 	case SHOW_ROUTERS:
 		imsg_compose(ibuf, IMSG_CTL_SHOW_SUM, 0, 0, -1, NULL, 0);
-		printf("%-4s\t%-8s\t%-24s\t%-7s\tStatus\n",
-		    "Id", "Type", "Name", "Avlblty");
+		printf("%-4s %-6s %-24.24s %-7.7s %-8.8s %s\n",
+		    "Id", "Type", "Name", "Avlblty", "Checks", "Status");
 		break;
 	case SHOW_SESSIONS:
 		imsg_compose(ibuf, IMSG_CTL_SESSION, 0, 0, -1, NULL, 0);
@@ -211,29 +217,28 @@ main(int argc, char *argv[])
 		imsg_compose(ibuf, IMSG_CTL_NOTIFY, 0, 0, -1, NULL, 0);
 		break;
 	case LOG_VERBOSE:
-		verbose = 2;
+		relayd_log_level = 2;
 		/* FALLTHROUGH */
 	case LOG_BRIEF:
 		imsg_compose(ibuf, IMSG_CTL_VERBOSE, 0, 0, -1,
-		    &verbose, sizeof(verbose));
+		    &relayd_log_level, sizeof(relayd_log_level));
 		printf("logging request sent.\n");
 		done = 1;
 		break;
 	}
 
-	while (ibuf->w.queued)
-		if (msgbuf_write(&ibuf->w) <= 0 && errno != EAGAIN)
-			err(1, "write error");
+	if (imsgbuf_flush(ibuf) == -1)
+		err(1, "write error");
 
 	while (!done) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			errx(1, "imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			err(1, "read error");
 		if (n == 0)
 			errx(1, "pipe closed");
 
 		while (!done) {
-			if ((n = imsg_get(ibuf, &imsg)) == -1)
-				errx(1, "imsg_get error");
+			if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+				errx(1, "imsgbuf_get error");
 			if (n == 0)
 				break;
 			switch (res->action) {
@@ -292,9 +297,9 @@ monitor_host_status(struct imsg *imsg)
 {
 	struct ctl_status	 cs;
 
-	memcpy(&cs, imsg->data, sizeof(cs));
-	printf("\tid: %u\n", cs.id);
-	printf("\tstate: ");
+	if (imsg_get_data(imsg, &cs, sizeof(cs)) == -1)
+		errx(1, "imsg_get_data ctl status error");
+	printf("host_status: id: %u status: ", cs.id);
 	switch (cs.up) {
 	case HOST_UP:
 		printf("up\n");
@@ -313,25 +318,21 @@ monitor_id(struct imsg *imsg)
 {
 	struct ctl_id		 id;
 
-	memcpy(&id, imsg->data, sizeof(id));
-	printf("\tid: %u\n", id.id);
+	if (imsg_get_data(imsg, &id, sizeof(id)) == -1)
+		errx(1, "imsg_get_data ctl id error");
+	printf("monitor_id: id: %u\n", id.id);
 	if (strlen(id.name))
-		printf("\tname: %s\n", id.name);
+		printf("name: %s\n", id.name);
 }
 
 int
 monitor(struct imsg *imsg)
 {
-	time_t			 now;
 	int			 done = 0;
 	struct imsgname		*imn;
 
-	now = time(NULL);
-
-	imn = monitor_lookup(imsg->hdr.type);
-	printf("%s: imsg type %u len %u peerid %u pid %d\n", imn->name,
-	    imsg->hdr.type, imsg->hdr.len, imsg->hdr.peerid, imsg->hdr.pid);
-	printf("\ttimestamp: %lld, %s", (long long)now, ctime(&now));
+	imn = monitor_lookup(imsg_get_type(imsg));
+	print_imsg(imsg, imn->name);
 	if (imn->type == -1)
 		done = 1;
 	if (imn->func != NULL)
@@ -343,102 +344,123 @@ monitor(struct imsg *imsg)
 int
 show_summary_msg(struct imsg *imsg, int type)
 {
-	struct rdr		*rdr;
-	struct table		*table;
-	struct host		*host;
-	struct relay		*rlay;
-	struct router		*rt;
-	struct netroute		*nr;
-	struct ctl_stats	 stats[PROC_MAX_INSTANCES];
-	char			 name[HOST_NAME_MAX+1];
+	struct rdr		 rdr;
+	struct table		 table;
+	struct host		 host;
+	struct relay		 rlay;
+	struct router		 rt;
+	struct netroute		 nr;
+	struct ctl_stats	 stats[PROC_MAX_INSTANCES + 1];
+	char			 name[HOST_NAME_MAX + 1];
+	char			 checks[16];
+	char			 status[128];
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_CTL_RDR:
 		if (!(type == SHOW_SUM || type == SHOW_RDRS))
 			break;
-		rdr = imsg->data;
-		printf("%-4u\t%-8s\t%-24s\t%-7s\t%s\n",
-		    rdr->conf.id, "redirect", rdr->conf.name, "",
-		    print_rdr_status(rdr->conf.flags));
+		if (imsg_get_data(imsg, &rdr, sizeof(rdr)) == -1)
+			errx(1, "imsg_get_data rdr error");
+		rdr.conf.name[sizeof(rdr.conf.name) - 1] = '\0';
+		printf("%-4u %-6s %-24.24s %-7.7s %-8.8s %s\n",
+		    rdr.conf.id, "rdr", rdr.conf.name, "", "",
+		    print_rdr_status(rdr.conf.flags));
 		break;
 	case IMSG_CTL_TABLE:
-		if (!(type == SHOW_SUM || type == SHOW_HOSTS))
+		if (type != SHOW_SUM)
 			break;
-		table = imsg->data;
-		printf("%-4u\t%-8s\t%-24s\t%-7s\t%s\n",
-		    table->conf.id, "table", table->conf.name, "",
-		    print_table_status(table->up, table->conf.flags));
+		if (imsg_get_data(imsg, &table, sizeof(table)) == -1)
+			errx(1, "imsg_get_data table error");
+		table.conf.name[sizeof(table.conf.name) - 1] = '\0';
+		printf("%-4u %-6s %-24.24s %-7.7s %-8.8s %s\n",
+		    table.conf.id, "table", table.conf.name, "", "",
+		    print_table_status(table.up, table.conf.flags));
 		break;
 	case IMSG_CTL_HOST:
 		if (!(type == SHOW_SUM || type == SHOW_HOSTS))
 			break;
-		host = imsg->data;
-		if (host->conf.parentid)
+		if (imsg_get_data(imsg, &host, sizeof(host)) == -1)
+			errx(1, "imsg_get_data host error");
+		host.conf.name[sizeof(host.conf.name) - 1] = '\0';
+		if (host.conf.parentid)
 			snprintf(name, sizeof(name), "%s parent %u",
-			    host->conf.name, host->conf.parentid);
+			    host.conf.name, host.conf.parentid);
 		else
-			strlcpy(name, host->conf.name, sizeof(name));
-		printf("%-4u\t%-8s\t%-24s\t%-7s\t%s\n",
-		    host->conf.id, "host", name,
-		    print_availability(host->check_cnt, host->up_cnt),
-		    print_host_status(host->up, host->flags));
-		if (type == SHOW_HOSTS && host->check_cnt) {
-			printf("\t%8s\ttotal: %lu/%lu checks",
-			    "", host->up_cnt, host->check_cnt);
-			if (host->retry_cnt)
-				printf(", %d retries", host->retry_cnt);
-			if (host->he && host->up == HOST_DOWN)
-				printf(", error: %s", host_error(host->he));
-			printf("\n");
-		}
+			strlcpy(name, host.conf.name, sizeof(name));
+		if (host.check_cnt)
+			snprintf(checks, sizeof(checks), "%lu/%lu",
+			    host.up_cnt, host.check_cnt);
+		else
+			checks[0] = '\0';
+		if (host.he && host.up == HOST_DOWN && verbose)
+			snprintf(status, sizeof(status), "%s (%s)",
+			    print_host_status(host.up, host.flags),
+			    host_error(host.he));
+		else
+			strlcpy(status, print_host_status(host.up, host.flags),
+			    sizeof(status));
+		printf("%-4u %-6s %-24.24s %-7.7s %-8.8s %s\n",
+		    host.conf.id, "host", name,
+		    print_availability(host.check_cnt, host.up_cnt),
+		    checks, status);
+		if (type == SHOW_HOSTS && verbose && host.retry_cnt)
+			printf("\t%8s\t%d retries\n", "", host.retry_cnt);
 		break;
 	case IMSG_CTL_RELAY:
 		if (!(type == SHOW_SUM || type == SHOW_RELAYS))
 			break;
-		rlay = imsg->data;
-		printf("%-4u\t%-8s\t%-24s\t%-7s\t%s\n",
-		    rlay->rl_conf.id, "relay", rlay->rl_conf.name, "",
-		    print_relay_status(rlay->rl_conf.flags));
+		if (imsg_get_data(imsg, &rlay, sizeof(rlay)) == -1)
+			errx(1, "imsg_get_data relay error");
+		rlay.rl_conf.name[sizeof(rlay.rl_conf.name) - 1] = '\0';
+		printf("%-4u %-6s %-24.24s %-7.7s %-8.8s %s\n",
+		    rlay.rl_conf.id, "relay", rlay.rl_conf.name, "", "",
+		    print_relay_status(rlay.rl_conf.flags));
 		break;
 	case IMSG_CTL_RDR_STATS:
 		if (type != SHOW_RDRS)
 			break;
-		bcopy(imsg->data, &stats[0], sizeof(stats[0]));
+		if (imsg_get_data(imsg, &stats[0], sizeof(stats[0])) == -1)
+			errx(1, "imsg_get_data rdr stats error");
 		stats[1].id = EMPTY_ID;
 		print_statistics(stats);
 		break;
 	case IMSG_CTL_RELAY_STATS:
 		if (type != SHOW_RELAYS)
 			break;
-		bcopy(imsg->data, &stats, sizeof(stats));
+		if (imsg_get_data(imsg, stats, sizeof(stats)) == -1)
+			errx(1, "imsg_get_data relay stats error");
 		print_statistics(stats);
 		break;
 	case IMSG_CTL_ROUTER:
 		if (!(type == SHOW_SUM || type == SHOW_ROUTERS))
 			break;
-		rt = imsg->data;
-		printf("%-4u\t%-8s\t%-24s\t%-7s\t%s\n",
-		    rt->rt_conf.id, "router", rt->rt_conf.name, "",
-		    print_relay_status(rt->rt_conf.flags));
+		if (imsg_get_data(imsg, &rt, sizeof(rt)) == -1)
+			errx(1, "imsg_get_data router error");
+		rt.rt_conf.name[sizeof(rt.rt_conf.name) - 1] = '\0';
+		rt.rt_conf.label[sizeof(rt.rt_conf.label) - 1] = '\0';
+		printf("%-4u %-6s %-24.24s %-7.7s %-8.8s %s\n",
+		    rt.rt_conf.id, "router", rt.rt_conf.name, "", "",
+		    print_relay_status(rt.rt_conf.flags));
 		if (type != SHOW_ROUTERS)
 			break;
-		if (rt->rt_conf.rtable)
-			printf("\t%8s\trtable: %d\n", "", rt->rt_conf.rtable);
-		if (strlen(rt->rt_conf.label))
-			printf("\t%8s\trtlabel: %s\n", "", rt->rt_conf.label);
+		if (rt.rt_conf.rtable)
+			printf("\t%8s\trtable: %d\n", "", rt.rt_conf.rtable);
+		if (strlen(rt.rt_conf.label))
+			printf("\t%8s\trtlabel: %s\n", "", rt.rt_conf.label);
 		break;
 	case IMSG_CTL_NETROUTE:
 		if (type != SHOW_ROUTERS)
 			break;
-		nr = imsg->data;
-		(void)print_host(&nr->nr_conf.ss, name, sizeof(name));
+		if (imsg_get_data(imsg, &nr, sizeof(nr)) == -1)
+			errx(1, "imsg_get_data net route error");
+		(void)print_host(&nr.nr_conf.ss, name, sizeof(name));
 		printf("\t%8s\troute: %s/%d\n",
-		    "", name, nr->nr_conf.prefixlen);
+		    "", name, nr.nr_conf.prefixlen);
 		break;
 	case IMSG_CTL_END:
 		return (1);
 	default:
-		errx(1, "wrong message in summary: %u", imsg->hdr.type);
+		errx(1, "wrong message in summary: %u", imsg_get_type(imsg));
 		break;
 	}
 	return (0);
@@ -447,35 +469,36 @@ show_summary_msg(struct imsg *imsg, int type)
 int
 show_session_msg(struct imsg *imsg)
 {
-	struct rsession		*con;
+	struct rsession		 con;
 	char			 a[128], b[128];
 	struct timeval		 tv_now;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_CTL_SESSION:
-		con = imsg->data;
+		if (imsg_get_data(imsg, &con, sizeof(con)) == -1)
+			errx(1, "imsg_get_data session error");
 
-		(void)print_host(&con->se_in.ss, a, sizeof(a));
-		(void)print_host(&con->se_out.ss, b, sizeof(b));
+		(void)print_host(&con.se_in.ss, a, sizeof(a));
+		(void)print_host(&con.se_out.ss, b, sizeof(b));
 		printf("session %u:%u %s:%u -> %s:%u\t%s\n",
-		    imsg->hdr.peerid, con->se_id,
-		    a, ntohs(con->se_in.port), b, ntohs(con->se_out.port),
-		    con->se_done ? "DONE" : "RUNNING");
+		    imsg_get_id(imsg), con.se_id,
+		    a, ntohs(con.se_in.port), b, ntohs(con.se_out.port),
+		    con.se_done ? "DONE" : "RUNNING");
 
 		getmonotime(&tv_now);
-		print_time(&tv_now, &con->se_tv_start, a, sizeof(a));
-		print_time(&tv_now, &con->se_tv_last, b, sizeof(b));
-		printf("\tage %s, idle %s, relay %u, pid %u",
-		    a, b, con->se_relayid, con->se_pid);
+		print_time(&tv_now, &con.se_tv_start, a, sizeof(a));
+		print_time(&tv_now, &con.se_tv_last, b, sizeof(b));
+		printf("age %s, idle %s, relay %u, pid %u",
+		    a, b, con.se_relayid, con.se_pid);
 		/* XXX grab tagname instead of tag id */
-		if (con->se_tag)
-			printf(", tag (id) %u", con->se_tag);
+		if (con.se_tag)
+			printf(", tag (id) %u", con.se_tag);
 		printf("\n");
 		break;
 	case IMSG_CTL_END:
 		return (1);
 	default:
-		errx(1, "wrong message in session: %u", imsg->hdr.type);
+		errx(1, "wrong message in session: %u", imsg_get_type(imsg));
 		break;
 	}
 	return (0);
@@ -484,7 +507,7 @@ show_session_msg(struct imsg *imsg)
 int
 show_command_output(struct imsg *imsg)
 {
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_CTL_OK:
 		printf("command succeeded\n");
 		break;
@@ -493,7 +516,7 @@ show_command_output(struct imsg *imsg)
 		error++;
 		break;
 	default:
-		errx(1, "wrong message in summary: %u", imsg->hdr.type);
+		errx(1, "wrong message in command: %u", imsg_get_type(imsg));
 	}
 	return (1);
 }
@@ -521,9 +544,11 @@ print_table_status(int up, int fl)
 	if (fl & F_DISABLE) {
 		snprintf(buf, sizeof(buf) - 1, "disabled");
 	} else if (!up) {
-		snprintf(buf, sizeof(buf) - 1, "empty");
-	} else
+		snprintf(buf, sizeof(buf) - 1, "unavailable");
+	} else if (verbose)
 		snprintf(buf, sizeof(buf) - 1, "active (%d hosts)", up);
+	else
+		snprintf(buf, sizeof(buf) - 1, "active");
 	return (buf);
 }
 
@@ -555,7 +580,7 @@ print_relay_status(int flags)
 }
 
 void
-print_statistics(struct ctl_stats stats[PROC_MAX_INSTANCES + 1])
+print_statistics(struct ctl_stats stats[PROC_MAX_INSTANCES+1])
 {
 	struct ctl_stats	 crs;
 	int			 i;
@@ -581,4 +606,20 @@ print_statistics(struct ctl_stats stats[PROC_MAX_INSTANCES + 1])
 	    crs.last_hour, crs.last_day,
 	    "", crs.avg, crs.interval,
 	    crs.avg_hour, crs.avg_day);
+}
+
+void
+print_imsg(struct imsg *imsg, const char *name)
+{
+	time_t			 now;
+
+	if (!verbose)
+		return;
+
+	now = time(NULL);
+
+	printf("%s: imsg type %u len %zu peerid %u pid %d\n", name,
+	    imsg_get_type(imsg), imsg_get_len(imsg), imsg_get_id(imsg),
+	    imsg_get_pid(imsg));
+	printf("%s: timestamp: %lld, %s", name, (long long)now, ctime(&now));
 }

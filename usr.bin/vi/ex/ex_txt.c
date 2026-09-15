@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_txt.c,v 1.17 2020/04/30 10:40:21 millert Exp $	*/
+/*	$OpenBSD: ex_txt.c,v 1.18 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -335,7 +335,7 @@ ins_ch:			if (LF_ISSET(TXT_BEAUTIFY) && iscntrl(ev.e_c) &&
 
 done:	return (rval);
 
-err:	
+err:
 alloc_err:
 	return (1);
 }

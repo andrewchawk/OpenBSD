@@ -5,23 +5,23 @@ use strict ;
 use warnings;
 use bytes;
 
-use Compress::Raw::Zlib  2.204 ;
-use IO::Compress::Base::Common  2.204 qw(:Status );
+use Compress::Raw::Zlib 2.222 ;
+use IO::Compress::Base::Common  2.223 qw(:Status );
 
-use IO::Uncompress::Base  2.204 ;
-use IO::Uncompress::Adapter::Inflate  2.204 ;
+use IO::Uncompress::Base  2.223 ;
+use IO::Uncompress::Adapter::Inflate  2.223 ;
 
 require Exporter ;
 our ($VERSION, @ISA, @EXPORT_OK, %EXPORT_TAGS, %DEFLATE_CONSTANTS, $RawInflateError);
 
-$VERSION = '2.204';
+$VERSION = '2.223';
 $RawInflateError = '';
 
 @ISA    = qw(IO::Uncompress::Base Exporter);
 @EXPORT_OK = qw( $RawInflateError rawinflate ) ;
 %DEFLATE_CONSTANTS = ();
 %EXPORT_TAGS = %IO::Uncompress::Base::EXPORT_TAGS ;
-push @{ $EXPORT_TAGS{all} }, @EXPORT_OK ;
+$EXPORT_TAGS{all} = [ defined $EXPORT_TAGS{all} ? @{ $EXPORT_TAGS{all} } : (), @EXPORT_OK ] ;
 Exporter::export_ok_tags('all');
 
 #{
@@ -306,7 +306,7 @@ sub zap
     my $headerLength = *$self->{Info}{HeaderLength};
     my $block_offset =  $headerLength + *$self->{Uncomp}->getLastBlockOffset();
     $_[0] = $headerLength + *$self->{Uncomp}->getEndOffset();
-    #printf "# End $_[0], headerlen $headerLength \n";;
+    #printf "# End $_[0], headerlen $headerLength \n";
     #printf "# block_offset $block_offset %x\n", $block_offset;
     my $byte ;
     ( $self->smartSeek($block_offset) &&
@@ -624,7 +624,7 @@ C<InputLength> option.
 
 =back
 
-=head2 Examples
+=head2 OneShot Examples
 
 To read the contents of the file C<file1.txt.1951> and write the
 uncompressed data to the file C<file1.txt>.
@@ -684,6 +684,9 @@ The format of the constructor for IO::Uncompress::RawInflate is shown below
     my $z = IO::Uncompress::RawInflate->new( $input [OPTS] )
         or die "IO::Uncompress::RawInflate failed: $RawInflateError\n";
 
+The constructor takes one mandatory parameter, C<$input>, defined below, and
+zero or more C<OPTS>, defined in L<Constructor Options>.
+
 Returns an C<IO::Uncompress::RawInflate> object on success and undef on failure.
 The variable C<$RawInflateError> will contain an error message on failure.
 
@@ -695,6 +698,20 @@ use either of these forms
 
     $line = $z->getline();
     $line = <$z>;
+
+Below is a simple exaple of using the OO interface to read the compressed file
+C<myfile.1951> and write its contents to stdout.
+
+    my $filename = "myfile.1951";
+    my $z = IO::Uncompress::RawInflate->new($filename)
+        or die "IO::Uncompress::RawInflate failed: $RawInflateError\n";
+
+    while (<$z>) {
+        print $_;
+    }
+    $z->close();
+
+See L</EXAMPLES> for further examples
 
 The mandatory parameter C<$input> is used to determine the source of the
 compressed data. This parameter can take one of three forms.
@@ -812,10 +829,6 @@ Defaults to 0.
 This option is a no-op.
 
 =back
-
-=head2 Examples
-
-TODO
 
 =head1 Methods
 
@@ -1125,7 +1138,7 @@ See the Changes file.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (c) 2005-2023 Paul Marquess. All rights reserved.
+Copyright (c) 2005-2026 Paul Marquess. All rights reserved.
 
 This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.

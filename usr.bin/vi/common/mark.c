@@ -1,4 +1,4 @@
-/*	$OpenBSD: mark.c,v 1.14 2016/05/27 09:18:11 martijn Exp $	*/
+/*	$OpenBSD: mark.c,v 1.15 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -114,12 +114,12 @@ mark_get(SCR *sp, CHAR_T key, MARK *mp, mtype_t mtype)
 	lmp = mark_find(sp, key);
 	if (lmp == NULL || lmp->name != key) {
 		msgq(sp, mtype, "Mark %s: not set", KEY_NAME(sp, key));
-                return (1);
+		return (1);
 	}
 	if (F_ISSET(lmp, MARK_DELETED)) {
 		msgq(sp, mtype,
 		    "Mark %s: the line was deleted", KEY_NAME(sp, key));
-                return (1);
+		return (1);
 	}
 
 	/*

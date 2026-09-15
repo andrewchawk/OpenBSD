@@ -1,4 +1,4 @@
-/*	$OpenBSD: screen.c,v 1.14 2017/04/18 01:45:35 deraadt Exp $	*/
+/*	$OpenBSD: screen.c,v 1.15 2026/04/20 11:37:18 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -131,8 +131,8 @@ screen_end(SCR *sp)
 	SCR *tsp;
 
 	/* If multiply referenced, just decrement the count and return. */
-	 if (--sp->refcnt != 0)
-		 return (0);
+	if (--sp->refcnt != 0)
+		return (0);
 
 	/*
 	 * Remove the screen from the displayed and hidden queues.

@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.13 2023/11/11 18:35:36 robert Exp $
+# $OpenBSD: Makefile,v 1.15 2026/05/29 11:18:30 robert Exp $
 
 LIB=	LLVMAArch64CodeGen
 NOPROFILE=
@@ -20,6 +20,7 @@ SRCS+=	AArch64CallLowering.cpp \
 
 SRCS+=	AArch64A57FPLoadBalancing.cpp \
 	AArch64AdvSIMDScalarPass.cpp \
+	AArch64Arm64ECCallLowering.cpp \
 	AArch64AsmPrinter.cpp \
 	AArch64BranchTargets.cpp \
 	AArch64CallingConvention.cpp \
@@ -37,10 +38,10 @@ SRCS+=	AArch64A57FPLoadBalancing.cpp \
 	AArch64CompressJumpTables.cpp \
 	AArch64ConditionOptimizer.cpp \
 	AArch64RedundantCopyElimination.cpp \
+	AArch64RedundantCondBranchPass.cpp \
 	AArch64ISelDAGToDAG.cpp \
 	AArch64ISelLowering.cpp \
 	AArch64InstrInfo.cpp \
-	AArch64KCFI.cpp \
 	AArch64LoadStoreOptimizer.cpp \
 	AArch64LowerHomogeneousPrologEpilog.cpp \
 	AArch64MachineFunctionInfo.cpp \
@@ -48,9 +49,12 @@ SRCS+=	AArch64A57FPLoadBalancing.cpp \
 	AArch64MacroFusion.cpp \
 	AArch64MIPeepholeOpt.cpp \
 	AArch64MCInstLower.cpp \
+	AArch64PointerAuth.cpp \
+	AArch64PostCoalescerPass.cpp \
 	AArch64PromoteConstant.cpp \
 	AArch64PBQPRegAlloc.cpp \
 	AArch64RegisterInfo.cpp \
+	AArch64SMEAttributes.cpp \
 	AArch64ReturnProtectorLowering.cpp \
 	AArch64SLSHardening.cpp \
 	AArch64SelectionDAGInfo.cpp \
@@ -63,8 +67,11 @@ SRCS+=	AArch64A57FPLoadBalancing.cpp \
 	AArch64TargetObjectFile.cpp \
 	AArch64TargetTransformInfo.cpp \
 	SMEABIPass.cpp \
+	SMEPeepholeOpt.cpp \
 	SVEIntrinsicOpts.cpp \
-	AArch64SIMDInstrOpt.cpp
+	MachineSMEABIPass.cpp \
+	AArch64SIMDInstrOpt.cpp \
+	AArch64PrologueEpilogue.cpp
 
 .PATH:	${.CURDIR}/../../../llvm/llvm/lib/Target/AArch64
 .PATH:	${.CURDIR}/../../../llvm/llvm/lib/Target/AArch64/GISel

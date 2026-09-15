@@ -44,6 +44,7 @@
 
 #include "config.h"
 #include <ctype.h>
+#include "util/as112.h"
 #include "util/log.h"
 #include "util/config_file.h"
 #include "util/module.h"
@@ -140,10 +141,13 @@ check_mod(struct config_file* cfg, struct module_func_block* fb)
 		fatal_exit("out of memory");
 	if(!edns_known_options_init(&env))
 		fatal_exit("out of memory");
-	if(!(*fb->init)(&env, 0)) {
-		fatal_exit("bad config for %s module", fb->name);
-	}
+	if(fb->startup && !(*fb->startup)(&env, 0))
+		fatal_exit("bad config during startup for %s module", fb->name);
+	if(!(*fb->init)(&env, 0))
+		fatal_exit("bad config during init for %s module", fb->name);
 	(*fb->deinit)(&env, 0);
+	if(fb->destartup)
+		(*fb->destartup)(&env, 0);
 	sldns_buffer_free(env.scratch_buffer);
 	regional_destroy(env.scratch);
 	edns_known_options_delete(&env);
@@ -185,11 +189,56 @@ donotquerylocalhostcheck(struct config_file* cfg)
 	}
 }
 
+static void
+nodefaultzonescheck(struct config_file* cfg)
+{
+	struct config_strlist* d;
+	const char** zstr;
+	size_t len;
+
+#define COMPARE_ZONE_NAME(confname, builtname, len)		\
+	(strncasecmp(confname, builtname, (len)) == 0 &&	\
+	(strlen(confname) == (len) ||				\
+	(strlen(confname) == (len) + 1				\
+	&& confname[(len)] == '.')))
+
+	for(d = cfg->local_zones_nodefault; d; d = d->next) {
+		if(!cfg->unblock_lan_zones) {
+			for(zstr = as112_zones; *zstr; zstr++) {
+				len = strlen(*zstr) - 1; /* trailing '.' */
+				if(COMPARE_ZONE_NAME(d->str, *zstr, len))
+					goto default_continue;
+			}
+		}
+		for(zstr = local_zones_default_special; *zstr; zstr++) {
+			len = strlen(*zstr) - 1; /* trailing '.' */
+			if(COMPARE_ZONE_NAME(d->str, *zstr, len))
+				goto default_continue;
+		}
+		for(zstr = local_zones_default_reverse; *zstr; zstr++) {
+			len = strlen(*zstr) - 1; /* trailing '.' */
+			if(COMPARE_ZONE_NAME(d->str, *zstr, len))
+				goto default_continue;
+		}
+		if(COMPARE_ZONE_NAME(d->str, "localhost.", 10 - 1))
+			goto default_continue;
+		fprintf(stderr, "unbound-checkconf: warning: local-zone: '%s' "
+			"is configured as 'nodefault' but there is no such "
+			"default local-zone. Check the unbound.conf "
+			"documentation for default configured local-zones.\n",
+			d->str);
+default_continue:
+		; /* statement to jump to, for older gcc. */
+	}
+#undef COMPARE_ZONE_NAME
+}
+
 /** check localzones */
 static void
 localzonechecks(struct config_file* cfg)
 {
 	struct local_zones* zs;
+	nodefaultzonescheck(cfg);
 	if(!(zs = local_zones_create()))
 		fatal_exit("out of memory");
 	if(!local_zones_apply_cfg(zs, cfg))
@@ -291,7 +340,8 @@ view_and_respipchecks(struct config_file* cfg)
 {
 	struct views* views = NULL;
 	struct respip_set* respip = NULL;
-	int ignored = 0;
+	int have_view_respip_cfg = 0;
+	int use_response_ip = 0;
 	if(!(views = views_create()))
 		fatal_exit("Could not create views: out of memory");
 	if(!(respip = respip_set_create()))
@@ -300,8 +350,11 @@ view_and_respipchecks(struct config_file* cfg)
 		fatal_exit("Could not set up views");
 	if(!respip_global_apply_cfg(respip, cfg))
 		fatal_exit("Could not setup respip set");
-	if(!respip_views_apply_cfg(views, cfg, &ignored))
+	if(!respip_views_apply_cfg(views, cfg, &have_view_respip_cfg))
 		fatal_exit("Could not setup per-view respip sets");
+	use_response_ip = !respip_set_is_empty(respip) || have_view_respip_cfg;
+	if(use_response_ip && !strstr(cfg->module_conf, "respip"))
+		fatal_exit("response-ip options require respip module");
 	acl_view_tag_checks(cfg, views);
 	views_delete(views);
 	respip_set_delete(respip);
@@ -339,8 +392,6 @@ interfacechecks(struct config_file* cfg)
 	int i, j, i2, j2;
 	char*** resif = NULL;
 	int* num_resif = NULL;
-	char portbuf[32];
-	snprintf(portbuf, sizeof(portbuf), "%d", cfg->port);
 
 	if(cfg->num_ifs != 0) {
 		resif = (char***)calloc(cfg->num_ifs, sizeof(char**));
@@ -363,14 +414,18 @@ interfacechecks(struct config_file* cfg)
 				cfg->ifs[i]);
 		}
 		/* check for port combinations that are not supported */
-		if(if_is_pp2(resif[i][0], portbuf, cfg->proxy_protocol_port)) {
-			if(if_is_dnscrypt(resif[i][0], portbuf,
+		if(if_is_pp2(resif[i][0], cfg->port, cfg->proxy_protocol_port)) {
+			if(if_is_dnscrypt(resif[i][0], cfg->port,
 				cfg->dnscrypt_port)) {
 				fatal_exit("PROXYv2 and DNSCrypt combination not "
 					"supported!");
-			} else if(if_is_https(resif[i][0], portbuf,
+			} else if(if_is_https(resif[i][0], cfg->port,
 				cfg->https_port)) {
 				fatal_exit("PROXYv2 and DoH combination not "
+					"supported!");
+			} else if(if_is_quic(resif[i][0], cfg->port,
+				cfg->quic_port)) {
+				fatal_exit("PROXYv2 and DoQ combination not "
 					"supported!");
 			}
 		}
@@ -442,6 +497,39 @@ ifautomaticportschecks(char* ifautomaticports)
 		if(extraport == 0 && now == after)
 			fatal_exit("interface-automatic-ports: parse error at position %d in '%s'", (int)(now-ifautomaticports)+1, ifautomaticports);
 		now = after;
+	}
+}
+
+/** check control interface strings */
+static void
+controlinterfacechecks(struct config_file* cfg)
+{
+	struct config_strlist* p;
+	for(p = cfg->control_ifs.first; p; p = p->next) {
+		struct sockaddr_storage a;
+		socklen_t alen;
+		char** rcif = NULL;
+		int i, num_rcif = 0;
+		/* See if it is a local socket, starts with a '/'. */
+		if(p->str && p->str[0] == '/')
+			continue;
+		if(!resolve_interface_names(&p->str, 1, NULL, &rcif,
+			&num_rcif)) {
+			fatal_exit("could not resolve interface names, for control-interface: %s",
+				p->str);
+		}
+		for(i=0; i<num_rcif; i++) {
+			if(!extstrtoaddr(rcif[i], &a, &alen,
+				cfg->control_port)) {
+				if(strcmp(p->str, rcif[i])!=0)
+					fatal_exit("cannot parse control-interface address '%s' from the control-interface specified as '%s'",
+						rcif[i], p->str);
+				else
+					fatal_exit("cannot parse control-interface specified as '%s'",
+						p->str);
+			}
+		}
+		config_del_strarray(rcif, num_rcif);
 	}
 }
 
@@ -631,8 +719,10 @@ check_modules_exist(const char* module_conf)
 				}
 				n[j] = s[j];
 			}
-			fatal_exit("module_conf lists module '%s' but that "
-				"module is not available.", n);
+			fatal_exit("Unknown value in module-config, module: "
+				"'%s'. This module is not present (not "
+				"compiled in); see the list of linked modules "
+				"with unbound -V", n);
 		}
 		s += strlen(names[i]);
 	}
@@ -739,7 +829,6 @@ morechecks(struct config_file* cfg)
 	/* check that the modules listed in module_conf exist */
 	check_modules_exist(cfg->module_conf);
 
-	/* Respip is known to *not* work with dns64. */
 	if(strcmp(cfg->module_conf, "iterator") != 0
 		&& strcmp(cfg->module_conf, "validator iterator") != 0
 		&& strcmp(cfg->module_conf, "dns64 validator iterator") != 0
@@ -825,6 +914,7 @@ morechecks(struct config_file* cfg)
 		&& strcmp(cfg->module_conf, "respip cachedb iterator") != 0
 		&& strcmp(cfg->module_conf, "dns64 validator cachedb iterator") != 0
 		&& strcmp(cfg->module_conf, "dns64 cachedb iterator") != 0
+		&& strcmp(cfg->module_conf, "respip dns64 validator cachedb iterator") != 0
 #endif
 #if defined(WITH_PYTHONMODULE) && defined(USE_CACHEDB)
 		&& strcmp(cfg->module_conf, "python dns64 cachedb iterator") != 0
@@ -908,7 +998,7 @@ morechecks(struct config_file* cfg)
 #  endif
 	}
 
-	if (pledge("stdio rpath", NULL) == -1)
+	if (pledge("stdio rpath dns", NULL) == -1)
 		fatal_exit("Could not pledge");
 
 #endif
@@ -925,6 +1015,8 @@ morechecks(struct config_file* cfg)
 			fatal_exit("control-cert-file: \"%s\" does not exist",
 				cfg->control_cert_file);
 	}
+	if(cfg->remote_control_enable)
+		controlinterfacechecks(cfg);
 
 	donotquerylocalhostcheck(cfg);
 	localzonechecks(cfg);
@@ -965,6 +1057,8 @@ check_auth(struct config_file* cfg)
 	if(!az || !auth_zones_apply_cfg(az, cfg, 0, &is_rpz, NULL, NULL)) {
 		fatal_exit("Could not setup authority zones");
 	}
+	if(is_rpz && !strstr(cfg->module_conf, "respip"))
+		fatal_exit("RPZ requires the respip module");
 	auth_zones_delete(az);
 }
 

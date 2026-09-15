@@ -1,4 +1,4 @@
-/*	$OpenBSD: sd.c,v 1.336 2024/05/04 16:40:38 kn Exp $	*/
+/*	$OpenBSD: sd.c,v 1.343 2026/06/24 17:03:06 krw Exp $	*/
 /*	$NetBSD: sd.c,v 1.111 1997/04/02 02:29:41 mycroft Exp $	*/
 
 /*-
@@ -75,8 +75,6 @@
 #include <scsi/scsiconf.h>
 #include <scsi/sdvar.h>
 
-#include <ufs/ffs/fs.h>			/* for BBSIZE and SBSIZE */
-
 #include <sys/vnode.h>
 
 int	sdmatch(struct device *, void *, void *);
@@ -116,7 +114,7 @@ const struct cfattach sd_ca = {
 };
 
 struct cfdriver sd_cd = {
-	NULL, "sd", DV_DISK
+	NULL, "sd", DV_DISK, CD_COCOVM
 };
 
 const struct scsi_inquiry_pattern sd_patterns[] = {
@@ -1221,7 +1219,8 @@ sdsize(dev_t dev)
 	struct disklabel		*lp;
 	struct sd_softc			*sc;
 	daddr_t				 size;
-	int				 part, omask;
+	int				 part;
+	uint64_t			 omask;
 
 	sc = sdlookup(DISKUNIT(dev));
 	if (sc == NULL)
@@ -1232,7 +1231,7 @@ sdsize(dev_t dev)
 	}
 
 	part = DISKPART(dev);
-	omask = sc->sc_dk.dk_openmask & (1 << part);
+	omask = sc->sc_dk.dk_openmask & (1ULL << part);
 
 	if (omask == 0 && sdopen(dev, 0, S_IFBLK, NULL) != 0) {
 		size = -1;
@@ -1648,7 +1647,7 @@ sd_get_parms(struct sd_softc *sc, int flags)
 		return -1;
 
 	if (ISSET(sc->flags, SDF_THIN) && sd_thin_params(sc, flags) != 0) {
-		/* we dont know the unmap limits, so we cant use thin shizz */
+		/* we don't know the unmap limits, so we can't use this shizz */
 		CLR(sc->flags, SDF_THIN);
 	}
 

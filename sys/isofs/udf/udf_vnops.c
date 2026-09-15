@@ -1,4 +1,4 @@
-/*	$OpenBSD: udf_vnops.c,v 1.72 2024/05/13 11:17:40 semarie Exp $	*/
+/*	$OpenBSD: udf_vnops.c,v 1.76 2026/06/30 14:04:03 kirill Exp $	*/
 
 /*
  * Copyright (c) 2001, 2002 Scott Long <scottl@freebsd.org>
@@ -103,6 +103,8 @@ udf_hashlookup(struct umount *ump, udfino_t id, int flags, struct vnode **vpp)
 {
 	struct unode *up;
 	struct udf_hash_lh *lh;
+	struct vnode *vp;
+	u_int vpid;
 	int error;
 
 	*vpp = NULL;
@@ -118,13 +120,19 @@ loop:
 
 	LIST_FOREACH(up, lh, u_le) {
 		if (up->u_ino == id) {
+			vp = up->u_vnode;
+			vpid = vp->v_id;
 			mtx_leave(&ump->um_hashmtx);
-			error = vget(up->u_vnode, flags);
+			error = vget(vp, flags);
 			if (error == ENOENT)
 				goto loop;
 			if (error)
 				return (error);
-			*vpp = up->u_vnode;
+			if (vpid != vp->v_id) {
+				vput(vp);
+				goto loop;
+			}
+			*vpp = vp;
 			return (0);
 		}
 	}
@@ -471,7 +479,7 @@ udf_read(void *v)
 		}
 		if (error)
 			break;
-	};
+	}
 
 	return (error);
 }
@@ -564,6 +572,12 @@ udf_uiodir(struct udf_uiodir *uiodir, struct uio *uio, long off)
 	}
 	uiodir->dirent->d_off = off;
 	uiodir->dirent->d_reclen = de_size;
+
+	if (memchr(uiodir->dirent->d_name, '/',
+	    uiodir->dirent->d_namlen) != NULL) {
+		/* illegal file name */
+		return (EINVAL);
+	}
 
 	return (uiomove(uiodir->dirent, de_size, uio));
 }
@@ -938,6 +952,7 @@ udf_islocked(void *v)
 int
 udf_print(void *v)
 {
+#if defined(DEBUG) || defined(DIAGNOSTIC) || defined(VFSLCKDEBUG)
 	struct vop_print_args *ap = v;
 	struct vnode *vp = ap->a_vp;
 	struct unode *up = VTOU(vp);
@@ -948,6 +963,7 @@ udf_print(void *v)
 	printf("tag VT_UDF, hash id %u\n", up->u_ino);
 #ifdef DIAGNOSTIC
 	printf("\n");
+#endif
 #endif
 	return (0);
 }

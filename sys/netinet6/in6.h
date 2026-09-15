@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6.h,v 1.118 2024/05/13 01:15:53 jsg Exp $	*/
+/*	$OpenBSD: in6.h,v 1.125 2025/09/16 09:19:16 florian Exp $	*/
 /*	$KAME: in6.h,v 1.83 2001/03/29 02:55:07 jinmei Exp $	*/
 
 /*
@@ -405,16 +405,17 @@ struct ifaddr;
 struct in6_ifaddr;
 struct ifnet;
 struct rtentry;
+struct netstack;
 
-void	ipv6_input(struct ifnet *, struct mbuf *);
+void	ipv6_input(struct ifnet *, struct mbuf *, struct netstack *);
 struct mbuf *
 	ipv6_check(struct ifnet *, struct mbuf *);
 
 int	in6_cksum(struct mbuf *, uint8_t, uint32_t, uint32_t);
 void	in6_proto_cksum_out(struct mbuf *, struct ifnet *);
-int	in6_addrscope(struct in6_addr *);
-struct	in6_ifaddr *in6_ifawithscope(struct ifnet *, struct in6_addr *, u_int,
-	    struct rtentry *);
+int	in6_addrscope(const struct in6_addr *);
+struct	in6_ifaddr *in6_ifawithscope(struct ifnet *, const struct in6_addr *,
+	    u_int, struct rtentry *);
 int	in6_mask2len(struct in6_addr *, u_char *);
 int	in6_nam2sin6(const struct mbuf *, struct sockaddr_in6 **);
 int	in6_sa2sin6(struct sockaddr *, struct sockaddr_in6 **);
@@ -576,14 +577,13 @@ ifatoia6(struct ifaddr *ifa)
 #define IPV6CTL_MRTPROTO	8	/* multicast routing protocol */
 #define IPV6CTL_MAXFRAGPACKETS	9	/* max packets reassembly queue */
 #define IPV6CTL_SOURCECHECK	10	/* verify source route and intf */
-#define IPV6CTL_SOURCECHECK_LOGINT 11	/* minimume logging interval */
+#define IPV6CTL_SOURCECHECK_LOGINT 11	/* minimum logging interval */
 #define IPV6CTL_ACCEPT_RTADV	12
 #define IPV6CTL_LOG_INTERVAL	14
 #define IPV6CTL_HDRNESTLIMIT	15
 #define IPV6CTL_DAD_COUNT	16
 #define IPV6CTL_AUTO_FLOWLABEL	17
 #define IPV6CTL_DEFMCASTHLIM	18
-#define IPV6CTL_USE_DEPRECATED	21	/* use deprecated addr (RFC2462 5.5.4) */
 /* 24 to 40: reserved */
 #define IPV6CTL_MAXFRAGS	41	/* max fragments */
 #define IPV6CTL_MFORWARDING	42
@@ -596,8 +596,7 @@ ifatoia6(struct ifaddr *ifa)
 #define IPV6CTL_IFQUEUE		51
 #define IPV6CTL_MRTMIF		52
 #define IPV6CTL_MRTMFC		53
-#define IPV6CTL_SOIIKEY		54
-#define IPV6CTL_MAXID		55
+#define IPV6CTL_MAXID		54
 
 /* New entries should be added here from current IPV6CTL_MAXID value. */
 /* to define items, should talk with KAME guys first, for *BSD compatibility */
@@ -617,14 +616,14 @@ ifatoia6(struct ifaddr *ifa)
 	{ "sourcecheck_logint", CTLTYPE_INT }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
-	{ "log_interval", CTLTYPE_INT }, \
+	{ 0, 0 }, \
 	{ "hdrnestlimit", CTLTYPE_INT }, \
 	{ "dad_count", CTLTYPE_INT }, \
-	{ "auto_flowlabel", CTLTYPE_INT }, \
+	{ 0, 0 }, \
 	{ "defmcasthlim", CTLTYPE_INT }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
-	{ "use_deprecated", CTLTYPE_INT }, \
+	{ 0, 0 }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
@@ -657,7 +656,6 @@ ifatoia6(struct ifaddr *ifa)
 	{ "ifq", CTLTYPE_NODE }, \
 	{ "mrtmif", CTLTYPE_STRUCT }, \
 	{ "mrtmfc", CTLTYPE_STRUCT }, \
-	{ "soiikey", CTLTYPE_STRING }, /* binary string */ \
 }
 
 __BEGIN_DECLS

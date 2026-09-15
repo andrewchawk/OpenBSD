@@ -86,6 +86,31 @@ dt_pack(const Dnstap__Dnstap *d, void **buf, size_t *sz)
 	return 1;
 }
 
+/** See if the message is sent due to dnstap sample rate */
+static int
+dt_sample_rate_limited(struct dt_env* env)
+{
+	lock_basic_lock(&env->sample_lock);
+	/* Sampling is every [n] packets. Where n==1, every packet is sent */
+	if(env->sample_rate > 1) {
+		int submit = 0;
+		/* if sampling is engaged... */
+		if (env->sample_rate_count > env->sample_rate) {
+			/* once the count passes the limit */
+			/* submit the message */
+			submit = 1;
+			/* and reset the count */
+			env->sample_rate_count = 0;
+		}
+		/* increment count regardless */
+		env->sample_rate_count++;
+		lock_basic_unlock(&env->sample_lock);
+		return !submit;
+	}
+	lock_basic_unlock(&env->sample_lock);
+	return 0;
+}
+
 static void
 dt_send(const struct dt_env *env, void *buf, size_t len_buf)
 {
@@ -146,6 +171,7 @@ dt_create(struct config_file* cfg)
 	env = (struct dt_env *) calloc(1, sizeof(struct dt_env));
 	if (!env)
 		return NULL;
+	lock_basic_init(&env->sample_lock);
 
 	env->dtio = dt_io_thread_create();
 	if(!env->dtio) {
@@ -166,8 +192,11 @@ static void
 dt_apply_identity(struct dt_env *env, struct config_file *cfg)
 {
 	char buf[MAXHOSTNAMELEN+1];
-	if (!cfg->dnstap_send_identity)
+	if (!cfg->dnstap_send_identity) {
+		free(env->identity);
+		env->identity = NULL;
 		return;
+	}
 	free(env->identity);
 	if (cfg->dnstap_identity == NULL || cfg->dnstap_identity[0] == 0) {
 		if (gethostname(buf, MAXHOSTNAMELEN) == 0) {
@@ -189,8 +218,11 @@ dt_apply_identity(struct dt_env *env, struct config_file *cfg)
 static void
 dt_apply_version(struct dt_env *env, struct config_file *cfg)
 {
-	if (!cfg->dnstap_send_version)
+	if (!cfg->dnstap_send_version) {
+		free(env->version);
+		env->version = NULL;
 		return;
+	}
 	free(env->version);
 	if (cfg->dnstap_version == NULL || cfg->dnstap_version[0] == 0)
 		env->version = strdup(PACKAGE_STRING);
@@ -204,13 +236,8 @@ dt_apply_version(struct dt_env *env, struct config_file *cfg)
 }
 
 void
-dt_apply_cfg(struct dt_env *env, struct config_file *cfg)
+dt_apply_logcfg(struct dt_env *env, struct config_file *cfg)
 {
-	if (!cfg->dnstap)
-		return;
-
-	dt_apply_identity(env, cfg);
-	dt_apply_version(env, cfg);
 	if ((env->log_resolver_query_messages = (unsigned int)
 	     cfg->dnstap_log_resolver_query_messages))
 	{
@@ -241,6 +268,23 @@ dt_apply_cfg(struct dt_env *env, struct config_file *cfg)
 	{
 		verbose(VERB_OPS, "dnstap Message/FORWARDER_RESPONSE enabled");
 	}
+	lock_basic_lock(&env->sample_lock);
+	if((env->sample_rate = (unsigned int)cfg->dnstap_sample_rate))
+	{
+		verbose(VERB_OPS, "dnstap SAMPLE_RATE enabled and set to \"%d\"", (int)env->sample_rate);
+	}
+	lock_basic_unlock(&env->sample_lock);
+}
+
+void
+dt_apply_cfg(struct dt_env *env, struct config_file *cfg)
+{
+	if (!cfg->dnstap)
+		return;
+
+	dt_apply_identity(env, cfg);
+	dt_apply_version(env, cfg);
+	dt_apply_logcfg(env, cfg);
 }
 
 int
@@ -273,6 +317,7 @@ dt_delete(struct dt_env *env)
 	if (!env)
 		return;
 	dt_io_thread_delete(env->dtio);
+	lock_basic_destroy(&env->sample_lock);
 	free(env->identity);
 	free(env->version);
 	free(env);
@@ -409,6 +454,9 @@ dt_msg_send_client_query(struct dt_env *env,
 	struct dt_msg dm;
 	struct timeval qtime;
 
+	if(dt_sample_rate_limited(env))
+		return;
+
 	if(tstamp)
 		memcpy(&qtime, tstamp, sizeof(qtime));
 	else 	gettimeofday(&qtime, NULL);
@@ -447,6 +495,9 @@ dt_msg_send_client_response(struct dt_env *env,
 	struct dt_msg dm;
 	struct timeval rtime;
 
+	if(dt_sample_rate_limited(env))
+		return;
+
 	gettimeofday(&rtime, NULL);
 
 	/* type */
@@ -484,11 +535,14 @@ dt_msg_send_outside_query(struct dt_env *env,
 	struct timeval qtime;
 	uint16_t qflags;
 
+	if(dt_sample_rate_limited(env))
+		return;
+
 	gettimeofday(&qtime, NULL);
 	qflags = sldns_buffer_read_u16_at(qmsg, 2);
 
 	/* type */
-	if (qflags & BIT_RD) {
+	if ((qflags & BIT_RD)) {
 		if (!env->log_forwarder_query_messages)
 			return;
 		dt_msg_init(env, &dm, DNSTAP__MESSAGE__TYPE__FORWARDER_QUERY);
@@ -537,12 +591,15 @@ dt_msg_send_outside_response(struct dt_env *env,
 	struct dt_msg dm;
 	uint16_t qflags;
 
+	if(dt_sample_rate_limited(env))
+		return;
+
 	(void)qbuf_len; log_assert(qbuf_len >= sizeof(qflags));
 	memcpy(&qflags, qbuf, sizeof(qflags));
 	qflags = ntohs(qflags);
 
 	/* type */
-	if (qflags & BIT_RD) {
+	if ((qflags & BIT_RD)) {
 		if (!env->log_forwarder_response_messages)
 			return;
 		dt_msg_init(env, &dm, DNSTAP__MESSAGE__TYPE__FORWARDER_RESPONSE);

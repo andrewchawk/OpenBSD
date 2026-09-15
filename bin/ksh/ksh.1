@@ -1,8 +1,8 @@
-.\"	$OpenBSD: ksh.1,v 1.220 2023/10/20 18:51:09 schwarze Exp $
+.\"	$OpenBSD: ksh.1,v 1.223 2025/12/31 22:12:25 jsg Exp $
 .\"
 .\"	Public Domain
 .\"
-.Dd $Mdocdate: October 20 2023 $
+.Dd $Mdocdate: December 31 2025 $
 .Dt KSH 1
 .Os
 .Sh NAME
@@ -528,6 +528,13 @@ stripped; any space within a pattern must be quoted.
 Both the word and the
 patterns are subject to parameter, command, and arithmetic substitution, as
 well as tilde substitution.
+The initial
+.Sq (\&
+is optional,
+as is the terminating
+.Sq ;;
+for the final
+.Ar list .
 For historical reasons, open and close braces may be used instead of
 .Cm in
 and
@@ -1800,10 +1807,8 @@ command may be used to list, change, and add to this cache (e.g.\&
 Brace expressions take the following form:
 .Bd -unfilled -offset indent
 .Sm off
-.Xo
 .Ar prefix No { Ar str1 No ,...,
 .Ar strN No } Ar suffix
-.Xc
 .Sm on
 .Ed
 .Pp
@@ -5591,7 +5596,7 @@ Privileged shell profile.
 .Rs
 .%A IEEE Inc.
 .%D 1993
-.%O ISBN 1-55937-266-9
+.%O ISBN 1-55937-255-9
 .%T IEEE Standard for Information Technology \- Portable Operating \
     System Interface (POSIX) \- Part 2: Shell and Utilities
 .Re

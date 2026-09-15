@@ -18,13 +18,30 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 
-namespace llvm {
-namespace object {
+using namespace llvm;
+using namespace llvm::object;
 
 namespace {
 
-template <typename ELFT>
-std::optional<BuildIDRef> getBuildID(const ELFFile<ELFT> &Obj) {
+template <typename ELFT> BuildIDRef getBuildID(const ELFFile<ELFT> &Obj) {
+  auto findBuildID = [&Obj](const auto &ShdrOrPhdr,
+                            uint64_t Alignment) -> std::optional<BuildIDRef> {
+    Error Err = Error::success();
+    for (auto N : Obj.notes(ShdrOrPhdr, Err))
+      if (N.getType() == ELF::NT_GNU_BUILD_ID &&
+          N.getName() == ELF::ELF_NOTE_GNU)
+        return N.getDesc(Alignment);
+    consumeError(std::move(Err));
+    return std::nullopt;
+  };
+
+  auto Sections = cantFail(Obj.sections());
+  for (const auto &S : Sections) {
+    if (S.sh_type != ELF::SHT_NOTE)
+      continue;
+    if (std::optional<BuildIDRef> ShdrRes = findBuildID(S, S.sh_addralign))
+      return ShdrRes.value();
+  }
   auto PhdrsOrErr = Obj.program_headers();
   if (!PhdrsOrErr) {
     consumeError(PhdrsOrErr.takeError());
@@ -33,28 +50,33 @@ std::optional<BuildIDRef> getBuildID(const ELFFile<ELFT> &Obj) {
   for (const auto &P : *PhdrsOrErr) {
     if (P.p_type != ELF::PT_NOTE)
       continue;
-    Error Err = Error::success();
-    for (auto N : Obj.notes(P, Err))
-      if (N.getType() == ELF::NT_GNU_BUILD_ID &&
-          N.getName() == ELF::ELF_NOTE_GNU)
-        return N.getDesc();
-    consumeError(std::move(Err));
+    if (std::optional<BuildIDRef> PhdrRes = findBuildID(P, P.p_align))
+      return PhdrRes.value();
   }
   return {};
 }
 
 } // namespace
 
-std::optional<BuildIDRef> getBuildID(const ObjectFile *Obj) {
+BuildID llvm::object::parseBuildID(StringRef Str) {
+  std::string Bytes;
+  if (!tryGetFromHex(Str, Bytes))
+    return {};
+  ArrayRef<uint8_t> BuildID(reinterpret_cast<const uint8_t *>(Bytes.data()),
+                            Bytes.size());
+  return SmallVector<uint8_t>(BuildID);
+}
+
+BuildIDRef llvm::object::getBuildID(const ObjectFile *Obj) {
   if (auto *O = dyn_cast<ELFObjectFile<ELF32LE>>(Obj))
-    return getBuildID(O->getELFFile());
+    return ::getBuildID(O->getELFFile());
   if (auto *O = dyn_cast<ELFObjectFile<ELF32BE>>(Obj))
-    return getBuildID(O->getELFFile());
+    return ::getBuildID(O->getELFFile());
   if (auto *O = dyn_cast<ELFObjectFile<ELF64LE>>(Obj))
-    return getBuildID(O->getELFFile());
+    return ::getBuildID(O->getELFFile());
   if (auto *O = dyn_cast<ELFObjectFile<ELF64BE>>(Obj))
-    return getBuildID(O->getELFFile());
-  return std::nullopt;
+    return ::getBuildID(O->getELFFile());
+  return {};
 }
 
 std::optional<std::string> BuildIDFetcher::fetch(BuildIDRef BuildID) const {
@@ -88,6 +110,3 @@ std::optional<std::string> BuildIDFetcher::fetch(BuildIDRef BuildID) const {
   }
   return std::nullopt;
 }
-
-} // namespace object
-} // namespace llvm

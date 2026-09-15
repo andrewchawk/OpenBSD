@@ -1,20 +1,14 @@
-# $OpenBSD: Makefile,v 1.11 2023/10/30 17:15:21 tb Exp $
+# $OpenBSD: Makefile,v 1.16 2025/07/25 16:33:15 tb Exp $
 
 # Connect a client to a server.  Both can be current libressl, or
-# openssl 1.1 or 3.0.  Create client and server certificates
+# openssl 3.x.  Create client and server certificates
 # that are signed by a CA and not signed by a fake CA.  Try all
 # combinations with, without, and with wrong CA for client and server
 # and check the result of certificate verification.
 
 LIBRARIES =		libressl
-.if exists(/usr/local/bin/eopenssl11)
-LIBRARIES +=		openssl11
-.endif
-.if exists(/usr/local/bin/eopenssl30)
-LIBRARIES +=		openssl30
-.endif
-.if exists(/usr/local/bin/eopenssl31)
-LIBRARIES +=		openssl31
+.if exists(/usr/local/bin/eopenssl35)
+LIBRARIES +=		openssl35
 .endif
 
 .for cca in noca ca fakeca

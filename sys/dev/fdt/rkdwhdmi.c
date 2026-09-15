@@ -1,4 +1,4 @@
-/* $OpenBSD: rkdwhdmi.c,v 1.7 2024/01/16 23:37:50 jsg Exp $ */
+/* $OpenBSD: rkdwhdmi.c,v 1.9 2025/03/24 11:26:59 jmatthew Exp $ */
 /* $NetBSD: rk_dwhdmi.c,v 1.4 2019/12/17 18:26:36 jakllsch Exp $ */
 
 /*-
@@ -123,8 +123,6 @@ rkdwhdmi_attach(struct device *parent, struct device *self, void *aux)
 	struct rkdwhdmi_softc *sc = (struct rkdwhdmi_softc *)self;
 	struct fdt_attach_args *faa = aux;
 	uint32_t grf;
-	bus_addr_t addr;
-	bus_size_t size;
 	uint32_t phandle;
 
 	if (faa->fa_nreg < 1) {
@@ -132,7 +130,7 @@ rkdwhdmi_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 
-	pinctrl_byname(sc->sc_node, "default");
+	pinctrl_byname(faa->fa_node, "default");
 
 	clock_enable(faa->fa_node, "iahb");
 	clock_enable(faa->fa_node, "isfr");

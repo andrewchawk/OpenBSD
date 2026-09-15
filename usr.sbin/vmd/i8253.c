@@ -1,4 +1,4 @@
-/* $OpenBSD: i8253.c,v 1.41 2024/07/10 09:27:33 dv Exp $ */
+/* $OpenBSD: i8253.c,v 1.48 2026/08/29 18:44:42 dv Exp $ */
 /*
  * Copyright (c) 2016 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -23,15 +23,12 @@
 
 #include <event.h>
 #include <string.h>
-#include <stddef.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "i8253.h"
 #include "vmd.h"
 #include "atomicio.h"
-
-extern char *__progname;
 
 /*
  * Channel 0 is used to generate the legacy hardclock interrupt (HZ).
@@ -177,11 +174,11 @@ vcpu_exit_i8253_misc(struct vm_run_params *vrp)
 		if (i8253_channel[2].mode == TIMER_INTTC) {
 			if (i8253_channel[2].state) {
 				set_return_data(vei, (1 << 5));
-				log_debug("%s: counter 2 fired, returning "
+				DPRINTF("%s: counter 2 fired, returning "
 				    "0x20", __func__);
 			} else {
 				set_return_data(vei, 0);
-				log_debug("%s: counter 2 clear, returning 0x0",
+				DPRINTF("%s: counter 2 clear, returning 0x0",
 				    __func__);
 			}
 		} else if (i8253_channel[2].mode == TIMER_SQWAVE) {
@@ -200,7 +197,7 @@ vcpu_exit_i8253_misc(struct vm_run_params *vrp)
 			}
 		}
 	} else {
-		log_debug("%s: discarding data written to PIT misc port",
+		DPRINTF("%s: discarding data written to PIT misc port",
 		    __func__);
 	}
 
@@ -265,18 +262,20 @@ vcpu_exit_i8253(struct vm_run_params *vrp)
 					    ticks % i8253_channel[sel].start;
 				} else
 					i8253_channel[sel].olatch = 0;
+				i8253_channel[sel].last_r = 1;
 				goto ret;
 			} else if (rw != TIMER_16BIT) {
 				log_warnx("%s: i8253 PIT: unsupported counter "
 				    "%d rw mode 0x%x selected", __func__,
 				    sel, (rw & TIMER_16BIT));
 			}
+			i8253_channel[sel].last_w = 0;
 			i8253_channel[sel].mode = (out_data & 0xe) >> 1;
 
 			goto ret;
 		} else {
-			log_warnx("%s: i8253 PIT: read from control port "
-			    "unsupported", __progname);
+			log_warnx("i8253 PIT: read from control port "
+			    "unsupported");
 			set_return_data(vei, 0);
 		}
 	} else {
@@ -284,7 +283,7 @@ vcpu_exit_i8253(struct vm_run_params *vrp)
 
 		if (vei->vei.vei_dir == VEI_DIR_OUT) { /* OUT instruction */
 			if (i8253_channel[sel].last_w == 0) {
-				i8253_channel[sel].ilatch |= (out_data & 0xff);
+				i8253_channel[sel].ilatch = out_data & 0xff;
 				i8253_channel[sel].last_w = 1;
 			} else {
 				i8253_channel[sel].ilatch |=
@@ -295,6 +294,9 @@ vcpu_exit_i8253(struct vm_run_params *vrp)
 
 				if (i8253_channel[sel].start == 0)
 					i8253_channel[sel].start = 0xffff;
+
+				clock_gettime(CLOCK_MONOTONIC,
+				    &i8253_channel[sel].ts);
 
 				DPRINTF("%s: channel %d reset, mode=%d, "
 				    "start=%d\n", __func__,
@@ -368,7 +370,8 @@ i8253_fire(int fd, short type, void *arg)
 	struct timeval tv;
 	struct i8253_channel *ctr = (struct i8253_channel *)arg;
 
-	vcpu_assert_irq(ctr->vm_id, 0, 0);
+	if (ctr == &i8253_channel[0])
+		vcpu_assert_irq(ctr->vm_id, 0, 0);
 
 	if (ctr->mode != TIMER_INTTC) {
 		timerclear(&tv);
@@ -376,42 +379,6 @@ i8253_fire(int fd, short type, void *arg)
 		evtimer_add(&ctr->timer, &tv);
 	} else
 		ctr->state = 1;
-}
-
-int
-i8253_dump(int fd)
-{
-	log_debug("%s: sending PIT", __func__);
-	if (atomicio(vwrite, fd, &i8253_channel, sizeof(i8253_channel)) !=
-	    sizeof(i8253_channel)) {
-		log_warnx("%s: error writing PIT to fd", __func__);
-		return (-1);
-	}
-	return (0);
-}
-
-int
-i8253_restore(int fd, uint32_t vm_id)
-{
-	int i;
-	log_debug("%s: restoring PIT", __func__);
-	if (atomicio(read, fd, &i8253_channel, sizeof(i8253_channel)) !=
-	    sizeof(i8253_channel)) {
-		log_warnx("%s: error reading PIT from fd", __func__);
-		return (-1);
-	}
-
-	for (i = 0; i < 3; i++) {
-		memset(&i8253_channel[i].timer, 0, sizeof(struct event));
-		i8253_channel[i].vm_id = vm_id;
-		evtimer_set(&i8253_channel[i].timer, i8253_fire,
-		    &i8253_channel[i]);
-		i8253_reset(i);
-	}
-
-	vm_pipe_init(&dev_pipe, i8253_pipe_dispatch);
-
-	return (0);
 }
 
 void

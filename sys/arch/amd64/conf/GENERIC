@@ -1,4 +1,4 @@
-#	$OpenBSD: GENERIC,v 1.524 2024/08/04 11:05:18 kettenis Exp $
+#	$OpenBSD: GENERIC,v 1.540 2026/08/19 08:56:28 hshoexer Exp $
 #
 # For further information on compiling OpenBSD kernels, see the config(8)
 # man page.
@@ -21,6 +21,7 @@ option		MTRR		# CPU memory range attributes control
 option		NTFS		# NTFS support
 option		SUSPEND
 option		HIBERNATE
+option		AMDSEV
 
 config		bsd	swap generic
 
@@ -48,6 +49,7 @@ acpicmos*	at acpi?
 acpidock*	at acpi?
 acpidmar0	at acpi? disable
 acpiec*		at acpi?
+acpihid*	at acpi?
 acpipci*	at acpi?
 acpiprt*	at acpi?
 acpisbs*	at acpi?
@@ -81,11 +83,13 @@ asmc*		at acpi?	# Apple SMC
 tpm*		at acpi?
 acpihve*	at acpi?
 acpisurface*	at acpi?
-acpihid*	at acpi?
+inthid*		at acpi?
 ipmi0		at acpi? disable
 ccpmic*		at iic?
 tipmic*		at iic?
 intelpmc*	at acpi?
+amdpmc*		at acpi?
+pckbc*		at acpi?
 
 efi0		at bios0
 mpbios0		at bios0
@@ -120,6 +124,7 @@ ksmn*	at pci?			# AMD K17 temperature sensor
 amas*	at pci? disable		# AMD memory configuration
 pchtemp* at pci?		# Intel C610 temperature sensor
 ccp*	at pci?			# AMD Cryptographic Co-processor
+psp*	at ccp?			# AMD Platform Security Processor
 
 # National Semiconductor LM7[89] and compatible hardware monitors
 lm0	at isa? port 0x290
@@ -203,6 +208,9 @@ wskbd*	at icc? mux 1
 skgpio0 at isa? port 0x680	# Soekris net6501 GPIO and LEDs
 gpio* at skgpio?
 
+ispi*	at acpi?		# Intel LPSS SPI controller
+ispi*	at pci?
+
 #option PCMCIAVERBOSE
 
 # PCI PCMCIA controllers
@@ -225,6 +233,7 @@ uhci*	at pci?			# Universal Host Controller (Intel)
 uhci*	at cardbus?		# Universal Host Controller (Intel)
 ohci*	at pci?			# Open Host Controller
 ohci*	at cardbus?		# Open Host Controller
+nhi*	at pci?			# USB4 Host Controller
 
 # USB bus support
 usb*	at xhci?
@@ -391,6 +400,7 @@ wsmouse*	at pms? mux 0
 #agp*		at mmuagp?
 
 inteldrm*	at pci? 	# Intel i915, i945 DRM driver
+option		I915
 intagp*		at inteldrm?
 agp*		at intagp?
 drm0		at inteldrm? primary 1
@@ -528,6 +538,10 @@ msk*	at mskc?			#  each port of above
 em*	at pci?				# Intel Pro/1000 ethernet
 ixgb*	at pci?				# Intel Pro/10Gb ethernet
 ix*	at pci?				# Intel 82598EB 10Gb ethernet
+ixv*	at pci?				# Virtual Function of Intel 82599
+ixl*	at pci?				# Intel Ethernet 700 Series
+iavf*	at pci?				# Intel Ethernet Adaptive VF
+ice*	at pci?				# Intel Ethernet 800 Series
 myx*	at pci?				# Myricom Myri-10G 10Gb ethernet
 oce*	at pci?				# Emulex OneConnect 10Gb ethernet
 txp*	at pci?				# 3com 3CR990
@@ -557,10 +571,8 @@ ale*	at pci?				# Attansic L1E Ethernet
 lii*	at pci?				# Attansic L2 Ethernet
 jme*	at pci?				# JMicron JMC250/JMC260 Ethernet
 bnxt*	at pci?				# Broadcom BCM573xx, BCM574xx
-ixl*	at pci?				# Intel Ethernet 700 Series
 dwqe*	at pci?				# Intel Elkhart Lake Ethernet
 mcx*	at pci?				# Mellanox ConnectX-4
-iavf*	at pci?				# Intel Ethernet Adaptive VF
 aq*	at pci?				# Aquantia aQtion Ethernet
 igc*	at pci?				# Intel I225 Ethernet
 ngbe*	at pci?				# WangXun WX1860 Ethernet
@@ -586,6 +598,7 @@ iwn*	at pci?				# Intel WiFi Link 4965/5000/1000/6000
 iwm*	at pci?				# Intel WiFi Link 7xxx
 iwx*	at pci?				# Intel WiFi Link 22xxx
 qwx*	at pci?				# Qualcomm 802.11ax
+qwz*	at pci?				# Qualcomm 802.11be
 ral*	at pci?				# Ralink RT2500/RT2501/RT2600
 ral*	at cardbus?			# Ralink RT2500/RT2501/RT2600
 rtw*	at pci?				# Realtek 8180

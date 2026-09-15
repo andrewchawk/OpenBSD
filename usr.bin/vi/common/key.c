@@ -1,4 +1,4 @@
-/*	$OpenBSD: key.c,v 1.20 2022/04/21 17:50:29 millert Exp $	*/
+/*	$OpenBSD: key.c,v 1.21 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1991, 1993, 1994
@@ -570,10 +570,10 @@ append:			if (v_event_append(sp, argp))
 	 */
 	if (LF_ISSET(EC_INTERRUPT | EC_TIMEOUT))
 		return (0);
-	 
+
 newmap:	evp = &gp->i_event[gp->i_next];
 
-	/* 
+	/*
 	 * If the next event in the queue isn't a character event, return
 	 * it, we're done.
 	 */
@@ -582,7 +582,7 @@ newmap:	evp = &gp->i_event[gp->i_next];
 		QREM(1);
 		return (0);
 	}
-	
+
 	/*
 	 * If the key isn't mappable because:
 	 *

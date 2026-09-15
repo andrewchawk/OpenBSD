@@ -1,5 +1,5 @@
 package stable;
-$stable::VERSION = '0.031';
+$stable::VERSION = '0.035';
 use strict;
 use warnings;
 use version ();
@@ -12,6 +12,8 @@ my %allow_at = (
 	isa           => 5.032000,
 	lexical_subs  => 5.022000,
 	postderef     => 5.020000,
+	const_attr    => 5.022000,
+	for_list      => 5.036000,
 );
 
 sub import {
@@ -53,7 +55,7 @@ stable - Experimental features made easy, once we know they're stable
 
 =head1 VERSION
 
-version 0.031
+version 0.035
 
 =head1 SYNOPSIS
 
@@ -62,7 +64,7 @@ version 0.031
 
 =head1 DESCRIPTION
 
-The L<experimental> pragma makes it easy to turn on experimental while turning
+The L<experimental> pragma makes it easy to turn on experiments while turning
 off associated warnings.  You should read about it, if you don't already know
 what it does.
 
@@ -139,6 +141,10 @@ change, but significant bugs makes them unsafe to use before 5.22.
 
 =item * C<postderef> - stable as of perl 5.20, available via stable 0.031
 
+=item * C<const_attr> - stable as of perl 5.22, available via stable 0.032
+
+=item * C<for_list> - stable as of perl 5.36, available via stable 0.032
+
 =back
 
 =head1 SEE ALSO
@@ -147,7 +153,7 @@ L<perlexperiment|perlexperiment> contains more information about experimental fe
 
 =head1 AUTHOR
 
-Leon Timmermans <leont@cpan.org>
+Leon Timmermans <fawaka@gmail.com>
 
 =head1 COPYRIGHT AND LICENSE
 

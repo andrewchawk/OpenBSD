@@ -1,4 +1,4 @@
-/*	$OpenBSD: ipcs.c,v 1.27 2019/06/28 13:35:01 deraadt Exp $	*/
+/*	$OpenBSD: ipcs.c,v 1.29 2026/04/17 02:01:29 dgl Exp $	*/
 /*	$NetBSD: ipcs.c,v 1.25 2000/06/16 03:58:20 simonb Exp $	*/
 
 /*-
@@ -558,7 +558,7 @@ shm_sysctl(void)
 		show_shminfo_hdr();
 		for (i = 0; i < shmsi->shminfo.shmmni; i++) {
 			struct shmid_ds *shmptr = &shmsi->shmids[i];
-			if (shmptr->shm_internal)
+			if (shmptr->shm_cpid)
 				show_shminfo(shmptr->shm_atime,
 				    shmptr->shm_dtime,
 				    shmptr->shm_ctime,
@@ -630,7 +630,7 @@ sem_sysctl(void)
 		for (i = 0; i < semsi->seminfo.semmni; i++) {
 			struct semid_ds *semaptr = &semsi->semids[i];
 
-			if (semaptr->sem_base != NULL)
+			if (semaptr->sem_ctime != 0)
 				show_seminfo(semaptr->sem_otime,
 				    semaptr->sem_ctime,
 				    IXSEQ_TO_IPCID(i, semaptr->sem_perm),

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_exec.c,v 1.257 2024/08/06 08:44:54 claudio Exp $	*/
+/*	$OpenBSD: kern_exec.c,v 1.272 2026/08/30 19:10:17 kirill Exp $	*/
 /*	$NetBSD: kern_exec.c,v 1.75 1996/02/09 18:59:28 christos Exp $	*/
 
 /*-
@@ -90,10 +90,30 @@ int exec_sigcode_map(struct process *);
 int exec_timekeep_map(struct process *);
 
 /*
+ * Free exec-package allocations owned by image-format loaders.
+ */
+void exec_free_package(struct exec_package *);
+
+/*
  * If non-zero, stackgap_random specifies the upper limit of the random gap size
  * added to the fixed stack position. Must be n^2.
  */
 int stackgap_random = STACKGAP_RANDOM;
+
+void
+exec_free_package(struct exec_package *pack)
+{
+	if (pack->ep_interp != NULL) {
+		pool_put(&namei_pool, pack->ep_interp);
+		pack->ep_interp = NULL;
+	}
+	free(pack->ep_args, M_TEMP, sizeof(*pack->ep_args));
+	pack->ep_args = NULL;
+	free(pack->ep_pins, M_PINSYSCALL,
+	    pack->ep_npins * sizeof(*pack->ep_pins));
+	pack->ep_pins = NULL;
+	pack->ep_npins = 0;
+}
 
 /*
  * check exec:
@@ -120,7 +140,7 @@ int stackgap_random = STACKGAP_RANDOM;
  *			error code, locked vnode, exec header unmodified
  */
 int
-check_exec(struct proc *p, struct exec_package *epp)
+check_exec(struct proc *p, struct exec_package *epp, int realpath)
 {
 	int error, i;
 	struct vnode *vp;
@@ -129,7 +149,7 @@ check_exec(struct proc *p, struct exec_package *epp)
 
 	ndp = epp->ep_ndp;
 	ndp->ni_cnd.cn_nameiop = LOOKUP;
-	ndp->ni_cnd.cn_flags = FOLLOW | LOCKLEAF | SAVENAME;
+	ndp->ni_cnd.cn_flags = FOLLOW | LOCKLEAF | SAVENAME | realpath;
 	if (epp->ep_flags & EXEC_INDIR)
 		ndp->ni_cnd.cn_flags |= BYPASSUNVEIL;
 	/* first get the vnode */
@@ -222,6 +242,7 @@ check_exec(struct proc *p, struct exec_package *epp)
 	 * and release their references
 	 */
 	kill_vmcmds(&epp->ep_vmcmds);
+	exec_free_package(epp);
 
 bad2:
 	/*
@@ -257,14 +278,14 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	struct nameidata nid;
 	struct vattr attr;
 	struct ucred *cred = p->p_ucred;
-	char *argp;
+	char *argp, *pathname = NULL, *rpbuf = NULL;
 	char * const *cpp, *dp, *sp;
 #ifdef KTRACE
 	char *env_start;
 #endif
 	struct process *pr = p->p_p;
 	long argc, envc;
-	size_t len, sgap, dstsize;
+	size_t len, sgap, dstsize, pathlen;
 #ifdef MACHINE_STACK_GROWS_UP
 	size_t slen;
 #endif
@@ -273,12 +294,51 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	struct vmspace *vm = p->p_vmspace;
 	struct vnode *otvp;
 
+	/* Copy into kernel for realpath-like calculations */
+	pathname = pool_get(&namei_pool, PR_WAITOK);
+	if ((error = copyinstr(SCARG(uap, path), pathname, MAXPATHLEN,
+	    &pathlen))) {
+		pool_put(&namei_pool, pathname);
+		return (error);
+	}
+
+	/*
+	 * If realpath calculations fail, execve proceeds without
+	 * the information
+	 */
+	rpbuf = pool_get(&namei_pool, PR_WAITOK | PR_ZERO);
+	if (pathlen >= 2 && pathname[0] != '/') {
+		int cwdlen = MAXPATHLEN * 4; /* for vfs_getcwd_common */
+		char *cwdbuf, *bp;
+
+		cwdbuf = malloc(cwdlen, M_TEMP, M_WAITOK);
+
+		/* vfs_getcwd_common fills this in backwards */
+		bp = &cwdbuf[cwdlen - 1];
+		*bp = '\0';
+
+		KERNEL_LOCK();
+		error = vfs_getcwd_common(p->p_fd->fd_cdir, NULL, &bp, cwdbuf,
+		    cwdlen/2, GETCWD_CHECK_ACCESS, p);
+		KERNEL_UNLOCK();
+
+		if (error || strlcpy(rpbuf, bp, MAXPATHLEN) >= MAXPATHLEN) {
+			pool_put(&namei_pool, rpbuf);
+			rpbuf = NULL;
+		}
+		free(cwdbuf, M_TEMP, cwdlen);
+	}
+
 	/*
 	 * Get other threads to stop, if contested return ERESTART,
 	 * so the syscall is restarted after halting in userret.
 	 */
-	if (single_thread_set(p, SINGLE_UNWIND | SINGLE_DEEP))
+	if (single_thread_set(p, SINGLE_UNWIND | SINGLE_DEEP)) {
+		pool_put(&namei_pool, pathname);
+		if (rpbuf)
+			pool_put(&namei_pool, rpbuf);
 		return (ERESTART);
+	}
 
 	/*
 	 * Cheap solution to complicated problems.
@@ -286,14 +346,18 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	 */
 	atomic_setbits_int(&pr->ps_flags, PS_INEXEC);
 
-	NDINIT(&nid, LOOKUP, NOFOLLOW, UIO_USERSPACE, SCARG(uap, path), p);
+	NDINIT(&nid, LOOKUP, NOFOLLOW, UIO_SYSSPACE, pathname, p);
 	nid.ni_pledge = PLEDGE_EXEC;
 	nid.ni_unveil = UNVEIL_EXEC;
+	if (rpbuf) {
+		nid.ni_cnd.cn_rpbuf = rpbuf;
+		nid.ni_cnd.cn_rpi = strlen(rpbuf);
+	}
 
 	/*
 	 * initialize the fields of the exec package.
 	 */
-	pack.ep_name = (char *)SCARG(uap, path);
+	pack.ep_name = pathname;
 	pack.ep_hdr = malloc(exec_maxhdrsz, M_EXEC, M_WAITOK);
 	pack.ep_hdrlen = exec_maxhdrsz;
 	pack.ep_hdrvalid = 0;
@@ -308,7 +372,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	pack.ep_npins = 0;
 
 	/* see if we can run it. */
-	if ((error = check_exec(p, &pack)) != 0) {
+	if ((error = check_exec(p, &pack, rpbuf ? REALPATH : 0)) != 0) {
 		goto freehdr;
 	}
 
@@ -423,7 +487,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 
 	/* Now check if args & environ fit into new stack */
 	len = ((argc + envc + 2 + ELF_AUX_WORDS) * sizeof(char *) +
-	    sizeof(long) + dp + sgap + sizeof(struct ps_strings)) - argp;
+	    sizeof(long) + dp + sgap + PATH_MAX + sizeof(struct ps_strings)) - argp;
 
 	len = (len + _STACKALIGNBYTES) &~ _STACKALIGNBYTES;
 
@@ -440,6 +504,9 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	 * kill the other threads now.
 	 */
 	single_thread_set(p, SINGLE_EXIT);
+
+	/* Clear profiling state in new image */
+	prof_exec(pr);
 
 	/*
 	 * Prepare vmspace for remapping. Note that uvmspace_exec can replace
@@ -472,14 +539,16 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		goto exec_abort;
 
 #ifdef MACHINE_STACK_GROWS_UP
-	pr->ps_strings = (vaddr_t)vm->vm_maxsaddr + sgap;
-        if (uvm_map_protect(&vm->vm_map, (vaddr_t)vm->vm_maxsaddr,
-            trunc_page(pr->ps_strings), PROT_NONE, 0, TRUE, FALSE))
+	pr->ps_strings = (vaddr_t)vm->vm_maxsaddr + sgap + PATH_MAX;
+	pack.ep_execpath = vm->vm_maxsaddr + sgap;
+	if (uvm_map_protect(&vm->vm_map, (vaddr_t)vm->vm_maxsaddr,
+            trunc_page((vaddr_t)pack.ep_execpath), PROT_NONE, 0, TRUE, FALSE))
                 goto exec_abort;
 #else
-	pr->ps_strings = (vaddr_t)vm->vm_minsaddr - sizeof(arginfo) - sgap;
+	pr->ps_strings = (vaddr_t)vm->vm_minsaddr - sgap - PATH_MAX - sizeof(arginfo);
+	pack.ep_execpath = vm->vm_minsaddr - sgap - PATH_MAX;
         if (uvm_map_protect(&vm->vm_map,
-            round_page(pr->ps_strings + sizeof(arginfo)),
+            round_page((vaddr_t)pack.ep_execpath + PATH_MAX),
             (vaddr_t)vm->vm_minsaddr, PROT_NONE, 0, TRUE, FALSE))
                 goto exec_abort;
 #endif
@@ -491,8 +560,8 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	arginfo.ps_nenvstr = envc;
 
 #ifdef MACHINE_STACK_GROWS_UP
-	stack = (char *)vm->vm_maxsaddr + sizeof(arginfo) + sgap;
-	slen = len - sizeof(arginfo) - sgap;
+	stack = (char *)vm->vm_maxsaddr + sgap + PATH_MAX + sizeof(arginfo);
+	slen = len - sgap - PATH_MAX - sizeof(arginfo);
 #else
 	stack = (char *)(vm->vm_minsaddr - len);
 #endif
@@ -505,6 +574,11 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	/* copy out the process's ps_strings structure */
 	if (copyout(&arginfo, (char *)pr->ps_strings, sizeof(arginfo)))
 		goto exec_abort;
+	if (rpbuf) {
+		if (copyoutstr(rpbuf, pack.ep_execpath, PATH_MAX, NULL))
+			goto exec_abort;
+	} else
+		pack.ep_execpath = NULL;
 
 	free(pr->ps_pin.pn_pins, M_PINSYSCALL,
 	    pr->ps_pin.pn_npins * sizeof(u_int));
@@ -514,12 +588,10 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		pr->ps_pin.pn_pins = pack.ep_pins;
 		pack.ep_pins = NULL;
 		pr->ps_pin.pn_npins = pack.ep_npins;
-		pr->ps_flags |= PS_PIN;
 	} else {
 		pr->ps_pin.pn_start = pr->ps_pin.pn_end = 0;
 		pr->ps_pin.pn_pins = NULL;
 		pr->ps_pin.pn_npins = 0;
-		pr->ps_flags &= ~PS_PIN;
 	}
 	if (pr->ps_libcpin.pn_pins) {
 		free(pr->ps_libcpin.pn_pins, M_PINSYSCALL,
@@ -527,11 +599,10 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		pr->ps_libcpin.pn_start = pr->ps_libcpin.pn_end = 0;
 		pr->ps_libcpin.pn_pins = NULL;
 		pr->ps_libcpin.pn_npins = 0;
-		pr->ps_flags &= ~PS_LIBCPIN;
 	}
 
 	stopprofclock(pr);	/* stop profiling */
-	fdcloseexec(p);		/* handle close on exec */
+	fdprepforexec(p);	/* handle close on exec and close on fork */
 	execsigs(p);		/* reset caught signals */
 	TCB_SET(p, NULL);	/* reset the TCB address */
 	pr->ps_kbind_addr = 0;	/* reset the kbind bits */
@@ -550,15 +621,19 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	if (otvp)
 		vrele(otvp);
 
+	p->p_p->ps_iflags &= ~(PSI_NOBTCFI | PSI_PROFILE | PSI_WXNEEDED);
 	if (pack.ep_flags & EXEC_NOBTCFI)
-		atomic_setbits_int(&p->p_p->ps_flags, PS_NOBTCFI);
-	else
-		atomic_clearbits_int(&p->p_p->ps_flags, PS_NOBTCFI);
+		p->p_p->ps_iflags |= PSI_NOBTCFI;
+	if (pack.ep_flags & EXEC_PROFILE)
+		p->p_p->ps_iflags |= PSI_PROFILE;
+	if (pack.ep_flags & EXEC_WXNEEDED)
+		p->p_p->ps_iflags |= PSI_WXNEEDED;
 
 	atomic_setbits_int(&pr->ps_flags, PS_EXEC);
 	if (pr->ps_flags & PS_PPWAIT) {
 		atomic_clearbits_int(&pr->ps_flags, PS_PPWAIT);
 		atomic_clearbits_int(&pr->ps_pptr->ps_flags, PS_ISPWAIT);
+		atomic_setbits_int(&pr->ps_pptr->ps_flags, PS_WAITEVENT);
 		wakeup(pr->ps_pptr);
 	}
 
@@ -575,15 +650,14 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		atomic_clearbits_int(&pr->ps_flags, PS_SUGIDEXEC);
 
 	if (pr->ps_flags & PS_EXECPLEDGE) {
+		p->p_pledge = pr->ps_execpledge;
 		pr->ps_pledge = pr->ps_execpledge;
 		atomic_setbits_int(&pr->ps_flags, PS_PLEDGE);
 	} else {
 		atomic_clearbits_int(&pr->ps_flags, PS_PLEDGE);
+		p->p_pledge = 0;
 		pr->ps_pledge = 0;
-		/* XXX XXX XXX XXX */
-		/* Clear our unveil paths out so the child
-		 * starts afresh
-		 */
+		/* Clear our unveil paths out so the child starts afresh */
 		unveil_destroy(pr);
 		pr->ps_uvdone = 0;
 	}
@@ -699,7 +773,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	/* reset CPU time usage for the thread, but not the process */
 	timespecclear(&p->p_tu.tu_runtime);
 	p->p_tu.tu_uticks = p->p_tu.tu_sticks = p->p_tu.tu_iticks = 0;
-	p->p_tu.tu_gen = 0;
+	pc_lock_init(&p->p_tu.tu_pcl);
 
 	memset(p->p_name, 0, sizeof p->p_name);
 
@@ -740,18 +814,16 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		psignal(p, SIGTRAP);
 
 	free(pack.ep_hdr, M_EXEC, pack.ep_hdrlen);
+	pool_put(&namei_pool, pathname);
+	if (rpbuf)
+		pool_put(&namei_pool, rpbuf);
 
 	p->p_descfd = 255;
 	if ((pack.ep_flags & EXEC_HASFD) && pack.ep_fd < 255)
 		p->p_descfd = pack.ep_fd;
 
-	if (pack.ep_flags & EXEC_WXNEEDED)
-		atomic_setbits_int(&p->p_p->ps_flags, PS_WXNEEDED);
-	else
-		atomic_clearbits_int(&p->p_p->ps_flags, PS_WXNEEDED);
-
 	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
-	single_thread_clear(p, P_SUSPSIG);
+	single_thread_clear(p);
 
 	/* setregs() sets up all the registers, so just 'return' */
 	return EJUSTRETURN;
@@ -766,10 +838,7 @@ bad:
 		/* fdrelease unlocks p->p_fd. */
 		(void) fdrelease(p, pack.ep_fd);
 	}
-	if (pack.ep_interp != NULL)
-		pool_put(&namei_pool, pack.ep_interp);
-	free(pack.ep_args, M_TEMP, sizeof *pack.ep_args);
-	free(pack.ep_pins, M_PINSYSCALL, pack.ep_npins * sizeof(u_int));
+	exec_free_package(&pack);
 	/* close and put the exec'd file */
 	vn_close(pack.ep_vp, FREAD, cred, p);
 	pool_put(&namei_pool, nid.ni_cnd.cn_pnbuf);
@@ -777,8 +846,11 @@ bad:
 
 freehdr:
 	free(pack.ep_hdr, M_EXEC, pack.ep_hdrlen);
+	pool_put(&namei_pool, pathname);
+	if (rpbuf)
+		pool_put(&namei_pool, rpbuf);
 	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
-	single_thread_clear(p, P_SUSPSIG);
+	single_thread_clear(p);
 
 	return (error);
 
@@ -789,21 +861,18 @@ exec_abort:
 	 * of our namei data and vnode, and exit noting failure
 	 */
 	uvm_unmap(&vm->vm_map, VM_MIN_ADDRESS, VM_MAXUSER_ADDRESS);
-	if (pack.ep_interp != NULL)
-		pool_put(&namei_pool, pack.ep_interp);
-	free(pack.ep_args, M_TEMP, sizeof *pack.ep_args);
+	exec_free_package(&pack);
 	pool_put(&namei_pool, nid.ni_cnd.cn_pnbuf);
 	vn_close(pack.ep_vp, FREAD, cred, p);
 	km_free(argp, NCARGS, &kv_exec, &kp_pageable);
 
 free_pack_abort:
 	free(pack.ep_hdr, M_EXEC, pack.ep_hdrlen);
+	pool_put(&namei_pool, pathname);
+	if (rpbuf)
+		pool_put(&namei_pool, rpbuf);
 	exit1(p, 0, SIGABRT, EXIT_NORMAL);
-
 	/* NOTREACHED */
-	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
-
-	return (0);
 }
 
 
@@ -863,29 +932,27 @@ exec_sigcode_map(struct process *pr)
 	/*
 	 * If we don't have a sigobject yet, create one.
 	 *
-	 * sigobject is an anonymous memory object (just like SYSV shared
-	 * memory) that we keep a permanent reference to and that we map
-	 * in all processes that need this sigcode. The creation is simple,
-	 * we create an object, add a permanent reference to it, map it in
-	 * kernel space, copy out the sigcode to it and unmap it.  Then we map
-	 * it with PROT_EXEC into the process just the way sys_mmap would map it.
+	 * sigobject is an anonymous memory object (just like SYSV
+	 * shared memory) that we keep a permanent reference to and
+	 * that we map in all processes that need this sigcode. The
+	 * creation is simple, we create an object, map it in kernel
+	 * space, copy out the sigcode to it and map it PROT_READ such
+	 * that the coredump code can write it out into core dumps.
+	 * Then we map it with PROT_EXEC into the process just the way
+	 * sys_mmap would map it.
 	 */
 	if (sigobject == NULL) {
 		extern int sigfillsiz;
 		extern u_char sigfill[];
 		size_t off, left;
 		vaddr_t va;
-		int r;
 
-		sigobject = uao_create(sz, 0);
-		uao_reference(sigobject);	/* permanent reference */
+		sigobject = uao_create(sz, 0);	/* permanent reference */
 
-		if ((r = uvm_map(kernel_map, &va, round_page(sz), sigobject,
-		    0, 0, UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
-		    MAP_INHERIT_SHARE, MADV_RANDOM, 0)))) {
-			uao_detach(sigobject);
-			return (ENOMEM);
-		}
+		if (uvm_map(kernel_map, &va, round_page(sz), sigobject, 0, 0,
+		    UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
+		    MAP_INHERIT_SHARE, MADV_RANDOM, 0)))
+			panic("can't map sigobject");
 
 		for (off = 0, left = round_page(sz); left != 0;
 		    off += sigfillsiz) {
@@ -895,8 +962,10 @@ exec_sigcode_map(struct process *pr)
 		}
 		memcpy((caddr_t)va, sigcode, sz);
 
-		(void) uvm_map_protect(kernel_map, va, round_page(sz),
-		    PROT_READ, 0, FALSE, FALSE);
+		if (uvm_map_protect(kernel_map, va, round_page(va + sz),
+		    PROT_READ, 0, FALSE, FALSE))
+			panic("can't write-protect sigobject");
+
 		sigcode_va = va;
 		sigcode_sz = round_page(sz);
 	}

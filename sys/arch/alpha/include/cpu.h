@@ -1,4 +1,4 @@
-/* $OpenBSD: cpu.h,v 1.75 2024/06/09 21:15:29 jca Exp $ */
+/* $OpenBSD: cpu.h,v 1.80 2025/12/04 22:21:22 miod Exp $ */
 /* $NetBSD: cpu.h,v 1.45 2000/08/21 02:03:12 thorpej Exp $ */
 
 /*-
@@ -103,6 +103,7 @@ typedef union alpha_t_float {
 #include <sys/device.h>
 #include <sys/sched.h>
 #include <sys/srp.h>
+#include <uvm/uvm_percpu.h>
 
 struct pcb;
 struct proc;
@@ -191,6 +192,8 @@ struct cpu_info {
 
 #if defined(MULTIPROCESSOR)
 	struct srp_hazard ci_srp_hazards[SRP_HAZARD_NUM];
+#define	__HAVE_UVM_PERCPU
+	struct uvm_pmr_cache ci_uvm;
 #endif
 
 	/*
@@ -202,11 +205,11 @@ struct cpu_info {
 	paddr_t ci_idle_pcb_paddr;	/* PA of idle PCB */
 	struct device *ci_dev;		/* pointer to our device */
 	u_long ci_want_resched;		/* preempt current process */
-	u_long ci_intrdepth;		/* interrupt trap depth */
+	u_long ci_idepth;		/* interrupt trap depth */
 	struct trapframe *ci_db_regs;	/* registers for debuggers */
 
-#if defined(MULTIPROCESSOR)
 	volatile u_long ci_flags;	/* flags; see below */
+#if defined(MULTIPROCESSOR)
 	volatile u_long ci_ipis;	/* interprocessor interrupts pending */
 #endif
 #ifdef GPROF
@@ -268,7 +271,12 @@ do {									\
 									\
 	if (__ci->ci_ipis != 0) {					\
 		__s = splipi();						\
-		alpha_ipi_process_with_frame(__ci);			\
+		/*							\
+		 * Skip processing ipis if within an intr_disable()	\
+		 * block. mtx_enter_park() depends on this.		\
+		 */							\
+		if (__s != ALPHA_PSL_IPL_MASK)				\
+			alpha_ipi_process_with_frame(__ci);		\
 		splx(__s);						\
 	}								\
 } while (0)
@@ -317,7 +325,7 @@ struct clockframe {
  * r/m/w cycle is complete, we won't be counted... but it's not
  * like this statistic has to be extremely accurate.
  */
-#define	CLKF_INTR(framep)	(curcpu()->ci_intrdepth)
+#define	CLKF_INTR(framep)	(curcpu()->ci_idepth)
 
 /*
  * This is used during profiling to integrate system time.
@@ -436,13 +444,13 @@ void alpha_enable_fp(struct proc *, int);
 static inline u_long
 intr_disable(void)
 {
-	return (u_long)splhigh();
+	return (u_long)alpha_pal_swpipl(ALPHA_PSL_IPL_MASK);
 }
 
 static inline void
 intr_restore(u_long s)
 {
-	splx((int)s);
+	(void)alpha_pal_swpipl(s);
 }
 
 #define copyinsn(p, v, ip)	copyin32((v), (ip))

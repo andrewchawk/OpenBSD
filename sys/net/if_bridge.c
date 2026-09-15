@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_bridge.c,v 1.371 2024/08/05 17:47:29 bluhm Exp $	*/
+/*	$OpenBSD: if_bridge.c,v 1.382 2025/12/02 03:24:19 dlg Exp $	*/
 
 /*
  * Copyright (c) 1999, 2000 Jason L. Wright (jason@thought.net)
@@ -32,7 +32,6 @@
  */
 
 #include "bpfilter.h"
-#include "gif.h"
 #include "pf.h"
 #include "carp.h"
 #include "vlan.h"
@@ -42,13 +41,11 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <sys/kernel.h>
 
 #include <net/if.h>
 #include <net/if_types.h>
 #include <net/if_llc.h>
 #include <net/netisr.h>
-#include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -62,9 +59,7 @@
 #endif
 
 #ifdef INET6
-#include <netinet6/in6_var.h>
 #include <netinet/ip6.h>
-#include <netinet6/ip6_var.h>
 #endif
 
 #if NPF > 0
@@ -111,7 +106,8 @@ void	bridge_spandetach(void *);
 int	bridge_ifremove(struct bridge_iflist *);
 void	bridge_spanremove(struct bridge_iflist *);
 struct mbuf *
-	bridge_input(struct ifnet *, struct mbuf *, uint64_t, void *);
+	bridge_input(struct ifnet *, struct mbuf *, uint64_t, void *,
+	    struct netstack *);
 void	bridge_process(struct ifnet *, struct mbuf *);
 void	bridgeintr_frame(struct ifnet *, struct ifnet *, struct mbuf *);
 void	bridge_bifgetstp(struct bridge_softc *, struct bridge_iflist *,
@@ -139,8 +135,9 @@ int bridge_ipsec(struct ifnet *, struct ether_header *, int, struct llc *,
 #endif
 int     bridge_clone_create(struct if_clone *, int);
 int	bridge_clone_destroy(struct ifnet *);
-void	bridge_take(void *);
-void	bridge_rele(void *);
+
+void	*bridge_take(void *);
+void	 bridge_rele(void *, void *);
 
 #define	ETHERADDR_IS_IP_MCAST(a) \
 	/* struct etheraddr *a;	*/				\
@@ -153,7 +150,7 @@ struct niqueue bridgeintrq = NIQUEUE_INITIALIZER(1024, NETISR_BRIDGE);
 struct if_clone bridge_cloner =
     IF_CLONE_INITIALIZER("bridge", bridge_clone_create, bridge_clone_destroy);
 
-const struct ether_brport bridge_brport = {
+const struct ether_port bridge_brport = {
 	bridge_input,
 	bridge_take,
 	bridge_rele,
@@ -262,7 +259,7 @@ bridge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 
 	/*
 	 * bridge(4) data structure aren't protected by the NET_LOCK().
-	 * Idealy it shouldn't be taken before calling `ifp->if_ioctl'
+	 * Ideally it shouldn't be taken before calling `ifp->if_ioctl'
 	 * but we aren't there yet.  Media ioctl run without netlock.
 	 */
 	switch (cmd) {
@@ -1138,7 +1135,8 @@ bridge_ourether(struct ifnet *ifp, uint8_t *ena)
  * not for us, and schedule an interrupt.
  */
 struct mbuf *
-bridge_input(struct ifnet *ifp, struct mbuf *m, uint64_t dst, void *null)
+bridge_input(struct ifnet *ifp, struct mbuf *m, uint64_t dst, void *null,
+    struct netstack *ns)
 {
 	KASSERT(m->m_flags & M_PKTHDR);
 
@@ -1172,18 +1170,6 @@ bridge_process(struct ifnet *ifp, struct mbuf *m)
 
 	if (m->m_pkthdr.len < sizeof(*eh))
 		goto bad;
-
-#if NVLAN > 0
-	/*
-	 * If the underlying interface removed the VLAN header itself,
-	 * add it back.
-	 */
-	if (ISSET(m->m_flags, M_VLANTAG)) {
-		m = vlan_inject(m, ETHERTYPE_VLAN, m->m_pkthdr.ether_vtag);
-		if (m == NULL)
-			goto bad;
-	}
-#endif
 
 #if NBPFILTER > 0
 	if_bpf = brifp->if_bpf;
@@ -1597,10 +1583,10 @@ bridge_ipsec(struct ifnet *ifp, struct ether_header *eh, int hassnap,
 			}
 
 			prot = (*(tdb->tdb_xform->xf_input))(&m, tdb, hlen,
-			    off);
+			    off, NULL);
 			tdb_unref(tdb);
 			if (prot != IPPROTO_DONE)
-				ip_deliver(&m, &hlen, prot, af, 0);
+				ip_deliver(&m, &hlen, prot, af, 0, NULL);
 			return (1);
 		} else {
 			tdb_unref(tdb);
@@ -1638,7 +1624,8 @@ bridge_ipsec(struct ifnet *ifp, struct ether_header *eh, int hassnap,
 
 			ip = mtod(m, struct ip *);
 			if ((af == AF_INET) &&
-			    ip_mtudisc && (ip->ip_off & htons(IP_DF)) &&
+			    atomic_load_int(&ip_mtudisc) &&
+			    (ip->ip_off & htons(IP_DF)) &&
 			    tdb->tdb_mtu && ntohs(ip->ip_len) > tdb->tdb_mtu &&
 			    tdb->tdb_mtutimeout > gettime()) {
 				bridge_send_icmp_err(ifp, eh, m,
@@ -1646,7 +1633,8 @@ bridge_ipsec(struct ifnet *ifp, struct ether_header *eh, int hassnap,
 				    ICMP_UNREACH, ICMP_UNREACH_NEEDFRAG);
 			} else {
 				KERNEL_LOCK();
-				error = ipsp_process_packet(m, tdb, af, 0);
+				error = ipsp_process_packet(m, tdb, af, 0,
+				    IPSP_DF_INHERIT);
 				KERNEL_UNLOCK();
 			}
 			tdb_unref(tdb);
@@ -1745,7 +1733,7 @@ bridge_ip(struct ifnet *brifp, int dir, struct ifnet *ifp,
 			m_resethdr(m);
 			m->m_pkthdr.ph_ifidx = ifp->if_index;
 			m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
-			ipv4_input(ifp, m);
+			ipv4_input(ifp, m, NULL);
 			return (NULL);
 		}
 #endif /* NPF > 0 */
@@ -1781,7 +1769,7 @@ bridge_ip(struct ifnet *brifp, int dir, struct ifnet *ifp,
 			m_resethdr(m);
 			m->m_pkthdr.ph_ifidx = ifp->if_index;
 			m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
-			ipv6_input(ifp, m);
+			ipv6_input(ifp, m, NULL);
 			return (NULL);
 		}
 #endif /* NPF > 0 */
@@ -1916,21 +1904,29 @@ bridge_ifenqueue(struct ifnet *brifp, struct ifnet *ifp, struct mbuf *m)
 {
 	int error, len;
 
+	m = ether_offload_ifcap(ifp, m);
+	if (m == NULL) {
+		error = ENOBUFS;
+		goto err;
+	}
+
 	/* Loop prevention. */
 	m->m_flags |= M_PROTO1;
 
 	len = m->m_pkthdr.len;
 
 	error = if_enqueue(ifp, m);
-	if (error) {
-		brifp->if_oerrors++;
-		return (error);
-	}
+	if (error) 
+		goto err; 
 
 	brifp->if_opackets++;
 	brifp->if_obytes += len;
 
 	return (0);
+
+ err:
+	brifp->if_oerrors++;
+	return (error);
 }
 
 void
@@ -2016,14 +2012,14 @@ bridge_send_icmp_err(struct ifnet *ifp,
 	m_freem(n);
 }
 
-void
+void *
 bridge_take(void *unused)
 {
-	return;
+	return (NULL);
 }
 
 void
-bridge_rele(void *unused)
+bridge_rele(void *null, void *unused)
 {
 	return;
 }

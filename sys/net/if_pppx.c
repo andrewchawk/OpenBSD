@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_pppx.c,v 1.129 2024/07/30 13:41:15 yasuoka Exp $ */
+/*	$OpenBSD: if_pppx.c,v 1.135 2025/07/07 02:28:50 jsg Exp $ */
 
 /*
  * Copyright (c) 2010 Claudio Jeker <claudio@openbsd.org>
@@ -44,10 +44,7 @@
  */
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/buf.h>
-#include <sys/kernel.h>
 #include <sys/malloc.h>
-#include <sys/device.h>
 #include <sys/conf.h>
 #include <sys/queue.h>
 #include <sys/pool.h>
@@ -61,20 +58,13 @@
 #include <sys/refcnt.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_types.h>
 #include <netinet/in.h>
-#include <netinet/if_ether.h>
 #include <net/if_dl.h>
 
 #include <netinet/in_var.h>
 #include <netinet/ip.h>
-#include <netinet/ip_var.h>
-
-#ifdef INET6
-#include <netinet6/in6_var.h>
-#include <netinet/ip6.h>
-#include <netinet6/nd6.h>
-#endif /* INET6 */
 
 #include "bpfilter.h"
 #if NBPFILTER > 0
@@ -87,11 +77,9 @@
 #endif
 
 #include <net/ppp_defs.h>
-#include <net/ppp-comp.h>
 #include <crypto/arc4.h>
 
 #ifdef PIPEX
-#include <net/radix.h>
 #include <net/pipex.h>
 #include <net/pipex_local.h>
 #else
@@ -401,11 +389,11 @@ pppxwrite(dev_t dev, struct uio *uio, int ioflag)
 
 	switch (proto) {
 	case AF_INET:
-		ipv4_input(&pxi->pxi_if, top);
+		ipv4_input(&pxi->pxi_if, top, NULL);
 		break;
 #ifdef INET6
 	case AF_INET6:
-		ipv6_input(&pxi->pxi_if, top);
+		ipv6_input(&pxi->pxi_if, top, NULL);
 		break;
 #endif
 	default:
@@ -443,8 +431,6 @@ pppxioctl(dev_t dev, u_long cmd, caddr_t addr, int flags, struct proc *p)
 		    (struct pipex_session_descr_req *)addr);
 		break;
 
-	case FIONBIO:
-		break;
 	case FIONREAD:
 		*(int *)addr = mq_hdatalen(&pxd->pxd_svcq);
 		break;
@@ -562,7 +548,7 @@ pppxclose(dev_t dev, int flags, int mode, struct proc *p)
 	mq_purge(&pxd->pxd_svcq);
 
 	klist_free(&pxd->pxd_rklist);
-	klist_free(&pxd->pxd_rklist);
+	klist_free(&pxd->pxd_wklist);
 
 	free(pxd, M_DEVBUF, sizeof(*pxd));
 
@@ -786,10 +772,8 @@ pppx_set_session_descr(struct pppx_dev *pxd,
 	if (pxi == NULL)
 		return (EINVAL);
 
-	NET_LOCK();
 	(void)memset(pxi->pxi_if.if_description, 0, IFDESCRSIZE);
 	strlcpy(pxi->pxi_if.if_description, req->pdr_descr, IFDESCRSIZE);
-	NET_UNLOCK();
 
 	pppx_if_rele(pxi);
 
@@ -1071,7 +1055,7 @@ pppacopen(dev_t dev, int flags, int mode, struct proc *p)
 
 	ifp->if_softc = sc;
 	ifp->if_type = IFT_L3IPVLAN;
-	ifp->if_hdrlen = sizeof(uint32_t); /* for BPF */;
+	ifp->if_hdrlen = sizeof(uint32_t); /* for BPF */
 	ifp->if_mtu = MAXMCLBYTES - sizeof(uint32_t);
 	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST;
 	ifp->if_xflags = IFXF_CLONED | IFXF_MPSAFE;
@@ -1197,11 +1181,11 @@ pppacwrite(dev_t dev, struct uio *uio, int ioflag)
 
 	switch (proto) {
 	case AF_INET:
-		ipv4_input(ifp, m);
+		ipv4_input(ifp, m, NULL);
 		break;
 #ifdef INET6
 	case AF_INET6:
-		ipv6_input(ifp, m);
+		ipv6_input(ifp, m, NULL);
 		break;
 #endif
 	default:
@@ -1222,8 +1206,6 @@ pppacioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 	int error = 0;
 
 	switch (cmd) {
-	case FIONBIO:
-		break;
 	case FIONREAD:
 		*(int *)data = mq_hdatalen(&sc->sc_mq);
 		break;

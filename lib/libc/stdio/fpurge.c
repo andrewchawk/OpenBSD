@@ -1,4 +1,4 @@
-/*	$OpenBSD: fpurge.c,v 1.10 2015/08/31 02:53:57 guenther Exp $ */
+/*	$OpenBSD: fpurge.c,v 1.12 2025/08/08 15:58:53 yasuoka Exp $ */
 /*-
  * Copyright (c) 1990, 1993
  *	The Regents of the University of California.  All rights reserved.
@@ -52,10 +52,10 @@ fpurge(FILE *fp)
 
 	if (HASUB(fp))
 		FREEUB(fp);
-	WCIO_FREE(fp);
+	fp->_ungetwc_inbuf = 0;
 	fp->_p = fp->_bf._base;
 	fp->_r = 0;
-	fp->_w = fp->_flags & (__SLBF|__SNBF) ? 0 : fp->_bf._size;
+	fp->_w = fp->_flags & (__SLBF|__SNBF|__SRD) ? 0 : fp->_bf._size;
 	FUNLOCKFILE(fp);
 	return (0);
 }

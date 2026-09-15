@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_tls.c,v 1.3 2023/07/03 09:38:08 claudio Exp $	*/
+/*	$OpenBSD: check_tls.c,v 1.6 2026/08/07 10:21:39 rsadowski Exp $	*/
 
 /*
  * Copyright (c) 2017 Claudio Jeker <claudio@openbsd.org>
@@ -29,6 +29,7 @@
 #include <imsg.h>
 
 #include "relayd.h"
+#include "log.h"
 
 void	check_tls_read(int, short, void *);
 void	check_tls_write(int, short, void *);
@@ -181,7 +182,7 @@ check_tls_handshake(int fd, short event, void *arg)
 	} else {
 		cte->host->up = HOST_DOWN;
 		check_tls_error(cte, cte->host->conf.name,
-		   "cannot connect");
+		    "cannot connect");
 		hce_notify_done(cte->host, HCE_TLS_CONNECT_FAIL);
 		check_tls_cleanup(cte);
 		return;
@@ -205,8 +206,6 @@ check_tls_cleanup(struct ctl_tcp_event *cte)
 void
 check_tls_error(struct ctl_tcp_event *cte, const char *where, const char *what)
 {
-	if (log_getverbose() < 2)
-		return;
 	log_debug("TLS error: %s: %s: %s", where, what, tls_error(cte->tls));
 }
 

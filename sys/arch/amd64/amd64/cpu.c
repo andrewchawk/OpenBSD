@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.191 2024/07/21 19:41:31 bluhm Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.206 2026/05/14 01:39:38 jsg Exp $	*/
 /* $NetBSD: cpu.c,v 1.1 2003/04/26 18:39:26 fvdl Exp $ */
 
 /*-
@@ -69,6 +69,7 @@
 #include "vmm.h"
 #include "pctr.h"
 #include "pvbus.h"
+#include "xcall.h"
 
 #include <sys/param.h>
 #include <sys/proc.h>
@@ -445,7 +446,7 @@ const struct cfattach cpu_ca = {
 };
 
 struct cfdriver cpu_cd = {
-	NULL, "cpu", DV_DULL
+	NULL, "cpu", DV_DULL, CD_COCOVM
 };
 
 /*
@@ -453,7 +454,10 @@ struct cfdriver cpu_cd = {
  * CPU, on uniprocessors).  The CPU info list is initialized to
  * point at it.
  */
-struct cpu_info_full cpu_info_full_primary = { .cif_cpu = { .ci_self = &cpu_info_primary } };
+struct cpu_info_full cpu_info_full_primary = { .cif_cpu = {
+	.ci_self = &cpu_info_primary,
+	.ci_flags = CPUF_PRIMARY,
+} };
 
 struct cpu_info *cpu_info_list = &cpu_info_primary;
 
@@ -479,6 +483,11 @@ cpu_match(struct device *parent, void *match, void *aux)
 		return 0;
 
 	if (cf->cf_unit >= MAXCPUS)
+		return 0;
+
+	/* XXX We don't support MP with SEV-ES, yet */
+	if (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED) &&
+	    cf->cf_unit >= 1)
 		return 0;
 
 	return 1;
@@ -634,6 +643,10 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 #endif
 
 #if defined(MULTIPROCESSOR)
+#if NXCALL > 0
+	cpu_xcall_establish(ci);
+#endif
+
 	/*
 	 * Allocate UPAGES contiguous pages for the idle PCB and stack.
 	 */
@@ -716,8 +729,11 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 		sched_init_cpu(ci);
 		ncpus++;
 		if (ci->ci_flags & CPUF_PRESENT) {
-			ci->ci_next = cpu_info_list->ci_next;
-			cpu_info_list->ci_next = ci;
+			struct cpu_info *ci_last = cpu_info_list;
+
+			while (ci_last->ci_next != NULL)
+				ci_last = ci_last->ci_next;
+			ci_last->ci_next = ci;
 		}
 #else
 		printf("%s: not started\n", sc->sc_dev.dv_xname);
@@ -854,12 +870,6 @@ cpu_init(struct cpu_info *ci)
 		fpureset();
 	}
 
-#if NVMM > 0
-	/* Re-enable VMM if needed */
-	if (ci->ci_flags & CPUF_VMM)
-		start_vmm_on_cpu(ci);
-#endif /* NVMM > 0 */
-
 #ifdef MULTIPROCESSOR
 	atomic_setbits_int(&ci->ci_flags, CPUF_RUNNING);
 	/*
@@ -889,8 +899,10 @@ cpu_init(struct cpu_info *ci)
 void
 cpu_init_vmm(struct cpu_info *ci)
 {
+	uint64_t msr;
+
 	/*
-	 * Allocate a per-cpu VMXON region for VMX CPUs
+	 * Detect VMX specific features and initialize VMX-related state.
 	 */
 	if (ci->ci_vmm_flags & CI_VMM_VMX) {
 		ci->ci_vmxon_region = (struct vmxon_region *)malloc(PAGE_SIZE,
@@ -898,8 +910,17 @@ cpu_init_vmm(struct cpu_info *ci)
 		if (!pmap_extract(pmap_kernel(), (vaddr_t)ci->ci_vmxon_region,
 		    &ci->ci_vmxon_region_pa))
 			panic("Can't locate VMXON region in phys mem");
+
 		ci->ci_vmcs_pa = VMX_VMCS_PA_CLEAR;
 		rw_init(&ci->ci_vmcs_lock, "vmcslock");
+
+		if (rdmsr_safe(IA32_VMX_EPT_VPID_CAP, &msr) == 0 &&
+		    msr & IA32_EPT_VPID_CAP_INVEPT_CONTEXT)
+			ci->ci_vmm_cap.vcc_vmx.vmx_invept_mode =
+			    IA32_VMX_INVEPT_SINGLE_CTX;
+		else
+			ci->ci_vmm_cap.vcc_vmx.vmx_invept_mode =
+			    IA32_VMX_INVEPT_GLOBAL_CTX;
 	}
 }
 #endif /* NVMM > 0 */
@@ -1200,7 +1221,7 @@ mp_cpu_start_cleanup(struct cpu_info *ci)
 #endif	/* MULTIPROCESSOR */
 
 typedef void (vector)(void);
-extern vector Xsyscall_meltdown, Xsyscall, Xsyscall32;
+extern vector Xsyscall_meltdown, Xsyscall;
 
 void
 cpu_init_msrs(struct cpu_info *ci)
@@ -1271,12 +1292,29 @@ cpu_fix_msrs(struct cpu_info *ci)
 			if (msr != nmsr)
 				wrmsr(MSR_DE_CFG, nmsr);
 		}
+		/* Zen 2 mitigations: Zenbleed, op cache corruption */
 		if (family == 0x17 && ci->ci_model >= 0x31 &&
 		    (cpu_ecxfeature & CPUIDECX_HV) == 0) {
 			nmsr = msr = rdmsr(MSR_DE_CFG);
 			nmsr |= DE_CFG_SERIALIZE_9;
 			if (msr != nmsr)
 				wrmsr(MSR_DE_CFG, nmsr);
+
+			nmsr = msr = rdmsr(MSR_BP_CFG);
+			nmsr |= BP_CFG_33;
+			if (msr != nmsr)
+				wrmsr(MSR_BP_CFG, nmsr);
+		}
+		/*
+		 * Mitigation for Floating Point Divider State Sampling
+		 * from AMD-SB-7053
+		 */
+		if (family == 0x17 && ci->ci_model <= 0x2f &&
+		    (cpu_ecxfeature & CPUIDECX_HV) == 0) {
+			nmsr = msr = rdmsr(MSR_FP_CFG);
+			nmsr |= FP_CFG_9;
+			if (msr != nmsr)
+				wrmsr(MSR_FP_CFG, nmsr);
 		}
 	}
 
@@ -1461,9 +1499,10 @@ wbinvd_on_all_cpus(void)
 	wbinvd();
 	return 0;
 }
-#endif
+#endif /* MULTIPROCESSOR */
 
 int cpu_suspended;
+int cpu_wakeups;
 
 #ifdef SUSPEND
 
@@ -1480,9 +1519,6 @@ int
 cpu_suspend_primary(void)
 {
 	struct cpu_info *ci = curcpu();
-	int count = 0;
-
-	printf("suspend\n");
 
 	/* Mask clock interrupts. */
 	local_pic.pic_hwmask(&local_pic, 0);
@@ -1500,7 +1536,7 @@ cpu_suspend_primary(void)
 
 	while (cpu_suspended) {
 		cpu_suspend_cycle();
-		count++;
+		cpu_wakeups++;
 	}
 
 	intr_disable();
@@ -1509,7 +1545,6 @@ cpu_suspend_primary(void)
 	/* Unmask clock interrupts. */
 	local_pic.pic_hwunmask(&local_pic, 0);
 
-	printf("resume %d\n", count);
 	return 0;
 }
 

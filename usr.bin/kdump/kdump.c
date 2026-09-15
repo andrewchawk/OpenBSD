@@ -1,4 +1,4 @@
-/*	$OpenBSD: kdump.c,v 1.164 2024/06/29 11:32:35 jsg Exp $	*/
+/*	$OpenBSD: kdump.c,v 1.167 2026/06/03 03:07:10 deraadt Exp $	*/
 
 /*-
  * Copyright (c) 1988, 1993
@@ -834,6 +834,7 @@ static const formatter scargs[][8] = {
     [SYS_kill]		= { Ppgid, Signame },
     [SYS_fchown]	= { Pfd, Uidname, Gidname },
     [SYS_fchmod]	= { Pfd, Modename },
+    [SYS___pledge_open]	= { Ppath, PASS_TWO, Flagsandmodename },
     [SYS_setreuid]	= { Uidname, Uidname },
     [SYS_setregid]	= { Gidname, Gidname },
     [SYS_rename]	= { Ppath, Ppath },
@@ -854,7 +855,6 @@ static const formatter scargs[][8] = {
     [SYS_mimmutable]	= { Pptr, Pbigsize },
     [SYS_waitid]	= { PASS_TWO, Idtypeandid, Pptr, Waitidoptname },
     [SYS_getfh]		= { Ppath, Pptr },
-    [SYS___tmpfd]	= { Openflagsname },
     [SYS_sysarch]	= { Pdecint, Pptr },
     [SYS_lseek]		= { Pfd, Poff_t, Whencename, END64 },
     [SYS_truncate]	= { Ppath, Poff_t, END64 },
@@ -1019,7 +1019,6 @@ skip:
 static struct ctlname topname[] = CTL_NAMES;
 static struct ctlname kernname[] = CTL_KERN_NAMES;
 static struct ctlname vmname[] = CTL_VM_NAMES;
-static struct ctlname fsname[] = CTL_FS_NAMES;
 static struct ctlname netname[] = CTL_NET_NAMES;
 static struct ctlname hwname[] = CTL_HW_NAMES;
 static struct ctlname debugname[CTL_DEBUG_MAXID];
@@ -1073,9 +1072,6 @@ kresolvsysctl(int depth, const int *top)
 			break;
 		case CTL_VM:
 			SETNAME(vmname);
-			break;
-		case CTL_FS:
-			SETNAME(fsname);
 			break;
 		case CTL_NET:
 			SETNAME(netname);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.134 2024/01/11 19:16:27 miod Exp $	*/
+/*	$OpenBSD: trap.c,v 1.136 2026/03/08 17:07:31 deraadt Exp $	*/
 /*	$NetBSD: trap.c,v 1.3 1996/10/13 03:31:37 christos Exp $	*/
 
 /*
@@ -231,7 +231,7 @@ trap(struct trapframe *frame)
 	struct proc *p = curproc;
 	int type = frame->exc;
 	union sigval sv;
-	char *name;
+	const char *name;
 	db_expr_t offset;
 	faultbuf *fb;
 	struct vm_map *map;
@@ -354,7 +354,7 @@ trap(struct trapframe *frame)
 		break;
 
 	case EXC_SC|EXC_USER:
-		uvmexp.syscalls++;
+		atomic_inc_int(&uvmexp.syscalls);
 
 		code = frame->fixreg[0];
 	        if (code <= 0 || code >= SYS_MAXSYSCALL) {
@@ -402,7 +402,7 @@ trap(struct trapframe *frame)
 	case EXC_FPU|EXC_USER:
 		if (ci->ci_fpuproc)
 			save_fpu();
-		uvmexp.fpswtch++;
+		atomic_inc_int(&uvmexp.fpswtch);
 		enable_fpu(p);
 		break;
 
@@ -493,7 +493,7 @@ brain_damage:
 
 	case EXC_AST|EXC_USER:
 		p->p_md.md_astpending = 0;	/* we are about to do it */
-		uvmexp.softs++;
+		atomic_inc_int(&uvmexp.softs);
 		mi_ast(p, curcpu()->ci_want_resched);
 		break;
 	}

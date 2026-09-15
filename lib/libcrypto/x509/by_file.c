@@ -1,4 +1,4 @@
-/* $OpenBSD: by_file.c,v 1.30 2023/12/25 22:14:23 tb Exp $ */
+/* $OpenBSD: by_file.c,v 1.32 2025/05/10 05:54:39 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -62,16 +62,16 @@
 #include <unistd.h>
 
 #include <openssl/buffer.h>
-#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include "err_local.h"
 #include "x509_local.h"
 
 static int by_file_ctrl(X509_LOOKUP *ctx, int cmd, const char *argc,
     long argl, char **ret);
 
-static X509_LOOKUP_METHOD x509_file_lookup = {
+static const X509_LOOKUP_METHOD x509_file_lookup = {
 	.name = "Load file into cache",
 	.new_item = NULL,
 	.free = NULL,
@@ -79,7 +79,7 @@ static X509_LOOKUP_METHOD x509_file_lookup = {
 	.get_by_subject = NULL,
 };
 
-X509_LOOKUP_METHOD *
+const X509_LOOKUP_METHOD *
 X509_LOOKUP_file(void)
 {
 	return &x509_file_lookup;

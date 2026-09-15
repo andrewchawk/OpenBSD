@@ -1,4 +1,4 @@
-/*	$OpenBSD: unwind.c,v 1.68 2023/02/15 13:47:00 florian Exp $	*/
+/*	$OpenBSD: unwind.c,v 1.80 2026/09/06 18:45:29 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -37,6 +37,7 @@
 #include <asr.h>
 #include <pwd.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
@@ -126,16 +127,15 @@ main(int argc, char *argv[])
 	int		 frontend_routesock, rtfilter;
 	int		 pipe_main2frontend[2], pipe_main2resolver[2];
 	int		 control_fd, ta_fd;
-	char		*csock, *saved_argv0;
+	char		*csock, execpath[PATH_MAX];
 
 	csock = _PATH_UNWIND_SOCKET;
 
 	log_init(1, LOG_DAEMON);	/* Log to stderr until daemonized. */
 	log_setverbose(1);
 
-	saved_argv0 = argv[0];
-	if (saved_argv0 == NULL)
-		saved_argv0 = "unwind";
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	while ((ch = getopt(argc, argv, "dEFf:ns:v")) != -1) {
 		switch (ch) {
@@ -214,10 +214,10 @@ main(int argc, char *argv[])
 		fatal("main2resolver socketpair");
 
 	/* Start children. */
-	resolver_pid = start_child(PROC_RESOLVER, saved_argv0,
+	resolver_pid = start_child(PROC_RESOLVER, execpath,
 	    pipe_main2resolver[1], debug, cmd_opts & (OPT_VERBOSE |
 	    OPT_VERBOSE2 | OPT_VERBOSE3));
-	frontend_pid = start_child(PROC_FRONTEND, saved_argv0,
+	frontend_pid = start_child(PROC_FRONTEND, execpath,
 	    pipe_main2frontend[1], debug, cmd_opts & (OPT_VERBOSE |
 	    OPT_VERBOSE2 | OPT_VERBOSE3));
 
@@ -239,9 +239,13 @@ main(int argc, char *argv[])
 	if ((iev_frontend = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_resolver = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_frontend->ibuf, pipe_main2frontend[0]);
+	if (imsgbuf_init(&iev_frontend->ibuf, pipe_main2frontend[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_frontend->ibuf);
 	iev_frontend->handler = main_dispatch_frontend;
-	imsg_init(&iev_resolver->ibuf, pipe_main2resolver[0]);
+	if (imsgbuf_init(&iev_resolver->ibuf, pipe_main2resolver[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_resolver->ibuf);
 	iev_resolver->handler = main_dispatch_resolver;
 
 	/* Setup event handlers for pipes. */
@@ -312,9 +316,9 @@ main_shutdown(void)
 	int	 status;
 
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_resolver->ibuf.w);
+	imsgbuf_clear(&iev_resolver->ibuf);
 	close(iev_resolver->ibuf.fd);
 
 	config_clear(main_conf);
@@ -339,7 +343,7 @@ main_shutdown(void)
 }
 
 static pid_t
-start_child(enum uw_process p, char *argv0, int fd, int debug, int verbose)
+start_child(enum uw_process p, char *execpath, int fd, int debug, int verbose)
 {
 	char	*argv[7];
 	int	 argc = 0;
@@ -361,7 +365,7 @@ start_child(enum uw_process p, char *argv0, int fd, int debug, int verbose)
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	switch (p) {
 	case PROC_MAIN:
 		fatalx("Can not start main process");
@@ -382,8 +386,8 @@ start_child(enum uw_process p, char *argv0, int fd, int debug, int verbose)
 		argv[argc++] = "-v";
 	argv[argc++] = NULL;
 
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 void
@@ -392,27 +396,28 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgev	*iev = bula;
 	struct imsgbuf	*ibuf;
 	struct imsg	 imsg;
-	ssize_t		 n;
-	int		 shut = 0, verbose;
+	int		 n, shut = 0, verbose;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -455,27 +460,28 @@ main_dispatch_resolver(int fd, short event, void *bula)
 	struct imsgev		*iev = bula;
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
-	ssize_t			 n;
-	int			 shut = 0;
+	int			 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -523,7 +529,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -640,7 +646,7 @@ main_sendall(enum imsg_type type, void *buf, uint16_t len)
 void
 merge_config(struct uw_conf *conf, struct uw_conf *xconf)
 {
-	struct uw_forwarder		*uw_forwarder;
+	struct uw_forwarder	*uw_forwarder;
 	struct force_tree_entry	*n, *nxt;
 
 	/* Remove & discard existing forwarders. */
@@ -663,6 +669,8 @@ merge_config(struct uw_conf *conf, struct uw_conf *xconf)
 
 	memcpy(&conf->enabled_resolvers, &xconf->enabled_resolvers,
 	    sizeof(conf->enabled_resolvers));
+	memcpy(&conf->force_resolvers, &xconf->force_resolvers,
+	    sizeof(conf->force_resolvers));
 
 	memcpy(&conf->res_pref, &xconf->res_pref,
 	    sizeof(conf->res_pref));
@@ -912,6 +920,12 @@ imsg_receive_config(struct imsg *imsg, struct uw_conf **xconf)
 			fatal(NULL);
 		memcpy(uw_forwarder, imsg->data, sizeof(struct
 		    uw_forwarder));
+		if (uw_forwarder->ip[sizeof(uw_forwarder->ip) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+		if (uw_forwarder->auth_name[
+		    sizeof(uw_forwarder->auth_name) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+
 		TAILQ_INSERT_TAIL(&nconf->uw_forwarder_list,
 		    uw_forwarder, entry);
 		break;
@@ -925,6 +939,12 @@ imsg_receive_config(struct imsg *imsg, struct uw_conf **xconf)
 			fatal(NULL);
 		memcpy(uw_forwarder, imsg->data, sizeof(struct
 		    uw_forwarder));
+		if (uw_forwarder->ip[sizeof(uw_forwarder->ip) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+		if (uw_forwarder->auth_name[
+		    sizeof(uw_forwarder->auth_name) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+
 		TAILQ_INSERT_TAIL(&nconf->uw_dot_forwarder_list,
 		    uw_forwarder, entry);
 		break;
@@ -938,6 +958,10 @@ imsg_receive_config(struct imsg *imsg, struct uw_conf **xconf)
 			fatal(NULL);
 		memcpy(force_entry, imsg->data, sizeof(struct
 		    force_tree_entry));
+		if (force_entry->domain[
+		    sizeof(force_entry->domain) - 1] != '\0')
+			fatalx("%s: invalid force_entry", __func__);
+
 		if (RB_INSERT(force_tree, &nconf->force, force_entry) != NULL) {
 			free(force_entry);
 			fatalx("%s: IMSG_RECONF_FORCE duplicate entry",

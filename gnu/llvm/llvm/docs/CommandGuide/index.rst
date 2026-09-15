@@ -18,6 +18,7 @@ Basic Commands
    llc
    lli
    llvm-as
+   llvm-cgdata
    llvm-config
    llvm-cov
    llvm-cxxmap
@@ -26,15 +27,18 @@ Basic Commands
    llvm-dis
    llvm-dwarfdump
    llvm-dwarfutil
+   llvm-ir2vec
    llvm-lib
    llvm-libtool-darwin
    llvm-link
    llvm-lipo
+   llvm-mc
    llvm-mca
    llvm-opt-report
    llvm-otool
    llvm-profdata
    llvm-readobj
+   llvm-reduce
    llvm-stress
    llvm-symbolizer
    opt
@@ -84,9 +88,11 @@ Developer Tools
    llvm-exegesis
    llvm-ifs
    llvm-locstats
+   llvm-test-mustache-spec
    llvm-pdbutil
    llvm-profgen
    llvm-tli-checker
+   llvm-offload-binary
 
 Remarks Tools
 ~~~~~~~~~~~~~~
@@ -94,5 +100,4 @@ Remarks Tools
 .. toctree::
    :maxdepth: 1
 
-   llvm-remark-size-diff
    llvm-remarkutil

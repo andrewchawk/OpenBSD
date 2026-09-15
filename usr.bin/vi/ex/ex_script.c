@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_script.c,v 1.27 2017/04/18 01:45:35 deraadt Exp $	*/
+/*	$OpenBSD: ex_script.c,v 1.28 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -354,7 +354,7 @@ sscr_check_input(SCR *sp)
 	gp = sp->gp;
 	rval = 0;
 
-	/* Allocate space for pfd. */   
+	/* Allocate space for pfd. */
 	nfds = 1;
 	TAILQ_FOREACH(tsp, &gp->dq, q)
 		if (F_ISSET(sp, SC_SCRIPT))

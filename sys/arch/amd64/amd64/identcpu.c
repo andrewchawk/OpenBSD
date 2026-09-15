@@ -1,4 +1,4 @@
-/*	$OpenBSD: identcpu.c,v 1.146 2024/07/08 14:46:47 mpi Exp $	*/
+/*	$OpenBSD: identcpu.c,v 1.157 2026/09/08 21:01:59 daniel Exp $	*/
 /*	$NetBSD: identcpu.c,v 1.1 2003/04/26 18:39:28 fvdl Exp $	*/
 
 /*
@@ -66,7 +66,8 @@ char cpu_model[48];
 int cpuspeed;
 
 int amd64_has_xcrypt;
-int amd64_pos_cbit;
+int amd64_pos_cbit;	/* C bit position for SEV */
+int amd64_min_noes_asid;
 int has_rdrand;
 int has_rdseed;
 
@@ -494,6 +495,7 @@ identifycpu(struct cpu_info *ci)
 	uint32_t cflushsz, curcpu_1_ecx, curcpu_apmi_edx = 0;
 	uint32_t curcpu_perf_eax = 0, curcpu_perf_edx = 0;
 	uint32_t curcpu_tpm_ecxflags = 0, curcpu_d_1_eax = 0;
+	uint32_t sefflags_max = 0;
 	uint64_t freq = 0;
 	u_int32_t dummy;
 	char mycpu_model[48];
@@ -605,10 +607,15 @@ identifycpu(struct cpu_info *ci)
 
 	if (ci->ci_cpuid_level >= 0x07) {
 		/* "Structured Extended Feature Flags" */
-		CPUID_LEAF(0x7, 0, dummy, ci->ci_feature_sefflags_ebx,
+		CPUID_LEAF(0x7, 0, sefflags_max, ci->ci_feature_sefflags_ebx,
 		    ci->ci_feature_sefflags_ecx, ci->ci_feature_sefflags_edx);
+
 		/* SEFF0ECX_OSPKE is set late on AP */
 		ci->ci_feature_sefflags_ecx &= ~SEFF0ECX_OSPKE;
+
+		if (sefflags_max >= 2)
+			CPUID_LEAF(0x7, 2, dummy, dummy, dummy,
+			    ci->ci_feature_sefflags_2_edx);
 	}
 
 	printf("%s: %s", ci->ci_dev->dv_xname, mycpu_model);
@@ -658,6 +665,8 @@ identifycpu(struct cpu_info *ci)
 	    'b', CPUID_MEMBER(ci_feature_sefflags_ebx), SEFF0_EBX_BITS,
 	    'c', CPUID_MEMBER(ci_feature_sefflags_ecx), SEFF0_ECX_BITS,
 	    'd', CPUID_MEMBER(ci_feature_sefflags_edx), SEFF0_EDX_BITS);
+	pcpuid(ci, "7.2", 'd', CPUID_MEMBER(ci_feature_sefflags_2_edx),
+	    SEFF2_EDX_BITS);
 	print_perf_cpuid(ci, curcpu_perf_eax, curcpu_perf_edx);
 	pcpuid(ci, "d.1", 'a', curcpu_d_1_eax, prevcpu_d_1_eax, XSAVE_BITS);
 	pcpuid2(ci, "80000001",
@@ -710,6 +719,14 @@ identifycpu(struct cpu_info *ci)
 		    'd', CPUID_MEMBER(ci_feature_amdsev_edx),
 		    CPUID_AMDSEV_EDX_BITS);
 		amd64_pos_cbit = (ci->ci_feature_amdsev_ebx & 0x3f);
+		amd64_min_noes_asid = ci->ci_feature_amdsev_edx;
+		if (cpu_sev_guestmode && CPU_IS_PRIMARY(ci)) {
+			printf("\n%s: SEV%s guest mode", ci->ci_dev->dv_xname,
+			    ISSET(cpu_sev_guestmode, SEV_STAT_SNP_ACTIVE) ?
+			    "-SNP" :
+			    (ISSET(cpu_sev_guestmode, SEV_STAT_ES_ENABLED) ?
+			    "-ES" : ""));
+		}
 	}
 
 	printf("\n");
@@ -825,6 +842,7 @@ cpu_topology(struct cpu_info *ci)
 	u_int32_t apicid, max_apicid = 0, max_coreid = 0;
 	u_int32_t smt_bits = 0, core_bits, pkg_bits = 0;
 	u_int32_t smt_mask = 0, core_mask, pkg_mask = 0;
+	char type[8], *typ = type;
 
 	/* We need at least apicid at CPUID 1 */
 	if (ci->ci_cpuid_level < 1)
@@ -860,6 +878,10 @@ cpu_topology(struct cpu_info *ci)
 		/* Cut logical thread_id into core id, and smt id in a core */
 		ci->ci_core_id = thread_id / nthreads;
 		ci->ci_smt_id = thread_id % nthreads;
+		if (ci->ci_smt_id) {
+			ci->ci_cputype |= CPUTYP_SMT;
+			*typ++ = 'S';
+		}
 	} else if (ci->ci_vendor == CPUV_INTEL) {
 		/* We only support leaf 1/4 detection */
 		if (ci->ci_cpuid_level < 4)
@@ -882,10 +904,36 @@ cpu_topology(struct cpu_info *ci)
 		pkg_mask = ~0U << core_bits;
 
 		ci->ci_smt_id = apicid & smt_mask;
+		if (ci->ci_smt_id) {
+			ci->ci_cputype |= CPUTYP_SMT;
+			*typ++ = 'S';
+		}
 		ci->ci_core_id = (apicid & core_mask) >> smt_bits;
 		ci->ci_pkg_id = (apicid & pkg_mask) >> pkg_bits;
+
+		if (ci->ci_cpuid_level >= 0x1a) {
+			CPUID_LEAF(0x1a, 0, eax, ebx, ecx, edx);
+			if ((eax >> 24) == 0x20) {
+				CPUID_LEAF(4, 3, eax, ebx, ecx, edx);
+				if (eax == 0) {
+					/* No L3 cache is classified as Lethargic */
+					ci->ci_cputype |= CPUTYP_L;
+					*typ++ = 'L';
+				} else {
+					ci->ci_cputype |= CPUTYP_E;
+					*typ++ = 'E';
+				}
+			}
+		}
+	
 	} else
 		goto no_topology;
+	if ((ci->ci_cputype & (CPUTYP_E | CPUTYP_L)) == 0) {
+		ci->ci_cputype |= CPUTYP_P;
+		*typ++ = 'P';
+	}
+	*typ ='\0';
+
 #ifdef DEBUG
 	printf("cpu%d: smt %u, core %u, pkg %u "
 		"(apicid 0x%x, max_apicid 0x%x, max_coreid 0x%x, smt_bits 0x%x, smt_mask 0x%x, "
@@ -894,14 +942,15 @@ cpu_topology(struct cpu_info *ci)
 		apicid, max_apicid, max_coreid, smt_bits, smt_mask, core_bits,
 		core_mask, pkg_bits, pkg_mask);
 #else
-	printf("cpu%d: smt %u, core %u, package %u\n", ci->ci_cpuid,
-		ci->ci_smt_id, ci->ci_core_id, ci->ci_pkg_id);
+	printf("cpu%d: smt %u, core %u, package %u, type %s\n", ci->ci_cpuid,
+		ci->ci_smt_id, ci->ci_core_id, ci->ci_pkg_id, type);
 
 #endif
 	return;
 	/* We can't map, so consider ci_core_id as ci_cpuid */
 no_topology:
 #endif
+	ci->ci_cputype = CPUTYP_P;
 	ci->ci_smt_id  = 0;
 	ci->ci_core_id = ci->ci_cpuid;
 	ci->ci_pkg_id  = 0;
@@ -949,14 +998,10 @@ cpu_check_vmm_cap(struct cpu_info *ci)
 		msr = rdmsr(IA32_VMX_PROCBASED_CTLS);
 		if (msr & (IA32_VMX_ACTIVATE_SECONDARY_CONTROLS) << 32) {
 			msr = rdmsr(IA32_VMX_PROCBASED2_CTLS);
-			/* EPT available? */
-			if (msr & (IA32_VMX_ENABLE_EPT) << 32)
+			/* EPT and UG available? */
+			if ((msr & (IA32_VMX_ENABLE_EPT) << 32) &&
+			    (msr & (IA32_VMX_UNRESTRICTED_GUEST) << 32))
 				ci->ci_vmm_flags |= CI_VMM_EPT;
-			/* VM Functions available? */
-			if (msr & (IA32_VMX_ENABLE_VM_FUNCTIONS) << 32) {
-				ci->ci_vmm_cap.vcc_vmx.vmx_vm_func =
-				    rdmsr(IA32_VMX_VMFUNC);
-			}
 		}
 	}
 
@@ -1017,12 +1062,13 @@ cpu_check_vmm_cap(struct cpu_info *ci)
 	}
 
 	/*
-	 * Check for SVM Nested Paging
+	 * Check for SVM Nested Paging and NRIP Save.
 	 */
 	if ((ci->ci_vmm_flags & CI_VMM_SVM) &&
 	    ci->ci_pnfeatset >= CPUID_AMD_SVM_CAP) {
 		CPUID(CPUID_AMD_SVM_CAP, dummy, dummy, dummy, cap);
-		if (cap & AMD_SVM_NESTED_PAGING_CAP)
+		if ((cap & AMD_SVM_NESTED_PAGING_CAP) &&
+		    (cap & AMD_SVM_NRIP_SAVE_CAP))
 			ci->ci_vmm_flags |= CI_VMM_RVI;
 	}
 

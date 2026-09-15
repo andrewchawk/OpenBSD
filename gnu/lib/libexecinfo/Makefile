@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.3 2024/01/26 11:51:45 robert Exp $
+# $OpenBSD: Makefile,v 1.6 2026/08/31 08:58:48 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -23,6 +23,7 @@ CXXFLAGS+= -I${BSDSRCDIR}/gnu/llvm/libunwind/include \
            -I${BSDSRCDIR}/gnu/llvm/libcxx/include
 CFLAGS+= -I${BSDSRCDIR}/gnu/llvm/libunwind/include
 
+CPPFLAGS+=  -D_LIBUNWIND_HAVE_ELF_AUX_INFO
 CPPFLAGS+=  -D_LIBUNWIND_IS_NATIVE_ONLY
 CPPFLAGS+=  -DLIBUNWIND_USE_WEAK_PTHREAD
 CPPFLAGS+=  -DNDEBUG
@@ -39,8 +40,7 @@ SRCS+=unwind.c \
 	UnwindLevel1.c \
 	UnwindRegistersRestore.S \
 	UnwindRegistersSave.S \
-	libunwind.cpp \
-	new.cpp
+	libunwind.cpp
 
 .else # !${USE_UNWIND}
 SRCS+=builtin.c

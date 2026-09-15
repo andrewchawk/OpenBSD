@@ -1,4 +1,4 @@
-/*	$OpenBSD: sdmmc_mem.c,v 1.37 2022/01/10 18:23:39 tobhe Exp $	*/
+/*	$OpenBSD: sdmmc_mem.c,v 1.39 2026/06/12 03:56:30 mglocker Exp $	*/
 
 /*
  * Copyright (c) 2006 Uwe Stuehler <uwe@openbsd.org>

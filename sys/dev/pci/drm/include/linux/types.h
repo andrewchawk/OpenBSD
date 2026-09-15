@@ -45,12 +45,15 @@ typedef off_t loff_t;
 
 typedef __ptrdiff_t ptrdiff_t;
 
+typedef unsigned int umode_t;
 typedef unsigned int gfp_t;
 
 typedef unsigned long pgoff_t;
 typedef int pgprot_t;
 
 typedef int atomic_t;
+
+typedef int64_t ktime_t;
 
 struct list_head {
 	struct list_head *next, *prev;

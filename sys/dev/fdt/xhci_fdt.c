@@ -1,4 +1,4 @@
-/*	$OpenBSD: xhci_fdt.c,v 1.24 2023/07/23 11:49:17 kettenis Exp $	*/
+/*	$OpenBSD: xhci_fdt.c,v 1.32 2026/09/05 20:36:56 kettenis Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -26,6 +26,7 @@
 
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_clock.h>
+#include <dev/ofw/ofw_gpio.h>
 #include <dev/ofw/ofw_misc.h>
 #include <dev/ofw/ofw_power.h>
 #include <dev/ofw/ofw_regulator.h>
@@ -67,6 +68,7 @@ int	xhci_cdns_attach(struct xhci_fdt_softc *);
 int	xhci_snps_attach(struct xhci_fdt_softc *);
 int	xhci_snps_init(struct xhci_fdt_softc *);
 void	xhci_init_phys(struct xhci_fdt_softc *);
+void	xhci_init_hubs(struct xhci_fdt_softc *);
 
 int
 xhci_fdt_match(struct device *parent, void *match, void *aux)
@@ -74,9 +76,13 @@ xhci_fdt_match(struct device *parent, void *match, void *aux)
 	struct fdt_attach_args *faa = aux;
 
 	return OF_is_compatible(faa->fa_node, "generic-xhci") ||
+	    OF_is_compatible(faa->fa_node, "apple,t8103-dwc3") ||
 	    OF_is_compatible(faa->fa_node, "cavium,octeon-7130-xhci") ||
 	    OF_is_compatible(faa->fa_node, "cdns,usb3") ||
-	    OF_is_compatible(faa->fa_node, "snps,dwc3");
+	    OF_is_compatible(faa->fa_node, "qcom,snps-dwc3") ||
+	    OF_is_compatible(faa->fa_node, "snps,dwc3") ||
+	    OF_is_compatible(faa->fa_node, "spacemit,k1-dwc3") ||
+	    OF_is_compatible(faa->fa_node, "spacemit,k3-dwc3");
 }
 
 void
@@ -84,6 +90,7 @@ xhci_fdt_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct xhci_fdt_softc *sc = (struct xhci_fdt_softc *)self;
 	struct fdt_attach_args *faa = aux;
+	uint32_t vbus_supply;
 	int error = 0;
 	int idx;
 
@@ -142,14 +149,23 @@ xhci_fdt_attach(struct device *parent, struct device *self, void *aux)
 	 */
 	if (OF_is_compatible(sc->sc_node, "cdns,usb3"))
 		error = xhci_cdns_attach(sc);
-	if (OF_is_compatible(sc->sc_node, "snps,dwc3"))
+	if (OF_is_compatible(sc->sc_node, "apple,t8103-dwc3") ||
+	    OF_is_compatible(sc->sc_node, "qcom,snps-dwc3") ||
+	    OF_is_compatible(sc->sc_node, "snps,dwc3") ||
+	    OF_is_compatible(sc->sc_node, "spacemit,k1-dwc3") ||
+	    OF_is_compatible(sc->sc_node, "spacemit,k3-dwc3"))
 		error = xhci_snps_attach(sc);
 	if (error) {
 		printf(": can't initialize hardware\n");
 		goto disestablish_ret;
 	}
 
+	vbus_supply = OF_getpropint(sc->sc_node, "vbus-supply", 0);
+	if (vbus_supply)
+		regulator_enable(vbus_supply);
+
 	xhci_init_phys(sc);
+	xhci_init_hubs(sc);
 
 	strlcpy(sc->sc.sc_vendor, "Generic", sizeof(sc->sc.sc_vendor));
 	if ((error = xhci_init(&sc->sc)) != 0) {
@@ -185,7 +201,9 @@ xhci_fdt_activate(struct device *self, int act)
 		break;
 	case DVACT_RESUME:
 		power_domain_enable(sc->sc_node);
-		if (OF_is_compatible(sc->sc_node, "snps,dwc3"))
+		if (OF_is_compatible(sc->sc_node, "apple,t8103-dwc3") ||
+		    OF_is_compatible(sc->sc_node, "qcom,snps-dwc3") ||
+		    OF_is_compatible(sc->sc_node, "snps,dwc3"))
 			xhci_snps_init(sc);
 		rv = xhci_activate(self, act);
 		break;
@@ -282,10 +300,16 @@ int
 xhci_snps_attach(struct xhci_fdt_softc *sc)
 {
 	/*
-	 * On Apple hardware we need to reset the controller when we
-	 * see a new connection.
+	 * Apple hardware uses two IOMMUs in parallel, so we have to
+	 * mirror the streams.  We also need to reset the controller
+	 * when we see a new connection on this hardware..
 	 */
-	if (OF_is_compatible(sc->sc_node, "apple,dwc3")) {
+	if (OF_is_compatible(sc->sc_node, "apple,dwc3") ||
+	    OF_is_compatible(sc->sc_node, "apple,t8103-dwc3")) {
+		sc->sc.sc_bus.dmatag =
+			iommu_device_mirror_idx(sc->sc_node,
+						sc->sc.sc_bus.dmatag, 1);
+
 		sc->sc_usb_controller_port.up_cookie = sc;
 		sc->sc_usb_controller_port.up_connect = xhci_snps_connect;
 		task_set(&sc->sc_snps_connect_task, xhci_snps_do_connect, sc);
@@ -323,17 +347,17 @@ xhci_snps_init(struct xhci_fdt_softc *sc)
 		reg &= ~USB3_GUSB2PHYCFG0_PHYIF;
 		reg |= USB3_GUSB2PHYCFG0_USBTRDTIM(0x9);
 	}
-	if (OF_getproplen(node, "snps,dis-u2-freeclk-exists-quirk") == 0)
+	if (OF_getpropbool(node, "snps,dis-u2-freeclk-exists-quirk"))
 		reg &= ~USB3_GUSB2PHYCFG0_U2_FREECLK_EXISTS;
-	if (OF_getproplen(node, "snps,dis_enblslpm_quirk") == 0)
+	if (OF_getpropbool(node, "snps,dis_enblslpm_quirk"))
 		reg &= ~USB3_GUSB2PHYCFG0_ENBLSLPM;
-	if (OF_getproplen(node, "snps,dis_u2_susphy_quirk") == 0)
+	if (OF_getpropbool(node, "snps,dis_u2_susphy_quirk"))
 		reg &= ~USB3_GUSB2PHYCFG0_SUSPENDUSB20;
 	bus_space_write_4(sc->sc.iot, sc->sc.ioh, USB3_GUSB2PHYCFG0, reg);
 
 	/* Configure USB3 quirks. */
 	reg = bus_space_read_4(sc->sc.iot, sc->sc.ioh, USB3_GUCTL1);
-	if (OF_getproplen(node, "snps,dis-tx-ipgap-linecheck-quirk") == 0)
+	if (OF_getpropbool(node, "snps,dis-tx-ipgap-linecheck-quirk"))
 		reg |= USB3_GUCTL1_TX_IPGAP_LINECHECK_DIS;
 	bus_space_write_4(sc->sc.iot, sc->sc.ioh, USB3_GUCTL1, reg);
 
@@ -446,6 +470,36 @@ xhci_init_phys(struct xhci_fdt_softc *sc)
 	}
 }
 
+void
+xhci_init_hubs(struct xhci_fdt_softc *sc)
+{
+	uint32_t *reset_gpio;
+	ssize_t reset_gpiolen;
+	int node, vdd_supply;
+
+	for (node = OF_child(sc->sc_node); node; node = OF_peer(node)) {
+		vdd_supply = OF_getpropint(node, "vdd-supply", 0);
+		if (vdd_supply)
+			regulator_enable(vdd_supply);
+
+		/*
+		 * Linux uses a 14ms delay for the WCH CH344 USB hub
+		 * and shorter delays for others.
+		 */
+		delay(15000);
+
+		reset_gpiolen = OF_getproplen(node, "reset-gpios");
+		if (reset_gpiolen <= 0)
+			continue;
+		reset_gpio = malloc(reset_gpiolen, M_TEMP, M_WAITOK);
+		OF_getpropintarray(node, "reset-gpios", reset_gpio,
+		    reset_gpiolen);
+		gpio_controller_config_pin(reset_gpio, GPIO_CONFIG_OUTPUT);
+		gpio_controller_set_pin(reset_gpio, 0);
+		free(reset_gpio, M_TEMP, reset_gpiolen);
+	}
+}
+
 /*
  * Samsung Exynos 5 PHYs.
  */
@@ -551,7 +605,8 @@ void
 imx8mp_usb_init(struct xhci_fdt_softc *sc, uint32_t *cells)
 {
 	uint32_t phy_reg[2], reg;
-	int node, vbus_supply;
+	uint32_t vbus_supply;
+	int node;
 
 	node = OF_getnodebyphandle(cells[0]);
 	KASSERT(node != 0);
@@ -607,7 +662,8 @@ void
 imx8mq_usb_init(struct xhci_fdt_softc *sc, uint32_t *cells)
 {
 	uint32_t phy_reg[2], reg;
-	int node, vbus_supply;
+	uint32_t vbus_supply;
+	int node;
 
 	node = OF_getnodebyphandle(cells[0]);
 	KASSERT(node != 0);

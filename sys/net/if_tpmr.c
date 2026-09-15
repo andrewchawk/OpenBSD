@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_tpmr.c,v 1.35 2023/12/23 10:52:54 bluhm Exp $ */
+/*	$OpenBSD: if_tpmr.c,v 1.45 2026/02/05 03:26:00 dlg Exp $ */
 
 /*
  * Copyright (c) 2019 The University of Queensland
@@ -28,21 +28,17 @@
 #include "vlan.h"
 
 #include <sys/param.h>
-#include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
-#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <sys/systm.h>
 #include <sys/syslog.h>
-#include <sys/rwlock.h>
 #include <sys/percpu.h>
 #include <sys/smr.h>
 #include <sys/task.h>
 
 #include <net/if.h>
-#include <net/if_dl.h>
 #include <net/if_types.h>
 
 #include <netinet/in.h>
@@ -83,9 +79,10 @@ struct tpmr_port {
 	struct tpmr_softc	*p_tpmr;
 	unsigned int		 p_slot;
 
-	int		 	 p_refcnt;
+	struct refcnt		 p_refcnt;
+	struct cpumem		*p_percpu;
 
-	struct ether_brport	 p_brport;
+	struct ether_port	 p_brport;
 };
 
 struct tpmr_softc {
@@ -127,8 +124,11 @@ static int	tpmr_add_port(struct tpmr_softc *,
 static int	tpmr_del_port(struct tpmr_softc *,
 		    const struct ifbreq *);
 static int	tpmr_port_list(struct tpmr_softc *, struct ifbifconf *);
-static void	tpmr_p_take(void *);
-static void	tpmr_p_rele(void *);
+
+static void	 tpmr_p_take(struct tpmr_port *);
+static void	 tpmr_p_rele(struct tpmr_port *);
+static void	*tpmr_cpu_take(void *);
+static void	 tpmr_cpu_rele(void *, void *);
 
 static struct if_clone tpmr_cloner =
     IF_CLONE_INITIALIZER("tpmr", tpmr_clone_create, tpmr_clone_destroy);
@@ -215,6 +215,11 @@ tpmr_vlan_filter(const struct mbuf *m)
 {
 	const struct ether_header *eh;
 
+#if NVLAN > 0
+	if (ISSET(m->m_flags, M_VLANTAG))
+		return (1);
+#endif
+
 	eh = mtod(m, struct ether_header *);
 	switch (ntohs(eh->ether_type)) {
 	case ETHERTYPE_VLAN:
@@ -249,7 +254,8 @@ tpmr_8021q_filter(const struct mbuf *m, uint64_t dst)
 struct tpmr_pf_ip_family {
 	sa_family_t	   af;
 	struct mbuf	*(*ip_check)(struct ifnet *, struct mbuf *);
-	void		 (*ip_input)(struct ifnet *, struct mbuf *);
+	void		 (*ip_input)(struct ifnet *, struct mbuf *,
+			    struct netstack *);
 };
 
 static const struct tpmr_pf_ip_family tpmr_pf_ipv4 = {
@@ -267,10 +273,15 @@ static const struct tpmr_pf_ip_family tpmr_pf_ipv6 = {
 #endif
 
 static struct mbuf *
-tpmr_pf(struct ifnet *ifp0, int dir, struct mbuf *m)
+tpmr_pf(struct ifnet *ifp0, int dir, struct mbuf *m, struct netstack *ns)
 {
 	struct ether_header *eh, copy;
 	const struct tpmr_pf_ip_family *fam;
+
+#if NVLAN > 0
+	if (ISSET(m->m_flags, M_VLANTAG))
+		return (m);
+#endif
 
 	eh = mtod(m, struct ether_header *);
 	switch (ntohs(eh->ether_type)) {
@@ -305,7 +316,7 @@ tpmr_pf(struct ifnet *ifp0, int dir, struct mbuf *m)
 	if (dir == PF_IN && ISSET(m->m_pkthdr.pf.flags, PF_TAG_DIVERTED)) {
 		pf_mbuf_unlink_state_key(m);
 		pf_mbuf_unlink_inpcb(m);
-		(*fam->ip_input)(ifp0, m);
+		if_input_proto(ifp0, m, fam->ip_input, ns);
 		return (NULL);
 	}
 
@@ -323,7 +334,8 @@ tpmr_pf(struct ifnet *ifp0, int dir, struct mbuf *m)
 #endif /* NPF > 0 */
 
 static struct mbuf *
-tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
+tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport,
+ struct netstack *ns)
 {
 	struct tpmr_port *p = brport;
 	struct tpmr_softc *sc = p->p_tpmr;
@@ -331,6 +343,7 @@ tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
 	struct ifnet *ifpn;
 	unsigned int iff;
 	struct tpmr_port *pn;
+	void *pnref;
 	int len;
 #if NBPFILTER > 0
 	caddr_t if_bpf;
@@ -339,20 +352,6 @@ tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
 	iff = READ_ONCE(ifp->if_flags);
 	if (!ISSET(iff, IFF_RUNNING))
 		goto drop;
-
-#if NVLAN > 0
-	/*
-	 * If the underlying interface removed the VLAN header itself,
-	 * add it back.
-	 */
-	if (ISSET(m->m_flags, M_VLANTAG)) {
-		m = vlan_inject(m, ETHERTYPE_VLAN, m->m_pkthdr.ether_vtag);
-		if (m == NULL) {
-			counters_inc(ifp->if_counters, ifc_ierrors);
-			goto drop;
-		}
-	}
-#endif
 
 	if (!ISSET(iff, IFF_LINK2) &&
 	    tpmr_vlan_filter(m))
@@ -364,7 +363,7 @@ tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
 
 #if NPF > 0
 	if (!ISSET(iff, IFF_LINK1) &&
-	    (m = tpmr_pf(ifp0, PF_IN, m)) == NULL)
+	    (m = tpmr_pf(ifp0, PF_IN, m, ns)) == NULL)
 		return (NULL);
 #endif
 
@@ -374,7 +373,7 @@ tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
 #if NBPFILTER > 0
 	if_bpf = READ_ONCE(ifp->if_bpf);
 	if (if_bpf) {
-		if (bpf_mtap(if_bpf, m, 0))
+		if (bpf_mtap_ether(if_bpf, m, 0))
 			goto drop;
 	}
 #endif
@@ -382,7 +381,7 @@ tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
 	smr_read_enter();
 	pn = SMR_PTR_GET(&sc->sc_ports[!p->p_slot]);
 	if (pn != NULL)
-		tpmr_p_take(pn);
+		pnref = tpmr_cpu_take(pn);
 	smr_read_leave();
 	if (pn == NULL)
 		goto drop;
@@ -390,20 +389,25 @@ tpmr_input(struct ifnet *ifp0, struct mbuf *m, uint64_t dst, void *brport)
 	ifpn = pn->p_ifp0;
 #if NPF > 0
 	if (!ISSET(iff, IFF_LINK1) &&
-	    (m = tpmr_pf(ifpn, PF_OUT, m)) == NULL) {
-		tpmr_p_rele(pn);
-		return (NULL);
-	}
+	    (m = tpmr_pf(ifpn, PF_OUT, m, ns)) == NULL)
+		goto rele;
 #endif
 
-	if (if_enqueue(ifpn, m))
+	m = ether_offload_ifcap(ifpn, m);
+	if (m == NULL) {
 		counters_inc(ifp->if_counters, ifc_oerrors);
-	else {
-		counters_pkt(ifp->if_counters,
-		    ifc_opackets, ifc_obytes, len);
+		goto rele;
 	}
 
-	tpmr_p_rele(pn);
+	if (if_enqueue(ifpn, m) != 0) {
+		counters_inc(ifp->if_counters, ifc_oerrors);
+		goto rele;
+	}
+
+	counters_pkt(ifp->if_counters, ifc_opackets, ifc_obytes, len);
+
+rele:
+	tpmr_cpu_rele(pnref, pn);
 
 	return (NULL);
 
@@ -493,6 +497,8 @@ tpmr_add_port(struct tpmr_softc *sc, const struct ifbreq *req)
 	struct ifnet *ifp0;
 	struct tpmr_port **pp;
 	struct tpmr_port *p;
+	struct refcnt *r;
+	struct cpumem_iter cmi;
 	int i;
 	int error;
 
@@ -520,6 +526,14 @@ tpmr_add_port(struct tpmr_softc *sc, const struct ifbreq *req)
 		error = ENOMEM;
 		goto put;
 	}
+	refcnt_init(&p->p_refcnt);
+
+	/* create per cpu refcnts as a proxy for the real refcnt */
+	p->p_percpu = cpumem_malloc(sizeof(*r), M_DEVBUF);
+	CPUMEM_FOREACH(r, &cmi, p->p_percpu) {
+		tpmr_p_take(p);
+		refcnt_init(r);
+	}
 
 	ifsetlro(ifp0, 0);
 
@@ -544,10 +558,10 @@ tpmr_add_port(struct tpmr_softc *sc, const struct ifbreq *req)
 	task_set(&p->p_dtask, tpmr_p_detach, p);
 	if_detachhook_add(ifp0, &p->p_dtask);
 
-	p->p_brport.eb_input = tpmr_input;
-	p->p_brport.eb_port_take = tpmr_p_take;
-	p->p_brport.eb_port_rele = tpmr_p_rele;
-	p->p_brport.eb_port = p;
+	p->p_brport.ep_input = tpmr_input;
+	p->p_brport.ep_port_take = tpmr_cpu_take;
+	p->p_brport.ep_port_rele = tpmr_cpu_rele;
+	p->p_brport.ep_port = p;
 
 	/* commit */
 	DPRINTF(sc, "%s %s trunkport: creating port\n",
@@ -562,7 +576,7 @@ tpmr_add_port(struct tpmr_softc *sc, const struct ifbreq *req)
 
 	p->p_slot = i;
 
-	tpmr_p_take(p);
+	/* give the ref to the SMR pointers */
 	ether_brport_set(ifp0, &p->p_brport);
 	ifp0->if_ioctl = tpmr_p_ioctl;
 	ifp0->if_output = tpmr_p_output;
@@ -576,6 +590,7 @@ tpmr_add_port(struct tpmr_softc *sc, const struct ifbreq *req)
 unpromisc:
 	ifpromisc(ifp0, 0);
 free:
+	cpumem_free(p->p_percpu, M_DEVBUF, sizeof(*r));
 	free(p, M_DEVBUF, sizeof(*p));
 put:
 	if_put(ifp0);
@@ -660,18 +675,18 @@ done:
 static int
 tpmr_p_ioctl(struct ifnet *ifp0, u_long cmd, caddr_t data)
 {
-	const struct ether_brport *eb = ether_brport_get_locked(ifp0);
+	const struct ether_port *ep = ether_brport_get_locked(ifp0);
 	struct tpmr_port *p;
 	int error = 0;
 
-	KASSERTMSG(eb != NULL,
+	KASSERTMSG(ep != NULL,
 	    "%s: %s called without an ether_brport set",
 	    ifp0->if_xname, __func__);
-	KASSERTMSG(eb->eb_input == tpmr_input,
-	    "%s: %s called, but eb_input seems wrong (%p != tpmr_input())",
-	    ifp0->if_xname, __func__, eb->eb_input);
+	KASSERTMSG(ep->ep_input == tpmr_input,
+	    "%s: %s called, but ep_input seems wrong (%p != tpmr_input())",
+	    ifp0->if_xname, __func__, ep->ep_input);
 
-	p = eb->eb_port;
+	p = ep->ep_port;
 
 	switch (cmd) {
 	case SIOCSIFADDR:
@@ -692,7 +707,7 @@ tpmr_p_output(struct ifnet *ifp0, struct mbuf *m, struct sockaddr *dst,
 {
 	int (*p_output)(struct ifnet *, struct mbuf *, struct sockaddr *,
 	    struct rtentry *) = NULL;
-	const struct ether_brport *eb;
+	const struct ether_port *ep;
 
 	/* restrict transmission to bpf only */
 	if ((m_tag_find(m, PACKET_TAG_DLT, NULL) == NULL)) {
@@ -701,9 +716,9 @@ tpmr_p_output(struct ifnet *ifp0, struct mbuf *m, struct sockaddr *dst,
 	}
 
 	smr_read_enter();
-	eb = ether_brport_get(ifp0);
-	if (eb != NULL && eb->eb_input == tpmr_input) {
-		struct tpmr_port *p = eb->eb_port;
+	ep = ether_brport_get(ifp0);
+	if (ep != NULL && ep->ep_input == tpmr_input) {
+		struct tpmr_port *p = ep->ep_port;
 		p_output = p->p_output; /* code doesn't go away */
 	}
 	smr_read_leave();
@@ -717,23 +732,41 @@ tpmr_p_output(struct ifnet *ifp0, struct mbuf *m, struct sockaddr *dst,
 }
 
 static void
-tpmr_p_take(void *p)
+tpmr_p_take(struct tpmr_port *p)
 {
-	struct tpmr_port *port = p;
-
-	atomic_inc_int(&port->p_refcnt);
+	refcnt_take(&p->p_refcnt);
 }
 
 static void
-tpmr_p_rele(void *p)
+tpmr_p_rele(struct tpmr_port *p)
 {
-	struct tpmr_port *port = p;
-	struct ifnet *ifp0 = port->p_ifp0;
-
-	if (atomic_dec_int_nv(&port->p_refcnt) == 0) {
-		if_put(ifp0);
-		free(port, M_DEVBUF, sizeof(*port));
+	if (refcnt_rele(&p->p_refcnt)) {
+		if_put(p->p_ifp0);
+		cpumem_free(p->p_percpu, M_DEVBUF, sizeof(struct refcnt));
+		free(p, M_DEVBUF, sizeof(*p));
 	}
+}
+
+static void *
+tpmr_cpu_take(void *port)
+{
+	struct tpmr_port *p = port;
+	struct refcnt *r;
+
+	r = cpumem_enter(p->p_percpu);
+	refcnt_take(r);
+	cpumem_leave(p->p_percpu, r);
+
+	return (r);
+}
+
+static void
+tpmr_cpu_rele(void *ref, void *port)
+{
+	struct refcnt *r = ref;
+
+	if (refcnt_rele(r))
+		tpmr_p_rele(port);
 }
 
 static void
@@ -741,6 +774,8 @@ tpmr_p_dtor(struct tpmr_softc *sc, struct tpmr_port *p, const char *op)
 {
 	struct ifnet *ifp = &sc->sc_if;
 	struct ifnet *ifp0 = p->p_ifp0;
+	struct refcnt *r;
+	struct cpumem_iter cmi;
 
 	DPRINTF(sc, "%s %s: destroying port\n",
 	    ifp->if_xname, ifp0->if_xname);
@@ -761,9 +796,12 @@ tpmr_p_dtor(struct tpmr_softc *sc, struct tpmr_port *p, const char *op)
 	if_detachhook_del(ifp0, &p->p_dtask);
 	if_linkstatehook_del(ifp0, &p->p_ltask);
 
-	tpmr_p_rele(p);
-
+	/* wait for the sc_ports and brport SMR pointers */
 	smr_barrier();
+
+	CPUMEM_FOREACH(r, &cmi, p->p_percpu)
+		tpmr_cpu_rele(r, p);
+	tpmr_p_rele(p);
 
 	if (ifp->if_link_state != LINK_STATE_DOWN) {
 		ifp->if_link_state = LINK_STATE_DOWN;

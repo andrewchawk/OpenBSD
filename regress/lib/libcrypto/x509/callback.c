@@ -1,4 +1,4 @@
-/* $OpenBSD: callback.c,v 1.4 2023/01/28 19:12:20 tb Exp $ */
+/* $OpenBSD: callback.c,v 1.8 2026/05/04 13:52:39 tb Exp $ */
 /*
  * Copyright (c) 2020 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2020-2021 Bob Beck <beck@openbsd.org>
@@ -110,7 +110,7 @@ verify_cert_cb(int ok, X509_STORE_CTX *xsc)
 
 static void
 verify_cert(const char *roots_dir, const char *roots_file,
-    const char *bundle_file, int *chains, int mode)
+    const char *bundle_file, int *chains, int set_depth, int mode)
 {
 	STACK_OF(X509) *roots = NULL, *bundle = NULL;
 	X509_STORE_CTX *xsc = NULL;
@@ -141,6 +141,10 @@ verify_cert(const char *roots_dir, const char *roots_file,
 		if (!X509_STORE_load_locations(store, NULL, roots_dir))
 			errx(1, "failed to set by_dir directory of %s", roots_dir);
 	}
+	if (set_depth > 0) {
+		X509_VERIFY_PARAM_set_depth(X509_STORE_CTX_get0_param(xsc),
+		    set_depth);
+	}
 	if (mode == MODE_LEGACY_VFY)
 		X509_STORE_CTX_set_flags(xsc, X509_V_FLAG_LEGACY_VERIFY);
 	else
@@ -158,7 +162,7 @@ verify_cert(const char *roots_dir, const char *roots_file,
 
 	verify_err = X509_STORE_CTX_get_error(xsc);
 	if (verify_err == 0)
-		errx(1, "Error unset on failure!\n");
+		errx(1, "Error unset on failure!");
 
 	fprintf(stderr, "failed to verify at %d: %s\n",
 	    X509_STORE_CTX_get_error_depth(xsc),
@@ -173,7 +177,9 @@ verify_cert(const char *roots_dir, const char *roots_file,
 }
 
 struct verify_cert_test {
+	const char *desc;
 	const char *id;
+	int set_depth;
 	int want_chains;
 	int failing;
 };
@@ -186,6 +192,24 @@ struct verify_cert_test verify_cert_tests[] = {
 	{
 		.id = "2a",
 		.want_chains = 1,
+	},
+	{
+		.desc = "2a with depth 2",
+		.id = "2a",
+		.set_depth = 2,
+		.want_chains = 1,
+	},
+	{
+		.desc = "2a with depth 1",
+		.id = "2a",
+		.set_depth = 1,
+		.want_chains = 0,
+	},
+	{
+		.desc = "2a with depth 1",
+		.id = "2a",
+		.set_depth = 1,
+		.want_chains = 0,
 	},
 	{
 		.id = "2b",
@@ -340,6 +364,15 @@ struct verify_cert_test verify_cert_tests[] = {
 		.want_chains = 1,
 		.failing = 1,
 	},
+	{
+		.id = "14a",
+		.want_chains = 1,
+	},
+	{
+		.id = "14b",
+		.want_chains = 0,
+		.failing = 1,
+	},
 };
 
 #define N_VERIFY_CERT_TESTS \
@@ -366,10 +399,12 @@ verify_cert_test(const char *certs_path, int mode)
 		if (asprintf(&roots_dir, "./%s/roots", vct->id) == -1)
 			errx(1, "asprintf");
 
-		fprintf(output, "== Test %zu (%s)\n", i, vct->id);
+		fprintf(output, "== Test %zu (%s)\n", i,
+		    vct->desc != NULL ? vct->desc : vct->id);
 		fprintf(output, "== Legacy:\n");
 		mode = MODE_LEGACY_VFY;
-		verify_cert(roots_dir, roots_file, bundle_file, &chains, mode);
+		verify_cert(roots_dir, roots_file, bundle_file, &chains,
+		   vct->set_depth, mode);
 		if ((mode == MODE_VERIFY && chains == vct->want_chains) ||
 		    (chains == 0 && vct->want_chains == 0) ||
 		    (chains == 1 && vct->want_chains > 0)) {
@@ -386,7 +421,8 @@ verify_cert_test(const char *certs_path, int mode)
 		fprintf(output, "\n");
 		fprintf(output, "== Modern:\n");
 		mode = MODE_MODERN_VFY;
-		verify_cert(roots_dir, roots_file, bundle_file, &chains, mode);
+		verify_cert(roots_dir, roots_file, bundle_file, &chains,
+		    vct->set_depth, mode);
 		if ((mode == MODE_VERIFY && chains == vct->want_chains) ||
 		    (chains == 0 && vct->want_chains == 0) ||
 		    (chains == 1 && vct->want_chains > 0)) {

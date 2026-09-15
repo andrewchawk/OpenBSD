@@ -1,4 +1,4 @@
-/*	$OpenBSD: patch.c,v 1.76 2024/03/22 19:22:23 jcs Exp $	*/
+/*	$OpenBSD: patch.c,v 1.79 2026/04/03 12:58:40 kirill Exp $	*/
 
 /*
  * patch - a program to apply diffs to original files
@@ -152,7 +152,7 @@ main(int argc, char *argv[])
 	const	char *tmpdir;
 	char	*v;
 
-	if (pledge("stdio rpath wpath cpath tmppath fattr unveil", NULL) == -1) {
+	if (pledge("stdio rpath wpath cpath fattr unveil", NULL) == -1) {
 		perror("pledge");
 		my_exit(2);
 	}
@@ -252,7 +252,7 @@ main(int argc, char *argv[])
 			perror("unveil");
 			my_exit(2);
 		}
-	if (pledge("stdio rpath wpath cpath tmppath fattr", NULL) == -1) {
+	if (pledge("stdio rpath wpath cpath fattr", NULL) == -1) {
 		perror("pledge");
 		my_exit(2);
 	}
@@ -293,6 +293,12 @@ main(int argc, char *argv[])
 		/* for ed script just up and do it and exit */
 		if (diff_type == ED_DIFF) {
 			do_ed_script();
+			if (ofp)
+				fclose(ofp);
+			ofp = NULL;
+			if (rejfp)
+				fclose(rejfp);
+			rejfp = NULL;
 			continue;
 		}
 
@@ -542,6 +548,7 @@ get_some_switches(void)
 		{NULL,			0,			0,	0}
 	};
 	int ch;
+	const char *errstr;
 
 	rejname[0] = '\0';
 	Argc_last = Argc;
@@ -598,7 +605,10 @@ get_some_switches(void)
 			force = true;
 			break;
 		case 'F':
-			maxfuzz = atoi(optarg);
+			maxfuzz = strtonum(optarg, 0, INT_MAX, &errstr);
+			if (errstr != NULL)
+				fatal("maximum fuzz is %s: %s\n",
+				    errstr, optarg);
 			break;
 		case 'i':
 			if (++filec == MAXFILEC)
@@ -618,7 +628,10 @@ get_some_switches(void)
 			outname = xstrdup(optarg);
 			break;
 		case 'p':
-			strippath = atoi(optarg);
+			strippath = strtonum(optarg, 0, INT_MAX, &errstr);
+			if (errstr != NULL)
+				fatal("strip count is %s: %s\n",
+				    errstr, optarg);
 			break;
 		case 'r':
 			if (strlcpy(rejname, optarg,
@@ -647,7 +660,10 @@ get_some_switches(void)
 			break;
 #ifdef DEBUGGING
 		case 'x':
-			debug = atoi(optarg);
+			debug = strtonum(optarg, 0, INT_MAX, &errstr);
+			if (errstr != NULL)
+				fatal("debug number is %s: %s\n",
+				    errstr, optarg);
 			break;
 #endif
 		default:

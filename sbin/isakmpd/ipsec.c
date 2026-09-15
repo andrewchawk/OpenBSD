@@ -1,4 +1,4 @@
-/* $OpenBSD: ipsec.c,v 1.154 2023/12/20 00:34:13 tobhe Exp $	 */
+/* $OpenBSD: ipsec.c,v 1.161 2026/06/24 09:57:32 hshoexer Exp $	 */
 /* $EOM: ipsec.c,v 1.143 2000/12/11 23:57:42 niklas Exp $	 */
 
 /*
@@ -779,13 +779,13 @@ ipsec_free_exchange_data(void *vie)
 	free(ie->id_cr);
 	free(ie->g_xi);
 	free(ie->g_xr);
-	free(ie->g_xy);
-	free(ie->skeyid);
-	free(ie->skeyid_d);
-	free(ie->skeyid_a);
-	free(ie->skeyid_e);
-	free(ie->hash_i);
-	free(ie->hash_r);
+	freezero(ie->g_xy, ie->g_xy_len);
+	freezero(ie->skeyid, ie->skeyid_len);
+	freezero(ie->skeyid_d, ie->skeyid_len);
+	freezero(ie->skeyid_a, ie->skeyid_len);
+	freezero(ie->skeyid_e, ie->skeyid_len);
+	freezero(ie->hash_i, ie->hash_i_sz);
+	freezero(ie->hash_r, ie->hash_r_sz);
 	if (ie->group)
 		group_free(ie->group);
 	for (attr = LIST_FIRST(&ie->attrs); attr;
@@ -807,8 +807,8 @@ ipsec_free_sa_data(void *visa)
 	free(isa->src_mask);
 	free(isa->dst_net);
 	free(isa->dst_mask);
-	free(isa->skeyid_a);
-	free(isa->skeyid_d);
+	freezero(isa->skeyid_a, isa->skeyid_len);
+	freezero(isa->skeyid_d, isa->skeyid_len);
 }
 
 /* Free the DOI-specific protocol data of an SA pointed to by VIPROTO.  */
@@ -818,8 +818,12 @@ ipsec_free_proto_data(void *viproto)
 	struct ipsec_proto *iproto = viproto;
 	int             i;
 
-	for (i = 0; i < 2; i++)
-		free(iproto->keymat[i]);
+	for (i = 0; i < 2; i++) {
+		if (iproto->keymat[i] == NULL)
+			continue;
+		freezero(iproto->keymat[i], iproto->keymat_len[i]);
+		iproto->keymat[i] = NULL;
+	}
 }
 
 /* Return exchange script based on TYPE.  */
@@ -947,24 +951,34 @@ ipsec_validate_id_information(u_int8_t type, u_int8_t *extra, u_int8_t *buf,
 
 	switch (type) {
 	case IPSEC_ID_IPV4_ADDR:
+		if (sz != sizeof(struct in_addr))
+			return -1;
 		LOG_DBG_BUF((LOG_MESSAGE, 40,
 		    "ipsec_validate_id_information: IPv4", buf,
 		    sizeof(struct in_addr)));
 		break;
 
 	case IPSEC_ID_IPV6_ADDR:
+		if (sz != sizeof(struct in6_addr))
+			return -1;
 		LOG_DBG_BUF((LOG_MESSAGE, 40,
 		    "ipsec_validate_id_information: IPv6", buf,
 		    sizeof(struct in6_addr)));
 		break;
 
 	case IPSEC_ID_IPV4_ADDR_SUBNET:
+	case IPSEC_ID_IPV4_RANGE:
+		if (sz != 2 * sizeof(struct in_addr))
+			return -1;
 		LOG_DBG_BUF((LOG_MESSAGE, 40,
 		    "ipsec_validate_id_information: IPv4 network/netmask",
 		    buf, 2 * sizeof(struct in_addr)));
 		break;
 
 	case IPSEC_ID_IPV6_ADDR_SUBNET:
+	case IPSEC_ID_IPV6_RANGE:
+		if (sz != 2 * sizeof(struct in6_addr))
+			return -1;
 		LOG_DBG_BUF((LOG_MESSAGE, 40,
 		    "ipsec_validate_id_information: IPv6 network/netmask",
 		    buf, 2 * sizeof(struct in6_addr)));
@@ -1283,7 +1297,11 @@ ipsec_is_attribute_incompatible(u_int16_t type, u_int8_t *value, u_int16_t len,
     void *vmsg)
 {
 	struct message *msg = vmsg;
-	u_int16_t dv = decode_16(value);
+	u_int16_t dv;
+
+	if (len < sizeof(dv))
+		return 1;
+	dv = decode_16(value);
 
 	if (msg->exchange->phase == 1) {
 		switch (type) {
@@ -1298,7 +1316,7 @@ ipsec_is_attribute_incompatible(u_int16_t type, u_int8_t *value, u_int16_t len,
 			    dv > IKE_GROUP_DESC_MODP_1536) &&
 			    (dv < IKE_GROUP_DESC_MODP_2048 ||
 			    dv > IKE_GROUP_DESC_ECP_521) &&
-			    (dv < IKE_GROUP_DESC_ECP_192 ||
+			    (dv < IKE_GROUP_DESC_ECP_224 ||
 			    dv > IKE_GROUP_DESC_BP_512);
 		case IKE_ATTR_GROUP_TYPE:
 			return 1;
@@ -1342,7 +1360,7 @@ ipsec_is_attribute_incompatible(u_int16_t type, u_int8_t *value, u_int16_t len,
 			    dv > IKE_GROUP_DESC_MODP_1536) &&
 			    (dv < IKE_GROUP_DESC_MODP_2048 ||
 			    dv > IKE_GROUP_DESC_ECP_521) &&
-			    (dv < IKE_GROUP_DESC_ECP_192 ||
+			    (dv < IKE_GROUP_DESC_ECP_224 ||
 			    dv > IKE_GROUP_DESC_BP_512);
 		case IPSEC_ATTR_ENCAPSULATION_MODE:
 			return dv != IPSEC_ENCAP_TUNNEL &&
@@ -1417,6 +1435,16 @@ ipsec_decode_attribute(u_int16_t type, u_int8_t *value, u_int16_t len,
 	struct exchange *exchange = msg->exchange;
 	struct ipsec_exch *ie = exchange->data;
 	static int      lifetype = 0;
+
+	/* LIFE_DURATION attributes are validated below, so pass them on. */
+	if (len < sizeof(u_int16_t) &&
+	    !(exchange->phase == 1 && type == IKE_ATTR_LIFE_DURATION) &&
+	    !(exchange->phase != 1 && type == IPSEC_ATTR_SA_LIFE_DURATION)) {
+		log_print("ipsec_decode_attribute: too short attribute "
+		    "(type %u, len %u)", type, len);
+		lifetype = 0;
+		return 0;
+	}
 
 	if (exchange->phase == 1) {
 		switch (type) {
@@ -1748,6 +1776,7 @@ ipsec_handle_leftover_payload(struct message *msg, u_int8_t type,
     struct payload *payload)
 {
 	u_int32_t       spisz, nspis;
+	size_t		len;
 	struct sockaddr *dst;
 	int             reenter = 0;
 	u_int8_t       *spis, proto;
@@ -1771,6 +1800,13 @@ ipsec_handle_leftover_payload(struct message *msg, u_int8_t type,
 			log_print("ipsec_handle_leftover_payload: invalid SPI "
 			    "size %d for proto %d in DELETE payload",
 			    spisz, proto);
+			return -1;
+		}
+		len = GET_ISAKMP_GEN_LENGTH(payload->p);
+		if (len < ISAKMP_DELETE_SPI_OFF ||
+		    (len - ISAKMP_DELETE_SPI_OFF) / spisz < nspis) {
+			log_print("ipsec_handle_leftover_payload: "
+			    "SPI count %u exceeds payload length %zu", nspis, len);
 			return -1;
 		}
 		spis = calloc(nspis, spisz);

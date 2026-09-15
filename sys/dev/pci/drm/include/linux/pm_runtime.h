@@ -75,9 +75,26 @@ pm_runtime_get_if_in_use(struct device *dev)
 }
 
 static inline int
-pm_runtime_get_if_active(struct device *dev, bool x)
+pm_runtime_get_if_active(struct device *dev)
 {
 	return -EINVAL;
 }
 
+static inline int
+pm_runtime_suspended(struct device *dev)
+{
+	return 0;
+}
+
+static inline int
+pm_runtime_resume(struct device *dev)
+{
+	return 1;
+}
+
+static inline int
+pm_runtime_resume_and_get(struct device *dev)
+{
+	return 1;
+}
 #endif

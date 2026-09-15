@@ -1,4 +1,4 @@
-/*	$OpenBSD: in_cksum.c,v 1.4 2010/04/26 19:43:23 kettenis Exp $	*/
+/*	$OpenBSD: in_cksum.c,v 1.6 2025/10/19 17:59:19 miod Exp $	*/
 
 /*
  * Copyright (c) 2000 Michael Shalayeff
@@ -70,16 +70,14 @@
 				: "+r" (sum), "+r" (w), "+r" (mlen) :: "r19")
 
 int
-in_cksum(m, len)
-	register struct mbuf *m;
-	register int len;
+in_cksum(struct mbuf *m, int len)
 {
-	register u_int sum = 0;
-	register u_int bins = 0;
+	u_int sum = 0;
+	u_int bins = 0;
 
 	for (; m && len; m = m->m_next) {
-		register int mlen = m->m_len;
-		register u_char *w;
+		int mlen = m->m_len;
+		u_char *w;
 
 		if (!mlen)
 			continue;

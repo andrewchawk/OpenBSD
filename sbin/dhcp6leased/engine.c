@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.c,v 1.24 2024/07/11 10:48:51 florian Exp $	*/
+/*	$OpenBSD: engine.c,v 1.42 2026/08/04 12:50:43 claudio Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021, 2024 Florian Obser <florian@openbsd.org>
@@ -135,9 +135,13 @@ void			 request_dhcp_discover(struct dhcp6leased_iface *);
 void			 request_dhcp_request(struct dhcp6leased_iface *);
 void			 configure_interfaces(struct dhcp6leased_iface *);
 void			 deconfigure_interfaces(struct dhcp6leased_iface *);
+void			 deprecate_interfaces(struct dhcp6leased_iface *);
 int			 prefixcmp(struct prefix *, struct prefix *, int);
 void			 send_reconfigure_interface(struct iface_pd_conf *,
 			     struct prefix *, enum reconfigure_action);
+void			 send_reconfigure_reject_route(
+			     struct dhcp6leased_iface *, struct in6_addr *,
+			     uint8_t, enum reconfigure_action);
 int			 engine_imsg_compose_main(int, pid_t, void *, uint16_t);
 const char		*dhcp_option_type2str(int);
 const char		*dhcp_duid2str(int, uint8_t *);
@@ -215,7 +219,9 @@ engine(int debug, int verbose)
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
 
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = engine_dispatch_main;
 
 	/* Setup event handlers. */
@@ -235,9 +241,9 @@ __dead void
 engine_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	free(iev_frontend);
@@ -269,28 +275,29 @@ engine_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf = &iev->ibuf;
 	struct imsg			 imsg;
-	struct dhcp6leased_iface		*iface;
-	ssize_t				 n;
-	int				 shut = 0;
+	struct dhcp6leased_iface	*iface;
+	int				 n, shut = 0;
 	int				 verbose;
 	uint32_t			 if_index;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -379,25 +386,26 @@ engine_dispatch_main(int fd, short event, void *bula)
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf = &iev->ibuf;
 	struct imsg_ifinfo		 imsg_ifinfo;
-	ssize_t				 n;
-	int				 shut = 0;
+	int				 n, shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("%s: imsg_get error", __func__);
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("%s: imsgbuf_get error", __func__);
 		if (n == 0)	/* No more messages. */
 			break;
 
@@ -419,7 +427,8 @@ engine_dispatch_main(int fd, short event, void *bula)
 			if (iev_frontend == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_frontend->ibuf, fd);
+			if (imsgbuf_init(&iev_frontend->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_frontend->handler = engine_dispatch_frontend;
 			iev_frontend->events = EV_READ;
 
@@ -471,6 +480,11 @@ engine_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(iface_conf, imsg.data, sizeof(struct
 			    iface_conf));
+			if (iface_conf->name[sizeof(iface_conf->name) - 1]
+			    != '\0')
+				fatalx("%s: IMSG_RECONF_IFACE invalid name",
+				    __func__);
+
 			SIMPLEQ_INIT(&iface_conf->iface_ia_list);
 			SIMPLEQ_INSERT_TAIL(&nconf->iface_list,
 			    iface_conf, entry);
@@ -504,6 +518,11 @@ engine_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(iface_pd_conf, imsg.data, sizeof(struct
 			    iface_pd_conf));
+			if (iface_pd_conf->name[sizeof(iface_pd_conf->name) - 1]
+			    != '\0')
+				fatalx("%s: IMSG_RECONF_IFACE_PD invalid name",
+				__func__);
+
 			SIMPLEQ_INSERT_TAIL(&iface_ia_conf->iface_pd_list,
 			    iface_pd_conf, entry);
 			break;
@@ -711,6 +730,7 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 	size_t			 rem;
 	uint32_t		 t1, t2, lease_time;
 	int			 serverid_len, rapid_commit = 0;
+	int			 found_client_id = 0;
 	uint8_t			 serverid[SERVERID_SIZE];
 	uint8_t			*p;
 	char			 ifnamebuf[IF_NAMESIZE], *if_name;
@@ -732,6 +752,7 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 	    iface_conf->ia_count);
 
 	serverid_len = t1 = t2 = lease_time = 0;
+	memset(serverid, 0, SERVERID_SIZE);
 	memset(iface->new_pds, 0, sizeof(iface->new_pds));
 
 	p = dhcp->packet;
@@ -772,6 +793,7 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 				log_debug("%s: message not for us", __func__);
 				goto out;
 			}
+			found_client_id = 1;
 			break;
 		case DHO_SERVERID:
 			/*
@@ -849,6 +871,11 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 		goto out;
 	}
 
+	if (!found_client_id) {
+		log_warnx("%s: Did not receive client identifier", __func__);
+		goto out;
+	}
+
 
 	SIMPLEQ_FOREACH(ia_conf, &iface_conf->iface_ia_list, entry) {
 		struct prefix	*pd = &iface->new_pds[ia_conf->id];
@@ -865,7 +892,7 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 			goto out;
 		}
 
-		if (lease_time < pd->vltime)
+		if (lease_time == 0 || lease_time > pd->vltime)
 			lease_time = pd->vltime;
 
 		log_debug("%s: pltime: %u, vltime: %u, prefix: %s/%u",
@@ -896,6 +923,11 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 			    dhcp_message_type2str(hdr.msg_type));
 			goto out;
 		}
+		if (memcmp(hdr.xid, iface->xid, XID_SIZE) != 0) {
+			log_debug("%s: ignoring %s with wrong transaction id",
+			    __func__, dhcp_message_type2str(hdr.msg_type));
+			goto out;
+		}
 		iface->serverid_len = serverid_len;
 		memcpy(iface->serverid, serverid, SERVERID_SIZE);
 		memcpy(iface->pds, iface->new_pds, sizeof(iface->pds));
@@ -905,6 +937,15 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 		switch (iface->state) {
 		case IF_REQUESTING:
 		case IF_RENEWING:
+			if (serverid_len == 0 || serverid_len !=
+			    iface->serverid_len || memcmp(serverid,
+			    iface->serverid, serverid_len) != 0) {
+				log_debug("%s: ignoring %s from wrong server",
+				    __func__, dhcp_message_type2str(
+				    hdr.msg_type));
+				goto out;
+			}
+			break;
 		case IF_REBINDING:
 		case IF_REBOOTING:
 			break;
@@ -917,12 +958,22 @@ parse_dhcp(struct dhcp6leased_iface *iface, struct imsg_dhcp *dhcp)
 			    dhcp_message_type2str(hdr.msg_type));
 			goto out;
 		}
+		if (memcmp(hdr.xid, iface->xid, XID_SIZE) != 0) {
+			log_debug("%s: ignoring %s with wrong transaction id",
+			    __func__, dhcp_message_type2str(hdr.msg_type));
+			goto out;
+		}
 		iface->serverid_len = serverid_len;
 		memcpy(iface->serverid, serverid, SERVERID_SIZE);
 
-		/* XXX handle t1 = 0 or t2 = 0 */
-		iface->t1 = t1;
-		iface->t2 = t2;
+		if (t1 == 0)
+			iface->t1 = lease_time / 2;
+		else
+			iface->t1 = t1;
+		if (t2 == 0)
+		    iface->t2 = lease_time - (lease_time / 8);
+		else
+			iface->t2 = t2;
 		iface->lease_time = lease_time;
 		clock_gettime(CLOCK_MONOTONIC, &iface->request_time);
 		state_transition(iface, IF_BOUND);
@@ -966,7 +1017,7 @@ parse_ia_pd_options(uint8_t *p, size_t len, struct prefix *prefix)
 
 		switch (opt_hdr.code) {
 		case DHO_IA_PREFIX:
-			if (len < sizeof(struct dhcp_iaprefix)) {
+			if (opt_hdr.len != sizeof(struct dhcp_iaprefix)) {
 				log_warnx("%s: malformed packet, ignoring",
 				    __func__);
 				return DHCP_STATUS_UNSPECFAIL;
@@ -991,6 +1042,12 @@ parse_ia_pd_options(uint8_t *p, size_t len, struct prefix *prefix)
 				break;
 			}
 
+			if (iaprefix.prefix_len > 128) {
+				log_debug("%s: prefix_len > 128, ignoring "
+				    "IA_PD", __func__);
+				break;
+			}
+
 			prefix->prefix = iaprefix.prefix;
 			prefix->prefix_len = iaprefix.prefix_len;
 			prefix->vltime = ntohl(iaprefix.vltime);
@@ -1005,13 +1062,20 @@ parse_ia_pd_options(uint8_t *p, size_t len, struct prefix *prefix)
 			break;
 		case DHO_STATUS_CODE:
 			/* XXX STATUS_CODE can also appear outside of options */
-			if (len < 2) {
+			if (opt_hdr.len < 2) {
 				log_warnx("%s: malformed packet, ignoring",
 				    __func__);
 				return DHCP_STATUS_UNSPECFAIL;
 			}
 			memcpy(&status_code, p, sizeof(uint16_t));
 			status_code = ntohs(status_code);
+
+			if (opt_hdr.len == 2) {
+				/* empty status-message */
+				log_debug("%s: %s", __func__,
+				    dhcp_status2str(status_code));
+				break;
+			}
 			/* must be at least 4 * srclen + 1 long */
 			visbuf = calloc(4, opt_hdr.len - 2 + 1);
 			if (visbuf == NULL) {
@@ -1021,6 +1085,7 @@ parse_ia_pd_options(uint8_t *p, size_t len, struct prefix *prefix)
 			strvisx(visbuf, p + 2, opt_hdr.len - 2, VIS_SAFE);
 			log_debug("%s: %s - %s", __func__,
 			    dhcp_status2str(status_code), visbuf);
+			free(visbuf);
 			break;
 		default:
 			log_debug("unhandled option: %u", opt_hdr.code);
@@ -1042,8 +1107,19 @@ state_transition(struct dhcp6leased_iface *iface, enum if_state new_state)
 
 	switch (new_state) {
 	case IF_DOWN:
+		switch (old_state) {
+		case IF_RENEWING:
+		case IF_REBINDING:
+		case IF_REBOOTING:
+		case IF_BOUND:
+			deprecate_interfaces(iface);
+			break;
+		default:
+			break;
+		}
 		/*
-		 * Nothing to do until iface comes up. IP addresses will expire.
+		 * Nothing else to do until iface comes up.
+		 * IP addresses will expire.
 		 */
 		iface->timo.tv_sec = -1;
 		break;
@@ -1271,7 +1347,6 @@ request_dhcp_request(struct dhcp6leased_iface *iface)
 	}
 }
 
-/* XXX we need to install a reject route for the delegated prefix */
 void
 configure_interfaces(struct dhcp6leased_iface *iface)
 {
@@ -1302,6 +1377,9 @@ configure_interfaces(struct dhcp6leased_iface *iface)
 		    "server %s", i, inet_ntop(AF_INET6, &pd->prefix, ntopbuf,
 		    INET6_ADDRSTRLEN), pd->prefix_len, if_name,
 		    dhcp_duid2str(iface->serverid_len, iface->serverid));
+
+		send_reconfigure_reject_route(iface, &pd->prefix,
+		    pd->prefix_len, CONFIGURE);
 	}
 
 	SIMPLEQ_FOREACH(ia_conf, &iface_conf->iface_ia_list, entry) {
@@ -1368,6 +1446,8 @@ deconfigure_interfaces(struct dhcp6leased_iface *iface)
 		    "server %s", i, inet_ntop(AF_INET6, &pd->prefix, ntopbuf,
 		    INET6_ADDRSTRLEN), pd->prefix_len, if_name,
 		    dhcp_duid2str(iface->serverid_len, iface->serverid));
+		send_reconfigure_reject_route(iface, &pd->prefix,
+		    pd->prefix_len, DECONFIGURE);
 	}
 
 	SIMPLEQ_FOREACH(ia_conf, &iface_conf->iface_ia_list, entry) {
@@ -1378,6 +1458,58 @@ deconfigure_interfaces(struct dhcp6leased_iface *iface)
 		}
 	}
 	memset(iface->pds, 0, sizeof(iface->pds));
+}
+
+void
+deprecate_interfaces(struct dhcp6leased_iface *iface)
+{
+	struct iface_conf	*iface_conf;
+	struct iface_ia_conf	*ia_conf;
+	struct iface_pd_conf	*pd_conf;
+	struct timespec		 now, diff;
+	uint32_t	 	 i;
+	char		 	 ntopbuf[INET6_ADDRSTRLEN];
+	char			 ifnamebuf[IF_NAMESIZE], *if_name;
+
+
+	if ((if_name = if_indextoname(iface->if_index, ifnamebuf)) == NULL) {
+		log_debug("%s: unknown interface %d", __func__,
+		    iface->if_index);
+		return;
+	}
+	if ((iface_conf = find_iface_conf(&engine_conf->iface_list, if_name))
+	    == NULL) {
+		log_debug("%s: no interface configuration for %d", __func__,
+		    iface->if_index);
+		return;
+	}
+
+	for (i = 0; i < iface_conf->ia_count; i++) {
+		struct prefix *pd = &iface->pds[i];
+
+		log_info("%s went down, deprecating prefix delegation #%d %s/%d"
+		    " from server %s", if_name, i, inet_ntop(AF_INET6,
+		    &pd->prefix, ntopbuf, INET6_ADDRSTRLEN), pd->prefix_len,
+		    dhcp_duid2str(iface->serverid_len, iface->serverid));
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	timespecsub(&now, &iface->request_time, &diff);
+
+	SIMPLEQ_FOREACH(ia_conf, &iface_conf->iface_ia_list, entry) {
+		struct prefix	*pd = &iface->pds[ia_conf->id];
+
+		if (pd->vltime > diff.tv_sec)
+			pd->vltime -= diff.tv_sec;
+		else
+			pd->vltime = 0;
+
+		pd->pltime = 0;
+
+		SIMPLEQ_FOREACH(pd_conf, &ia_conf->iface_pd_list, entry) {
+			send_reconfigure_interface(pd_conf, pd, CONFIGURE);
+		}
+	}
 }
 
 int
@@ -1443,6 +1575,27 @@ send_reconfigure_interface(struct iface_pd_conf *pd_conf, struct prefix *pd,
 	else
 		engine_imsg_compose_main(IMSG_DECONFIGURE_ADDRESS, 0, &address,
 		    sizeof(address));
+}
+
+void
+send_reconfigure_reject_route(struct dhcp6leased_iface *iface,
+    struct in6_addr *prefix, uint8_t prefix_len, enum reconfigure_action action)
+{
+	struct imsg_configure_reject_route	 imsg;
+
+	memset(&imsg, 0, sizeof(imsg));
+
+	imsg.if_index = iface->if_index;
+	imsg.rdomain = iface->rdomain;
+	memcpy(&imsg.prefix, prefix, sizeof(imsg.prefix));
+	in6_prefixlen2mask(&imsg.mask, prefix_len);
+
+	if (action == CONFIGURE)
+		engine_imsg_compose_main(IMSG_CONFIGURE_REJECT_ROUTE, 0, &imsg,
+		    sizeof(imsg));
+	else
+		engine_imsg_compose_main(IMSG_DECONFIGURE_REJECT_ROUTE, 0,
+		    &imsg, sizeof(imsg));
 }
 
 const char *
@@ -1595,8 +1748,10 @@ in6_prefixlen2mask(struct in6_addr *maskp, int len)
 	u_char maskarray[8] = {0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff};
 	int bytelen, bitlen, i;
 
-	if (0 > len || len > 128)
-		fatalx("%s: invalid prefix length(%d)\n", __func__, len);
+	if (0 > len || len > 128) {
+		log_debug("%s: invalid prefix length(%d)", __func__, len);
+		len = 128;
+	}
 
 	bzero(maskp, sizeof(*maskp));
 	bytelen = len / 8;

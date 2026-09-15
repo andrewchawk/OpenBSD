@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_elf.c,v 1.188 2024/07/14 11:36:54 jca Exp $	*/
+/*	$OpenBSD: exec_elf.c,v 1.204 2026/09/10 03:51:11 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1996 Per Fogelstrom
@@ -88,7 +88,6 @@
 #include <uvm/uvm_extern.h>
 
 #include <machine/reg.h>
-#include <machine/exec.h>
 #include <machine/elf.h>
 
 int	elf_load_file(struct proc *, char *, struct exec_package *,
@@ -97,7 +96,7 @@ int	elf_check_header(Elf_Ehdr *);
 int	elf_read_from(struct proc *, struct vnode *, u_long, void *, int);
 void	elf_load_psection(struct exec_vmcmd_set *, struct vnode *,
 	    Elf_Phdr *, Elf_Addr *, Elf_Addr *, int *, int);
-int	elf_os_pt_note_name(Elf_Note *);
+int	elf_os_pt_note_name(Elf_Note *, int *);
 int	elf_os_pt_note(struct proc *, struct exec_package *, Elf_Ehdr *, int *);
 int	elf_read_pintable(struct proc *p, struct vnode *vp, Elf_Phdr *pp,
 	    u_int **pinp, int is_ldso, size_t len);
@@ -120,10 +119,6 @@ struct elf_note_name {
 } elf_note_names[] = {
 	{ "OpenBSD",	ELF_NOTE_NAME_OPENBSD },
 };
-
-#define	ELFROUNDSIZE	sizeof(Elf_Word)
-#define	elfround(x)	roundup((x), ELFROUNDSIZE)
-
 
 /*
  * Check header for validity; return 0 for ok, ENOEXEC if error
@@ -242,7 +237,7 @@ elf_load_psection(struct exec_vmcmd_set *vcset, struct vnode *vp,
 	rf = round_page(*addr + ph->p_filesz + diff);
 
 	if (rm != rf) {
-		NEW_VMCMD2(vcset, vmcmd_map_zero, rm - rf, rf, NULLVP, 0,
+		NEW_VMCMD2(vcset, vmcmd_map_zero, rm - rf, rf, NULL, 0,
 		    *prot, flags);
 	}
 	*size = msize;
@@ -311,8 +306,10 @@ elf_read_pintable(struct proc *p, struct vnode *vp, Elf_Phdr *pp,
 	for (i = 0; i < nsyscalls; i++) {
 		if (syscalls[i].sysno <= 0 ||
 		    syscalls[i].sysno >= SYS_MAXSYSCALL ||
-		    syscalls[i].offset > len)
+		    syscalls[i].offset > len) {
+			npins = 0;
 			goto bad;
+		}
 		npins = MAX(npins, syscalls[i].sysno);
 	}
 	if (is_ldso)
@@ -359,7 +356,7 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 	} loadmap[ELF_MAX_VALID_PHDR];
 	int nload, idx = 0;
 	Elf_Addr pos;
-	int file_align;
+	Elf_Off file_align = PAGE_SIZE;
 	int loop;
 	size_t randomizequota = ELF_RANDOMIZE_LIMIT;
 	vaddr_t text_start = -1, text_end = 0;
@@ -412,11 +409,16 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 			loadmap[idx].vaddr = trunc_page(ph[i].p_vaddr);
 			loadmap[idx].memsz = round_page (ph[i].p_vaddr +
 			    ph[i].p_memsz - loadmap[idx].vaddr);
-			file_align = ph[i].p_align;
+			if (ph[i].p_align > file_align)
+				file_align = ph[i].p_align;
 			idx++;
 		}
 	}
 	nload = idx;
+	if (nload == 0) {
+		error = EINVAL;
+		goto bad1;
+	}
 
 	/*
 	 * Load the interpreter where a non-fixed mmap(NULL, ...)
@@ -530,20 +532,20 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 			}
 			randomizequota -= ph[i].p_memsz;
 			NEW_VMCMD(&epp->ep_vmcmds, vmcmd_randomize,
-			    ph[i].p_memsz, ph[i].p_vaddr + pos, NULLVP, 0, 0);
+			    ph[i].p_memsz, ph[i].p_vaddr + pos, NULL, 0, 0);
 			break;
 
 		case PT_DYNAMIC:
 #if defined (__mips__)
 			/* DT_DEBUG is not ready on mips */
 			NEW_VMCMD(&epp->ep_vmcmds, vmcmd_mutable,
-			    ph[i].p_memsz, ph[i].p_vaddr + pos, NULLVP, 0, 0);
+			    ph[i].p_memsz, ph[i].p_vaddr + pos, NULL, 0, 0);
 #endif
 			break;
 		case PT_GNU_RELRO:
 		case PT_OPENBSD_MUTABLE:
 			NEW_VMCMD(&epp->ep_vmcmds, vmcmd_mutable,
-			    ph[i].p_memsz, ph[i].p_vaddr + pos, NULLVP, 0, 0);
+			    ph[i].p_memsz, ph[i].p_vaddr + pos, NULL, 0, 0);
 			break;
 		case PT_OPENBSD_SYSCALLS:
 			syscall_ph = &ph[i];
@@ -553,7 +555,7 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 		}
 	}
 
-	if (syscall_ph) {
+	if (syscall_ph && text_start != -1) {
 		struct process *pr = p->p_p;
 		vaddr_t base = pos;
 		size_t len = text_end;
@@ -569,8 +571,10 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 			pr->ps_pin.pn_end = base + len;
 			pr->ps_pin.pn_pins = pins;
 			pr->ps_pin.pn_npins = npins;
-			pr->ps_flags |= PS_PIN;
 		}
+	} else {
+		error = EINVAL;	/* nothing executable or no pin table */
+		goto bad1;
 	}
 
 	vn_marktext(nd.ni_vp);
@@ -737,10 +741,6 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 			} else
 				addr = ELF_NO_ADDR;
 
-			/* Static binaries may not call pinsyscalls() */
-			if (interp == NULL)
-				p->p_vmspace->vm_map.flags |= VM_MAP_PINSYSCALL_ONCE;
-
 			/*
 			 * Calculates size of text and data segments
 			 * by starting at first and going to end of last.
@@ -824,20 +824,20 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 			}
 			randomizequota -= ph[i].p_memsz;
 			NEW_VMCMD(&epp->ep_vmcmds, vmcmd_randomize,
-			    ph[i].p_memsz, ph[i].p_vaddr + exe_base, NULLVP, 0, 0);
+			    ph[i].p_memsz, ph[i].p_vaddr + exe_base, NULL, 0, 0);
 			break;
 
 		case PT_DYNAMIC:
 #if defined (__mips__)
 			/* DT_DEBUG is not ready on mips */
 			NEW_VMCMD(&epp->ep_vmcmds, vmcmd_mutable,
-			    ph[i].p_memsz, ph[i].p_vaddr + exe_base, NULLVP, 0, 0);
+			    ph[i].p_memsz, ph[i].p_vaddr + exe_base, NULL, 0, 0);
 #endif
 			break;
 		case PT_GNU_RELRO:
 		case PT_OPENBSD_MUTABLE:
 			NEW_VMCMD(&epp->ep_vmcmds, vmcmd_mutable,
-			    ph[i].p_memsz, ph[i].p_vaddr + exe_base, NULLVP, 0, 0);
+			    ph[i].p_memsz, ph[i].p_vaddr + exe_base, NULL, 0, 0);
 			break;
 		case PT_OPENBSD_SYSCALLS:
 			if (interp == NULL)
@@ -867,7 +867,6 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 			epp->ep_pinend = base + len;
 			epp->ep_pins = pins;
 			epp->ep_npins = npins;
-			p->p_p->ps_flags |= PS_PIN;
 		}
 	}
 
@@ -893,22 +892,14 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 	epp->ep_entry = eh->e_entry + exe_base;
 
 	/*
-	 * Check if we found a dynamically linked binary and arrange to load
-	 * its interpreter when the exec file is released.
+	 * Fill in details for auxinfo
 	 */
-	if (interp || eh->e_type == ET_DYN) {
-		struct elf_args *ap;
-
-		ap = malloc(sizeof(*ap), M_TEMP, M_WAITOK);
-
-		ap->arg_phaddr = phdr;
-		ap->arg_phentsize = eh->e_phentsize;
-		ap->arg_phnum = eh->e_phnum;
-		ap->arg_entry = eh->e_entry + exe_base;
-		ap->arg_interp = exe_base;
-
-		epp->ep_args = ap;
-	}
+	epp->ep_args = malloc(sizeof(*epp->ep_args), M_TEMP, M_WAITOK);
+	epp->ep_args->arg_phaddr = phdr;
+	epp->ep_args->arg_phentsize = eh->e_phentsize;
+	epp->ep_args->arg_phnum = eh->e_phnum;
+	epp->ep_args->arg_entry = eh->e_entry + exe_base;
+	epp->ep_args->arg_interp = exe_base;
 
 	free(ph, M_TEMP, phsize);
 	vn_marktext(epp->ep_vp);
@@ -939,25 +930,23 @@ unsigned long hwcap2;
 int
 exec_elf_fixup(struct proc *p, struct exec_package *epp)
 {
-	char	*interp;
+	char	*interp = NULL;
 	int	error = 0;
 	struct	elf_args *ap;
 	AuxInfo ai[ELF_AUX_ENTRIES], *a;
 
-	ap = epp->ep_args;
-	if (ap == NULL) {
-		return (0);
-	}
-
 	interp = epp->ep_interp;
 
-	/* disable kbind in programs that don't use ld.so */
-	if (interp == NULL)
+	/* disable kbind() and pinsyscalls() in programs that don't use ld.so */
+	if (interp == NULL) {
 		p->p_p->ps_kbind_addr = BOGO_PC;
+		p->p_vmspace->vm_map.flags |= VM_MAP_PINSYSCALL_ONCE;
+	}
+
+	ap = epp->ep_args;
 
 	if (interp &&
 	    (error = elf_load_file(p, interp, epp, ap)) != 0) {
-		uprintf("execve: cannot load %s\n", interp);
 		free(ap, M_TEMP, sizeof *ap);
 		pool_put(&namei_pool, interp);
 		kill_vmcmds(&epp->ep_vmcmds);
@@ -1016,9 +1005,17 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a++;
 #endif /* __HAVE_CPU_HWCAP2 */
 
+		a->au_id = AUX_execpath;	/* XXX delete */
+		a->au_v = (vaddr_t)epp->ep_execpath;
+    		a++;
+
 		a->au_id = AUX_openbsd_timekeep;
 		a->au_v = p->p_p->ps_timekeep;
 		a++;
+
+		a->au_id = AUX_openbsd_execpath;
+		a->au_v = (vaddr_t)epp->ep_execpath;
+    		a++;
 
 		a->au_id = AUX_null;
 		a->au_v = 0;
@@ -1033,13 +1030,13 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 }
 
 int
-elf_os_pt_note_name(Elf_Note *np)
+elf_os_pt_note_name(Elf_Note *np, int *typep)
 {
 	int i, j;
 
 	for (i = 0; i < nitems(elf_note_names); i++) {
 		size_t namlen = strlen(elf_note_names[i].name);
-		if (np->namesz < namlen)
+		if (np->namesz <= namlen)
 			continue;
 		/* verify name padding (after the NUL) is NUL */
 		for (j = namlen + 1; j < elfround(np->namesz); j++)
@@ -1049,8 +1046,10 @@ elf_os_pt_note_name(Elf_Note *np)
 		for (j = np->descsz; j < elfround(np->descsz); j++)
 			if (((char *)(np + 1))[j] != '\0')
 				continue;
-		if (strcmp((char *)(np + 1), elf_note_names[i].name) == 0)
+		if (strcmp((char *)(np + 1), elf_note_names[i].name) == 0) {
+			*typep = np->type;
 			return elf_note_names[i].id;
+		}
 	}
 	return (0);
 }
@@ -1095,14 +1094,31 @@ elf_os_pt_note(struct proc *p, struct exec_package *epp, Elf_Ehdr *eh, int *name
 
 		for (offset = 0; offset < ph->p_filesz; offset += total) {
 			Elf_Note *np2 = (Elf_Note *)((char *)np + offset);
+			size_t remaining = ph->p_filesz - offset;
+			int name, type;
 
-			if (offset + sizeof(Elf_Note) > ph->p_filesz)
+			if (sizeof(Elf_Note) > remaining)
 				break;
+			remaining -= sizeof(Elf_Note);
+
+			if (elfround(np2->namesz) < np2->namesz ||
+			    elfround(np2->descsz) < np2->descsz)
+				break;
+
+			if (elfround(np2->namesz) > remaining)
+				break;
+			remaining -= elfround(np2->namesz);
+			if (elfround(np2->descsz) > remaining)
+				break;
+			remaining -= elfround(np2->descsz);
+
 			total = sizeof(Elf_Note) + elfround(np2->namesz) +
 			    elfround(np2->descsz);
-			if (offset + total > ph->p_filesz)
-				break;
-			names |= elf_os_pt_note_name(np2);
+			name = elf_os_pt_note_name(np2, &type);
+			if (name == ELF_NOTE_NAME_OPENBSD &&
+			    type == NT_OPENBSD_PROF)
+				epp->ep_flags |= EXEC_PROFILE;
+			names |= name;
 		}
 	}
 
@@ -1143,8 +1159,6 @@ uvm_coredump_walk_cb	coredump_walk_elf;
 
 int	coredump_notes_elf(struct proc *, void *, size_t *);
 int	coredump_note_elf(struct proc *, void *, size_t *);
-int	coredump_writenote_elf(struct proc *, void *, Elf_Note *,
-	    const char *, void *);
 
 extern vaddr_t sigcode_va;
 extern vsize_t sigcode_sz;
@@ -1542,9 +1556,6 @@ coredump_note_elf(struct proc *p, void *iocookie, size_t *sizep)
 #ifdef PT_GETFPREGS
 	struct fpreg freg;
 #endif
-#ifdef PT_PACMASK
-	register_t pacmask[2];
-#endif
 
 	size = 0;
 
@@ -1555,6 +1566,7 @@ coredump_note_elf(struct proc *p, void *iocookie, size_t *sizep)
 
 	notesize = sizeof(nhdr) + elfround(namesize) + elfround(sizeof(intreg));
 	if (iocookie) {
+		memset(&intreg, 0, sizeof(intreg));
 		error = process_read_regs(p, &intreg);
 		if (error)
 			return (error);
@@ -1574,6 +1586,7 @@ coredump_note_elf(struct proc *p, void *iocookie, size_t *sizep)
 #ifdef PT_GETFPREGS
 	notesize = sizeof(nhdr) + elfround(namesize) + elfround(sizeof(freg));
 	if (iocookie) {
+		memset(&freg, 0, sizeof(freg));
 		error = process_read_fpregs(p, &freg);
 		if (error)
 			return (error);
@@ -1589,27 +1602,14 @@ coredump_note_elf(struct proc *p, void *iocookie, size_t *sizep)
 	size += notesize;
 #endif
 
-#ifdef PT_PACMASK
-	notesize = sizeof(nhdr) + elfround(namesize) +
-	    elfround(sizeof(pacmask));
-	if (iocookie) {
-		pacmask[0] = pacmask[1] = process_get_pacmask(p);
-
-		nhdr.namesz = namesize;
-		nhdr.descsz = sizeof(pacmask);
-		nhdr.type = NT_OPENBSD_PACMASK;
-
-		error = coredump_writenote_elf(p, iocookie, &nhdr,
-		    name, &pacmask);
-		if (error)
-			return (error);
-	}
-	size += notesize;
-#endif
-
 	*sizep = size;
-	/* XXX Add hook for machdep per-LWP notes. */
-	return (0);
+
+#ifdef __HAVE_COREDUMP_NOTE_ELF_MD
+	/* Add machdep per-thread notes. */
+	return coredump_note_elf_md(p, iocookie, name, sizep);
+#else
+	return 0;
+#endif
 }
 
 int

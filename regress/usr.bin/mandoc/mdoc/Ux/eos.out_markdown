@@ -7,7 +7,7 @@ UX-EOS(1) - General Commands Manual
 # DESCRIPTION
 
 In the beginning Ken and Dennis wrote
-UNIX.
+Unix.
 The CSRG rewrote it to become
 BSD.
 When it dissolved, people started
@@ -22,4 +22,4 @@ And
 DragonFly.
 By now, it's free for everyone.
 
-OpenBSD - July 4, 2017
+OpenBSD - July 4, 2017 - UX-EOS(1)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: dt_prov_static.c,v 1.23 2024/04/06 11:18:02 mpi Exp $ */
+/*	$OpenBSD: dt_prov_static.c,v 1.26 2025/07/21 20:36:41 bluhm Exp $ */
 
 /*
  * Copyright (c) 2019 Martin Pieuchot <mpi@openbsd.org>
@@ -44,9 +44,11 @@ DT_STATIC_PROBE2(sched, off__cpu, "pid_t", "pid_t");
 DT_STATIC_PROBE0(sched, on__cpu);
 DT_STATIC_PROBE0(sched, remain__cpu);
 DT_STATIC_PROBE0(sched, sleep);
+DT_STATIC_PROBE0(sched, stop);
 DT_STATIC_PROBE3(sched, steal, "pid_t", "pid_t", "int");
 DT_STATIC_PROBE2(sched, unsleep, "pid_t", "pid_t");
 DT_STATIC_PROBE3(sched, wakeup, "pid_t", "pid_t", "int");
+DT_STATIC_PROBE3(sched, unstop, "pid_t", "pid_t", "int");
 
 /*
  * Raw syscalls
@@ -100,8 +102,16 @@ DT_STATIC_PROBE3(refcnt, ifaddr, "void *", "int", "int");
 DT_STATIC_PROBE3(refcnt, ifmaddr, "void *", "int", "int");
 DT_STATIC_PROBE3(refcnt, inpcb, "void *", "int", "int");
 DT_STATIC_PROBE3(refcnt, rtentry, "void *", "int", "int");
+DT_STATIC_PROBE3(refcnt, socket, "void *", "int", "int");
 DT_STATIC_PROBE3(refcnt, syncache, "void *", "int", "int");
 DT_STATIC_PROBE3(refcnt, tdb, "void *", "int", "int");
+
+/*
+ * read write sleeping locks, keep in sync with sys/rwlock.h
+ */
+DT_STATIC_PROBE0(rwlock, none);
+DT_STATIC_PROBE3(rwlock, netlock, "void *", "int", "int");
+DT_STATIC_PROBE3(rwlock, solock, "void *", "int", "int");
 
 /*
  * List of all static probes
@@ -115,9 +125,11 @@ struct dt_probe *const dtps_static[] = {
 	&_DT_STATIC_P(sched, on__cpu),
 	&_DT_STATIC_P(sched, remain__cpu),
 	&_DT_STATIC_P(sched, sleep),
+	&_DT_STATIC_P(sched, stop),
 	&_DT_STATIC_P(sched, steal),
 	&_DT_STATIC_P(sched, unsleep),
 	&_DT_STATIC_P(sched, wakeup),
+	&_DT_STATIC_P(sched, unstop),
 	/* Raw syscalls */
 	&_DT_STATIC_P(raw_syscalls, sys_enter),
 	&_DT_STATIC_P(raw_syscalls, sys_exit),
@@ -153,11 +165,17 @@ struct dt_probe *const dtps_static[] = {
 	&_DT_STATIC_P(refcnt, ifmaddr),
 	&_DT_STATIC_P(refcnt, inpcb),
 	&_DT_STATIC_P(refcnt, rtentry),
+	&_DT_STATIC_P(refcnt, socket),
 	&_DT_STATIC_P(refcnt, syncache),
 	&_DT_STATIC_P(refcnt, tdb),
+	/* rwlock */
+	&_DT_STATIC_P(rwlock, none),
+	&_DT_STATIC_P(rwlock, netlock),
+	&_DT_STATIC_P(rwlock, solock),
 };
 
 struct dt_probe *const *dtps_index_refcnt;
+struct dt_probe *const *dtps_index_rwlock;
 
 int
 dt_prov_static_init(void)
@@ -167,6 +185,8 @@ dt_prov_static_init(void)
 	for (i = 0; i < nitems(dtps_static); i++) {
 		if (dtps_static[i] == &_DT_STATIC_P(refcnt, none))
 			dtps_index_refcnt = &dtps_static[i];
+		if (dtps_static[i] == &_DT_STATIC_P(rwlock, none))
+			dtps_index_rwlock = &dtps_static[i];
 		dt_dev_register_probe(dtps_static[i]);
 	}
 

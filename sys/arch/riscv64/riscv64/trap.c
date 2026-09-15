@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.19 2023/11/28 09:10:18 jsg Exp $	*/
+/*	$OpenBSD: trap.c,v 1.23 2026/05/09 17:38:50 jsing Exp $	*/
 
 /*
  * Copyright (c) 2020 Shivam Waghela <shivamwaghela@gmail.com>
@@ -29,6 +29,7 @@
 #include <machine/riscvreg.h>
 #include <machine/syscall.h>
 #include <machine/db_machdep.h>
+#include <machine/elf.h>
 
 /* Called from exception.S */
 void do_trap_supervisor(struct trapframe *);
@@ -80,6 +81,7 @@ do_trap_supervisor(struct trapframe *frame)
 	}
 
 	intr_enable();
+	atomic_inc_int(&uvmexp.traps);
 
 	exception = (frame->tf_scause & EXCP_MASK);
 	switch (exception) {
@@ -112,9 +114,9 @@ do_trap_supervisor(struct trapframe *frame)
 void
 do_trap_user(struct trapframe *frame)
 {
+	struct proc *p = curcpu()->ci_curproc;
 	uint64_t exception;
 	union sigval sv;
-	struct proc *p = curcpu()->ci_curproc;
 
 	p->p_addr->u_pcb.pcb_tf = frame;
 
@@ -132,6 +134,7 @@ do_trap_user(struct trapframe *frame)
 	}
 
 	intr_enable();
+	atomic_inc_int(&uvmexp.traps);
 	refreshcreds(p);
 
 	exception = (frame->tf_scause & EXCP_MASK);
@@ -149,6 +152,12 @@ do_trap_user(struct trapframe *frame)
 		svc_handler(frame);
 		break;
 	case EXCP_ILLEGAL_INSTRUCTION:
+		if ((riscv_hwcap & HWCAP_ISA_V) != 0 &&
+		    vector_instruction(frame->tf_stval) &&
+		    (frame->tf_sstatus & SSTATUS_VS_MASK) == SSTATUS_VS_OFF) {
+			vector_load(p);
+			break;
+		}
 		if ((frame->tf_sstatus & SSTATUS_FS_MASK) == SSTATUS_FS_OFF) {
 			fpu_load(p);
 			break;
@@ -174,10 +183,11 @@ accesstype(struct trapframe *frame)
 {
 	vm_prot_t access_type;
 
-	if ((frame->tf_scause == EXCP_FAULT_STORE) ||
-	    (frame->tf_scause == EXCP_STORE_PAGE_FAULT)) {
+	if (frame->tf_scause == EXCP_FAULT_STORE ||
+	    frame->tf_scause == EXCP_STORE_PAGE_FAULT) {
 		access_type = PROT_WRITE;
-	} else if (frame->tf_scause == EXCP_INST_PAGE_FAULT) {
+	} else if (frame->tf_scause == EXCP_FAULT_FETCH ||
+	    frame->tf_scause == EXCP_INST_PAGE_FAULT) {
 		access_type = PROT_EXEC;
 	} else {
 		access_type = PROT_READ;

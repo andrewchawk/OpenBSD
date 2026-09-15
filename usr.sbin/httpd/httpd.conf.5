@@ -1,4 +1,4 @@
-.\"	$OpenBSD: httpd.conf.5,v 1.125 2023/11/03 13:03:02 espie Exp $
+.\"	$OpenBSD: httpd.conf.5,v 1.135 2026/07/25 05:48:39 rsadowski Exp $
 .\"
 .\" Copyright (c) 2014, 2015 Reyk Floeter <reyk@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 3 2023 $
+.Dd $Mdocdate: July 25 2026 $
 .Dt HTTPD.CONF 5
 .Os
 .Sh NAME
@@ -28,15 +28,15 @@ is the configuration file for the HTTP daemon,
 .Nm
 is divided into the following main sections:
 .Bl -tag -width xxxx
-.It Sy Macros
-User-defined variables may be defined and used later, simplifying the
+.It Sx Macros
+Definitions of variables that can be used later, simplifying the
 configuration file.
-.It Sy Global Configuration
+.It Sx Global configuration
 Global settings for
 .Xr httpd 8 .
-.It Sy Servers
+.It Sx Servers
 Listening HTTP web servers.
-.It Sy Types
+.It Sx Types
 Media types and extensions.
 .El
 .Pp
@@ -75,7 +75,7 @@ and extend to the end of the current line.
 Care should be taken when commenting out multi-line text:
 the comment is effective until the end of the entire block.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Additional configuration files can be included with the
@@ -84,16 +84,21 @@ keyword, for example:
 .Bd -literal -offset indent
 include "/etc/httpd.conf.local"
 .Ed
-.Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example,
+.Ss Macros
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic directory ,
 .Ic log ,
 or
 .Ic root ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
@@ -102,7 +107,7 @@ server "example.com" {
 	listen on $ext_ip port 80
 }
 .Ed
-.Sh GLOBAL CONFIGURATION
+.Ss Global configuration
 Here are the settings that can be set globally:
 .Bl -tag -width Ds
 .It Ic chroot Ar directory
@@ -117,7 +122,7 @@ Set the default media type that is used if the media type for a
 specified extension is not found in the configured types or for files
 without a file extension;
 see the
-.Sx TYPES
+.Sx Types
 section below.
 If not specified, the default type is set to
 .Ar application/octet-stream .
@@ -166,6 +171,14 @@ If not specified, it defaults to
 within the
 .Xr chroot 2
 directory.
+.It Ic no banner
+Do not send the
+.Va Server
+HTTP response header, and hide the server software name in error documents.
+The
+.Va SERVER_SOFTWARE
+CGI environment variable is always set in accordance with
+.%R RFC 3875 .
 .It Ic prefork Ar number
 Run the specified number of server processes.
 This increases the performance and prevents delays when connecting
@@ -173,7 +186,7 @@ to a server.
 .Xr httpd 8
 runs 3 server processes by default.
 .El
-.Sh SERVERS
+.Ss Servers
 The configured web servers.
 .Pp
 Each
@@ -227,6 +240,32 @@ and must be readable by the www user.
 Use the
 .Ic no authenticate
 directive to disable authentication in a location.
+.It Oo Ic no Oc Ic banner
+When prefixed with the
+.Ic no
+keyword,
+suppress the
+.Va Server
+HTTP response header, and hide the server software name in error documents for
+the current
+.Ic server .
+If
+.Ic no
+is omitted, enable the banner for the current
+.Ic server
+if it was disabled globally.
+.It Oo Ic no Oc Ic static-cache-control
+Send
+.Dq Cache-Control: no-cache
+with static file responses.
+When
+.Ic gzip-static
+is enabled, also send
+.Dq Vary: Accept-Encoding
+with static file responses.
+This is enabled by default; use
+.Ic no static-cache-control
+to disable these headers.
 .It Ic block drop
 Drop the connection without sending an error page.
 .It Ic block Op Ic return Ar code Op Ar uri
@@ -365,6 +404,15 @@ This allows FastCGI server chroot to be a directory under httpd chroot.
 .It Ic param Ar variable value
 Sets a variable that will be sent to the FastCGI server.
 Each statement defines one variable.
+.It Ic pass Ic chunked
+Allow chunked uploads to be passed to the FastCGI server.
+By default data uploads with
+.Ar Transfer-Encoding: chunked
+are forbidden.
+By setting
+.Ic pass Ic chunked
+uploads with chunked encoding are accepted but because the CONTENT_LENGTH
+variable can not be set it violates the CGI specification.
 .El
 .Pp
 The FastCGI handler will be given the following variables by default:
@@ -437,6 +485,56 @@ Enable static gzip compression to save bandwidth.
 If gzip encoding is accepted and if the requested file exists with
 an additional .gz suffix, use the compressed file instead and deliver
 it with content encoding gzip.
+.It Ic header Ar option
+Manipulate HTTP response headers.
+Multiple
+.Ic header
+statements may be specified.
+Valid options are:
+.Bl -tag -width Ds
+.It Ic set Ar name Ar value Op Ic always
+Set a custom HTTP response header with the specified
+.Ar name
+and
+.Ar value .
+If a header with the same
+.Ar name
+is already present in the response, its value will be replaced.
+The header is added to successful responses
+(2xx and 3xx status codes) by default.
+.It Ic add Ar name Ar value Op Ic always
+Add a custom HTTP response header with the specified
+.Ar name
+and
+.Ar value .
+Unlike
+.Ic set ,
+this option appends the header even if one with the same
+.Ar name
+already exists, allowing for multiple headers with the same name.
+The header is added to successful responses
+(2xx and 3xx status codes) by default.
+.It Ic remove Ar name Op Ic always
+Suppress the HTTP response header with the specified
+.Ar name .
+This can be used to remove headers added by default, such as
+.Qq Last-Modified ,
+as well as headers inherited from a parent server configuration.
+.El
+.Pp
+If
+.Ic always
+is specified, the header is also added to error responses (4xx and
+5xx).
+.Pp
+Header names are limited to 256 characters and values to 8192 characters.
+Headers defined in a
+.Ic location
+block are inherited from the
+.Ic server
+context and override defined headers with the same name.
+If you do not wish to inherit these, you can remove them again with
+.Ic remove .
 .It Ic hsts Oo Ar option Oc
 Enable HTTP Strict Transport Security.
 Valid options are:
@@ -473,6 +571,7 @@ and for generic ones later on.
 A location section may include most of the server configuration rules
 except
 .Ic alias ,
+.Ic banner ,
 .Ic connection ,
 .Ic errdocs ,
 .Ic hsts ,
@@ -644,14 +743,15 @@ The
 should contain a PEM encoded certificate.
 The default is
 .Pa /etc/ssl/server.crt .
-.It Ic ciphers Ar string
-Specify the TLS cipher string.
+.It Cm ciphers Ar cipherstr
+Define the list of ciphers that may be used for TLS sessions.
+Refer to the
+.Xr tls_config_set_ciphers 3
+manpage for the format of
+.Ar cipherstr .
 If not specified, the default value
-.Qq HIGH:!aNULL
-will be used (strong crypto cipher suites without anonymous DH).
-See the CIPHERS section of
-.Xr openssl 1
-for information about TLS cipher suites and preference lists.
+.Ql secure
+will be used.
 .It Ic client ca Ar cafile Oo Ic crl Ar crlfile Oc Op Ic optional
 Require
 .Po
@@ -676,8 +776,8 @@ For legacy a fixed key length of 1024 bits is used, whereas for auto the key
 length is determined automatically.
 The default is none, which disables DHE cipher suites.
 .It Ic ecdhe Ar curves
-Specify a comma separated list of elliptic curves to use for ECDHE cipher suites,
-in order of preference.
+Specify a comma separated list of elliptic curves to use for
+ECDHE cipher suites, in order of preference.
 The special value of "default" will use the default curves; see
 .Xr tls_config_set_ecdhecurves 3
 for further details.
@@ -724,7 +824,7 @@ It is possible to set
 to default to use the httpd default timeout of 2 hours.
 .El
 .El
-.Sh TYPES
+.Ss Types
 Configure the supported media types.
 .Xr httpd 8
 will set the
@@ -864,6 +964,32 @@ server "example.com" {
 	listen on * port 80
 	location match "/old/(.*)" {
 		request rewrite "/new/%1"
+	}
+}
+.Ed
+.Pp
+Custom HTTP headers can be added to responses for security or compatibility:
+.Bd -literal -offset indent
+server "example.com" {
+	listen on * tls port 443
+
+	header set "X-Powered-By" "OpenBSD httpd"
+
+	header set "X-Content-Type-Options" "nosniff" always
+	header set "X-Frame-Options" "DENY" always
+
+	header add "Set-Cookie" "id=23; HttpOnly; Secure"
+
+	# Remove default Last-Modified header
+	header remove "Last-Modified"
+
+	location "/api/*" {
+		# This location defines its own headers
+		header add "Access-Control-Allow-Origin" "*"
+		# Override from server context
+		header set "Set-Cookie" "id=5; HttpOnly; Secure"
+		# Remove from server context
+		header remove "X-Frame-Options"
 	}
 }
 .Ed

@@ -16,7 +16,7 @@
 #
 # This script is normally invoked from regen.pl.
 
-$VERSION = '1.65';
+$VERSION = '1.74';
 
 BEGIN {
     require './regen/regen_lib.pl';
@@ -80,9 +80,9 @@ our $WARNING_TREE = {
                                 'deprecated::dot_in_inc'               => [ 5.025011, DEFAULT_ON],
                                 'deprecated::version_downgrade'        => [ 5.035009, DEFAULT_ON],
                                 'deprecated::delimiter_will_be_paired' => [ 5.035010, DEFAULT_ON],
-                                'deprecated::apostrophe_as_package_separator'
-                                                                       => [ 5.037009, DEFAULT_ON],
-                                'deprecated::smartmatch'               => [ 5.037010, DEFAULT_ON],
+                                'deprecated::missing_import_called_with_args'   
+                                                                       => [ 5.039002, DEFAULT_ON],
+                                'deprecated::subsequent_use_version'   => [ 5.039008, DEFAULT_ON],
                         }],
         'void'          => [ 5.008, DEFAULT_OFF],
         'recursion'     => [ 5.008, DEFAULT_OFF],
@@ -157,6 +157,10 @@ our $WARNING_TREE = {
                                     [ 5.035, DEFAULT_ON],
                                 'experimental::class' =>
                                     [ 5.037, DEFAULT_ON ],
+                                'experimental::keyword_any' =>
+                                    [ 5.041, DEFAULT_ON ],
+                                'experimental::keyword_all' =>
+                                    [ 5.041, DEFAULT_ON ],
                         }],
 
         'missing'       => [ 5.021, DEFAULT_OFF],
@@ -183,6 +187,7 @@ my %NAME_TO_VALUE; # ('NAME'       => index_number,       ....);
 # the experiments were successful (or abandonned),
 # so no warning bit is needed anymore
 my %NO_BIT_FOR = map { ( uc $_ => 1, $_ => 1 ) } qw(
+  deprecated::smartmatch
   experimental::lexical_subs
   experimental::postderef
   experimental::signatures
@@ -191,6 +196,8 @@ my %NO_BIT_FOR = map { ( uc $_ => 1, $_ => 1 ) } qw(
   experimental::script_run
   experimental::isa
   experimental::smartmatch
+  experimental::const_attr
+  experimental::for_list
 );
 
 ###########################################################################
@@ -1438,7 +1445,7 @@ X<warning, reporting> X<warning, registering>
 
 The C<warnings> pragma provides a number of functions that are useful for
 module authors.  These are used when you want to report a module-specific
-warning to a calling module has enabled warnings via the C<warnings>
+warning to a calling module that has enabled warnings via the C<warnings>
 pragma.
 
 Consider the module C<MyMod::Abc> below.
@@ -1461,12 +1468,23 @@ Consider the module C<MyMod::Abc> below.
 The call to C<warnings::register> will create a new warnings category
 called "MyMod::Abc", i.e. the new category name matches the current
 package name.  The C<open> function in the module will display a warning
-message if it gets given a relative path as a parameter.  This warnings
+message if it gets given a relative path as a parameter.  This warning
 will only be displayed if the code that uses C<MyMod::Abc> has actually
-enabled them with the C<warnings> pragma like below.
+enabled them with the C<warnings> pragma as below - note that a plain
+C<use warnings> enables even warnings that have not yet been registered.
 
+    use warnings;
     use MyMod::Abc;
-    use warnings 'MyMod::Abc';
+    ...
+    abc::open("../fred.txt");
+
+The specific warning can be enabled or disabled, but only after the module
+has been imported:
+
+    # no warnings 'MyMod::Abc';     # error, unknown category before
+                                    # the module is loaded
+    use MyMod::Abc;
+    no warnings 'MyMod::Abc';       # ok after the module is loaded
     ...
     abc::open("../fred.txt");
 
@@ -1476,26 +1494,26 @@ this snippet of code:
 
     package MyMod::Abc;
 
-    sub open {
+    sub open2 {
         if (warnings::enabled("deprecated")) {
             warnings::warn("deprecated",
-                           "open is deprecated, use new instead");
+                           "open2 is deprecated, use open instead");
         }
-        new(@_);
+        open(@_);
     }
 
-    sub new
+    sub open
     ...
     1;
 
-The function C<open> has been deprecated, so code has been included to
+The function C<open2> has been deprecated, so code has been included to
 display a warning message whenever the calling module has (at least) the
 "deprecated" warnings category enabled.  Something like this, say.
 
     use warnings 'deprecated';
     use MyMod::Abc;
     ...
-    MyMod::Abc::open($filename);
+    MyMod::Abc::open2($filename);
 
 Either the C<warnings::warn> or C<warnings::warnif> function should be
 used to actually display the warnings message.  This is because they can

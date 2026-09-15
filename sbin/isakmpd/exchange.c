@@ -1,4 +1,4 @@
-/* $OpenBSD: exchange.c,v 1.142 2018/01/15 09:54:48 mpi Exp $	 */
+/* $OpenBSD: exchange.c,v 1.145 2026/06/24 09:57:32 hshoexer Exp $	 */
 /* $EOM: exchange.c,v 1.143 2000/12/04 00:02:25 angelos Exp $	 */
 
 /*
@@ -279,8 +279,14 @@ exchange_run(struct message *msg)
 		 */
 		if (exchange->initiator ^ (exchange->step % 2)) {
 			done = 1;
-			if (exchange->step)
+			if (exchange->step) {
 				msg = message_alloc_reply(msg);
+				if (!msg) {
+					log_error("exchange_run: "
+					    "message_alloc_reply() failed");
+					return;
+				}
+			}
 			message_setup_header(msg, exchange->type, 0,
 			    exchange->message_id);
 			if (handler(msg)) {
@@ -939,6 +945,11 @@ exchange_establish_p2(struct sa *isakmp_sa, u_int8_t type, char *name,
 			}
 	}
 	msg = message_alloc(isakmp_sa->transport, 0, ISAKMP_HDR_SZ);
+	if (!msg) {
+		log_error("exchange_establish_p2: message_alloc() failed");
+		exchange_free(exchange);
+		return 0; /* exchange_free() runs finalize */
+	}
 	msg->isakmp_sa = isakmp_sa;
 	sa_reference(isakmp_sa);
 
@@ -1196,11 +1207,11 @@ exchange_free_aux(void *v_exch)
 	if (exchange->in_transit &&
 	    exchange->in_transit != exchange->last_sent)
 		message_free(exchange->in_transit);
-	free(exchange->nonce_i);
-	free(exchange->nonce_r);
+	freezero(exchange->nonce_i, exchange->nonce_i_len);
+	freezero(exchange->nonce_r, exchange->nonce_r_len);
 	free(exchange->id_i);
 	free(exchange->id_r);
-	free(exchange->keystate);
+	freezero(exchange->keystate, sizeof(struct keystate));
 	if (exchange->data) {
 		if (exchange->doi && exchange->doi->free_exchange_data)
 			exchange->doi->free_exchange_data(exchange->data);
@@ -1270,7 +1281,8 @@ exchange_upgrade_p1(struct message *msg)
 	GET_ISAKMP_HDR_RCOOKIE(msg->iov[0].iov_base, exchange->cookies +
 	    ISAKMP_HDR_ICOOKIE_LEN);
 	exchange_enter(exchange);
-	sa_isakmp_upgrade(msg);
+	if (!TAILQ_EMPTY(&exchange->sa_list))
+		sa_isakmp_upgrade(msg);
 }
 
 static int
@@ -1514,13 +1526,14 @@ exchange_nonce(struct exchange *exchange, int peer, size_t nonce_sz,
 	nonce = initiator ? &exchange->nonce_i : &exchange->nonce_r;
 	nonce_len =
 	    initiator ? &exchange->nonce_i_len : &exchange->nonce_r_len;
-	*nonce_len = nonce_sz;
 	*nonce = malloc(nonce_sz);
 	if (!*nonce) {
+		*nonce_len = 0;
 		log_error("exchange_nonce: malloc (%lu) failed",
 		    (unsigned long)nonce_sz);
 		return -1;
 	}
+	*nonce_len = nonce_sz;
 	memcpy(*nonce, buf, nonce_sz);
 	snprintf(header, sizeof header, "exchange_nonce: NONCE_%c",
 	    initiator ? 'i' : 'r');

@@ -1,3 +1,3 @@
-/*	$OpenBSD: Version.inc,v 1.9 2023/11/11 18:35:35 robert Exp $ */
+/*	$OpenBSD: Version.inc,v 1.11 2026/05/29 11:18:30 robert Exp $ */
 
-#define	LLD_VERSION_STRING "16.0.6"
+#define	LLD_VERSION_STRING "22.1.6"

@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_trace.c,v 1.20 2023/04/26 16:53:59 claudio Exp $	*/
+/*	$OpenBSD: db_trace.c,v 1.22 2026/04/09 17:57:09 gkoehler Exp $	*/
 /*	$NetBSD: db_trace.c,v 1.15 1996/02/22 23:23:41 gwr Exp $	*/
 
 /*
@@ -136,7 +136,7 @@ db_stack_trace_print(db_expr_t addr, int have_addr, db_expr_t count,
 	vaddr_t		 lr, sp, lastsp, *db_fp_args;
 	db_expr_t	 offset;
 	Elf_Sym		*sym;
-	char		*name;
+	const char	*name;
 	char		 c, *cp = modif;
 	int		 i, narg, trace_proc = 0;
 
@@ -244,13 +244,18 @@ stacktrace_save_at(struct stacktrace *st, unsigned int skip)
 {
 	vaddr_t		 lr, sp, lastsp;
 
-	sp = (vaddr_t)__builtin_frame_address(0);
+	st->st_count = 0;
+
+	/*
+	 * Each function saves its return address in its caller's
+	 * frame.  Start at our caller's frame.
+	 */
+	lr = (vaddr_t)__builtin_return_address(0) - 4;
+	sp = *(vaddr_t *)__builtin_frame_address(0);
 	if (!INKERNEL(sp) && !ININTSTK(sp))
 		return;
 
-	st->st_count = 0;
 	while (st->st_count < STACKTRACE_MAX) {
-		lr = *(vaddr_t *)(sp + 4) - 4;
 		if (lr & 3)
 			break;
 
@@ -266,6 +271,8 @@ stacktrace_save_at(struct stacktrace *st, unsigned int skip)
 			break;
 		if (!INKERNEL(sp) && !ININTSTK(sp))
 			break;
+
+		lr = *(vaddr_t *)(sp + 4) - 4;
 	}
 }
 

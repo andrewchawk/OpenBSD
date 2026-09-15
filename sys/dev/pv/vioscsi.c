@@ -1,4 +1,4 @@
-/*	$OpenBSD: vioscsi.c,v 1.32 2023/05/29 08:13:35 sf Exp $	*/
+/*	$OpenBSD: vioscsi.c,v 1.38 2025/11/23 10:32:47 sf Exp $	*/
 /*
  * Copyright (c) 2013 Google Inc.
  *
@@ -77,7 +77,7 @@ const struct cfattach vioscsi_ca = {
 };
 
 struct cfdriver vioscsi_cd = {
-	NULL, "vioscsi", DV_DULL,
+	NULL, "vioscsi", DV_DULL, CD_COCOVM
 };
 
 const struct scsi_adapter vioscsi_switch = {
@@ -93,9 +93,9 @@ const char *const vioscsi_vq_names[] = {
 int
 vioscsi_match(struct device *parent, void *self, void *aux)
 {
-	struct virtio_softc *va = (struct virtio_softc *)aux;
+	struct virtio_attach_args *va = aux;
 
-	if (va->sc_childdevid == PCI_PRODUCT_VIRTIO_SCSI)
+	if (va->va_devid == PCI_PRODUCT_VIRTIO_SCSI)
 		return (1);
 	return (0);
 }
@@ -105,6 +105,7 @@ vioscsi_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct virtio_softc *vsc = (struct virtio_softc *)parent;
 	struct vioscsi_softc *sc = (struct vioscsi_softc *)self;
+	struct virtio_attach_args *va = aux;
 	struct scsibus_attach_args saa;
 	int i, rv;
 
@@ -120,13 +121,16 @@ vioscsi_attach(struct device *parent, struct device *self, void *aux)
 	vsc->sc_vqs = sc->sc_vqs;
 	vsc->sc_nvqs = nitems(sc->sc_vqs);
 
-	virtio_negotiate_features(vsc, NULL);
+	if (virtio_negotiate_features(vsc, NULL) != 0)
+		goto err;
 	uint32_t cmd_per_lun = virtio_read_device_config_4(vsc,
 	    VIRTIO_SCSI_CONFIG_CMD_PER_LUN);
 	uint32_t seg_max = virtio_read_device_config_4(vsc,
 	    VIRTIO_SCSI_CONFIG_SEG_MAX);
 	uint16_t max_target = virtio_read_device_config_2(vsc,
 	    VIRTIO_SCSI_CONFIG_MAX_TARGET);
+	uint32_t max_lun = virtio_read_device_config_4(vsc,
+	    VIRTIO_SCSI_CONFIG_MAX_LUN);
 
 	if (seg_max < SEG_MAX) {
 		printf("\nMax number of segments %d too small\n", seg_max);
@@ -134,8 +138,8 @@ vioscsi_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	for (i = 0; i < nitems(sc->sc_vqs); i++) {
-		rv = virtio_alloc_vq(vsc, &sc->sc_vqs[i], i, MAXPHYS,
-		    ALLOC_SEGS, vioscsi_vq_names[i]);
+		rv = virtio_alloc_vq(vsc, &sc->sc_vqs[i], i, ALLOC_SEGS,
+		    vioscsi_vq_names[i]);
 		if (rv) {
 			printf(": failed to allocate virtqueue %d\n", i);
 			goto err;
@@ -160,13 +164,14 @@ vioscsi_attach(struct device *parent, struct device *self, void *aux)
 	saa.saa_adapter_softc = sc;
 	saa.saa_adapter_target = SDEV_NO_ADAPTER_TARGET;
 	saa.saa_adapter_buswidth = max_target;
-	saa.saa_luns = 8;
+	saa.saa_luns = MIN(UINT8_MAX, max_lun + 1);
 	saa.saa_openings = (nreqs > cmd_per_lun) ? cmd_per_lun : nreqs;
 	saa.saa_pool = &sc->sc_iopool;
 	saa.saa_quirks = saa.saa_flags = 0;
 	saa.saa_wwpn = saa.saa_wwnn = 0;
 
-	virtio_set_status(vsc, VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK);
+	if (virtio_attach_finish(vsc, va) != 0)
+		goto err;
 	config_found(self, &saa, scsiprint);
 	return;
 
@@ -430,7 +435,7 @@ vioscsi_alloc_reqs(struct vioscsi_softc *sc, struct virtio_softc *vsc,
 
 	allocsize = nreqs * sizeof(struct vioscsi_req);
 	r = bus_dmamem_alloc(vsc->sc_dmat, allocsize, 0, 0,
-	    &sc->sc_reqs_segs[0], 1, &rsegs, BUS_DMA_NOWAIT);
+	    &sc->sc_reqs_segs[0], 1, &rsegs, BUS_DMA_NOWAIT | BUS_DMA_64BIT);
 	if (r != 0) {
 		printf("bus_dmamem_alloc, size %zd, error %d\n",
 		    allocsize, r);
@@ -483,13 +488,15 @@ vioscsi_alloc_reqs(struct vioscsi_softc *sc, struct virtio_softc *vsc,
 		r = bus_dmamap_create(vsc->sc_dmat,
 		    offsetof(struct vioscsi_req, vr_xs), 1,
 		    offsetof(struct vioscsi_req, vr_xs), 0,
-		    BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW, &vr->vr_control);
+		    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
+		    &vr->vr_control);
 		if (r != 0) {
 			printf("bus_dmamap_create vr_control failed, error  %d\n", r);
 			return i;
 		}
-		r = bus_dmamap_create(vsc->sc_dmat, MAXPHYS, SEG_MAX,
-		    MAXPHYS, 0, BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW, &vr->vr_data);
+		r = bus_dmamap_create(vsc->sc_dmat, MAXPHYS, SEG_MAX, MAXPHYS,
+		    0, BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW | BUS_DMA_64BIT,
+		    &vr->vr_data);
 		if (r != 0) {
 			printf("bus_dmamap_create vr_data failed, error %d\n", r );
 			return i;

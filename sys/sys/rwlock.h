@@ -1,4 +1,4 @@
-/*	$OpenBSD: rwlock.h,v 1.28 2021/01/11 18:49:38 mpi Exp $	*/
+/*	$OpenBSD: rwlock.h,v 1.34 2025/07/21 20:36:41 bluhm Exp $	*/
 /*
  * Copyright (c) 2002 Artur Grabowski <art@openbsd.org>
  *
@@ -60,10 +60,13 @@ struct proc;
 
 struct rwlock {
 	volatile unsigned long	 rwl_owner;
+	volatile unsigned int	 rwl_waiters;
+	volatile unsigned int	 rwl_readers;
 	const char		*rwl_name;
 #ifdef WITNESS
 	struct lock_object	 rwl_lock_obj;
 #endif
+	int			 rwl_traceidx;
 };
 
 #define RWLOCK_LO_FLAGS(flags) \
@@ -91,14 +94,16 @@ struct rwlock {
 
 #ifdef WITNESS
 #define RWLOCK_INITIALIZER(name) \
-	{ 0, name, .rwl_lock_obj = RWLOCK_LO_INITIALIZER(name, 0) }
+	{ 0, 0, 0, name, .rwl_lock_obj = RWLOCK_LO_INITIALIZER(name, 0), 0 }
+#define RWLOCK_INITIALIZER_TRACE(name, trace) \
+	{ 0, 0, 0, name, .rwl_lock_obj = RWLOCK_LO_INITIALIZER(name, 0), trace }
 #else
 #define RWLOCK_INITIALIZER(name) \
-	{ 0, name }
+	{ 0, 0, 0, name, 0 }
+#define RWLOCK_INITIALIZER_TRACE(name, trace) \
+	{ 0, 0, 0, name, trace }
 #endif
 
-#define RWLOCK_WAIT		0x01UL
-#define RWLOCK_WRWANT		0x02UL
 #define RWLOCK_WRLOCK		0x04UL
 #define RWLOCK_MASK		0x07UL
 
@@ -110,10 +115,10 @@ struct rwlock {
 #define RW_WRITE		0x0001UL /* exclusive lock */
 #define RW_READ			0x0002UL /* shared lock */
 #define RW_DOWNGRADE		0x0004UL /* downgrade exclusive to shared */
+#define RW_UPGRADE		0x0005UL
 #define RW_OPMASK		0x0007UL
 
 #define RW_INTR			0x0010UL /* interruptible sleep */
-#define RW_SLEEPFAIL		0x0020UL /* fail if we slept for the lock */
 #define RW_NOSLEEP		0x0040UL /* don't wait for the lock */
 #define RW_RECURSEFAIL		0x0080UL /* Fail on recursion for RRW locks. */
 #define RW_DUPOK		0x0100UL /* Permit duplicate lock */
@@ -133,18 +138,24 @@ struct rrwlock {
 #ifdef _KERNEL
 
 void	_rw_init_flags(struct rwlock *, const char *, int,
-	    const struct lock_type *);
+	    const struct lock_type *, int);
 
 #ifdef WITNESS
+#define rw_init_flags_trace(rwl, name, flags, trace) do {		\
+	static const struct lock_type __lock_type = { .lt_name = #rwl };\
+	_rw_init_flags(rwl, name, flags, &__lock_type, trace);		\
+} while (0)
 #define rw_init_flags(rwl, name, flags) do {				\
 	static const struct lock_type __lock_type = { .lt_name = #rwl };\
-	_rw_init_flags(rwl, name, flags, &__lock_type);			\
+	_rw_init_flags(rwl, name, flags, &__lock_type, 0);	\
 } while (0)
-#define rw_init(rwl, name)	rw_init_flags(rwl, name, 0)
+#define rw_init(rwl, name)		rw_init_flags(rwl, name, 0)
 #else /* WITNESS */
+#define rw_init_flags_trace(rwl, name, flags, trace) \
+				_rw_init_flags(rwl, name, flags, NULL, trace)
 #define rw_init_flags(rwl, name, flags) \
-				_rw_init_flags(rwl, name, flags, NULL)
-#define rw_init(rwl, name)	_rw_init_flags(rwl, name, 0, NULL)
+				_rw_init_flags(rwl, name, flags, NULL, 0)
+#define rw_init(rwl, name)	_rw_init_flags(rwl, name, 0, NULL, 0)
 #endif /* WITNESS */
 
 void	rw_enter_read(struct rwlock *);
@@ -230,6 +241,10 @@ void	_rw_obj_alloc_flags(struct rwlock **, const char *, int,
 		struct lock_type *);
 void	rw_obj_hold(struct rwlock *);
 int	rw_obj_free(struct rwlock *);
+
+/* sorted alphabetically, keep in sync with dev/dt/dt_prov_static.c */
+#define DT_RWLOCK_IDX_NETLOCK	1
+#define DT_RWLOCK_IDX_SOLOCK	2
 
 #endif /* _KERNEL */
 

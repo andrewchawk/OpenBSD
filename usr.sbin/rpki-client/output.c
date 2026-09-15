@@ -1,4 +1,4 @@
-/*	$OpenBSD: output.c,v 1.33 2024/02/22 12:49:42 job Exp $ */
+/*	$OpenBSD: output.c,v 1.47 2026/07/15 07:53:06 tb Exp $ */
 /*
  * Copyright (c) 2019 Theo de Raadt <deraadt@openbsd.org>
  *
@@ -62,39 +62,85 @@ static char	 output_name[PATH_MAX];
 
 static const struct outputs {
 	int	 format;
+	int	 always_output;
 	char	*name;
-	int	(*fn)(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
+	int	(*fn)(FILE *, struct validation_data *, struct stats *);
 } outputs[] = {
-	{ FORMAT_OPENBGPD, "openbgpd", output_bgpd },
-	{ FORMAT_BIRD, "bird1v4", output_bird1v4 },
-	{ FORMAT_BIRD, "bird1v6", output_bird1v6 },
-	{ FORMAT_BIRD, "bird", output_bird2 },
-	{ FORMAT_CSV, "csv", output_csv },
-	{ FORMAT_JSON, "json", output_json },
-	{ FORMAT_OMETRIC, "metrics", output_ometric },
-	{ 0, NULL, NULL }
+	{ FORMAT_OPENBGPD, 0, "openbgpd", output_bgpd },
+	{ FORMAT_BIRD, 0, "bird", output_bird },
+	{ FORMAT_CSV, 0, "csv", output_csv },
+	{ FORMAT_JSON, 0, "json", output_json },
+	{ FORMAT_OMETRIC, 1, "metrics", output_ometric },
+	{ FORMAT_CCR, 0, "rpki.ccr", output_ccr_der },
+	{ 0, 0, NULL, NULL }
 };
 
 static FILE	*output_createtmp(char *);
 static void	 output_cleantmp(void);
-static int	 output_finish(FILE *);
+static int	 output_finish(FILE *, time_t);
 static void	 sig_handler(int);
 static void	 set_signal_handler(void);
 
+/*
+ * Detect & reject so-called "AS0 TALs".
+ * AS0 TALs are TALs where for each and every subordinate ROA the asID field
+ * set to 0. Such TALs introduce operational risk, as they change the fail-safe
+ * from 'fail-open' to 'fail-closed'. Some context:
+ *     https://lists.afrinic.net/pipermail/rpd/2021/013312.html
+ *     https://lists.afrinic.net/pipermail/rpd/2021/013314.html
+ */
+static void
+prune_as0_tals(struct vrp_tree *vrps)
+{
+	struct vrp *v, *tv;
+	int talid;
+	int has_vrps[TALSZ_MAX] = { 0 };
+	int is_as0_tal[TALSZ_MAX] = { 0 };
+
+	for (talid = 0; talid < talsz; talid++)
+		is_as0_tal[talid] = 1;
+
+	RB_FOREACH(v, vrp_tree, vrps) {
+		has_vrps[v->talid] = 1;
+		if (v->asid != 0)
+			is_as0_tal[v->talid] = 0;
+	}
+
+	for (talid = 0; talid < talsz; talid++) {
+		if (is_as0_tal[talid] && has_vrps[talid]) {
+			warnx("%s: Detected AS0 TAL, pruning associated VRPs",
+			    taldescs[talid]);
+		}
+	}
+
+	RB_FOREACH_SAFE(v, vrp_tree, vrps, tv) {
+		if (is_as0_tal[v->talid]) {
+			RB_REMOVE(vrp_tree, vrps, v);
+			free(v);
+		}
+	}
+
+	/* XXX: update talstats? */
+}
+
 int
-outputfiles(struct vrp_tree *v, struct brk_tree *b, struct vap_tree *a,
-    struct vsp_tree *p, struct stats *st)
+outputfiles(struct validation_data *vd, struct stats *st, int exit_code)
 {
 	int i, rc = 0;
 
 	atexit(output_cleantmp);
 	set_signal_handler();
 
+	if (excludeas0)
+		prune_as0_tals(&vd->vrps);
+
 	for (i = 0; outputs[i].name; i++) {
 		FILE *fout;
 
 		if (!(outformats & outputs[i].format))
+			continue;
+
+		if (exit_code != 0 && !outputs[i].always_output)
 			continue;
 
 		fout = output_createtmp(outputs[i].name);
@@ -103,14 +149,14 @@ outputfiles(struct vrp_tree *v, struct brk_tree *b, struct vap_tree *a,
 			rc = 1;
 			continue;
 		}
-		if ((*outputs[i].fn)(fout, v, b, a, p, st) != 0) {
+		if ((*outputs[i].fn)(fout, vd, st) != 0) {
 			warn("output for %s format failed", outputs[i].name);
 			fclose(fout);
 			output_cleantmp();
 			rc = 1;
 			continue;
 		}
-		if (output_finish(fout) != 0) {
+		if (output_finish(fout, vd->buildtime) != 0) {
 			warn("finish for %s format failed", outputs[i].name);
 			output_cleantmp();
 			rc = 1;
@@ -145,12 +191,23 @@ output_createtmp(char *name)
 }
 
 static int
-output_finish(FILE *out)
+output_finish(FILE *out, time_t buildtime)
 {
+	struct timespec ts[2];
+
 	if (fclose(out) != 0)
 		return -1;
+
+	ts[0].tv_nsec = UTIME_OMIT;
+	ts[1].tv_sec = buildtime;
+	ts[1].tv_nsec = 0;
+
+	if (utimensat(AT_FDCWD, output_tmpname, ts, 0) == -1)
+		return -1;
+
 	if (rename(output_tmpname, output_name) == -1)
 		return -1;
+
 	output_tmpname[0] = '\0';
 	return 0;
 }
@@ -197,15 +254,13 @@ set_signal_handler(void)
 }
 
 int
-outputheader(FILE *out, struct stats *st)
+outputheader(FILE *out, struct validation_data *vd, struct stats *st)
 {
 	char		hn[NI_MAXHOST], tbuf[80];
 	struct tm	*tp;
-	time_t		t;
 	int		i;
 
-	time(&t);
-	tp = gmtime(&t);
+	tp = gmtime(&vd->buildtime);
 	strftime(tbuf, sizeof tbuf, "%a %b %e %H:%M:%S UTC %Y", tp);
 
 	gethostname(hn, sizeof hn);
@@ -213,14 +268,20 @@ outputheader(FILE *out, struct stats *st)
 	if (fprintf(out,
 	    "# Generated on host %s at %s\n"
 	    "# Processing time %lld seconds (%llds user, %llds system)\n"
+	    "# CCR manifest hash: %s\n"
+	    "# CCR validated ROA payloads hash: %s\n"
+	    "# CCR validated ASPA payloads hash: %s\n"
 	    "# Route Origin Authorizations: %u (%u failed parse, %u invalid)\n"
 	    "# BGPsec Router Certificates: %u\n"
-	    "# Certificates: %u (%u invalid)\n",
-	    hn, tbuf, (long long)st->elapsed_time.tv_sec,
+	    "# Certificates: %u (%u invalid, %u non-functional, %u sync "
+	    "deferred)\n", hn, tbuf, (long long)st->elapsed_time.tv_sec,
 	    (long long)st->user_time.tv_sec, (long long)st->system_time.tv_sec,
+	    vd->ccr.mfts_hash, vd->ccr.vrps_hash, vd->ccr.vaps_hash,
 	    st->repo_tal_stats.roas, st->repo_tal_stats.roas_fail,
 	    st->repo_tal_stats.roas_invalid, st->repo_tal_stats.brks,
-	    st->repo_tal_stats.certs, st->repo_tal_stats.certs_fail) < 0)
+	    st->repo_tal_stats.certs, st->repo_tal_stats.certs_fail,
+	    st->repo_tal_stats.certs_nonfunc,
+	    st->repo_tal_stats.certs_nonfunc_deferred) < 0)
 		return -1;
 
 	if (fprintf(out,
@@ -235,12 +296,10 @@ outputheader(FILE *out, struct stats *st)
 	    " ]\n"
 	    "# Manifests: %u (%u failed parse)\n"
 	    "# Certificate revocation lists: %u\n"
-	    "# Ghostbuster records: %u\n"
 	    "# Repositories: %u\n"
 	    "# VRP Entries: %u (%u unique)\n",
 	    st->repo_tal_stats.mfts, st->repo_tal_stats.mfts_fail,
 	    st->repo_tal_stats.crls,
-	    st->repo_tal_stats.gbrs,
 	    st->repos,
 	    st->repo_tal_stats.vrps, st->repo_tal_stats.vrps_uniqs) < 0)
 		return -1;

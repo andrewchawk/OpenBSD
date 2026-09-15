@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.45 2022/12/15 08:06:13 florian Exp $ */
+/*	$OpenBSD: parse.y,v 1.48 2026/02/23 10:27:49 sthen Exp $ */
 
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -25,12 +25,15 @@
 
 %{
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/queue.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <limits.h>
+#include <netdb.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,11 +104,12 @@ typedef struct {
 %}
 
 %token	AUTHORITY URL API ACCOUNT CONTACT
-%token	DOMAIN ALTERNATIVE NAME NAMES CERT FULL CHAIN KEY SIGN WITH CHALLENGEDIR
-%token	YES NO
+%token	DOMAIN ALTERNATIVE NAME NAMES CERT FULL CHAIN KEY SIGN WITH
+%token	CHALLENGEDIR PROFILE
 %token	INCLUDE
 %token	ERROR
 %token	RSA ECDSA
+%token	INSECURE
 %token	<v.string>	STRING
 %token	<v.number>	NUMBER
 %type	<v.string>	string
@@ -219,7 +223,7 @@ authorityoptsl	: API URL STRING {
 				err(EXIT_FAILURE, "strdup");
 			auth->api = s;
 		}
-		| ACCOUNT KEY STRING keytype{
+		| ACCOUNT KEY STRING keytype {
 			char *s;
 			if (auth->account != NULL) {
 				yyerror("duplicate account");
@@ -240,13 +244,16 @@ authorityoptsl	: API URL STRING {
 				err(EXIT_FAILURE, "strdup");
 			auth->contact = s;
 		}
+		| INSECURE {
+			auth->insecure = 1;
+		}
 		;
 
 domain		: DOMAIN STRING {
 			char *s;
 			if ((s = strdup($2)) == NULL)
 				err(EXIT_FAILURE, "strdup");
-			if (!domain_valid(s)) {
+			if (!ip_valid(s) && !domain_valid(s)) {
 				yyerror("%s: bad domain syntax", s);
 				free(s);
 				YYERROR;
@@ -257,10 +264,21 @@ domain		: DOMAIN STRING {
 				YYERROR;
 			}
 		} '{' optnl domainopts_l '}' {
+			char		*s;
+			const char	*ip;
+
 			if (domain->domain == NULL) {
-				if ((domain->domain = strdup(domain->handle))
-				    == NULL)
-					err(EXIT_FAILURE, "strdup");
+				if ((ip = ip_valid(domain->handle)) != NULL) {
+					domain->idtype = ID_IP;
+					if ((s = strdup(ip)) == NULL)
+						err(EXIT_FAILURE, "strdup");
+				} else {
+					if ((s = strdup(domain->handle)) ==
+					    NULL)
+						err(EXIT_FAILURE, "strdup");
+					domain->idtype = ID_DNS;
+				}
+				domain->domain = s;
 			}
 			/* enforce minimum config here */
 			if (domain->key == NULL) {
@@ -289,13 +307,27 @@ domainopts_l	: domainopts_l domainoptsl nl
 
 domainoptsl	: ALTERNATIVE NAMES '{' optnl altname_l '}'
 		| DOMAIN NAME STRING {
-			char *s;
+			char		*s;
+			const char	*ip;
+
 			if (domain->domain != NULL) {
 				yyerror("duplicate domain name");
 				YYERROR;
 			}
-			if ((s = strdup($3)) == NULL)
-				err(EXIT_FAILURE, "strdup");
+
+			if ((ip = ip_valid($3)) != NULL) {
+				domain->idtype = ID_IP;
+				if ((s = strdup(ip)) == NULL)
+					err(EXIT_FAILURE, "strdup");
+			} else {
+				if (!domain_valid($3)) {
+					yyerror("bad domain name syntax");
+					YYERROR;
+				}
+				domain->idtype = ID_DNS;
+				if ((s = strdup($3)) == NULL)
+					err(EXIT_FAILURE, "strdup");
+			}
 			domain->domain = s;
 		}
 		| DOMAIN KEY STRING keytype {
@@ -393,6 +425,16 @@ domainoptsl	: ALTERNATIVE NAMES '{' optnl altname_l '}'
 				err(EXIT_FAILURE, "strdup");
 			domain->challengedir = s;
 		}
+		| PROFILE STRING {
+			char *s;
+			if (domain->profile != NULL) {
+				yyerror("duplicate profile");
+				YYERROR;
+			}
+			if ((s = strdup($2)) == NULL)
+				err(EXIT_FAILURE, "strdup");
+			domain->profile = s;
+		}
 		;
 
 altname_l	: altname optcommanl altname_l
@@ -401,17 +443,26 @@ altname_l	: altname optcommanl altname_l
 
 altname		: STRING {
 			char			*s;
+			const char		*ip;
 			struct altname_c	*ac;
-			if (!domain_valid($1)) {
-				yyerror("bad domain syntax");
-				YYERROR;
-			}
+
 			if ((ac = calloc(1, sizeof(struct altname_c))) == NULL)
 				err(EXIT_FAILURE, "calloc");
-			if ((s = strdup($1)) == NULL) {
-				free(ac);
-				err(EXIT_FAILURE, "strdup");
+
+			if ((ip = ip_valid($1)) != NULL) {
+				ac->idtype = ID_IP;
+				if ((s = strdup(ip)) == NULL)
+					err(EXIT_FAILURE, "strdup");
+			} else {
+				if (!domain_valid($1)) {
+					yyerror("bad domain name syntax");
+					YYERROR;
+				}
+				ac->idtype = ID_DNS;
+				if ((s = strdup($1)) == NULL)
+					err(EXIT_FAILURE, "strdup");
 			}
+
 			ac->domain = s;
 			TAILQ_INSERT_TAIL(&domain->altname_list, ac, entry);
 			domain->altname_count++;
@@ -467,9 +518,11 @@ lookup(char *s)
 		{"ecdsa",		ECDSA},
 		{"full",		FULL},
 		{"include",		INCLUDE},
+		{"insecure",		INSECURE},
 		{"key",			KEY},
 		{"name",		NAME},
 		{"names",		NAMES},
+		{"profile",		PROFILE},
 		{"rsa",			RSA},
 		{"sign",		SIGN},
 		{"url",			URL},
@@ -1054,6 +1107,8 @@ print_config(struct acme_conf *xconf)
 		if (a->account != NULL)
 			printf("\taccount key \"%s\" %s\n", a->account,
 			    kt2txt(a->keytype));
+		if (a->insecure)
+			printf("\tinsecure\n");
 		printf("}\n\n");
 	}
 	TAILQ_FOREACH(d, &xconf->domain_list, entry) {
@@ -1081,6 +1136,8 @@ print_config(struct acme_conf *xconf)
 		if (d->fullchain != NULL)
 			printf("\tdomain full chain certificate \"%s\"\n",
 			    d->fullchain);
+		if (d->profile != NULL)
+			printf("\tprofile \"%s\"\n", d->profile);
 		if (d->auth != NULL)
 			printf("\tsign with \"%s\"\n", d->auth);
 		if (d->challengedir != NULL)
@@ -1105,6 +1162,31 @@ domain_valid(const char *cp)
 			return 0;
 	return 1;
 }
+
+const char *
+ip_valid(const char *ip)
+{
+	static char	 ip_buf[NI_MAXHOST];
+	struct addrinfo	 hints, *res;
+	int		 error;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_flags = AI_NUMERICHOST;
+
+	error = getaddrinfo(ip, NULL, &hints, &res);
+	if (error)
+		return NULL;
+
+	error = getnameinfo(res->ai_addr, res->ai_addrlen, ip_buf,
+	    sizeof(ip_buf), NULL, 0, NI_NUMERICHOST);
+
+	if (error)
+		return NULL;
+
+	return ip_buf;
+}
+
 
 int
 conf_check_file(char *s)

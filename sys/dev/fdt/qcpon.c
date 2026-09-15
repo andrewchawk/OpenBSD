@@ -1,4 +1,4 @@
-/*	$OpenBSD: qcpon.c,v 1.4 2023/04/24 14:34:13 patrick Exp $	*/
+/*	$OpenBSD: qcpon.c,v 1.7 2025/06/16 20:21:33 kettenis Exp $	*/
 /*
  * Copyright (c) 2022 Patrick Wildt <patrick@blueri.se>
  *
@@ -28,9 +28,11 @@
 #include <dev/fdt/spmivar.h>
 
 #include <dev/ofw/openfirm.h>
-#include <dev/ofw/ofw_clock.h>
-#include <dev/ofw/ofw_power.h>
 #include <dev/ofw/fdt.h>
+
+/* Registers. */
+#define PON_RT_STS		0x10
+#define  PON_PMK8350_KPDPWR_N_SET	(1U << 7)
 
 struct qcpon_softc {
 	struct device		sc_dev;
@@ -38,17 +40,16 @@ struct qcpon_softc {
 
 	spmi_tag_t		sc_tag;
 	int8_t			sc_sid;
+	uint16_t		sc_addr;
 
 	void			*sc_pwrkey_ih;
-	int			sc_pwrkey_debounce;
-	struct task		sc_powerdown_task;
+	uint32_t		sc_last_sts;
 };
 
 int	qcpon_match(struct device *, void *, void *);
 void	qcpon_attach(struct device *, struct device *, void *);
 
 int	qcpon_pwrkey_intr(void *);
-void	qcpon_powerdown_task(void *);
 
 const struct cfattach qcpon_ca = {
 	sizeof(struct qcpon_softc), qcpon_match, qcpon_attach
@@ -72,13 +73,19 @@ qcpon_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct spmi_attach_args *saa = aux;
 	struct qcpon_softc *sc = (struct qcpon_softc *)self;
+	uint32_t reg[2];
 	int node;
+
+	if (OF_getpropintarray(saa->sa_node, "reg",
+	    reg, sizeof(reg)) != sizeof(reg)) {
+		printf(": can't find registers\n");
+		return;
+	}
 
 	sc->sc_node = saa->sa_node;
 	sc->sc_tag = saa->sa_tag;
 	sc->sc_sid = saa->sa_sid;
-
-	task_set(&sc->sc_powerdown_task, qcpon_powerdown_task, sc);
+	sc->sc_addr = reg[0];
 
 	printf("\n");
 
@@ -106,29 +113,26 @@ qcpon_pwrkey_intr(void *arg)
 #ifdef SUSPEND
 	extern int cpu_suspended;
 #endif
-
-	/* Ignore presses, handle releases. */
-	sc->sc_pwrkey_debounce = (sc->sc_pwrkey_debounce + 1) % 2;
-	if (sc->sc_pwrkey_debounce == 1)
-		return 1;
+	uint32_t sts;
+	int error;
 
 #ifdef SUSPEND
-	if (cpu_suspended)
+	if (cpu_suspended) {
 		cpu_suspended = 0;
-	else
-#endif
-		task_add(systq, &sc->sc_powerdown_task);
-
-	return 1;
-}
-
-void
-qcpon_powerdown_task(void *arg)
-{
-	extern int allowpowerdown;
-
-	if (allowpowerdown == 1) {
-		allowpowerdown = 0;
-		prsignal(initprocess, SIGUSR2);
+		return 1;
 	}
+#endif
+
+	error = spmi_cmd_read(sc->sc_tag, sc->sc_sid, SPMI_CMD_EXT_READL,
+	    sc->sc_addr + PON_RT_STS, &sts, sizeof(sts));
+	if (error)
+		return 0;
+
+	/* Ignore presses, handle releases. */
+	if ((sc->sc_last_sts & PON_PMK8350_KPDPWR_N_SET) &&
+	    (sts & PON_PMK8350_KPDPWR_N_SET) == 0)
+		powerbutton_event();
+
+	sc->sc_last_sts = sts;
+	return 1;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: lka.c,v 1.250 2024/06/11 16:30:06 tb Exp $	*/
+/*	$OpenBSD: lka.c,v 1.252 2026/05/26 22:49:18 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
 
 #include "smtpd.h"
 #include "log.h"
@@ -56,7 +57,8 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	struct msg		 m;
 	union lookup		 lk;
 	char			 buf[LINE_MAX];
-	const char		*tablename, *username, *password, *label, *procname;
+	const char		*tablename, *username, *password, *label;
+	const char		*procname, *tag;
 	uint64_t		 reqid;
 	int			 v;
 	struct timeval		 tv;
@@ -81,6 +83,8 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	size_t			 msgsz;
 	int			 ok;
 	int			 fcrdns;
+
+	memset(&userinfo, 0, sizeof userinfo);
 
 	if (imsg == NULL)
 		lka_shutdown();
@@ -344,6 +348,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	case IMSG_LKA_PROCESSOR_FORK:
 		m_msg(&m, imsg);
 		m_get_string(&m, &procname);
+		m_get_string(&m, &tag);
 		m_get_u32(&m, &subsystems);
 		m_end(&m);
 
@@ -351,7 +356,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 		m_add_string(p, procname);
 		m_close(p);
 
-		lka_proc_forked(procname, subsystems, imsg_get_fd(imsg));
+		lka_proc_forked(procname, tag, subsystems, imsg_get_fd(imsg));
 		return;
 
 	case IMSG_LKA_PROCESSOR_ERRFD:

@@ -1,4 +1,4 @@
-/*	$OpenBSD: radiusd_radius.c,v 1.21 2024/07/01 03:17:00 yasuoka Exp $	*/
+/*	$OpenBSD: radiusd_radius.c,v 1.23 2025/08/19 08:12:57 yasuoka Exp $	*/
 
 /*
  * Copyright (c) 2013 Internet Initiative Japan Inc.
@@ -139,6 +139,7 @@ main(int argc, char *argv[])
 	event_loop(0);
 
 	module_destroy(module_radius.base);
+	event_base_free(NULL);
 
 	exit(EXIT_SUCCESS);
 }
@@ -148,6 +149,7 @@ module_radius_init(struct module_radius *module)
 {
 	memset(module, 0, sizeof(struct module_radius));
 	TAILQ_INIT(&module->req);
+	module->max_tries = 3;
 }
 
 static void

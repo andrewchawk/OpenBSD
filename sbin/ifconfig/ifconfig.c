@@ -1,4 +1,4 @@
-/*	$OpenBSD: ifconfig.c,v 1.474 2024/06/29 12:09:51 jsg Exp $	*/
+/*	$OpenBSD: ifconfig.c,v 1.482 2026/07/13 01:08:59 dlg Exp $	*/
 /*	$NetBSD: ifconfig.c,v 1.40 1997/10/01 02:19:43 enami Exp $	*/
 
 /*
@@ -83,7 +83,6 @@
 #include <net/if_pppoe.h>
 #include <net/if_trunk.h>
 #include <net/if_wg.h>
-#include <net/trunklacp.h>
 #include <net/if_sppp.h>
 #include <net/ppp_defs.h>
 
@@ -562,6 +561,10 @@ const struct	cmd {
 	{ "-blocknonip",NEXTARG,	0,		unsetblocknonip },
 	{ "learn",	NEXTARG,	0,		setlearn },
 	{ "-learn",	NEXTARG,	0,		unsetlearn },
+	{ "locked",	NEXTARG,	0,		setlocked },
+	{ "-locked",	NEXTARG,	0,		unsetlocked },
+	{ "pvptags",	NEXTARG,	0,		setpvptags },
+	{ "-pvptags",	NEXTARG,	0,		unsetpvptags },
 	{ "stp",	NEXTARG,	0,		setstp },
 	{ "-stp",	NEXTARG,	0,		unsetstp },
 	{ "edge",	NEXTARG,	0,		setedge },
@@ -570,6 +573,20 @@ const struct	cmd {
 	{ "-autoedge",	NEXTARG,	0,		unsetautoedge },
 	{ "protected",	NEXTARG2,	0,		NULL, bridge_protect },
 	{ "-protected",	NEXTARG,	0,		bridge_unprotect },
+	{ "untagged",	NEXTARG2,	0,		NULL, bridge_pvid },
+	{ "-untagged",	NEXTARG,	0,		bridge_unpvid },
+	{ "tagged",	NEXTARG2,	0,		NULL, bridge_set_vidmap },
+	{ "-tagged",	NEXTARG,	0,		bridge_unset_vidmap },
+	{ "pvlan",	NEXTARG,	0,		bridge_pvlan_primary },
+	{ "-pvlan",	NEXTARG,	0,		bridge_unpvlan_primary },
+	{ "pvlan-isolated",
+			NEXTARG2,	0,		NULL, bridge_pvlan_isolated },
+	{ "-pvlan-isolated",
+			NEXTARG2,	0,		NULL, bridge_unpvlan_isolated },
+	{ "pvlan-community",
+			NEXTARG2,	0,		NULL, bridge_pvlan_community },
+	{ "-pvlan-community",
+			NEXTARG2,	0,		NULL, bridge_unpvlan_community },
 	{ "ptp",	NEXTARG,	0,		setptp },
 	{ "-ptp",	NEXTARG,	0,		unsetptp },
 	{ "autoptp",	NEXTARG,	0,		setautoptp },
@@ -578,9 +595,11 @@ const struct	cmd {
 	{ "flushall",	0,		0,		bridge_flushall },
 	{ "static",	NEXTARG2,	0,		NULL, bridge_addaddr },
 	{ "endpoint",	NEXTARG2,	0,		NULL, bridge_addendpoint },
+	{ "-endpoint",	NEXTARG,	0,		bridge_delendpoint },
 	{ "deladdr",	NEXTARG,	0,		bridge_deladdr },
 	{ "maxaddr",	NEXTARG,	0,		bridge_maxaddr },
 	{ "addr",	0,		0,		bridge_addrs },
+	{ "vaddr",	0,		0,		bridge_vaddrs },
 	{ "hellotime",	NEXTARG,	0,		bridge_hellotime },
 	{ "fwddelay",	NEXTARG,	0,		bridge_fwddelay },
 	{ "maxage",	NEXTARG,	0,		bridge_maxage },
@@ -624,7 +643,7 @@ const struct	cmd {
 	{ "wgpeer",	NEXTARG,	A_WIREGUARD,	setwgpeer},
 	{ "wgdescription", NEXTARG,	A_WIREGUARD,	setwgpeerdesc},
 	{ "wgdescr",	NEXTARG,	A_WIREGUARD,	setwgpeerdesc},
-	{ "wgendpoint",	NEXTARG2,	A_WIREGUARD,	NULL,	setwgpeerep},
+	{ "wgendpoint",	NEXTARG2,	A_WIREGUARD,	NULL, setwgpeerep},
 	{ "wgaip",	NEXTARG,	A_WIREGUARD,	setwgpeeraip},
 	{ "wgpsk",	NEXTARG,	A_WIREGUARD,	setwgpeerpsk},
 	{ "wgpka",	NEXTARG,	A_WIREGUARD,	setwgpeerpka},
@@ -726,6 +745,7 @@ void	ieee80211_listnodes(void);
 void	ieee80211_printnode(struct ieee80211_nodereq *);
 u_int	getwpacipher(const char *);
 void	print_cipherset(u_int32_t);
+void	print_rsnprotocol(u_int, u_int);
 
 void	spppauthinfo(struct sauthreq *, int);
 void	spppdnsinfo(struct sdnsreq *);
@@ -2097,6 +2117,8 @@ setifwpaakms(const char *val, int d)
 	while (str != NULL) {
 		if (strcasecmp(str, "psk") == 0)
 			rval |= IEEE80211_WPA_AKM_PSK;
+		else if (strcasecmp(str, "sha256-psk") == 0)
+			rval |= IEEE80211_WPA_AKM_SHA256_PSK;
 		else if (strcasecmp(str, "802.1x") == 0)
 			rval |= IEEE80211_WPA_AKM_8021X;
 		else
@@ -2397,6 +2419,22 @@ print_cipherset(u_int32_t cipherset)
 	}
 }
 
+void
+print_rsnprotocol(u_int proto, u_int akm)
+{
+	if (proto & IEEE80211_WPA_PROTO_WPA2) {
+		if (akm & IEEE80211_WPA_AKM_SAE) {
+			if (akm == IEEE80211_WPA_AKM_SAE)
+				fputs(",wpa3", stdout);
+			else
+				fputs(",wpa3,wpa2", stdout);
+		} else
+			fputs(",wpa2", stdout);
+	}
+	if (proto & IEEE80211_WPA_PROTO_WPA1)
+		fputs(",wpa1", stdout);
+}
+
 static void
 print_assoc_failures(uint32_t assoc_fail)
 {
@@ -2526,6 +2564,10 @@ ieee80211_status(void)
 			fputs("psk", stdout);
 			sep = ",";
 		}
+		if (wpa.i_akms & IEEE80211_WPA_AKM_SHA256_PSK) {
+			printf("%ssha256-psk", sep);
+			sep = ",";
+		}
 		if (wpa.i_akms & IEEE80211_WPA_AKM_8021X)
 			printf("%s802.1x", sep);
 
@@ -2639,6 +2681,11 @@ join_status(void)
 				printf(" wpaakms "); sep = "";
 				if (wpa->i_akms & IEEE80211_WPA_AKM_PSK) {
 					printf("psk");
+					sep = ",";
+				}
+				if (wpa->i_akms &
+				    IEEE80211_WPA_AKM_SHA256_PSK) {
+					printf("%ssha256-psk", sep);
 					sep = ",";
 				}
 				if (wpa->i_akms & IEEE80211_WPA_AKM_8021X)
@@ -2802,12 +2849,10 @@ ieee80211_printnode(struct ieee80211_nodereq *nr)
 	if (nr->nr_capinfo) {
 		printb_status(nr->nr_capinfo, IEEE80211_CAPINFO_BITS);
 		if (nr->nr_capinfo & IEEE80211_CAPINFO_PRIVACY) {
-			if (nr->nr_rsnprotos) {
-				if (nr->nr_rsnprotos & IEEE80211_WPA_PROTO_WPA2)
-					fputs(",wpa2", stdout);
-				if (nr->nr_rsnprotos & IEEE80211_WPA_PROTO_WPA1)
-					fputs(",wpa1", stdout);
-			} else
+			if (nr->nr_rsnprotos)
+				print_rsnprotocol(nr->nr_rsnprotos,
+				    nr->nr_rsnakms);
+			else
 				fputs(",wep", stdout);
 
 			if (nr->nr_rsnakms & IEEE80211_WPA_AKM_8021X ||

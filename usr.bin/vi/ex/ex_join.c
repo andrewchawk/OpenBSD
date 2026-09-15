@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_join.c,v 1.8 2016/01/06 22:28:52 millert Exp $	*/
+/*	$OpenBSD: ex_join.c,v 1.9 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -65,7 +65,7 @@ ex_join(SCR *sp, EXCMD *cmdp)
 		++cmdp->addr2.lno;
 
 	clen = tlen = 0;
-        for (first = 1,
+	for (first = 1,
 	    from = cmdp->addr1.lno, to = cmdp->addr2.lno; from <= to; ++from) {
 		/*
 		 * Get next line.  Historic versions of vi allowed "10J" while
@@ -157,7 +157,7 @@ ex_join(SCR *sp, EXCMD *cmdp)
 	sp->lno = cmdp->addr1.lno;
 
 	/* Delete the joined lines. */
-        for (from = cmdp->addr1.lno, to = cmdp->addr2.lno; to > from; --to)
+	for (from = cmdp->addr1.lno, to = cmdp->addr2.lno; to > from; --to)
 		if (db_delete(sp, to))
 			goto err;
 

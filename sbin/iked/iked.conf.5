@@ -1,4 +1,4 @@
-.\" $OpenBSD: iked.conf.5,v 1.98 2024/07/13 12:58:51 jmc Exp $
+.\" $OpenBSD: iked.conf.5,v 1.103 2026/01/18 16:38:01 schwarze Exp $
 .\"
 .\" Copyright (c) 2010 - 2014 Reyk Floeter <reyk@openbsd.org>
 .\" Copyright (c) 2004 Mathieu Sauve-Frankel  All rights reserved.
@@ -15,7 +15,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: July 13 2024 $
+.Dd $Mdocdate: January 18 2026 $
 .Dt IKED.CONF 5
 .Os
 .Sh NAME
@@ -46,7 +46,7 @@ by specifying
 policies in
 .Nm
 (see
-.Sx AUTOMATIC KEYING POLICIES ,
+.Sx Automatic keying policies ,
 below).
 .Pp
 Alternative methods of setting up flows and SAs are also possible
@@ -63,13 +63,13 @@ for more information about manual keying and ISAKMP support.
 .Nm
 is divided into three main sections:
 .Bl -tag -width xxxx
-.It Sy Macros
-User-defined macros may be defined and used later, simplifying the
+.It Sx Macros
+Definitions of variables that can be used later, simplifying the
 configuration file.
-.It Sy Global Configuration
+.It Sx Global configuration
 Global settings for
 .Xr iked 8 .
-.It Sy Automatic Keying Policies
+.It Sx Automatic keying policies
 Policies to set up IPsec flows and SAs automatically.
 .El
 .Pp
@@ -81,7 +81,7 @@ Lines may be split using the
 .Sq \e
 character.
 .Pp
-Argument names not beginning with a letter, digit, or underscore
+Arguments not beginning with a letter, digit, or underscore
 must be quoted.
 .Pp
 Addresses can be specified in CIDR notation (matching netblocks),
@@ -103,22 +103,28 @@ ikev2 esp proto { tcp, udp } \e
 	from 192.168.1.1 to 10.0.0.18 \e
 	peer 192.168.10.1
 .Ed
-.Sh MACROS
-Macros can be defined that will later be expanded in context.
-Macro names must start with a letter, digit, or underscore,
-and may contain any of those characters.
-Macro names may not be reserved words (for example
+.Ss Macros
+A macro is defined with a command of the form
+.Ar name Ns = Ns Ar value .
+The macro
+.Ar name
+can contain letters, digits, and underscores and cannot be a reserved word
+(for example,
 .Ic flow ,
 .Ic from ,
+or
 .Ic esp ) .
-Macros are not expanded inside quotes.
+Within unquoted arguments, the string
+.Pf $ Ar name
+is later expanded to
+.Ar value .
 .Pp
 For example:
 .Bd -literal -offset indent
 remote_gw = "192.168.3.12"
 ikev2 esp from 192.168.7.0/24 to 192.168.8.0/24 peer $remote_gw
 .Ed
-.Sh GLOBAL CONFIGURATION
+.Ss Global configuration
 Here are the settings that can be set globally:
 .Bl -tag -width xxxx
 .It Ic set active
@@ -239,7 +245,7 @@ The password has to be specified in plain text which is
 required to support different challenge-based EAP methods like
 EAP-MD5 or EAP-MSCHAPv2.
 .El
-.Sh AUTOMATIC KEYING POLICIES
+.Ss Automatic keying policies
 This section is used to configure policies that will be used by
 .Xr iked 8
 to set up flows and SAs automatically.
@@ -347,6 +353,10 @@ and
 .Ar transport ;
 the default is
 .Ar tunnel .
+.Pp
+.It Op Ar natt
+.Ar natt
+forces negotiation of NAT-Traversal after the initial handshake.
 .Pp
 .It Op Ar encap
 .Ar encap
@@ -658,7 +668,7 @@ The responder will use RSA public key authentication.
 To use RADIUS for EAP,
 at least one RADIUS server should be configured.
 See the
-.Sx RADIUS
+.Sx RADIUS CONFIGURATION
 section for RADIUS support.
 .It Ic ecdsa256
 Use ECDSA with a 256-bit elliptic curve key and SHA2-256 for authentication.
@@ -808,7 +818,7 @@ for the address family of the IKE CP option.
 .It Ar option
 Specify an IKE CP option.
 Choose from
-.Sx AUTOMATIC KEYING POLICIES
+.Sx Automatic keying policies
 config options
 .Po
 .Cm address ,
@@ -1142,7 +1152,6 @@ keyword:
 .It Li ecp256 Ta grp19 Ta 256 Ta "ECP" Ta "x"
 .It Li ecp384 Ta grp20 Ta 384 Ta "ECP" Ta "x"
 .It Li ecp521 Ta grp21 Ta 521 Ta "ECP" Ta "x"
-.It Li ecp192 Ta grp25 Ta 192 Ta "ECP" Ta ""
 .It Li ecp224 Ta grp26 Ta 224 Ta "ECP" Ta ""
 .It Li brainpool224 Ta grp27 Ta 224 Ta "ECP" Ta ""
 .It Li brainpool256 Ta grp28 Ta 256 Ta "ECP" Ta ""

@@ -1,4 +1,4 @@
-/* $OpenBSD: subr_suspend.c,v 1.18 2024/05/28 09:40:40 kettenis Exp $ */
+/* $OpenBSD: subr_suspend.c,v 1.23 2026/09/07 21:30:59 kettenis Exp $ */
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  * Copyright (c) 2005 Jordan Hargrave <jordan@openbsd.org>
@@ -39,6 +39,12 @@
 /* Number of (active) wakeup devices in the system. */
 u_int wakeup_devices;
 
+/* Uptime of last resume. */
+time_t resume_time;
+
+/* Current sleep mode. */
+int sleep_mode;
+
 void
 device_register_wakeup(struct device *dev)
 {
@@ -46,7 +52,7 @@ device_register_wakeup(struct device *dev)
 }
 
 int
-sleep_state(void *v, int sleepmode)
+sleep_state(void *v, int mode)
 {
 	int error, s;
 	extern int perflevel;
@@ -64,18 +70,20 @@ top:
 	rndbuf = NULL;
 	rndbuflen = 0;
 
-	if (sleepmode == SLEEP_SUSPEND && wakeup_devices == 0)
+	if (mode == SLEEP_SUSPEND && wakeup_devices == 0)
 		return EOPNOTSUPP;
 
-	if (sleep_showstate(v, sleepmode))
+	if (sleep_showstate(v, mode))
 		return EOPNOTSUPP;
+	sleep_mode = mode;
+
 #if NWSDISPLAY > 0
 	wsdisplay_suspend();
 #endif
 	stop_periodic_resettodr();
 
 #ifdef HIBERNATE
-	if (sleepmode == SLEEP_HIBERNATE) {
+	if (sleep_mode == SLEEP_HIBERNATE) {
 		/*
 		 * Discard useless memory to reduce fragmentation,
 		 * and attempt to create a hibernate work area
@@ -114,7 +122,7 @@ top:
 #endif
 
 #ifdef HIBERNATE
-	if (sleepmode == SLEEP_HIBERNATE) {
+	if (sleep_mode == SLEEP_HIBERNATE) {
 		/*
 		 * We've just done various forms of syncing to disk
 		 * churned lots of memory dirty.  We don't need to
@@ -142,7 +150,7 @@ top:
 		goto fail_pts;
 	}
 
-	if (sleepmode == SLEEP_SUSPEND) {
+	if (sleep_mode == SLEEP_SUSPEND) {
 		/*
 		 * XXX
 		 * Flag to disk drivers that they should "power down" the disk
@@ -159,7 +167,7 @@ top:
 	error = gosleep(v);
 
 #ifdef HIBERNATE
-	if (sleepmode == SLEEP_HIBERNATE) {
+	if (sleep_mode == SLEEP_HIBERNATE) {
 		uvm_pmr_dirty_everything();
 		hib_getentropy(&rndbuf, &rndbuflen);
 	}
@@ -177,6 +185,8 @@ fail_suspend:
 	inittodr(gettime());
 	clockintr_cpu_init(NULL);
 	clockintr_trigger();
+
+	resume_time = getuptime();
 
 	sleep_resume(v);
 	resume_randomness(rndbuf, rndbuflen);
@@ -197,7 +207,7 @@ fail_quiesce:
 	sensor_restart();
 
 #ifdef HIBERNATE
-	if (sleepmode == SLEEP_HIBERNATE) {
+	if (sleep_mode == SLEEP_HIBERNATE) {
 		hibernate_free();
 fail_hiballoc:
 		hibernate_resume_bufcache();
@@ -211,7 +221,15 @@ fail_hiballoc:
 	sys_sync(curproc, NULL, NULL);
 	if (cpu_setperf != NULL)
 		cpu_setperf(perflevel);	/* Restore hw.setperf */
-	if (suspend_finish(v) == EAGAIN)
+	sleep_mode = suspend_finish(v);
+	if (sleep_mode != SLEEP_RESUME)
 		goto top;
+	resume_time = getuptime();
 	return (error);
+}
+
+int
+resuming(void)
+{
+	return (getuptime() < resume_time + 10);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: intrdefs.h,v 1.18 2020/09/13 11:53:16 jsg Exp $	*/
+/*	$OpenBSD: intrdefs.h,v 1.20 2025/06/11 09:57:01 kettenis Exp $	*/
 /*	$NetBSD: intrdefs.h,v 1.2 2003/05/04 22:01:56 fvdl Exp $	*/
 
 #ifndef _I386_INTRDEFS_H
@@ -72,6 +72,7 @@
 
 #define	IPL_MPFLOOR	IPL_TTY
 #define	IPL_MPSAFE	0x100
+#define	IPL_WAKEUP	0
 
 /* Interrupt sharing types. */
 #define	IST_NONE	0	/* none */
@@ -119,11 +120,6 @@
 #define I386_IPI_WBINVD		0x00000100
 
 #define I386_NIPI	9
-
-#define I386_IPI_NAMES { "halt IPI", "nop IPI", "FPU flush IPI", \
-			 "FPU synch IPI", \
-			 "MTRR update IPI", "GDT update IPI", \
-			 "DDB IPI", "setperf IPI", "wbinvd IPI" }
 
 #define IREENT_MAGIC	0x18041969
 

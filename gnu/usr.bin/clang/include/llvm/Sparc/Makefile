@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.5 2021/04/28 12:55:38 patrick Exp $
+# $OpenBSD: Makefile,v 1.7 2026/05/29 11:18:30 robert Exp $
 
 .include <bsd.own.mk>
 
@@ -12,6 +12,8 @@ HDRS=	SparcGenAsmMatcher.inc \
 	SparcGenInstrInfo.inc \
 	SparcGenMCCodeEmitter.inc \
 	SparcGenRegisterInfo.inc \
+	SparcGenSDNodeInfo.inc \
+	SparcGenSearchableTables.inc \
 	SparcGenSubtargetInfo.inc
 
 all: ${HDRS}
@@ -59,6 +61,17 @@ SparcGenMCCodeEmitter.inc: ${LLVM_SRCS}/lib/Target/Sparc/Sparc.td
 
 SparcGenRegisterInfo.inc: ${LLVM_SRCS}/lib/Target/Sparc/Sparc.td
 	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-register-info \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/Sparc \
+		-o ${.TARGET} ${.ALLSRC}
+
+SparcGenSDNodeInfo.inc: ${LLVM_SRCS}/lib/Target/Sparc/Sparc.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-sd-node-info \
+			-sdnode-namespace=SPISD \
+		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/Sparc \
+		-o ${.TARGET} ${.ALLSRC}
+
+SparcGenSearchableTables.inc: ${LLVM_SRCS}/lib/Target/Sparc/Sparc.td
+	${.OBJDIR}/../../../llvm-tblgen/llvm-tblgen -gen-searchable-tables \
 		-I${LLVM_SRCS}/include -I${LLVM_SRCS}/lib/Target/Sparc \
 		-o ${.TARGET} ${.ALLSRC}
 

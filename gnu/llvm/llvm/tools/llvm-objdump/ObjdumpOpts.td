@@ -65,7 +65,11 @@ def : Flag<["-"], "D">, Alias<disassemble_all>,
 
 def symbol_description : Flag<["--"], "symbol-description">,
   HelpText<"Add symbol description for disassembly. This "
-           "option is for XCOFF files only.">;
+           "option is for XCOFF files only">;
+
+def traceback_table : Flag<["--"], "traceback-table">,
+  HelpText<"Decode traceback table in disassembly. Implies --disassemble. "
+           "This option is for XCOFF files only">;
 
 def disassemble_symbols_EQ : Joined<["--"], "disassemble-symbols=">,
   HelpText<"List of symbols to disassemble. "
@@ -82,6 +86,11 @@ def disassembler_options_EQ : Joined<["--"], "disassembler-options=">,
   HelpText<"Pass target specific disassembler options">;
 def : JoinedOrSeparate<["-"], "M">, Alias<disassembler_options_EQ>,
   HelpText<"Alias for --disassembler-options=">;
+
+def disassembler_color_EQ : Joined<["--"], "disassembler-color=">,
+  MetaVarName<"mode">,
+  HelpText<"Enable or disable disassembler color output. "
+           "Valid options are \"on\", \"off\" and \"terminal\" (default)">;
 
 def dynamic_reloc : Flag<["--"], "dynamic-reloc">,
   HelpText<"Display the dynamic relocation entries in the file">;
@@ -127,6 +136,9 @@ def mcpu_EQ : Joined<["--"], "mcpu=">,
 def mattr_EQ : Joined<["--"], "mattr=">,
   MetaVarName<"a1,+a2,-a3,...">,
   HelpText<"Target specific attributes (--mattr=help for details)">;
+
+def mllvm : Separate<["-"], "mllvm">, HelpText<"Specify an argument to forward to LLVM's CommandLine library">, MetaVarName<"<arg>">;
+def : Joined<["-"], "mllvm=">, Alias<mllvm>;
 
 def no_show_raw_insn : Flag<["--"], "no-show-raw-insn">,
   HelpText<"When disassembling instructions, "
@@ -198,6 +210,10 @@ def : Flag<["-"], "t">, Alias<syms>, HelpText<"Alias for --syms">;
 def symbolize_operands : Flag<["--"], "symbolize-operands">,
   HelpText<"Symbolize instruction operands when disassembling">;
 
+def pretty_pgo_analysis_map : Flag<["--"], "pretty-pgo-analysis-map">,
+                              HelpText<"Display PGO analysis values with "
+                                       "formatting rather than raw numbers">;
+
 def dynamic_syms : Flag<["--"], "dynamic-syms">,
   HelpText<"Display the contents of the dynamic symbol table">;
 def : Flag<["-"], "T">, Alias<dynamic_syms>,
@@ -225,16 +241,22 @@ defm prefix_strip
                          "paths. No effect without --prefix">,
       MetaVarName<"prefix">;
 
+def debug_indent_EQ : Joined<["--"], "debug-indent=">,
+  HelpText<"Distance to indent the source-level variable and inlined function display, "
+           "relative to the start of the disassembly">;
+
+def debug_inlined_funcs_EQ : Joined<["--"], "debug-inlined-funcs=">,
+  HelpText<"Print the locations of inlined functions alongside disassembly. "
+           "Supported formats: ascii, limits-only, and unicode (default)">,
+  Values<"ascii,limits-only,unicode">;
+def : Flag<["--"], "debug-inlined-funcs">, Alias<debug_inlined_funcs_EQ>, AliasArgs<["unicode"]>;
+
 def debug_vars_EQ : Joined<["--"], "debug-vars=">,
   HelpText<"Print the locations (in registers or memory) of "
            "source-level variables alongside disassembly. "
            "Supported formats: ascii, unicode (default)">,
-  Values<"unicode,ascii">;
+  Values<"ascii,unicode">;
 def : Flag<["--"], "debug-vars">, Alias<debug_vars_EQ>, AliasArgs<["unicode"]>;
-
-def debug_vars_indent_EQ : Joined<["--"], "debug-vars-indent=">,
-  HelpText<"Distance to indent the source-level variable display, "
-           "relative to the start of the disassembly">;
 
 def x86_asm_syntax_att : Flag<["--"], "x86-asm-syntax=att">,
   HelpText<"Emit AT&T-style disassembly">;

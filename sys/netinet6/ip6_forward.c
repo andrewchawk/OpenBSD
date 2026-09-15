@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip6_forward.c,v 1.124 2024/07/19 16:58:32 bluhm Exp $	*/
+/*	$OpenBSD: ip6_forward.c,v 1.130 2026/06/23 15:45:00 bluhm Exp $	*/
 /*	$KAME: ip6_forward.c,v 1.75 2001/06/29 12:42:13 jinmei Exp $	*/
 
 /*
@@ -38,19 +38,16 @@
 #include <sys/socket.h>
 #include <sys/errno.h>
 #include <sys/time.h>
-#include <sys/kernel.h>
 #include <sys/syslog.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/if_enc.h>
 #include <net/route.h>
 #if NPF > 0
 #include <net/pfvar.h>
 #endif
 
 #include <netinet/in.h>
-#include <netinet/ip_var.h>
 #include <netinet6/in6_var.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
@@ -58,12 +55,8 @@
 #include <netinet6/nd6.h>
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
-#include <netinet/tcp_timer.h>
-#include <netinet/tcp_var.h>
 #ifdef IPSEC
 #include <netinet/ip_ipsp.h>
-#include <netinet/ip_ah.h>
-#include <netinet/ip_esp.h>
 #endif
 
 /*
@@ -97,10 +90,10 @@ ip6_forward(struct mbuf *m, struct route *ro, int flags)
 	u_short mflags, pfflags;
 	struct mbuf *mcopy;
 	int error = 0, type = 0, code = 0, destmtu = 0;
+	u_int orig_rtableid;
 #ifdef IPSEC
 	struct tdb *tdb = NULL;
 #endif /* IPSEC */
-	char src6[INET6_ADDRSTRLEN], dst6[INET6_ADDRSTRLEN];
 
 	/*
 	 * Do not forward packets to multicast destination (should be handled
@@ -111,20 +104,7 @@ ip6_forward(struct mbuf *m, struct route *ro, int flags)
 	if ((m->m_flags & (M_BCAST|M_MCAST)) != 0 ||
 	    IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst) ||
 	    IN6_IS_ADDR_UNSPECIFIED(&ip6->ip6_src)) {
-		time_t uptime;
-
 		ip6stat_inc(ip6s_cantforward);
-		uptime = getuptime();
-
-		if (ip6_log_time + ip6_log_interval < uptime) {
-			ip6_log_time = uptime;
-			inet_ntop(AF_INET6, &ip6->ip6_src, src6, sizeof(src6));
-			inet_ntop(AF_INET6, &ip6->ip6_dst, dst6, sizeof(dst6));
-			log(LOG_DEBUG,
-			    "cannot forward "
-			    "from %s to %s nxt %d received on interface %u\n",
-			    src6, dst6, ip6->ip6_nxt, ifidx);
-		}
 		m_freem(m);
 		goto done;
 	}
@@ -180,6 +160,7 @@ ip6_forward(struct mbuf *m, struct route *ro, int flags)
 		icmp_len = 0;
 	}
 
+	orig_rtableid = m->m_pkthdr.ph_rtableid;
 #if NPF > 0
 reroute:
 #endif
@@ -226,21 +207,8 @@ reroute:
 	 */
 	if (in6_addr2scopeid(ifidx, &ip6->ip6_src) !=
 	    in6_addr2scopeid(rt->rt_ifidx, &ip6->ip6_src)) {
-		time_t uptime;
-
 		ip6stat_inc(ip6s_cantforward);
 		ip6stat_inc(ip6s_badscope);
-		uptime = getuptime();
-
-		if (ip6_log_time + ip6_log_interval < uptime) {
-			ip6_log_time = uptime;
-			inet_ntop(AF_INET6, &ip6->ip6_src, src6, sizeof(src6));
-			inet_ntop(AF_INET6, &ip6->ip6_dst, dst6, sizeof(dst6));
-			log(LOG_DEBUG,
-			    "cannot forward "
-			    "src %s, dst %s, nxt %d, rcvif %u, outif %u\n",
-			    src6, dst6, ip6->ip6_nxt, ifidx, rt->rt_ifidx);
-		}
 		type = ICMP6_DST_UNREACH;
 		code = ICMP6_DST_UNREACH_BEYONDSCOPE;
 		m_freem(m);
@@ -254,7 +222,7 @@ reroute:
 	 */
 	if (tdb != NULL) {
 		/* Callee frees mbuf */
-		error = ip6_output_ipsec_send(tdb, m, ro, 0, 1);
+		error = ip6_output_ipsec_send(tdb, m, ro, orig_rtableid, 1);
 		rt = ro->ro_rt;
 		if (error)
 			goto senderr;
@@ -399,8 +367,11 @@ senderr:
 	case EMSGSIZE:
 		type = ICMP6_PACKET_TOO_BIG;
 		if (rt != NULL) {
-			if (rt->rt_mtu) {
-				destmtu = rt->rt_mtu;
+			u_int rtmtu;
+
+			rtmtu = atomic_load_int(&rt->rt_mtu);
+			if (rtmtu != 0) {
+				destmtu = rtmtu;
 			} else {
 				struct ifnet *destifp;
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: fdt.c,v 1.35 2024/03/27 23:05:27 kettenis Exp $	*/
+/*	$OpenBSD: fdt.c,v 1.41 2026/07/19 03:15:38 jsg Exp $	*/
 
 /*
  * Copyright (c) 2009 Dariusz Swiderski <sfires@sfires.net>
@@ -996,6 +996,51 @@ OF_getprop(int handle, char *prop, void *buf, int buflen)
 }
 
 int
+OF_getpropstr(int handle, char *prop, char **bufp, int *buflenp)
+{
+	void *node = (char *)tree.header + handle;
+	char *data;
+	int len;
+
+	len = fdt_node_property(node, prop, &data);
+
+	/*
+	 * The "name" property is optional since version 16 of the
+	 * flattened device tree specification, so we synthesize one
+	 * from the unit name of the node if it is missing.
+	 */
+	if (len < 0 && strcmp(prop, "name") == 0) {
+		data = fdt_node_name(node);
+		if (data) {
+			*buflenp = strlen(data) + 1;
+			*bufp = malloc(*buflenp, M_TEMP, M_WAITOK);
+			strlcpy(*bufp, data, *buflenp);
+			data = strchr(*bufp, '@');
+			if (data)
+				*data = 0;
+			return 0;
+		}
+		return -1;
+	}
+
+	if (len > 0) {
+		*buflenp = len + 1;
+		*bufp = malloc(*buflenp, M_TEMP, M_WAITOK);
+		memcpy(*bufp, data, len);
+		(*bufp)[len] = 0;
+		return 0;
+	}
+
+	return -1;
+}
+
+void
+OF_freepropstr(char *bufp, int buflenp)
+{
+	free(bufp, M_TEMP, buflenp);
+}
+
+int
 OF_getpropbool(int handle, char *prop)
 {
 	void *node = (char *)tree.header + handle;
@@ -1088,6 +1133,21 @@ OF_is_compatible(int handle, const char *name)
 }
 
 int
+OF_is_enabled(int handle)
+{
+	char status[32];
+
+	if (OF_getprop(handle, "status", status, sizeof(status)) > 0) {
+		if (strcmp(status, "disabled") == 0)
+			return 0;
+		if (strcmp(status, "reserved") == 0)
+			return 0;
+	}
+
+	return 1;
+}
+
+int
 OF_getindex(int handle, const char *entry, const char *prop)
 {
 	char *names;
@@ -1117,4 +1177,80 @@ OF_getindex(int handle, const char *entry, const char *prop)
 	}
 	free(names, M_TEMP, len);
 	return -1;
+}
+
+int
+OF_translate(int node, char *name, uint64_t *addr, uint64_t *size)
+{
+	int len = OF_getproplen(node, name);
+	int acells, pacells, scells;
+	int parent;
+
+	parent = OF_parent(node);
+	while (parent) {
+		pacells = OF_getpropint(parent, "#address-cells", 0);
+		if (pacells > 0)
+			break;
+		parent = OF_parent(parent);
+	}
+	parent = OF_parent(node);
+	while (parent) {
+		scells = OF_getpropint(parent, "#size-cells", 0);
+		if (scells > 0)
+			break;
+		parent = OF_parent(parent);
+	}
+
+	acells = OF_getpropint(node, "#address-cells", pacells);
+	scells = OF_getpropint(node, "#size-cells", scells);
+
+	if (pacells == 0 || acells == 0 || scells == 0)
+		return EINVAL;
+
+	if (len > 0) {
+		uint64_t rfrom, rto, rsize;
+		uint32_t *range, *ranges;
+		int rlen, rone;
+
+		rlen = len / sizeof(uint64_t);
+		rone = pacells + acells + scells;
+
+		ranges = malloc(len, M_TEMP, M_WAITOK);
+		OF_getpropintarray(node, name, ranges, len);
+
+		for (range = ranges; rlen >= rone;
+		     rlen -= rone, range += rone) {
+			/* Extract from and size, so we can see if we fit. */
+			rfrom = range[0];
+			if (acells == 2)
+				rfrom = (rfrom << 32) + range[1];
+
+			rsize = range[acells + pacells];
+			if (scells == 2)
+				rsize = (rsize << 32) +
+				    range[acells + pacells + 1];
+
+			/* Try next, if we're not in the range. */
+			if (*addr < rfrom || (*addr + *size) > (rfrom + rsize))
+				continue;
+
+			/* All good, extract to address and translate. */
+			rto = range[acells];
+			if (acells == 2)
+				rto = (rto << 32) + range[acells + 1];
+
+			*addr -= rfrom;
+			*addr += rto;
+			break;
+		}
+		free(ranges, M_TEMP, len);
+		if (rlen < rone)
+			return ERANGE;
+	}
+
+	parent = OF_parent(node);
+	if (parent)
+		return OF_translate(parent, name, addr, size);
+
+	return 0;
 }

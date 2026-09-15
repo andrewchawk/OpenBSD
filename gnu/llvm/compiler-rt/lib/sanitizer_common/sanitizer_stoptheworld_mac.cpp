@@ -23,7 +23,7 @@
 
 namespace __sanitizer {
 typedef struct {
-  tid_t tid;
+  ThreadID tid;
   thread_t thread;
 } SuspendedThreadInfo;
 
@@ -31,7 +31,7 @@ class SuspendedThreadsListMac final : public SuspendedThreadsList {
  public:
   SuspendedThreadsListMac() = default;
 
-  tid_t GetThreadID(uptr index) const override;
+  ThreadID GetThreadID(uptr index) const override;
   thread_t GetThread(uptr index) const;
   uptr ThreadCount() const override;
   bool ContainsThread(thread_t thread) const;
@@ -111,7 +111,7 @@ typedef x86_thread_state32_t regs_struct;
 #error "Unsupported architecture"
 #endif
 
-tid_t SuspendedThreadsListMac::GetThreadID(uptr index) const {
+ThreadID SuspendedThreadsListMac::GetThreadID(uptr index) const {
   CHECK_LT(index, threads_.size());
   return threads_[index].tid;
 }
@@ -154,12 +154,10 @@ PtraceRegistersStatus SuspendedThreadsListMac::GetRegistersAndSP(
                          &reg_count);
   if (err != KERN_SUCCESS) {
     VReport(1, "Error - unable to get registers for a thread\n");
-    // KERN_INVALID_ARGUMENT indicates that either the flavor is invalid,
-    // or the thread does not exist. The other possible error case,
     // MIG_ARRAY_TOO_LARGE, means that the state is too large, but it's
     // still safe to proceed.
-    return err == KERN_INVALID_ARGUMENT ? REGISTERS_UNAVAILABLE_FATAL
-                                        : REGISTERS_UNAVAILABLE;
+    return err == MIG_ARRAY_TOO_LARGE ? REGISTERS_UNAVAILABLE
+                                      : REGISTERS_UNAVAILABLE_FATAL;
   }
 
   buffer->resize(RoundUpTo(sizeof(regs), sizeof(uptr)) / sizeof(uptr));

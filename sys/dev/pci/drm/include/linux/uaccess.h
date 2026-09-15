@@ -1,4 +1,4 @@
-/*	$OpenBSD: uaccess.h,v 1.7 2022/02/01 04:09:14 jsg Exp $	*/
+/*	$OpenBSD: uaccess.h,v 1.9 2026/08/18 00:53:37 jsg Exp $	*/
 /*
  * Copyright (c) 2015 Mark Kettenis
  *
@@ -23,6 +23,7 @@
 #include <uvm/uvm_extern.h>
 
 #include <linux/sched.h>
+#include <linux/nospec.h>
 
 static inline unsigned long
 __copy_to_user(void *to, const void *from, unsigned long len)
@@ -132,7 +133,8 @@ __copy_from_user_inatomic(void *to, const void *from, unsigned long len)
 }
 
 static inline unsigned long
-__copy_from_user_inatomic_nocache(void *to, const void *from, unsigned long len)
+copy_from_user_inatomic_nontemporal(void *to, const void *from,
+    unsigned long len)
 {
 	return __copy_from_user_inatomic(to, from, len);
 }

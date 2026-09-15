@@ -98,14 +98,14 @@ while (<DATA>) {
             if (defined $args[2]) {
                 $try .= qq| \$z = $CLASS->new("$args[2]");|;
             }
-            $try .= qq| $CLASS\::bgcd(\$x, \$y|;
+            $try .= qq| $CLASS->bgcd(\$x, \$y|;
             $try .= qq|, \$z| if defined $args[2];
             $try .= qq|);|;
         } elsif ($f eq "blcm") {
             if (defined $args[2]) {
                 $try .= qq| \$z = $CLASS->new("$args[2]");|;
             }
-            $try .= qq| $CLASS\::blcm(\$x, \$y|;
+            $try .= qq| $CLASS->blcm(\$x, \$y|;
             $try .= qq|, \$z| if defined $args[2];
             $try .= qq|);|;
         } elsif ($f eq "bcmp") {
@@ -158,8 +158,9 @@ while (<DATA>) {
         }
     }
 
+    note "\n$try\n\n";
     $got = eval $try;
-    print "# Error: $@\n" if $@;
+    diag "Error: $@\n" if $@;
 
     if ($want =~ m|^/(.*)$|) {
         my $pat = $1;
@@ -228,23 +229,23 @@ is($CLASS->new($monster)->mantissa(),
 
 $x = $CLASS->new(2);
 $x->bzero();
-is($x->{_a}, undef, qq|\$x = $CLASS->new(2); \$x->bzero(); \$x->{_a}|);
-is($x->{_p}, undef, qq|\$x = $CLASS->new(2); \$x->bzero(); \$x->{_p}|);
+is($x->{accuracy}, undef, qq|\$x = $CLASS->new(2); \$x->bzero(); \$x->{accuracy}|);
+is($x->{precision}, undef, qq|\$x = $CLASS->new(2); \$x->bzero(); \$x->{precision}|);
 
 $x = $CLASS->new(2);
 $x->binf();
-is($x->{_a}, undef, qq|\$x = $CLASS->new(2); \$x->binf(); \$x->{_a}|);
-is($x->{_p}, undef, qq|\$x = $CLASS->new(2); \$x->binf(); \$x->{_p}|);
+is($x->{accuracy}, undef, qq|\$x = $CLASS->new(2); \$x->binf(); \$x->{accuracy}|);
+is($x->{precision}, undef, qq|\$x = $CLASS->new(2); \$x->binf(); \$x->{precision}|);
 
 $x = $CLASS->new(2);
 $x->bone();
-is($x->{_a}, undef, qq|\$x = $CLASS->new(2); \$x->bone(); \$x->{_a}|);
-is($x->{_p}, undef, qq|\$x = $CLASS->new(2); \$x->bone(); \$x->{_p}|);
+is($x->{accuracy}, undef, qq|\$x = $CLASS->new(2); \$x->bone(); \$x->{accuracy}|);
+is($x->{precision}, undef, qq|\$x = $CLASS->new(2); \$x->bone(); \$x->{precision}|);
 
 $x = $CLASS->new(2);
 $x->bnan();
-is($x->{_a}, undef, qq|\$x = $CLASS->new(2); \$x->bnan(); \$x->{_a}|);
-is($x->{_p}, undef, qq|\$x = $CLASS->new(2); \$x->bnan(); \$x->{_p}|);
+is($x->{accuracy}, undef, qq|\$x = $CLASS->new(2); \$x->bnan(); \$x->{accuracy}|);
+is($x->{precision}, undef, qq|\$x = $CLASS->new(2); \$x->bnan(); \$x->{precision}|);
 
 ###############################################################################
 # bone/binf etc as plain calls (Lite failed them)
@@ -466,17 +467,17 @@ $y = $CLASS->new("18.2");
 
 # 2 * (2 ** int(18.2));
 $x <<= $y;
-is($x->copy()->bfround(-9), "602248.763144685",
+is($x, 524288,
    qq|\$x = $CLASS->new("2"); \$y = $CLASS->new("18.2");| .
-   q| $x <<= $y; $x->copy()->bfround(-9);|);
+   q| $x <<= $y|);
 
-# 2 * (2 ** 18.2) / (2 ** 18.2) => 2
+# 2 * (2 ** int(18.2)) / (2 ** int(18.2)) => 2
 is($x >>= $y, 2,
    qq|\$x = $CLASS->new("2"); \$y = $CLASS->new("18.2");| .
-   q| $x <<= $y; $x->copy()->bfround(-9); $x >>= $y|);
+   q| $x <<= $y; $x >>= $y|);
 is($x, 2,
    qq|\$x = $CLASS->new("2"); \$y = $CLASS->new("18.2");| .
-   q| $x <<= $y; $x->copy()->bfround(-9); $x >>= $y; $x|);
+   q| $x <<= $y; $x >>= $y; $x|);
 
 __DATA__
 
@@ -512,7 +513,7 @@ abc:+0:NaN
 abc:abc:NaN
 abc:+0:NaN
 +0:abc:NaN
-+0:+0:NaN
++0:+0:0
 +1:+0:0
 +0:+1:0
 +27:+90:270
@@ -1814,10 +1815,10 @@ invalid:-inf:NaN
 9:4:2,1
 9:5:1,4
 # bug in v1.74 with bdiv in list context, when $y is 1 or -1
-2.1:-1:-2.1,0
-2.1:1:2.1,0
--2.1:-1:2.1,0
--2.1:1:-2.1,0
+2.1:-1:-3,-0.9
+2.1:1:2,0.1
+-2.1:-1:2,-0.1
+-2.1:1:-3,0.9
 
 &bdiv
 $div_scale = 40; $round_mode = "even"

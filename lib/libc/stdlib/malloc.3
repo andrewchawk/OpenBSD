@@ -30,9 +30,9 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.\"	$OpenBSD: malloc.3,v 1.142 2024/08/03 20:09:24 guenther Exp $
+.\"	$OpenBSD: malloc.3,v 1.148 2026/08/22 12:22:16 schwarze Exp $
 .\"
-.Dd $Mdocdate: August 3 2024 $
+.Dd $Mdocdate: August 22 2026 $
 .Dt MALLOC 3
 .Os
 .Sh NAME
@@ -69,7 +69,8 @@
 .Fn malloc_conceal "size_t size"
 .Ft void *
 .Fn calloc_conceal "size_t nmemb" "size_t size"
-.Vt char *malloc_options ;
+.Vt const char * const
+.Va malloc_options ;
 .Sh DESCRIPTION
 The standard functions
 .Fn malloc ,
@@ -268,7 +269,15 @@ next checks the environment for a variable called
 and finally looks at the global variable
 .Va malloc_options
 in the program.
-Each is scanned for the flags documented below.
+Since
+.Fn malloc
+might already get called before the beginning of
+.Fn main ,
+either initialize
+.Va malloc_options
+to a string literal at file scope or do not declare it at all.
+.Pp
+Each of the three strings is scanned for the flags documented below.
 Unless otherwise noted uppercase means on, lowercase means off.
 During initialization, flags occurring later modify the behaviour
 that was requested by flags processed earlier.
@@ -306,6 +315,76 @@ or
 to record deeper call stacks.
 These malloc options imply
 .Cm D .
+.Pp
+The report begins with a header line showing the following integer variables:
+.Pp
+.Bl -tag -width Ds -compact
+.It M
+the number of pools used
+.It I
+internal
+.Fn recallocarray
+and
+.Fn freezero
+used (0 or 1)
+.It F
+whether the
+.Cm F Dq freecheck
+option is used (0 or 1)
+.It U
+whether the
+.Cm U Dq free unmap
+option is used (0 or 1)
+.It J
+the number of
+.Cm J Dq junking
+options used (0, 1, or 2)
+.It R
+whether the
+.Cm R Dq realloc
+option is used (0 or 1)
+.It X
+whether the
+.Cm X Dq xmalloc
+option is used (0 or 1)
+.It C
+whether the
+.Cm C Dq canaries
+option is used (0 or 1)
+.It cache
+the cache size in pages
+.It G
+the size of guard pages in bytes (0 or
+.Dv MALLOC_PAGESIZE )
+.El
+.Pp
+The leak report consists of five columns:
+.Pp
+.Bl -bullet -compact
+.It
+the address from where the allocation function was called
+.It
+the total number of bytes leaked from that location
+.It
+the number of allocations leaked from that location
+.It
+the average size in bytes per leak from that location,
+i.e. the quotient of the two preceding columns
+.It
+an
+.Xr addr2line 1
+invocation using the pathname of the object file calling
+the allocation function and the offset from where it is called
+to find the source file name and line number of the call site
+.El
+.Pp
+With malloc options
+.Cm 2 ,
+.Cm 3 ,
+or
+.Cm 4 ,
+each line of the leak report is followed by 1, 2, or 3 additional lines,
+respectively, giving the addresses, pathnames and offsets of indirect callers.
 .It Cm F
 .Dq Freecheck .
 Enable more extensive double free and write after free detection.
@@ -363,18 +442,9 @@ Use with
 to get a verbose dump of malloc's internal state.
 .It Cm X
 .Dq xmalloc .
-Rather than return failure,
+Rather than return failure to handle out-of-memory conditions gracefully,
 .Xr abort 3
 the program with a diagnostic message on stderr.
-It is the intention that this option be set at compile time by
-including in the source:
-.Bd -literal -offset indent
-extern char *malloc_options;
-malloc_options = "X";
-.Ed
-.Pp
-Note that this will cause code that is supposed to handle
-out-of-memory conditions gracefully to abort instead.
 .It Cm <
 .Dq Halve the cache size .
 Decrease the size of the free page cache by a factor of two.

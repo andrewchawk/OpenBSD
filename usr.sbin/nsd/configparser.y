@@ -106,15 +106,18 @@ struct component {
 %token VAR_TCP_TIMEOUT
 %token VAR_TCP_MSS
 %token VAR_OUTGOING_TCP_MSS
+%token VAR_TCP_LISTEN_QUEUE
 %token VAR_IPV4_EDNS_SIZE
 %token VAR_IPV6_EDNS_SIZE
 %token VAR_STATISTICS
 %token VAR_XFRD_RELOAD_TIMEOUT
 %token VAR_LOG_TIME_ASCII
+%token VAR_LOG_TIME_ISO
 %token VAR_ROUND_ROBIN
 %token VAR_MINIMAL_RESPONSES
 %token VAR_CONFINE_TO_ZONE
 %token VAR_REFUSE_ANY
+%token VAR_RELOAD_CONFIG
 %token VAR_ZONEFILES_CHECK
 %token VAR_ZONEFILES_WRITE
 %token VAR_RRL_SIZE
@@ -127,6 +130,8 @@ struct component {
 %token VAR_TLS_SERVICE_PEM
 %token VAR_TLS_SERVICE_OCSP
 %token VAR_TLS_PORT
+%token VAR_TLS_AUTH_PORT
+%token VAR_TLS_AUTH_XFR_ONLY
 %token VAR_TLS_CERT_BUNDLE
 %token VAR_PROXY_PROTOCOL_PORT
 %token VAR_CPU_AFFINITY
@@ -135,6 +140,10 @@ struct component {
 %token VAR_DROP_UPDATES
 %token VAR_XFRD_TCP_MAX
 %token VAR_XFRD_TCP_PIPELINE
+%token VAR_METRICS_ENABLE
+%token VAR_METRICS_INTERFACE
+%token VAR_METRICS_PORT
+%token VAR_METRICS_PATH
 
 /* dnstap */
 %token VAR_DNSTAP
@@ -192,6 +201,7 @@ struct component {
 %token VAR_ANSWER_COOKIE
 %token VAR_COOKIE_SECRET
 %token VAR_COOKIE_SECRET_FILE
+%token VAR_COOKIE_STAGING_SECRET
 %token VAR_MAX_REFRESH_TIME
 %token VAR_MIN_REFRESH_TIME
 %token VAR_MAX_RETRY_TIME
@@ -208,6 +218,11 @@ struct component {
 %token VAR_CATALOG
 %token VAR_CATALOG_MEMBER_PATTERN
 %token VAR_CATALOG_PRODUCER_ZONE
+%token VAR_XDP_INTERFACE
+%token VAR_XDP_PROGRAM_PATH
+%token VAR_XDP_PROGRAM_LOAD
+%token VAR_XDP_BPFFS_PATH
+%token VAR_XDP_FORCE_COPY
 
 /* zone */
 %token VAR_ZONE
@@ -281,9 +296,25 @@ server_option:
   | VAR_IP_FREEBIND boolean
     { cfg_parser->opt->ip_freebind = $2; }
   | VAR_SEND_BUFFER_SIZE number
-    { cfg_parser->opt->send_buffer_size = (int)$2; }
+    {
+      if ($2 > 0) {
+        cfg_parser->opt->send_buffer_size = (int)$2;
+      } else if ($2 == 0) {
+        /* do nothing and use the default value */
+      } else {
+        yyerror("expected a number equal to or greater than zero");
+      }
+    }
   | VAR_RECEIVE_BUFFER_SIZE number
-    { cfg_parser->opt->receive_buffer_size = (int)$2; }
+    {
+      if ($2 > 0) {
+        cfg_parser->opt->receive_buffer_size = (int)$2;
+      } else if ($2 == 0) {
+        /* do nothing and use the default value */
+      } else {
+        yyerror("expected a number equal to or greater than zero");
+      }
+    }
   | VAR_DEBUG_MODE boolean
     { cfg_parser->opt->debug_mode = $2; }
   | VAR_USE_SYSTEMD boolean
@@ -360,6 +391,9 @@ server_option:
     { cfg_parser->opt->tcp_mss = (int)$2; }
   | VAR_OUTGOING_TCP_MSS number
     { cfg_parser->opt->outgoing_tcp_mss = (int)$2; }
+  | VAR_TCP_LISTEN_QUEUE STRING
+    { /* With atoi is it allowed to be negative, for system chosen result. */
+      cfg_parser->opt->tcp_listen_queue = atoi($2); }
   | VAR_IPV4_EDNS_SIZE number
     { cfg_parser->opt->ipv4_edns_size = (size_t)$2; }
   | VAR_IPV6_EDNS_SIZE number
@@ -443,6 +477,8 @@ server_option:
       cfg_parser->opt->rrl_whitelist_ratelimit = (size_t)$2;
 #endif
     }
+  | VAR_RELOAD_CONFIG boolean
+    { cfg_parser->opt->reload_config = $2; }
   | VAR_ZONEFILES_CHECK boolean
     { cfg_parser->opt->zonefiles_check = $2; }
   | VAR_ZONEFILES_WRITE number
@@ -451,6 +487,11 @@ server_option:
     {
       cfg_parser->opt->log_time_ascii = $2;
       log_time_asc = cfg_parser->opt->log_time_ascii;
+    }
+  | VAR_LOG_TIME_ISO boolean
+    {
+      cfg_parser->opt->log_time_iso = $2;
+      log_time_iso = cfg_parser->opt->log_time_iso;
     }
   | VAR_ROUND_ROBIN boolean
     {
@@ -479,6 +520,21 @@ server_option:
       (void)snprintf(buf, sizeof(buf), "%lld", $2);
       cfg_parser->opt->tls_port = region_strdup(cfg_parser->opt->region, buf);
     }
+  | VAR_TLS_AUTH_PORT number
+    {
+      /* port number, stored as string */
+      char buf[16];
+      (void)snprintf(buf, sizeof(buf), "%lld", $2);
+      cfg_parser->opt->tls_auth_port = region_strdup(cfg_parser->opt->region, buf);
+    }
+  | VAR_TLS_AUTH_XFR_ONLY boolean
+    {
+      if (!cfg_parser->opt->tls_auth_port) {
+        yyerror("tls-auth-xfr-only set without or before tls-auth-port");
+        YYABORT;
+      }
+      cfg_parser->opt->tls_auth_xfr_only = $2;
+    }
   | VAR_TLS_CERT_BUNDLE STRING
     { cfg_parser->opt->tls_cert_bundle = region_strdup(cfg_parser->opt->region, $2); }
   | VAR_PROXY_PROTOCOL_PORT number
@@ -492,9 +548,39 @@ server_option:
   | VAR_ANSWER_COOKIE boolean
     { cfg_parser->opt->answer_cookie = $2; }
   | VAR_COOKIE_SECRET STRING
-    { cfg_parser->opt->cookie_secret = region_strdup(cfg_parser->opt->region, $2); }
+    {
+      uint8_t secret[32];
+      ssize_t len = hex_pton($2, secret, NSD_COOKIE_SECRET_SIZE);
+
+      if(len != NSD_COOKIE_SECRET_SIZE) {
+        yyerror("expected a 128 bit hex string");
+      } else {
+        cfg_parser->opt->cookie_secret = region_strdup(cfg_parser->opt->region, $2);
+      }
+    }
+  | VAR_COOKIE_STAGING_SECRET STRING
+    {
+      uint8_t secret[32];
+      ssize_t len = hex_pton($2, secret, NSD_COOKIE_SECRET_SIZE);
+
+      if(len != NSD_COOKIE_SECRET_SIZE) {
+        yyerror("expected a 128 bit hex string");
+      } else {
+        cfg_parser->opt->cookie_staging_secret = region_strdup(cfg_parser->opt->region, $2);
+      }
+    }
   | VAR_COOKIE_SECRET_FILE STRING
-    { cfg_parser->opt->cookie_secret_file = region_strdup(cfg_parser->opt->region, $2); }
+    {
+      /* Empty filename means explicitly disabled cookies from file, internally
+       * represented as NULL.
+       * Note that after parsing, if no value was configured, then
+       * cookie_secret_file_is_default is still 1, then the default cookie
+       * secret file value will be assigned to cookie_secret_file.
+       */
+      if(*$2) cfg_parser->opt->cookie_secret_file = region_strdup(cfg_parser->opt->region, $2);
+      cfg_parser->opt->cookie_secret_file_is_default = 0;
+    }
+    
   | VAR_XFRD_TCP_MAX number
     { cfg_parser->opt->xfrd_tcp_max = (int)$2; }
   | VAR_XFRD_TCP_PIPELINE number
@@ -530,6 +616,70 @@ server_option:
           }
         }
       }
+    }
+  | VAR_XDP_INTERFACE STRING
+    {
+#ifdef USE_XDP
+      cfg_parser->opt->xdp_interface = region_strdup(cfg_parser->opt->region, $2);
+#endif
+    }
+  | VAR_XDP_PROGRAM_PATH STRING
+    {
+#ifdef USE_XDP
+      cfg_parser->opt->xdp_program_path = region_strdup(cfg_parser->opt->region, $2);
+#endif
+    }
+  | VAR_XDP_PROGRAM_LOAD boolean
+    {
+#ifdef USE_XDP
+      cfg_parser->opt->xdp_program_load = $2;
+#endif
+    }
+  | VAR_XDP_BPFFS_PATH STRING
+    {
+#ifdef USE_XDP
+      cfg_parser->opt->xdp_bpffs_path = region_strdup(cfg_parser->opt->region, $2);
+#endif
+	}
+  | VAR_XDP_FORCE_COPY boolean
+    {
+#ifdef USE_XDP
+      cfg_parser->opt->xdp_force_copy = $2;
+#endif
+    }
+  | VAR_METRICS_ENABLE boolean
+    {
+#ifdef USE_METRICS
+      cfg_parser->opt->metrics_enable = $2;
+#endif /* USE_METRICS */
+    }
+  | VAR_METRICS_INTERFACE ip_address
+    {
+#ifdef USE_METRICS
+      struct ip_address_option *ip = cfg_parser->opt->metrics_interface;
+      if(ip == NULL) {
+        cfg_parser->opt->metrics_interface = $2;
+      } else {
+        while(ip->next != NULL) { ip = ip->next; }
+        ip->next = $2;
+      }
+#endif /* USE_METRICS */
+    }
+  | VAR_METRICS_PORT number
+    {
+#ifdef USE_METRICS
+      if($2 == 0) {
+        yyerror("metrics port number expected");
+      } else {
+        cfg_parser->opt->metrics_port = (int)$2;
+      }
+#endif /* USE_METRICS */
+    }
+  | VAR_METRICS_PATH STRING
+    {
+#ifdef USE_METRICS
+      cfg_parser->opt->metrics_path = region_strdup(cfg_parser->opt->region, $2);
+#endif /* USE_METRICS */
     }
   ;
 
@@ -921,7 +1071,7 @@ pattern_or_zone_option:
         yyerror("address range used for request-xfr");
       append_acl(&cfg_parser->pattern->request_xfr, acl);
     }
-	tlsauth_option
+	request_xfr_tlsauth_option
 	{ }
   | VAR_REQUEST_XFR VAR_AXFR STRING STRING
     {
@@ -933,7 +1083,7 @@ pattern_or_zone_option:
         yyerror("address range used for request-xfr");
       append_acl(&cfg_parser->pattern->request_xfr, acl);
     }
-	tlsauth_option
+	request_xfr_tlsauth_option
 	{ }
   | VAR_REQUEST_XFR VAR_UDP STRING STRING
     {
@@ -964,6 +1114,8 @@ pattern_or_zone_option:
       acl_options_type *acl = parse_acl_info(cfg_parser->opt->region, $2, $3);
       append_acl(&cfg_parser->pattern->provide_xfr, acl);
     }
+	provide_xfr_tlsauth_option
+	{ }
   | VAR_ALLOW_QUERY STRING STRING
     {
       acl_options_type *acl = parse_acl_info(cfg_parser->opt->region, $2, $3);
@@ -1174,10 +1326,15 @@ boolean:
       }
     } ;
 
-tlsauth_option:
+request_xfr_tlsauth_option:
 	| STRING
 	{ char *tls_auth_name = region_strdup(cfg_parser->opt->region, $1);
 	  add_to_last_acl(&cfg_parser->pattern->request_xfr, tls_auth_name);} ;
+
+provide_xfr_tlsauth_option:
+	| STRING
+	{ char *tls_auth_name = region_strdup(cfg_parser->opt->region, $1);
+	  add_to_last_acl(&cfg_parser->pattern->provide_xfr, tls_auth_name);} ;
 
 catalog_role:
     STRING

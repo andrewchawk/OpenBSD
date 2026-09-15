@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_mroute.h,v 1.31 2022/05/05 13:57:40 claudio Exp $	*/
+/*	$OpenBSD: ip_mroute.h,v 1.35 2026/06/24 12:33:49 bluhm Exp $	*/
 /*	$NetBSD: ip_mroute.h,v 1.23 2004/04/21 17:49:46 itojun Exp $	*/
 
 #ifndef _NETINET_IP_MROUTE_H_
@@ -17,8 +17,6 @@
  * MROUTING Revision: 1.2
  * advanced API support, bandwidth metering and signaling.
  */
-
-#include <sys/timeout.h>
 
 /*
  * Multicast Routing set/getsockopt commands.
@@ -56,9 +54,9 @@ typedef u_int16_t vifi_t;		/* type of a vif index */
  * (MRT_DEL_VIF takes a single vifi_t argument.)
  */
 struct vifctl {
-	vifi_t	  vifc_vifi;	    	/* the index of the vif to be added */
-	u_int8_t  vifc_flags;     	/* VIFF_ flags defined above */
-	u_int8_t  vifc_threshold; 	/* min ttl required to forward on vif */
+	vifi_t	  vifc_vifi;		/* the index of the vif to be added */
+	u_int8_t  vifc_flags;		/* VIFF_ flags defined above */
+	u_int8_t  vifc_threshold;	/* min ttl required to forward on vif */
 	u_int32_t vifc_rate_limit;	/* ignored */
 	struct	  in_addr vifc_lcl_addr;/* local interface address */
 	struct	  in_addr vifc_rmt_addr;/* remote address (tunnels only) */
@@ -84,7 +82,7 @@ struct mfcctl2 {
 	struct in_addr	mfcc_origin;		/* ip origin of mcasts	     */
 	struct in_addr	mfcc_mcastgrp;		/* multicast group associated*/
 	vifi_t		mfcc_parent;		/* incoming vif		     */
-	u_int8_t	mfcc_ttls[MAXVIFS]; 	/* forwarding ttls on vifs   */
+	u_int8_t	mfcc_ttls[MAXVIFS];	/* forwarding ttls on vifs   */
 
 	/* extension fields */
 	u_int8_t	mfcc_flags[MAXVIFS];	/* the MRT_MFC_FLAGS_* flags */
@@ -116,7 +114,7 @@ struct mfcinfo {
 
 /* structure used to get all the vif entries */
 struct vifinfo {
-	vifi_t	  v_vifi;	    	/* the index of the vif to be added */
+	vifi_t	  v_vifi;		/* the index of the vif to be added */
 	u_int8_t  v_flags;		/* VIFF_ flags defined above */
 	u_int8_t  v_threshold;		/* min ttl required to forward on vif */
 	struct	  in_addr v_lcl_addr;	/* local interface address */
@@ -163,20 +161,45 @@ struct mrtstat {
 	u_long	mrts_wrong_if;		/* arrived on wrong interface */
 	u_long	mrts_upq_ovflw;		/* upcall Q overflow */
 	u_long	mrts_cache_cleanups;	/* # entries with no upcalls */
-	u_long	mrts_drop_sel;     	/* pkts dropped selectively */
-	u_long	mrts_q_overflow;    	/* pkts dropped - Q overflow */
-	u_long	mrts_pkt2large;     	/* pkts dropped - size > BKT SIZE */
+	u_long	mrts_drop_sel;		/* pkts dropped selectively */
+	u_long	mrts_q_overflow;	/* pkts dropped - Q overflow */
+	u_long	mrts_pkt2large;		/* pkts dropped - size > BKT SIZE */
 	u_long	mrts_upq_sockfull;	/* upcalls dropped - socket full */
+	u_long	mrts_time_to_live;	/* ip ttl not above 1 */
+	u_long	mrts_source_route;	/* packet from source-routed tunnel */
 };
-
 
 #ifdef _KERNEL
 
+enum mrtstat_counters {
+	mrts_mfc_lookups,
+	mrts_mfc_misses,
+	mrts_upcalls,
+	mrts_no_route,
+	mrts_bad_tunnel,
+	mrts_cant_tunnel,
+	mrts_wrong_if,
+	mrts_upq_ovflw,
+	mrts_cache_cleanups,
+	mrts_drop_sel,
+	mrts_q_overflow,
+	mrts_pkt2large,
+	mrts_upq_sockfull,
+	mrts_time_to_live,
+	mrts_source_route,
+	mrts_ncounters
+};
+
+extern struct cpumem *mrtcounters;
+
+static inline void
+mrtstat_inc(enum mrtstat_counters c)
+{
+	counters_inc(mrtcounters, c);
+}
+
 /* How frequent should we look for expired entries (in seconds). */
 #define MCAST_EXPIRE_FREQUENCY		30
-
-extern struct rttimer_queue ip_mrouterq;
-void mfc_expire_route(struct rtentry *, u_int);
 
 extern int ip_mrtproto;
 
@@ -230,8 +253,10 @@ struct igmpmsg {
 
 int	ip_mrouter_set(struct socket *, int, struct mbuf *);
 int	ip_mrouter_get(struct socket *, int, struct mbuf *);
+void	mrt_init(void);
 int	mrt_ioctl(struct socket *, u_long, caddr_t);
 int	mrt_sysctl_vif(void *, size_t *);
+int	mrt_sysctl_mrtstat(void *, size_t *, void *);
 int	mrt_sysctl_mfc(void *, size_t *);
 int	ip_mrouter_done(struct socket *);
 void	vif_delete(struct ifnet *);

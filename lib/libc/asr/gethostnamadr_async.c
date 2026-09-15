@@ -1,4 +1,4 @@
-/*	$OpenBSD: gethostnamadr_async.c,v 1.49 2023/11/22 13:19:31 florian Exp $	*/
+/*	$OpenBSD: gethostnamadr_async.c,v 1.55 2026/07/21 09:50:31 florian Exp $	*/
 /*
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <limits.h>
 
 #include "asr_private.h"
@@ -54,7 +55,7 @@ struct netent_ext {
 static int gethostnamadr_async_run(struct asr_query *, struct asr_result *);
 static struct hostent_ext *hostent_alloc(int);
 static int hostent_set_cname(struct hostent_ext *, const char *, int);
-static int hostent_add_alias(struct hostent_ext *, const char *, int);
+static void hostent_add_alias(struct hostent_ext *, const char *, int);
 static int hostent_add_addr(struct hostent_ext *, const void *, size_t);
 static struct hostent_ext *hostent_from_addr(int, const char *, const char *);
 static struct hostent_ext *hostent_file_match(FILE *, int, int, const char *,
@@ -147,7 +148,7 @@ static int
 gethostnamadr_async_run(struct asr_query *as, struct asr_result *ar)
 {
 	struct hostent_ext	*h;
-	int			 r, type, saved_errno;
+	int			 r, type, saved_errno, fd;
 	FILE			*f;
 	char			 name[MAXDNAME], *data, addr[16], *c;
 
@@ -286,8 +287,13 @@ gethostnamadr_async_run(struct asr_query *as, struct asr_result *ar)
 
 			/* Try to find a match in the host file */
 
-			if ((f = fopen(_PATH_HOSTS, "re")) == NULL)
+			fd = __pledge_open(_PATH_HOSTS, O_RDONLY|O_CLOEXEC);
+			if (fd == -1)
 				break;
+			if ((f = fdopen(fd, "r")) == NULL) {
+				close(fd);
+				break;
+			}
 
 			if (as->as_type == ASR_GETHOSTBYNAME)
 				data = as->as.hostnamadr.name;
@@ -329,7 +335,7 @@ gethostnamadr_async_run(struct asr_query *as, struct asr_result *ar)
 
 		/*
 		 * We either got no packet or a packet without an answer.
-		 * Saveguard the h_errno and use the next DB.
+		 * Safeguard the h_errno and use the next DB.
 		 */
 		if (ar->ar_count == 0) {
 			free(ar->ar_data);
@@ -471,8 +477,7 @@ found:
 	if (hostent_set_cname(h, tokens[1], 0) == -1)
 		goto fail;
 	for (i = 2; i < n; i ++)
-		if (hostent_add_alias(h, tokens[i], 0) == -1)
-			goto fail;
+		hostent_add_alias(h, tokens[i], 0);
 	if (hostent_add_addr(h, addr, h->h.h_length) == -1)
 		goto fail;
 	return (h);
@@ -492,30 +497,38 @@ hostent_from_packet(int reqtype, int family, char *pkt, size_t pktlen)
 	struct asr_dns_header	 hdr;
 	struct asr_dns_query	 q;
 	struct asr_dns_rr	 rr;
-	char			 dname[MAXDNAME];
+	char			 dname[MAXDNAME], rr_dname[MAXDNAME];
 
 	if ((h = hostent_alloc(family)) == NULL)
 		return (NULL);
 
 	_asr_unpack_init(&p, pkt, pktlen);
-	_asr_unpack_header(&p, &hdr);
-	for (; hdr.qdcount; hdr.qdcount--)
-		_asr_unpack_query(&p, &q);
-	strlcpy(dname, q.q_dname, sizeof(dname));
+	if (_asr_unpack_header(&p, &hdr) == -1)
+		goto fail;
+
+	for (; hdr.qdcount; hdr.qdcount--) {
+		if (_asr_unpack_query(&p, &q) == -1)
+			goto fail;
+	}
+
+	_asr_strdname(q.q_dname, dname, sizeof(dname));
 
 	for (; hdr.ancount; hdr.ancount--) {
-		_asr_unpack_rr(&p, &rr);
+		if (_asr_unpack_rr(&p, &rr) == -1)
+			goto fail;
+
 		if (rr.rr_class != C_IN)
 			continue;
 		switch (rr.rr_type) {
 
 		case T_CNAME:
 			if (reqtype == ASR_GETHOSTBYNAME) {
-				if (hostent_add_alias(h, rr.rr_dname, 1) == -1)
-					goto fail;
+				hostent_add_alias(h, rr.rr_dname, 1);
 			} else {
-				if (strcasecmp(rr.rr_dname, dname) == 0)
-					strlcpy(dname, rr.rr.cname.cname,
+				_asr_strdname(rr.rr_dname, rr_dname,
+				    sizeof(rr_dname));
+				if (strcasecmp(rr_dname, dname) == 0)
+					_asr_strdname(rr.rr.cname.cname, dname,
 					    sizeof(dname));
 			}
 			break;
@@ -523,7 +536,8 @@ hostent_from_packet(int reqtype, int family, char *pkt, size_t pktlen)
 		case T_PTR:
 			if (reqtype != ASR_GETHOSTBYADDR)
 				break;
-			if (strcasecmp(rr.rr_dname, dname) != 0)
+			_asr_strdname(rr.rr_dname, rr_dname, sizeof(rr_dname));
+			if (strcasecmp(rr_dname, dname) != 0)
 				continue;
 			if (hostent_set_cname(h, rr.rr.ptr.ptrname, 1) == -1)
 				hostent_add_alias(h, rr.rr.ptr.ptrname, 1);
@@ -591,7 +605,7 @@ hostent_set_cname(struct hostent_ext *h, const char *name, int isdname)
 	if (isdname) {
 		_asr_strdname(name, buf, sizeof buf);
 		buf[strlen(buf) - 1] = '\0';
-		if (!res_hnok(buf))
+		if (buf[0] == '\0' || !res_hnok(buf))
 			return (-1);
 		name = buf;
 	}
@@ -606,7 +620,7 @@ hostent_set_cname(struct hostent_ext *h, const char *name, int isdname)
 	return (0);
 }
 
-static int
+static void
 hostent_add_alias(struct hostent_ext *h, const char *name, int isdname)
 {
 	char	buf[MAXDNAME];
@@ -616,24 +630,23 @@ hostent_add_alias(struct hostent_ext *h, const char *name, int isdname)
 		if (h->aliases[i] == NULL)
 			break;
 	if (i == MAXALIASES)
-		return (0);
+		return;
 
 	if (isdname) {
 		_asr_strdname(name, buf, sizeof buf);
 		buf[strlen(buf)-1] = '\0';
-		if (!res_hnok(buf))
-			return (-1);
+		if (buf[0] == '\0' || !res_hnok(buf))
+			return;
 		name = buf;
 	}
 
 	n = strlen(name) + 1;
 	if (h->pos + n >= h->end)
-		return (0);
+		return;
 
 	h->aliases[i] = h->pos;
 	memmove(h->pos, name, n);
 	h->pos += n;
-	return (0);
 }
 
 static int

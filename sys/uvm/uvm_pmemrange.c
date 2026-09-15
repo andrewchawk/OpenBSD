@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_pmemrange.c,v 1.66 2024/05/01 12:54:27 mpi Exp $	*/
+/*	$OpenBSD: uvm_pmemrange.c,v 1.83 2026/07/24 15:03:50 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2024 Martin Pieuchot <mpi@openbsd.org>
@@ -80,6 +80,19 @@ int	uvm_pmr_pg_to_memtype(struct vm_page *);
 #ifdef DDB
 void	uvm_pmr_print(void);
 #endif
+
+static inline int
+in_pagedaemon(int allowsyncer)
+{
+	if (curcpu()->ci_idepth > 0)
+		return 0;
+	if (curproc == uvm.pagedaemon_proc)
+		return 1;
+	/* XXX why is the syncer allowed to use the pagedaemon's reserve? */
+	if (allowsyncer && (curproc == syncerproc))
+		return 1;
+	return 0;
+}
 
 /*
  * Memory types. The page flags are used to derive what the current memory
@@ -822,13 +835,6 @@ uvm_pmr_extract_range(struct uvm_pmemrange *pmr, struct vm_page *pg,
 }
 
 /*
- * Indicate to the page daemon that a nowait call failed and it should
- * recover at least some memory in the most restricted region (assumed
- * to be dma_constraint).
- */
-extern volatile int uvm_nowait_failed;
-
-/*
  * Acquire a number of pages.
  *
  * count:	the number of pages returned
@@ -940,16 +946,17 @@ uvm_pmr_getpages(psize_t count, paddr_t start, paddr_t end, paddr_t align,
 	 */
 	desperate = 0;
 
-again:
 	uvm_lock_fpageq();
-
+retry:		/* Return point after sleeping. */
 	/*
 	 * check to see if we need to generate some free pages waking
 	 * the pagedaemon.
 	 */
-	if ((uvmexp.free - BUFPAGES_DEFICIT) < uvmexp.freemin ||
-	    ((uvmexp.free - BUFPAGES_DEFICIT) < uvmexp.freetarg &&
-	    (uvmexp.inactive + BUFPAGES_INACT) < uvmexp.inactarg))
+	if ((atomic_load_sint(&uvmexp.free) - BUFPAGES_DEFICIT) < uvmexp.freemin ||
+	    ((atomic_load_sint(&uvmexp.free) - BUFPAGES_DEFICIT) <
+	    atomic_load_sint(&uvmexp.freetarg) &&
+	    (atomic_load_sint(&uvmexp.inactive) + BUFPAGES_INACT) <
+	    atomic_load_sint(&uvmexp.inactarg)))
 		wakeup(&uvm.pagedaemon);
 
 	/*
@@ -960,23 +967,23 @@ again:
 	 * [3]  only pagedaemon "reserved" pages remain and
 	 *        the requestor isn't the pagedaemon nor the syncer.
 	 */
-	if ((uvmexp.free <= (uvmexp.reserve_kernel + count)) &&
+	if ((atomic_load_sint(&uvmexp.free) <= uvmexp.reserve_kernel + count) &&
 	    !(flags & UVM_PLA_USERESERVE)) {
 		uvm_unlock_fpageq();
 		return ENOMEM;
 	}
 
-	if ((uvmexp.free <= (uvmexp.reserve_pagedaemon + count)) &&
-	    (curproc != uvm.pagedaemon_proc) && (curproc != syncerproc)) {
-		uvm_unlock_fpageq();
+	if ((atomic_load_sint(&uvmexp.free) <= uvmexp.reserve_pagedaemon + count) &&
+	    !in_pagedaemon(1)) {
+	    	uvm_unlock_fpageq();
 		if (flags & UVM_PLA_WAITOK) {
 			uvm_wait("uvm_pmr_getpages");
-			goto again;
+			uvm_lock_fpageq();
+			goto retry;
 		}
 		return ENOMEM;
 	}
 
-retry:		/* Return point after sleeping. */
 	fcount = 0;
 	fnsegs = 0;
 
@@ -1172,15 +1179,13 @@ fail:
 		uvm_pmr_remove_1strange(result, 0, NULL, 0);
 
 	if (flags & UVM_PLA_WAITOK) {
-		if (uvm_wait_pla(ptoa(start), ptoa(end) - 1, ptoa(count),
-		    flags & UVM_PLA_FAILOK) == 0)
-			goto retry;
-		KASSERT(flags & UVM_PLA_FAILOK);
-	} else {
-		if (!(flags & UVM_PLA_NOWAKE)) {
-			uvm_nowait_failed = 1;
-			wakeup(&uvm.pagedaemon);
-		}
+		uvm_unlock_fpageq();
+		uvm_wait("pmrwait");
+		uvm_lock_fpageq();
+		goto retry;
+	}
+	if (!(flags & UVM_PLA_NOWAKE)) {
+		wakeup(&uvm.pagedaemon);
 	}
 	uvm_unlock_fpageq();
 
@@ -1188,7 +1193,7 @@ fail:
 
 out:
 	/* Allocation successful. */
-	uvmexp.free -= fcount;
+	atomic_sub_int(&uvmexp.free, fcount);
 
 	uvm_unlock_fpageq();
 
@@ -1203,23 +1208,23 @@ out:
 
 		if (found->pg_flags & PG_ZERO) {
 			uvm_lock_fpageq();
-			uvmexp.zeropages--;
-			if (uvmexp.zeropages < UVM_PAGEZERO_TARGET)
+			atomic_dec_int(&uvmexp.zeropages);
+			if (atomic_load_sint(&uvmexp.zeropages) < UVM_PAGEZERO_TARGET)
 				wakeup(&uvmexp.zeropages);
 			uvm_unlock_fpageq();
 		}
 		if (flags & UVM_PLA_ZERO) {
 			if (found->pg_flags & PG_ZERO)
-				uvmexp.pga_zerohit++;
+				atomic_inc_int(&uvmexp.pga_zerohit);
 			else {
-				uvmexp.pga_zeromiss++;
+				atomic_inc_int(&uvmexp.pga_zeromiss);
 				uvm_pagezero(found);
 			}
 		}
 		atomic_clearbits_int(&found->pg_flags, PG_ZERO|PQ_FREE);
 
-		found->uobject = NULL;
-		found->uanon = NULL;
+		KASSERT(found->uobject == NULL);
+		KASSERT(found->uanon == NULL);
 		found->pg_version++;
 
 		/*
@@ -1292,9 +1297,11 @@ uvm_pmr_freepages(struct vm_page *pg, psize_t count)
 {
 	struct uvm_pmemrange *pmr;
 	psize_t i, pmr_count;
-	struct vm_page *firstpg = pg;
 
 	for (i = 0; i < count; i++) {
+		KASSERT(pg->uobject == NULL);
+		KASSERT(pg->uanon == NULL);
+
 		KASSERT(atop(VM_PAGE_TO_PHYS(&pg[i])) ==
 		    atop(VM_PAGE_TO_PHYS(pg)) + i);
 
@@ -1319,14 +1326,12 @@ uvm_pmr_freepages(struct vm_page *pg, psize_t count)
 		pg->fpgsz = pmr_count;
 		uvm_pmr_insert(pmr, pg, 0);
 
-		uvmexp.free += pmr_count;
+		atomic_add_int(&uvmexp.free, pmr_count);
 		pg += pmr_count;
 	}
 	wakeup(&uvmexp.free);
-	if (uvmexp.zeropages < UVM_PAGEZERO_TARGET)
+	if (atomic_load_sint(&uvmexp.zeropages) < UVM_PAGEZERO_TARGET)
 		wakeup(&uvmexp.zeropages);
-
-	uvm_wakeup_pla(VM_PAGE_TO_PHYS(firstpg), ptoa(count));
 
 	uvm_unlock_fpageq();
 }
@@ -1342,6 +1347,9 @@ uvm_pmr_freepageq(struct pglist *pgl)
 	psize_t plen;
 
 	TAILQ_FOREACH(pg, pgl, pageq) {
+		KASSERT(pg->uobject == NULL);
+		KASSERT(pg->uanon == NULL);
+
 		if (!((pg->pg_flags & PQ_FREE) == 0 &&
 		    VALID_FLAGS(pg->pg_flags))) {
 			printf("Flags: 0x%x, will panic now.\n",
@@ -1367,12 +1375,10 @@ uvm_pmr_freepageq(struct pglist *pgl)
 			pstart = VM_PAGE_TO_PHYS(TAILQ_FIRST(pgl));
 			plen = uvm_pmr_remove_1strange(pgl, 0, NULL, 0);
 		}
-		uvmexp.free += plen;
-
-		uvm_wakeup_pla(pstart, ptoa(plen));
+		atomic_add_int(&uvmexp.free, plen);
 	}
 	wakeup(&uvmexp.free);
-	if (uvmexp.zeropages < UVM_PAGEZERO_TARGET)
+	if (atomic_load_sint(&uvmexp.zeropages) < UVM_PAGEZERO_TARGET)
 		wakeup(&uvmexp.zeropages);
 	uvm_unlock_fpageq();
 
@@ -1696,7 +1702,6 @@ uvm_pmr_init(void)
 
 	TAILQ_INIT(&uvm.pmr_control.use);
 	RBT_INIT(uvm_pmemrange_addr, &uvm.pmr_control.addr);
-	TAILQ_INIT(&uvm.pmr_control.allocs);
 
 	/* By default, one range for the entire address space. */
 	new_pmr = uvm_pmr_allocpmr();
@@ -2080,102 +2085,6 @@ uvm_pmr_print(void)
 }
 #endif
 
-/*
- * uvm_wait_pla: wait (sleep) for the page daemon to free some pages
- * in a specific physmem area.
- *
- * Returns ENOMEM if the pagedaemon failed to free any pages.
- * If not failok, failure will lead to panic.
- *
- * Must be called with fpageq locked.
- */
-int
-uvm_wait_pla(paddr_t low, paddr_t high, paddr_t size, int failok)
-{
-	struct uvm_pmalloc pma;
-	const char *wmsg = "pmrwait";
-
-	if (curproc == uvm.pagedaemon_proc) {
-		/*
-		 * This is not that uncommon when the pagedaemon is trying
-		 * to flush out a large mmapped file. VOP_WRITE will circle
-		 * back through the buffer cache and try to get more memory.
-		 * The pagedaemon starts by calling bufbackoff, but we can
-		 * easily use up that reserve in a single scan iteration.
-		 */
-		uvm_unlock_fpageq();
-		if (bufbackoff(NULL, atop(size)) == 0) {
-			uvm_lock_fpageq();
-			return 0;
-		}
-		uvm_lock_fpageq();
-
-		/*
-		 * XXX detect pagedaemon deadlock - see comment in
-		 * uvm_wait(), as this is exactly the same issue.
-		 */
-		printf("pagedaemon: wait_pla deadlock detected!\n");
-		msleep_nsec(&uvmexp.free, &uvm.fpageqlock, PVM, wmsg,
-		    MSEC_TO_NSEC(125));
-#if defined(DEBUG)
-		/* DEBUG: panic so we can debug it */
-		panic("wait_pla pagedaemon deadlock");
-#endif
-		return 0;
-	}
-
-	for (;;) {
-		pma.pm_constraint.ucr_low = low;
-		pma.pm_constraint.ucr_high = high;
-		pma.pm_size = size;
-		pma.pm_flags = UVM_PMA_LINKED;
-		TAILQ_INSERT_TAIL(&uvm.pmr_control.allocs, &pma, pmq);
-
-		wakeup(&uvm.pagedaemon);		/* wake the daemon! */
-		while (pma.pm_flags & (UVM_PMA_LINKED | UVM_PMA_BUSY))
-			msleep_nsec(&pma, &uvm.fpageqlock, PVM, wmsg, INFSLP);
-
-		if (!(pma.pm_flags & UVM_PMA_FREED) &&
-		    pma.pm_flags & UVM_PMA_FAIL) {
-			if (failok)
-				return ENOMEM;
-			printf("uvm_wait: failed to free %ld pages between "
-			    "0x%lx-0x%lx\n", atop(size), low, high);
-		} else
-			return 0;
-	}
-	/* UNREACHABLE */
-}
-
-/*
- * Wake up uvm_pmalloc sleepers.
- */
-void
-uvm_wakeup_pla(paddr_t low, psize_t len)
-{
-	struct uvm_pmalloc *pma, *pma_next;
-	paddr_t high;
-
-	high = low + len;
-
-	/* Wake specific allocations waiting for this memory. */
-	for (pma = TAILQ_FIRST(&uvm.pmr_control.allocs); pma != NULL;
-	    pma = pma_next) {
-		pma_next = TAILQ_NEXT(pma, pmq);
-
-		if (low < pma->pm_constraint.ucr_high &&
-		    high > pma->pm_constraint.ucr_low) {
-			pma->pm_flags |= UVM_PMA_FREED;
-			if (!(pma->pm_flags & UVM_PMA_BUSY)) {
-				pma->pm_flags &= ~UVM_PMA_LINKED;
-				TAILQ_REMOVE(&uvm.pmr_control.allocs, pma,
-				    pmq);
-				wakeup(pma);
-			}
-		}
-	}
-}
-
 void
 uvm_pagezero_thread(void *arg)
 {
@@ -2191,7 +2100,7 @@ uvm_pagezero_thread(void *arg)
 	TAILQ_INIT(&pgl);
 	for (;;) {
 		uvm_lock_fpageq();
-		while (uvmexp.zeropages >= UVM_PAGEZERO_TARGET ||
+		while (atomic_load_sint(&uvmexp.zeropages) >= UVM_PAGEZERO_TARGET ||
 		    (count = uvm_pmr_get1page(16, UVM_PMR_MEMTYPE_DIRTY,
 		     &pgl, 0, 0, 1)) == 0) {
 			msleep_nsec(&uvmexp.zeropages, &uvm.fpageqlock,
@@ -2207,7 +2116,7 @@ uvm_pagezero_thread(void *arg)
 		uvm_lock_fpageq();
 		while (!TAILQ_EMPTY(&pgl))
 			uvm_pmr_remove_1strange(&pgl, 0, NULL, 0);
-		uvmexp.zeropages += count;
+		atomic_add_int(&uvmexp.zeropages, count);
  		uvm_unlock_fpageq();
 
 		yield();
@@ -2223,7 +2132,7 @@ uvm_pmr_cache_alloc(struct uvm_pmr_cache_item *upci)
 	int flags = UVM_PLA_NOWAIT|UVM_PLA_NOWAKE;
 	int npages = UVM_PMR_CACHEMAGSZ;
 
-	splassert(IPL_VM);
+	splassert(IPL_BIO);
 	KASSERT(upci->upci_npages == 0);
 
 	TAILQ_INIT(&pgl);
@@ -2248,7 +2157,11 @@ uvm_pmr_cache_get(int flags)
 	struct vm_page *pg;
 	int s;
 
-	s = splvm();
+	/*
+	 * XXX The buffer flipper (incorrectly?) allocates & frees pages
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
 	upci = &upc->upc_magz[upc->upc_actv];
 	if (upci->upci_npages == 0) {
 		unsigned int prev;
@@ -2279,13 +2192,13 @@ uvm_pmr_cache_get(int flags)
 	return pg;
 }
 
-void
+unsigned int
 uvm_pmr_cache_free(struct uvm_pmr_cache_item *upci)
 {
 	struct pglist pgl;
 	unsigned int i;
 
-	splassert(IPL_VM);
+	splassert(IPL_BIO);
 
 	TAILQ_INIT(&pgl);
 	for (i = 0; i < upci->upci_npages; i++)
@@ -2296,6 +2209,8 @@ uvm_pmr_cache_free(struct uvm_pmr_cache_item *upci)
 	atomic_sub_int(&uvmexp.percpucaches, upci->upci_npages);
 	upci->upci_npages = 0;
 	memset(upci->upci_pages, 0, sizeof(upci->upci_pages));
+
+	return i;
 }
 
 void
@@ -2303,9 +2218,28 @@ uvm_pmr_cache_put(struct vm_page *pg)
 {
 	struct uvm_pmr_cache *upc = &curcpu()->ci_uvm;
 	struct uvm_pmr_cache_item *upci;
+	struct uvm_pmemrange *pmr;
 	int s;
 
-	s = splvm();
+	/*
+	 * Always give back low pages to the allocator to not accelerate
+	 * their exhaustion.
+	 */
+	pmr = uvm_pmemrange_find(atop(VM_PAGE_TO_PHYS(pg)));
+	if (pmr->use > 0) {
+		uvm_pmr_freepages(pg, 1);
+		return;
+	}
+
+	KASSERT(pg->wire_count == 0);
+	KASSERT(pg->uanon == (void*)0xdeadbeef || pg->uanon == NULL);
+	KASSERT(pg->uobject == (void*)0xdeadbeef || pg->uobject == NULL);
+
+	/*
+	 * XXX The buffer flipper (incorrectly?) allocates & frees pages
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
 	upci = &upc->upc_magz[upc->upc_actv];
 	if (upci->upci_npages >= UVM_PMR_CACHEMAGSZ) {
 		unsigned int prev;
@@ -2326,16 +2260,23 @@ uvm_pmr_cache_put(struct vm_page *pg)
 	splx(s);
 }
 
-void
+unsigned int
 uvm_pmr_cache_drain(void)
 {
 	struct uvm_pmr_cache *upc = &curcpu()->ci_uvm;
+	unsigned int freed = 0;
 	int s;
 
-	s = splvm();
-	uvm_pmr_cache_free(&upc->upc_magz[0]);
-	uvm_pmr_cache_free(&upc->upc_magz[1]);
+	/*
+	 * XXX The buffer flipper (incorrectly?) allocates & frees pages
+	 * (from uvm_pagerealloc_multi()) from interrupt context!
+	 */
+	s = splbio();
+	freed += uvm_pmr_cache_free(&upc->upc_magz[0]);
+	freed += uvm_pmr_cache_free(&upc->upc_magz[1]);
 	splx(s);
+
+	return freed;
 }
 
 #else /* !(MULTIPROCESSOR && __HAVE_UVM_PERCPU) */
@@ -2352,8 +2293,9 @@ uvm_pmr_cache_put(struct vm_page *pg)
 	uvm_pmr_freepages(pg, 1);
 }
 
-void
+unsigned int
 uvm_pmr_cache_drain(void)
 {
+	return 0;
 }
 #endif

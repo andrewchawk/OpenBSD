@@ -1,4 +1,4 @@
-/* $OpenBSD: tasn_prn.c,v 1.27 2024/03/02 09:04:07 tb Exp $ */
+/* $OpenBSD: tasn_prn.c,v 1.30 2026/05/16 07:06:35 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2000.
  */
@@ -61,7 +61,6 @@
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
 #include <openssl/buffer.h>
-#include <openssl/err.h>
 #include <openssl/objects.h>
 #include <openssl/x509v3.h>
 
@@ -393,7 +392,7 @@ asn1_print_obstring_ctx(BIO *out, ASN1_STRING *str, int indent,
 	} else if (BIO_puts(out, "\n") <= 0)
 		return 0;
 	if ((str->length > 0) &&
-	    BIO_dump_indent(out, (char *)str->data, str->length,
+	    BIO_dump_indent(out, (const char *)str->data, str->length,
 	    indent + 2) <= 0)
 		return 0;
 	return 1;
@@ -411,7 +410,7 @@ asn1_primitive_print(BIO *out, ASN1_VALUE **fld, const ASN1_ITEM *it,
 	if (!asn1_print_fsname(out, indent, fname, sname, pctx))
 		return 0;
 
-	if (it != NULL && it->funcs != NULL) {
+	if (it->funcs != NULL) {
 		const ASN1_PRIMITIVE_FUNCS *pf = it->funcs;
 
 		if (pf->prim_print == NULL)

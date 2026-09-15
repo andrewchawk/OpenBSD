@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_domain.c,v 1.65 2024/01/11 14:15:11 bluhm Exp $	*/
+/*	$OpenBSD: uipc_domain.c,v 1.70 2025/06/12 20:37:58 deraadt Exp $	*/
 /*	$NetBSD: uipc_domain.c,v 1.14 1996/02/09 19:00:44 christos Exp $	*/
 
 /*
@@ -41,8 +41,13 @@
 #include <sys/sysctl.h>
 #include <sys/timeout.h>
 
+#include "af_frame.h"
 #include "bpfilter.h"
 #include "pflow.h"
+
+#if NAF_FRAME > 0
+extern const struct domain framedomain;
+#endif
 
 const struct domain *const domains[] = {
 #ifdef MPLS
@@ -57,6 +62,9 @@ const struct domain *const domains[] = {
 	&inetdomain,
 	&unixdomain,
 	&routedomain,
+#if NAF_FRAME > 0
+	&framedomain,
+#endif
 	NULL
 };
 
@@ -90,8 +98,10 @@ domaininit(void)
 		max_linkhdr = 64;
 
 	max_hdr = max_linkhdr + max_protohdr;
-	timeout_set_proc(&pffast_timeout, pffasttimo, &pffast_timeout);
-	timeout_set_proc(&pfslow_timeout, pfslowtimo, &pfslow_timeout);
+	timeout_set_flags(&pffast_timeout, pffasttimo, &pffast_timeout,
+	    KCLOCK_NONE, TIMEOUT_PROC | TIMEOUT_MPSAFE);
+	timeout_set_flags(&pfslow_timeout, pfslowtimo, &pfslow_timeout,
+	    KCLOCK_NONE, TIMEOUT_PROC | TIMEOUT_MPSAFE);
 	timeout_add(&pffast_timeout, 1);
 	timeout_add(&pfslow_timeout, 1);
 }
@@ -150,6 +160,7 @@ pffindproto(int family, int protocol, int type)
 	return (maybe);
 }
 
+#ifndef SMALL_KERNEL
 static int
 net_link_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
     void *newp, size_t newlen)
@@ -180,6 +191,7 @@ net_link_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 
 	return (error);
 }
+#endif /* SMALL_KERNEL */
 
 int
 net_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
@@ -200,6 +212,7 @@ net_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 
 	if (family == PF_UNSPEC)
 		return (0);
+#ifndef SMALL_KERNEL
 	if (family == PF_LINK)
 		return (net_link_sysctl(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
@@ -210,22 +223,23 @@ net_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	if (family == PF_BPF)
 		return (bpf_sysctl(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
-#endif
+#endif /* NBPFILTER > 0 */
 #if NPFLOW > 0
 	if (family == PF_PFLOW)
 		return (pflow_sysctl(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
-#endif
+#endif /* NPFLOW > 0 */
 #ifdef PIPEX
 	if (family == PF_PIPEX)
 		return (pipex_sysctl(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
-#endif
+#endif /* PIPEX */
 #ifdef MPLS
 	if (family == PF_MPLS)
 		return (mpls_sysctl(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
-#endif
+#endif /* MPLS */
+#endif /* SMALL_KERNEL */
 	dp = pffinddomain(family);
 	if (dp == NULL)
 		return (ENOPROTOOPT);
@@ -234,9 +248,22 @@ net_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (EISDIR);		/* overloaded */
 	protocol = name[1];
 	for (pr = dp->dom_protosw; pr < dp->dom_protoswNPROTOSW; pr++)
-		if (pr->pr_protocol == protocol && pr->pr_sysctl)
-			return ((*pr->pr_sysctl)(name + 2, namelen - 2,
-			    oldp, oldlenp, newp, newlen));
+		if (pr->pr_protocol == protocol && pr->pr_sysctl) {
+			size_t savelen;
+			int error;
+
+			if ((pr->pr_flags & PR_MPSYSCTL) == 0) {
+				savelen = *oldlenp;
+				if ((error = sysctl_vslock(oldp, savelen)))
+					return (error);
+			}
+			error = (*pr->pr_sysctl)(name + 2, namelen - 2,
+			    oldp, oldlenp, newp, newlen);
+			if ((pr->pr_flags & PR_MPSYSCTL) == 0)
+				sysctl_vsunlock(oldp, savelen);
+
+			return (error);
+		}
 	return (ENOPROTOOPT);
 }
 

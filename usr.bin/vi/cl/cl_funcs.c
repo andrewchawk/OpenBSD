@@ -1,4 +1,4 @@
-/*	$OpenBSD: cl_funcs.c,v 1.23 2022/12/26 19:16:03 jmc Exp $	*/
+/*	$OpenBSD: cl_funcs.c,v 1.25 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -100,7 +100,7 @@ cl_attr(SCR *sp, scr_attr_t attribute, int on)
 	 *
 	 * Note that the :command input is a true vi input mode, e.g., input
 	 * maps and abbreviations are being done.  So, we need to be able to
-	 * switch back into the vi screen mode, without flashing the screen. 
+	 * switch back into the vi screen mode, without flashing the screen.
 	 *
 	 * To make matters worse, the curses initscr() and endwin() calls will
 	 * do this automatically -- so, this attribute isn't as controlled by
@@ -294,7 +294,7 @@ cl_deleteln(SCR *sp)
 	return (deleteln() == ERR);
 }
 
-/* 
+/*
  * cl_ex_adjust --
  *	Adjust the screen for ex.  This routine is purely for standalone
  *	ex programs.  All special purpose, all special case.
@@ -429,10 +429,6 @@ cl_move(SCR *sp, size_t lno, size_t cno)
 int
 cl_refresh(SCR *sp, int repaint)
 {
-	CL_PRIVATE *clp;
-
-	clp = CLP(sp);
-
 	/*
 	 * If we received a killer signal, we're done, there's no point
 	 * in refreshing the screen.
@@ -519,7 +515,7 @@ cl_suspend(SCR *sp, int *allowedp)
 	 *
 	 * Setting allowedp to 0 will cause the editor to reject the command.
 	 */
-	if (F_ISSET(sp, SC_EX)) { 
+	if (F_ISSET(sp, SC_EX)) {
 		/* Save the terminal settings, and restore the original ones. */
 		if (F_ISSET(clp, CL_STDIN_TTY)) {
 			(void)tcgetattr(STDIN_FILENO, &t);
@@ -609,7 +605,7 @@ cl_suspend(SCR *sp, int *allowedp)
 /*
  * cl_usage --
  *	Print out the curses usage messages.
- * 
+ *
  * PUBLIC: void cl_usage(void);
  */
 void

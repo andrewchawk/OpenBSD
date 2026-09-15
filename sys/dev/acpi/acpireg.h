@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpireg.h,v 1.60 2023/09/12 08:32:58 jmatthew Exp $	*/
+/*	$OpenBSD: acpireg.h,v 1.65 2026/03/27 03:56:15 hshoexer Exp $	*/
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  * Copyright (c) 2005 Marco Peereboom <marco@openbsd.org>
@@ -352,6 +352,27 @@ struct acpi_madt_x2apic_nmi {
 	uint8_t		reserved[3];
 } __packed;
 
+struct acpi_madt_gicc {
+	uint8_t		apic_type;
+#define ACPI_MADT_GICC		11
+	uint8_t		length;
+	uint16_t	reserved1;
+	uint32_t	gic_id;
+	uint32_t	acpi_proc_uid;
+	uint32_t	flags;
+	uint32_t	parking_protocol_version;
+	uint32_t	performance_interrupt;
+	uint64_t	parked_address;
+	uint64_t	base_address;
+	uint64_t	gicv_base_address;
+	uint64_t	gich_base_address;
+	uint32_t	maintenance_interrupt;
+	uint64_t	gicr_base_address;
+	uint64_t	mpidr;
+	uint8_t		efficiency_class;
+	uint8_t		reserved2[3];
+} __packed;
+
 #define ACPI_MADT_OEM_RSVD	128
 
 union acpi_madt_entry {
@@ -477,6 +498,30 @@ struct acpi_tpm2 {
 } __packed;
 
 /*
+ * Intel ACPI Low Power S0 Idle
+ */
+struct acpi_lpit {
+	struct acpi_table_header	hdr;
+#define LPIT_SIG	"LPIT"
+	/* struct acpi_lpit_entry[]; */
+} __packed;
+
+struct acpi_lpit_entry {
+	uint32_t	type;
+	uint32_t	length;
+	uint16_t	uid;
+	uint16_t	reserved;
+	uint32_t	flags;
+#define LPIT_DISABLED			(1L << 0)
+#define LPIT_COUNTER_NOT_AVAILABLE	(1L << 1)
+	struct acpi_gas	entry_trigger;
+	uint32_t	residency;
+	uint32_t	latency;
+	struct acpi_gas	residency_counter;
+	uint64_t	residency_frequency;
+};
+
+/*
  * Intel ACPI DMA Remapping Entries
  */
 struct acpidmar_devpath {
@@ -559,6 +604,7 @@ struct acpi_dmar {
  */
 union acpi_ivhd_entry {
 	uint8_t		type;
+#define IVHD_RESVD			0
 #define IVHD_ALL			1
 #define IVHD_SEL			2
 #define IVHD_SOR			3
@@ -568,6 +614,10 @@ union acpi_ivhd_entry {
 #define IVHD_EXT_SEL			70
 #define IVHD_EXT_SOR			71
 #define IVHD_SPECIAL			72
+	struct {
+		uint8_t		type;
+		uint8_t		resvd[3];
+	} __packed resvd;
 	struct {
 		uint8_t		type;
 		uint16_t	resvd;
@@ -626,8 +676,8 @@ struct acpi_ivmd {
 	uint16_t	devid;
 	uint16_t	auxdata;
 	uint8_t		reserved[8];
-	uint64_t	base;
-	uint64_t	limit;
+	uint64_t	start_address;
+	uint64_t	block_length;
 } __packed;
 
 struct acpi_ivhd {
@@ -774,6 +824,27 @@ struct acpi_iort_smmu_context_interrupt {
 struct acpi_iort_smmu_pmu_interrupt {
 	uint32_t	gsiv;
 	uint32_t	flags;
+} __packed;
+
+struct acpi_iort_smmu_v3_node {
+	uint64_t	base_address;
+	uint32_t	flags;
+#define ACPI_IORT_SMMU_V3_COHACC_OVERRIDE(x)	(((x) >> 0) & 0x1)
+#define ACPI_IORT_SMMU_V3_HTTU_OVERRIDE(x)	(((x) >> 1) & 0x3)
+#define ACPI_IORT_SMMU_V3_PROX_DOM_VALID	(1 << 3)
+#define ACPI_IORT_SMMU_V3_DEVID_MAP_VALID	(1 << 4)
+	uint32_t	reserved;
+	uint64_t	vatos_address;
+	uint32_t	model;
+#define ACPI_IORT_SMMU_V3_GENERIC		0
+#define ACPI_IORT_SMMU_V3_HISILICON_HI161X	1
+#define ACPI_IORT_SMMU_V3_CAVIUM_CN99X		2
+	uint32_t	event;
+	uint32_t	pri;
+	uint32_t	gerr;
+	uint32_t	sync;
+	uint32_t	proximity_domain;
+	uint32_t	deviceid_mapping_index;
 } __packed;
 
 struct acpi_iort_mapping {

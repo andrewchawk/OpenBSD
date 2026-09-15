@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_proc.c,v 1.99 2024/07/08 13:17:12 claudio Exp $	*/
+/*	$OpenBSD: kern_proc.c,v 1.106 2026/07/15 19:46:34 kettenis Exp $	*/
 /*	$NetBSD: kern_proc.c,v 1.14 1996/02/09 18:59:41 christos Exp $	*/
 
 /*
@@ -319,7 +319,9 @@ enterthispgrp(struct process *pr, struct pgrp *pgrp)
 	fixjobc(pr, savepgrp, 0);
 
 	LIST_REMOVE(pr, ps_pglist);
+	mtx_enter(&pr->ps_mtx);
 	pr->ps_pgrp = pgrp;
+	mtx_leave(&pr->ps_mtx);
 	LIST_INSERT_HEAD(&pgrp->pg_members, pr, ps_pglist);
 	if (LIST_EMPTY(&savepgrp->pg_members))
 		pgdelete(savepgrp);
@@ -331,13 +333,16 @@ enterthispgrp(struct process *pr, struct pgrp *pgrp)
 void
 leavepgrp(struct process *pr)
 {
+	struct pgrp *savepgrp = pr->ps_pgrp;
 
 	if (pr->ps_session->s_verauthppid == pr->ps_pid)
 		zapverauth(pr->ps_session);
-	LIST_REMOVE(pr, ps_pglist);
-	if (LIST_EMPTY(&pr->ps_pgrp->pg_members))
-		pgdelete(pr->ps_pgrp);
+	mtx_enter(&pr->ps_mtx);
 	pr->ps_pgrp = NULL;
+	mtx_leave(&pr->ps_mtx);
+	LIST_REMOVE(pr, ps_pglist);
+	if (LIST_EMPTY(&savepgrp->pg_members))
+		pgdelete(savepgrp);
 }
 
 /*
@@ -462,7 +467,7 @@ orphanpg(struct pgrp *pg)
 	struct process *pr;
 
 	LIST_FOREACH(pr, &pg->pg_members, ps_pglist) {
-		if (pr->ps_mainproc->p_stat == SSTOP) {
+		if (pr->ps_flags & PS_STOPPED) {
 			LIST_FOREACH(pr, &pg->pg_members, ps_pglist) {
 				prsignal(pr, SIGHUP);
 				prsignal(pr, SIGCONT);
@@ -497,7 +502,7 @@ proc_printit(struct proc *p, const char *modif,
 	    p->p_runpri, p->p_usrpri, p->p_slppri, p->p_p->ps_nice);
 	(*pr)("    wchan=%p, wmesg=%s, ps_single=%p scnt=%d ecnt=%d\n",
 	    p->p_wchan, (p->p_wchan && p->p_wmesg) ?  p->p_wmesg : "",
-	    p->p_p->ps_single, p->p_p->ps_singlecnt, p->p_p->ps_exitcnt);
+	    p->p_p->ps_single, p->p_p->ps_suspendcnt, p->p_p->ps_exitcnt);
 	(*pr)("    forw=%p, list=%p,%p\n",
 	    TAILQ_NEXT(p, p_runq), p->p_list.le_next, p->p_list.le_prev);
 	(*pr)("    process=%p user=%p, vmspace=%p\n",
@@ -527,6 +532,22 @@ db_kill_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
 
 	/* Send uncatchable SIGABRT for coredump */
 	sigabort(p);
+}
+
+void
+db_stop_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
+{
+
+	struct process *pr;
+
+	pr = prfind(addr);
+	if (pr == NULL) {
+		db_printf("%ld: No such process", addr);
+		return;
+	}
+
+	/* Send uncatchable SIGSTOP */
+	prsignal(pr, SIGSTOP);
 }
 
 void
@@ -562,8 +583,9 @@ db_show_all_procs(db_expr_t addr, int haddr, db_expr_t count, char *modif)
 		    "COMMAND", "STRUCT PROC *", "UAREA *", "VMSPACE/VM_MAP");
 		break;
 	case 'n':
-		db_printf("   PID  %6s  %5s  %5s  S  %10s  %-12s  %-15s\n",
-		    "TID", "PPID", "UID", "FLAGS", "WAIT", "COMMAND");
+		db_printf("   PID  %6s  %5s %5s  S  %10s %10s %-9s %-15s\n",
+		    "TID", "PPID", "UID", "PRLAGS", "PFLAGS", "WAIT",
+		    "COMMAND");
 		break;
 	case 'w':
 		db_printf("    TID  %-15s  %-5s  %18s  %s\n",
@@ -581,7 +603,8 @@ db_show_all_procs(db_expr_t addr, int haddr, db_expr_t count, char *modif)
 
 		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
 #ifdef MULTIPROCESSOR
-			if (__mp_lock_held(&kernel_lock, p->p_cpu))
+			if (p->p_cpu != NULL &&
+			    __mp_lock_held(&kernel_lock, p->p_cpu))
 				has_kernel_lock = 1;
 			else
 				has_kernel_lock = 0;
@@ -611,11 +634,11 @@ db_show_all_procs(db_expr_t addr, int haddr, db_expr_t count, char *modif)
 					break;
 
 				case 'n':
-					db_printf("%6d  %5d  %5d  %d  %#10x  "
-					    "%-12.12s  %-15s\n",
+					db_printf("%6d  %5d %5d  %d  "
+					    "%#10x %#10x %-9.9s %-15s\n",
 					    p->p_tid, ppr ? ppr->ps_pid : -1,
 					    pr->ps_ucred->cr_ruid, p->p_stat,
-					    p->p_flag | pr->ps_flags,
+					    pr->ps_flags, p->p_flag,
 					    (p->p_wchan && p->p_wmesg) ?
 						p->p_wmesg : "", pr->ps_comm);
 					break;

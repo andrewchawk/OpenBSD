@@ -14,7 +14,8 @@
 : real (full) name, with any appropriate thread context paramaters, thus hiding
 : that detail from the typical code.
 :
-: Most macros (as opposed to function) listed here are the complete full name.
+: Many macros (as opposed to functions) listed here are the complete full name,
+: though we may want to start converting those to have full names.
 :
 : All non-static functions defined by perl need to be listed in this file.
 : embed.pl uses the entries here to construct:
@@ -52,10 +53,9 @@
 :
 : The default without flags is to declare a function for internal perl-core use
 : only.  The short name is visible only when the PERL_CORE symbol is defined.
-: On some platforms, such as Linux and Darwin, all non-static functions
-: are currently externally visible.  Because of this, and also for programs
-: that embed perl, most non-static functions should have the 'p' flag to avoid
-: namespace clashes.
+: On some platforms all non-static functions are currently externally visible.
+: Because of this, and also for programs that embed perl, most non-static
+: functions should have the 'p' flag to avoid namespace clashes.
 :
 : There are several advantages to using a macro instead of the full Perl_foo or
 : S_foo form: it hides the need to know if the called function requires a
@@ -64,9 +64,6 @@
 : that gets fixed in a later release, ppport.h can be changed to automatically
 : backport the fixed version to modules.  The only disadvantage khw can think
 : of is the namespace pollution one.
-:
-: Since we don't require a C compiler to support variadic macros (C99), the
-: macros can't be generated in such situations.
 :
 : WARNING: Any macro created in a header file is visible to XS code, unless
 : care is taken to wrap it within C preprocessor guards like the following
@@ -139,29 +136,49 @@
 :
 : Scattered around the perl source are lines of the form:
 :
-:   =for apidoc name
-:   =for apidoc_item name
+:   =for apidoc name ...
+:   =for apidoc_item name ...
+:   =for apidoc_defn name ...
 :
-: followed by pod for that function.  The purpose of these lines and the text
-: that immediately follows them is to furnish documentation for functions
-: and macros listed here in embed.fnc.  The lines tend to be placed near the
-: source for the item they describe.  autodoc.pl is run as part of the standard
-: build process to extract this documentation and build perlapi.pod from the
-: elements that are in the API (flagged as A in this file), and perlintern.pod
-: from the other elements.
+: The purpose of these lines is to furnish documentation for functions and
+: macros.  The lines tend to be placed near the source for the item they
+: describe.  autodoc.pl is run as part of the standard build process to
+: extract this documentation and build either perlapi.pod (from the elements
+: that are flagged as A in this file), or perlintern.pod (from the other
+: elements.
 :
-: 'name' in the apidoc line corresponds to an item listed in this file, so that
-: the signature and flags need only be specified once, here, and automatically
-: they get placed into the generated pod.
+: Functions need to be specified in this file, but macros may not necessarily
+: be.  The information in this file is sufficient to generate a usage line for
+: the element to be documented; otherwise that information needs to be
+: specified in the apidoc-ish lines.
 :
-: 'apidoc_item' is used for subsidiary entries, which share the same pod as the
-: plain apidoc one does.  Thus the documentation for functions which do
-: essentially the same thing, but with minor differences can all be placed in
-: the same entry.  This avoids needless repetition, making the pod shorter, and
-: makes it easier to compare and contrast the different forms, and less jumping
-: around the pod file for the person reading it.  The apidoc_item lines must
-: all come after the apidoc line and before the pod for the entry.  There need
-: not be empty lines between the apidoc line and any of its apidoc_item lines.
+: 'apidoc_defn' was added to supplement, for macros, the information in this
+: file.  It is designed to be placed at the point of definition of the macro
+: it is for, so that the information can easily be checked for correctness,
+: and you know at a glance that the macro actually has documentation.  It
+: doesn't by itself create any documentation; instead the other apidoc lines
+: pull in information specified by these lines.  Many of the lines in this
+: file for macros that don't also have the 'p' flag (described below) could be
+: pulled out of here and replaced by these lines throughout the source.  It is
+: a goal to do that as convenience dictates.
+:
+: The other apidoc lines either have the usage data as part of the line, or
+: pull in the data from this file or apidoc_defn lines.
+:
+: Many macros and functions are variants of each other.  It makes sense to use
+: a single group to document such elements so their similarities and
+: differences stand out, with less repetition than if there were separate
+: entries.  Such groups start with a plain 'apidoc' line, followed by any
+: number of 'apidoc_item' lines.  These indicate that the macro or function
+: listed as 'name' on each is part of the group whose head entry is the one
+: specified by 'name' on the apidoc line.
+:
+: After the block of apidoc-like statements, is the text that is the
+: documentation, ending with the next =cut or '=for apidoc foo' lines.
+:
+: The apidoc_item lines must all come after the apidoc line and before the pod
+: text for the entry.  There need not be empty lines between the apidoc line
+: and any of its apidoc_item lines.
 :
 : The entries in this file that have corresponding '=for apidoc' entries must
 : have the 'd' flag set in this file.
@@ -178,8 +195,8 @@
 : it, and perlapi or perlintern.  That may be what you want, but it gives you
 : the flexibility to choose that, or instead have just a link to the source pod
 : inserted in perlapi or perlintern.  This allows single-source browsing for
-: someone; they don't have to scan multiple pods trying to find something
-: suitable.
+: someone; they don't have to scan multiple pods trying to find whether
+: something suitable exists.
 :
 : There are also lines of this form scattered around the perl
 : source:
@@ -187,30 +204,34 @@
 :   =for apidoc_section Section Name
 :   =head1 Section Name
 :
-: These aren't tied to this embed.fnc file, and so are documented in autodoc.pl.
+: These organize the resultant pod file into major subgroups of related
+: functionality, but aren't tied to this embed.fnc file, and so are documented
+: in autodoc.pl.
 :
 : What goes into the documentation of a particular function ends with the next
 : line that begins with an '='.  In particular, an '=cut' line ends that
 : documentation without introducing something new.
 :
-: Various macros and other elements aren't listed here in embed.fnc.  They are
-: documented in the same manner, but since they don't have this file to get
-: information from, the defining lines have the syntax and meaning they do in
-: this file, so it can be specified:
+: Various macros and other elements aren't listed here in embed.fnc (though
+: they could be).  They are documented in the same manner, but since they don't
+: have this file to get information from, the defining lines have the syntax
+: and meaning they do in this file, so it can be specified:
 :
 :   =for apidoc flags|return_type|name|arg1|arg2|...|argN
 :   =for apidoc_item flags|return_type|name|arg1|arg2|...|argN
+:   =for apidoc_defn flags|return_type|name|arg1|arg2|...|argN
 :
 : The 'name' in any such line must not be the same as any in this file (i.e.,
 : no redundant definitions), and one of the flags on the apidoc lines must be
 : 'm' or 'y', indicating it is not a function.
 :
 : All but the name field of an apidoc_item line are optional, and if empty,
-: inherits from the controlling plain apidoc line.   The flags field is
+: inherits from a corresponding apidoc_defn line, if one exists, or the
+: controlling plain apidoc line if none such exist.   The flags field is
 : generally empty, and in fact, the only flags it can have are ones directly
 : related to its display.  For example it might have the T flag to indicate no
-: thread context parameter is used, whereas the apidoc entry does have a thread
-: context.  Here is an example:
+: thread context parameter is used, whereas the apidoc entry does have a
+: thread context.  Here is an example:
 :
 : =for apidoc    Am|char*      |SvPV       |SV* sv|STRLEN len
 : =for apidoc_item |const char*|SvPV_const |SV* sv|STRLEN len
@@ -282,22 +303,21 @@
 :        functions flagged with this, the installation can run Configure with
 :        the -Accflags='-DNO_MATHOMS' parameter to not even compile them.
 :
-:        Sometimes the function has been subsumed by a more general one (say,
-:        by adding a flags parameter), and a macro exists with the original
-:        short name API, and it calls the new function, bypassing this one, and
-:        the original 'Perl_' form is being deprecated. In this case also
-:        specify the 'M' flag.
+:        If the function can be implemented as a macro (that evaluates its
+:        arguments exactly once), use the 'm' and 'p' flags together to implement
+:        this.  (See the discussion under 'm'.)  Another option for this is to
+:        use the 'M' flag.
 :
-:        Without the M flag, these functions should be deprecated, and it is an
-:        error to not also specify the 'D' flag.
+:        Without the m or M flags, these functions should be deprecated, and it
+:        is an error to not also specify the 'D' flag.
 :
 :        The 'b' functions are normally moved to mathoms.c, but if
 :        circumstances dictate otherwise, they can be anywhere, provided the
 :        whole function is wrapped with
 :
-:	    #ifndef NO_MATHOMS
-:	    ...
-:	    #endif
+:           #ifndef NO_MATHOMS
+:           ...
+:           #endif
 :
 :        Note that this flag no longer automatically adds a 'Perl_' prefix to
 :        the name. Additionally specify 'p' to do that.
@@ -351,10 +371,10 @@
 :        then it is assumed to take a strftime-style format string as the 1st
 :        arg; otherwise it's assumed to take a printf style format string, not
 :        necessarily the 1st arg.  All the arguments following the second form
-:	 (including possibly '...') are assumed to be for the format.
+:        (including possibly '...') are assumed to be for the format.
 :
 :         embed.h: any entry in here for the second form is suppressed because
-:	           of varargs
+:                  of varargs
 :         proto.h: add __attribute__format__ (or ...null_ok__)
 :
 :   'F'  Function has a '...' parameter, but don't assume it is a format. This
@@ -377,7 +397,7 @@
 :        one NN argument.
 :
 :          proto.h: PERL_ARGS_ASSERT macro is not defined unless the function
-:		   has NN arguments
+:                   has NN arguments
 :
 :   'h'  Hide any documentation that would normally go into perlapi or
 :        perlintern. This is typically used when the documentation is actually
@@ -407,8 +427,8 @@
 :        code. (A typical guard will be that it is being included in a
 :        particular C file(s) or in the perl core.) Therefore, all non-guarded
 :        functions should also have the 'p' flag specified to avoid polluting
-:        the XS code name space. Otherwise an error is generated if the 'S'
-:        flag is not also specified.
+:        the XS code name space.  Otherwise, this flag also turns on the 'S'
+:        flag.
 :
 :          proto.h: function is declared as PERL_STATIC_INLINE
 :
@@ -420,23 +440,27 @@
 :                  __attribute__always_inline__ is added
 :
 :   'm'  Implemented as a macro; there is no function associated with this
-:        name, and hence no long Perl_ or S_ name. However, if the macro name
-:        itself begins with 'Perl_', autodoc.pl will show a thread context
-:        parameter unless the 'T' flag is specified.
+:        name.  There is no long S_ name.
+:
+:        However, you may #define the macro with a long name like 'Perl_foo',
+:        and specify the 'p' flag.  This will cause an embed.h entry to be
+:        created that #defines 'foo' as 'Perl_foo'.  This can be used to make
+:        any macro have a long name, perhaps to avoid name collisions.  If
+:        instead you define the macro as 'PERL_FOO' (all uppercase), the
+:        embed.h entry will use all uppercase.  Without the T flag the behavior
+:        is subject to change when both 'm' and 'p are specified.
 :
 :         suppress proto.h entry (actually, not suppressed, but commented out)
-:         suppress entry in the list of exported symbols available on all platforms
-:         suppress embed.h entry, as the implementation should furnish the macro
+:         suppress entry in the list of exported symbols available on all
+:             platforms
+:         suppress embed.h entry (when no 'p' flag), as the implementation
+:             should furnish the macro
 :
 :   'M'  The implementation is furnishing its own macro instead of relying on
 :        the automatically generated short name macro (which simply expands to
 :        call the real name function). One reason to do this is if the
-:        parameters need to be cast from what the caller has, or if there is a
-:        macro that bypasses this function (whose long name is being retained
-:        for backward compatibility for those who call it with that name). An
-:        example is when a new function is created with an extra parameter and
-:        a wrapper macro is added that has the old API, but calls the new one
-:        with the exta parameter set to a default.
+:        parameters need to be cast from what the caller has.  There is less
+:        need to do this now that 'm' and 'p' together is supported.
 :
 :        This flag requires the 'p' flag to be specified, as there would be no
 :        need to do this if the function weren't publicly accessible before.
@@ -450,8 +474,7 @@
 :        characters, and a warning is raised otherwise. This flag suppresses
 :        that warning, so that weird things can be documented
 :
-:   'n'  Has no arguments. Perhaps a better name would have been '0'. (used
-:        only in =for apidoc entries)
+:   'n'  Has no argument list (used only in =for apidoc entries)
 :
 :        The macro (it can't be a function) is used without any parameters nor
 :        empty parentheses.
@@ -471,16 +494,12 @@
 :
 :   'o'  Has no Perl_foo or S_foo compatibility macro:
 :
-:	 This is used for whatever reason to force the function to be called
-:	 with the long name.  Perhaps there is a varargs issue.  Use the 'M'
-:	 flag instead for wrapper macros, and legacy-only functions should
-:	 also use 'b'.
+:        This is used for whatever reason to force the function to be called
+:        with the long name.  Perhaps there is a varargs issue.  Use the 'M'
+:        or 'm' flags instead for wrapper macros, and legacy-only functions
+:        should also use 'b'.
 :
 :          embed.h: suppress "#define foo Perl_foo"
-:
-:        autodoc.pl adds a note that this function must be explicitly called as
-:        Perl_$name, and with an aTHX_ parameter unless the 'T' flag is also
-:        specified.
 :
 :        mnemonic: 'omit' generated macro
 :
@@ -503,9 +522,10 @@
 :
 :          proto.h: add __attribute__pure__
 :
-:   'p'  Function in source code has a Perl_ prefix:
+:   'p'  Function or macro in source code has a Perl_ prefix:
 :
-:          proto.h: function is declared as Perl_foo rather than foo
+:          proto.h: function or macro is declared as Perl_foo rather than foo
+:                   (though the entries for macros will be commented out)
 :          embed.h: "#define foo Perl_foo" entries added
 :
 :   'R'  Return value must not be ignored (also implied by 'a' and 'P' flags):
@@ -529,8 +549,8 @@
 :
 :   's'  Static function, but function in source code has a Perl_ prefix:
 :
-:	 This is used for functions that have always had a Perl_ prefix, but
-:	 have been moved to a header file and declared static.
+:        This is used for functions that have always had a Perl_ prefix, but
+:        have been moved to a header file and declared static.
 :
 :          proto.h: function is declared as Perl_foo rather than foo
 :                STATIC is added to declaration;
@@ -558,10 +578,16 @@
 :
 :   'U'  autodoc.pl will not output a usage example
 :
-:   'W'  Add a comma_pDEPTH argument to function prototypes, and a comma_aDEPTH argument
-:        to the function calls. This means that under DEBUGGING a depth
-:        argument is added to the functions, which is used for example by the
-:        regex engine for debugging and trace output. A non DEBUGGING build
+:   'v'  Guard the macro by !MULTIPLICITY || PERL_CORE if it uses __VA_ARGS__.
+:        This flag exists for backward-compatibility to ensure that code does
+:        not break when calling older functions without an aTHX in scope. It
+:        should not be added to newly-added functions as they will have no such
+:        compatibility issues.
+:
+:   'W'  Add a comma_pDEPTH argument to function prototypes, and a comma_aDEPTH
+:        argument to the function calls. This means that under DEBUGGING a
+:        depth argument is added to the functions, which is used for example by
+:        the regex engine for debugging and trace output. A non DEBUGGING build
 :        will not pass the unused argument. Currently restricted to functions
 :        with at least one argument.
 :
@@ -601,6 +627,13 @@
 : know "I have defined whether NULL is OK or not" rather than having neither
 : NULL or NULLOK, which is ambiguous.
 :
+: Pointer parameters that point to AVs, CVs or HVs will generate additional
+: checks in the arguments assertion macro, that check on entry to the
+: function that the SV being pointed to is of the intended type, by
+: inspecting its SvTYPE(). For some functions this check may be inappropriate
+: as in rare cases the arguments passed may not be of the correct type. To
+: skip checking on an argument type, prefix its type with NOCHECK.
+:
 : Numeric arguments may also be prefixed with NZ, which will cause the
 : appropriate asserts to be generated to validate that this is the case.
 :
@@ -634,7 +667,7 @@ ETXip	|void	|append_utf8_from_native_byte				\
 				|const U8 byte				\
 				|NN U8 **dest
 : FIXME - this is only called by pp_chown. They should be merged.
-p	|I32	|apply		|I32 type				\
+p	|SSize_t|apply		|I32 type				\
 				|NN SV **mark				\
 				|NN SV **sp
 Apx	|void	|apply_attrs_string					\
@@ -692,6 +725,8 @@ Adip	|void	|av_push_simple |NN AV *av				\
 				|NN SV *val
 : Used in scope.c, and by Data::Alias
 EXp	|void	|av_reify	|NN AV *av
+ipx	|void	|av_remove_offset					\
+				|NN AV *av
 ARdp	|SV *	|av_shift	|NN AV *av
 Adp	|SV **	|av_store	|NN AV *av				\
 				|SSize_t key				\
@@ -699,8 +734,6 @@ Adp	|SV **	|av_store	|NN AV *av				\
 Cdip	|SV **	|av_store_simple|NN AV *av				\
 				|SSize_t key				\
 				|NULLOK SV *val
-ARdm	|SSize_t|av_tindex	|NN AV *av
-ARdm	|SSize_t|av_top_index	|NN AV *av
 Adp	|void	|av_undef	|NN AV *av
 Adp	|void	|av_unshift	|NN AV *av				\
 				|SSize_t num
@@ -727,25 +760,27 @@ p	|OP *	|build_infix_plugin					\
 				|NN OP *lhs				\
 				|NN OP *rhs				\
 				|NN void *tokendata
-EXp	|char * |_byte_dump_string					\
-				|NN const U8 * const start		\
+EXp	|const char *|_byte_dump_string 				\
+				|NULLOK const U8 * const start		\
 				|const STRLEN len			\
 				|const bool format
 Adp	|int	|bytes_cmp_utf8 |NN const U8 *b 			\
 				|STRLEN blen				\
 				|NN const U8 *u 			\
 				|STRLEN ulen
-AMdpx	|U8 *	|bytes_from_utf8|NN const U8 *s 			\
+Adp	|U8 *	|bytes_from_utf8|NN const U8 *s 			\
 				|NN STRLEN *lenp			\
 				|NN bool *is_utf8p
-CTdpx	|U8 *	|bytes_from_utf8_loc					\
+Adip	|U8 *	|bytes_to_utf8	|NN const U8 *s 			\
+				|NN STRLEN *lenp
+Adp	|U8 *	|bytes_to_utf8_free_me					\
 				|NN const U8 *s 			\
 				|NN STRLEN *lenp			\
-				|NN bool *is_utf8p			\
-				|NULLOK const U8 **first_unconverted
-Adpx	|U8 *	|bytes_to_utf8	|NN const U8 *s 			\
+				|NULLOK void **free_me
+Adip	|U8 *	|bytes_to_utf8_temp_pv					\
+				|NN const U8 *s 			\
 				|NN STRLEN *lenp
-AOdp	|I32	|call_argv	|NN const char *sub_name		\
+AOdp	|SSize_t|call_argv	|NN const char *sub_name		\
 				|I32 flags				\
 				|NN char **argv
 
@@ -758,14 +793,14 @@ Adp	|const PERL_CONTEXT *|caller_cx 				\
 				|NULLOK const PERL_CONTEXT **dbcxp
 Cp	|void	|call_list	|I32 oldscope				\
 				|NN AV *paramList
-AOdp	|I32	|call_method	|NN const char *methname		\
+AOdp	|SSize_t|call_method	|NN const char *methname		\
 				|I32 flags
 CTadop	|Malloc_t|calloc	|MEM_SIZE elements			\
 				|MEM_SIZE size
-AOdp	|I32	|call_pv	|NN const char *sub_name		\
+AOdp	|SSize_t|call_pv	|NN const char *sub_name		\
 				|I32 flags
-AOdp	|I32	|call_sv	|NN SV *sv				\
-				|volatile I32 flags
+AOdp	|SSize_t|call_sv	|NN SV *sv				\
+				|I32 flags
 : Used in several source files
 Rp	|bool	|cando		|Mode_t mode				\
 				|bool effective 			\
@@ -794,10 +829,10 @@ Adp	|OP *	|ck_entersub_args_proto_or_list 			\
 
 CPop	|bool	|ckwarn 	|U32 w
 CPop	|bool	|ckwarn_d	|U32 w
-Adfp	|void	|ck_warner	|U32 err				\
+Adfpv	|void	|ck_warner	|U32 err				\
 				|NN const char *pat			\
 				|...
-Adfp	|void	|ck_warner_d	|U32 err				\
+Adfpv	|void	|ck_warner_d	|U32 err				\
 				|NN const char *pat			\
 				|...
 
@@ -806,6 +841,8 @@ Adfp	|void	|ck_warner_d	|U32 err				\
 
 Cp	|void	|clear_defarray |NN AV *av				\
 				|bool abandon
+Cipx	|void	|clear_defarray_simple					\
+				|NN AV *av
 p	|const COP *|closest_cop|NN const COP *cop			\
 				|NULLOK const OP *o			\
 				|NULLOK const OP *curop 		\
@@ -840,14 +877,18 @@ p	|OP *	|coresub_op	|NN SV * const coreargssv		\
 : Used in op.c and perl.c
 px	|void	|create_eval_scope					\
 				|NULLOK OP *retop			\
+				|NN SV **sp				\
 				|U32 flags
 : croak()'s first parm can be NULL.  Otherwise, mod_perl breaks.
-Adfpr	|void	|croak		|NULLOK const char *pat 		\
+Adfprv	|void	|croak		|NULLOK const char *pat 		\
 				|...
-Tfpr	|void	|croak_caller	|NULLOK const char *pat 		\
+Tfprv	|void	|croak_caller	|NULLOK const char *pat 		\
 				|...
 CTrs	|void	|croak_memory_wrap
 Tpr	|void	|croak_no_mem
+Tpr	|void	|croak_no_mem_ext					\
+				|NN const char *context 		\
+				|STRLEN len
 ATdpr	|void	|croak_no_modify
 TXpr	|void	|croak_popstack
 Adpr	|void	|croak_sv	|NN SV *baseex
@@ -857,6 +898,11 @@ CTp	|Signal_t|csighandler1	|int sig
 CTp	|Signal_t|csighandler3	|int sig				\
 				|NULLOK Siginfo_t *info 		\
 				|NULLOK void *uap
+ATdmp	|bool	|c9strict_utf8_to_uv					\
+				|NN const U8 * const s			\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p
 EXp	|regexp_engine const *|current_re_engine
 RXp	|XOPRETANY|custom_op_get_field					\
 				|NN const OP *o 			\
@@ -893,7 +939,7 @@ AMdip	|GV *	|CvGV		|NN CV *sv
 Xop	|GV *	|cvgv_from_hek	|NN CV *cv
 Xp	|void	|cvgv_set	|NN CV *cv				\
 				|NULLOK GV *gv
-Adp	|SV *	|cv_name	|NN CV *cv				\
+Adp	|SV *	|cv_name	|NN NOCHECK CV *cv			\
 				|NULLOK SV *sv				\
 				|U32 flags
 Adp	|void	|cv_set_call_checker					\
@@ -913,7 +959,7 @@ p	|void	|cv_undef_flags |NN CV *cv				\
 Cp	|void	|cx_dump	|NN PERL_CONTEXT *cx
 : Used by CXINC, which appears to be in widespread use
 CRp	|I32	|cxinc
-Adfp	|void	|deb		|NN const char *pat			\
+Adfpv	|void	|deb		|NN const char *pat			\
 				|...
 Cdp	|I32	|debop		|NN const OP *o
 Cdp	|void	|debprofdump
@@ -941,7 +987,7 @@ ETXdp	|char * |delimcpy_no_escape					\
 				|const int delim			\
 				|NN I32 *retlen
 Cp	|void	|despatch_signals
-Adfpr	|OP *	|die		|NULLOK const char *pat 		\
+Adfprv	|OP *	|die		|NULLOK const char *pat 		\
 				|...
 Adpr	|OP *	|die_sv 	|NN SV *baseex
 : Used in util.c
@@ -1087,7 +1133,7 @@ Adp	|void	|dump_all
 p	|void	|dump_all_perl	|bool justperl
 Adhp	|void	|dump_eval
 Adp	|void	|dump_form	|NN const GV *gv
-Cfp	|void	|dump_indent	|I32 level				\
+Cfpv	|void	|dump_indent	|I32 level				\
 				|NN PerlIO *file			\
 				|NN const char *pat			\
 				|...
@@ -1110,8 +1156,16 @@ EXopx	|void	|emulate_cop_io |NN const COP * const c 		\
 				|NN SV * const sv
 AOdp	|SV *	|eval_pv	|NN const char *p			\
 				|I32 croak_on_error
-AOdp	|I32	|eval_sv	|NN SV *sv				\
+AOdp	|SSize_t|eval_sv	|NN SV *sv				\
 				|I32 flags
+ATdmp	|bool	|extended_utf8_to_uv					\
+				|NN const U8 * const s			\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p
+Adfpv	|void	|fatal_warner	|U32 err				\
+				|NN const char *pat			\
+				|...
 Adp	|void	|fbm_compile	|NN SV *sv				\
 				|U32 flags
 ARdp	|char * |fbm_instr	|NN unsigned char *big			\
@@ -1167,13 +1221,13 @@ Cp	|I32	|foldEQ_utf8_flags					\
 Adpx	|void	|forbid_outofblock_ops					\
 				|NN OP *o				\
 				|NN const char *blockname
-Tp	|void	|force_locale_unlock
-Cp	|void	|_force_out_malformed_utf8_message			\
+p	|void	|force_locale_unlock
+Cp	|void	|force_out_malformed_utf8_message_			\
 				|NN const U8 * const p			\
 				|NN const U8 * const e			\
-				|const U32 flags			\
+				|U32 flags				\
 				|const bool die_here
-Adfp	|char * |form		|NN const char *pat			\
+Adfpv	|char * |form		|NN const char *pat			\
 				|...
 : Only used in perl.c
 p	|void	|free_tied_hv_pool
@@ -1196,8 +1250,7 @@ eop	|void	|get_db_sub	|NULLOK SV **svp			\
 				|NN CV *cv
 ERTXp	|const char *|get_deprecated_property_msg			\
 				|const Size_t warning_offset
-: Used in mg.c
-Tp	|int	|get_extended_os_errno
+MTp	|int	|get_extended_os_errno
 : Only used in perl.c
 p	|void	|get_hash_seed	|NN unsigned char * const seed_buffer
 AOdp	|HV *	|get_hv 	|NN const char *name			\
@@ -1258,18 +1311,14 @@ Adp	|GV *	|gv_add_by_type |NULLOK GV *gv				\
 				|svtype type
 Adp	|int	|Gv_AMupdate	|NN HV *stash				\
 				|bool destructing
-ARdm	|GV *	|gv_autoload4	|NULLOK HV *stash			\
-				|NN const char *name			\
-				|STRLEN len				\
-				|I32 method
-ARdp	|GV *	|gv_autoload_pv |NULLOK HV *stash			\
+ARdp	|GV *	|gv_autoload_pv |NULLOK NOCHECK HV *stash		\
 				|NN const char *namepv			\
 				|U32 flags
-ARdp	|GV *	|gv_autoload_pvn|NULLOK HV *stash			\
+ARdp	|GV *	|gv_autoload_pvn|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|STRLEN len				\
 				|U32 flags
-ARdp	|GV *	|gv_autoload_sv |NULLOK HV *stash			\
+ARdp	|GV *	|gv_autoload_sv |NULLOK NOCHECK HV *stash		\
 				|NN SV *namesv				\
 				|U32 flags
 AMbdp	|GV *	|gv_AVadd	|NULLOK GV *gv
@@ -1289,61 +1338,61 @@ Adp	|GV *	|gv_fetchfile_flags					\
 				|NN const char * const name		\
 				|const STRLEN len			\
 				|const U32 flags
-Adm	|GV *	|gv_fetchmeth	|NULLOK HV *stash			\
+Adm	|GV *	|gv_fetchmeth	|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|STRLEN len				\
 				|I32 level
 Adm	|GV *	|gv_fetchmeth_autoload					\
-				|NULLOK HV *stash			\
+				|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|STRLEN len				\
 				|I32 level
-AMbdp	|GV *	|gv_fetchmethod |NN HV *stash				\
+AMbdp	|GV *	|gv_fetchmethod |NN NOCHECK HV *stash			\
 				|NN const char *name
 Adp	|GV *	|gv_fetchmethod_autoload				\
-				|NN HV *stash				\
+				|NN NOCHECK HV *stash			\
 				|NN const char *name			\
 				|I32 autoload
 Apx	|GV *	|gv_fetchmethod_pv_flags				\
-				|NN HV *stash				\
+				|NN NOCHECK HV *stash			\
 				|NN const char *name			\
 				|U32 flags
 Apx	|GV *	|gv_fetchmethod_pvn_flags				\
-				|NN HV *stash				\
+				|NN NOCHECK HV *stash			\
 				|NN const char *name			\
 				|const STRLEN len			\
 				|U32 flags
 Apx	|GV *	|gv_fetchmethod_sv_flags				\
-				|NN HV *stash				\
+				|NN NOCHECK HV *stash			\
 				|NN SV *namesv				\
 				|U32 flags
-Adp	|GV *	|gv_fetchmeth_pv|NULLOK HV *stash			\
+Adp	|GV *	|gv_fetchmeth_pv|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|I32 level				\
 				|U32 flags
 Adp	|GV *	|gv_fetchmeth_pv_autoload				\
-				|NULLOK HV *stash			\
+				|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|I32 level				\
 				|U32 flags
 Adp	|GV *	|gv_fetchmeth_pvn					\
-				|NULLOK HV *stash			\
+				|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|STRLEN len				\
 				|I32 level				\
 				|U32 flags
 Adp	|GV *	|gv_fetchmeth_pvn_autoload				\
-				|NULLOK HV *stash			\
+				|NULLOK NOCHECK HV *stash		\
 				|NN const char *name			\
 				|STRLEN len				\
 				|I32 level				\
 				|U32 flags
-Adp	|GV *	|gv_fetchmeth_sv|NULLOK HV *stash			\
+Adp	|GV *	|gv_fetchmeth_sv|NULLOK NOCHECK HV *stash		\
 				|NN SV *namesv				\
 				|I32 level				\
 				|U32 flags
 Adp	|GV *	|gv_fetchmeth_sv_autoload				\
-				|NULLOK HV *stash			\
+				|NULLOK NOCHECK HV *stash		\
 				|NN SV *namesv				\
 				|I32 level				\
 				|U32 flags
@@ -1566,7 +1615,7 @@ Cp	|void	|init_stacks
 Cp	|void	|init_tm	|NN struct tm *ptm
 p	|void	|init_uniprops
 : Used in perly.y
-AMPRTbdp|char * |instr		|NN const char *big			\
+APRTdmp |char * |instr		|NN const char *big			\
 				|NN const char *little
 Adp	|U32	|intro_my
 ERXp	|Size_t |_inverse_folds |const UV cp				\
@@ -1581,8 +1630,6 @@ p	|bool	|io_close	|NN IO *io				\
 				|NULLOK GV *gv				\
 				|bool is_explicit			\
 				|bool warn_on_fail
-APRTdm	|bool	|is_ascii_string|NN const U8 * const s			\
-				|STRLEN len
 ARTdip	|Size_t |isC9_STRICT_UTF8_CHAR					\
 				|NN const U8 * const s0 		\
 				|NN const U8 * const e
@@ -1601,12 +1648,9 @@ ATdip	|bool	|is_c9strict_utf8_string_loclen 			\
 
 APTdp	|bool	|isinfnan	|NV nv
 dp	|bool	|isinfnansv	|NN SV *sv
-Cp	|bool	|_is_in_locale_category 				\
+Cp	|bool	|is_in_locale_category_ 				\
 				|const bool compiling			\
 				|const int category
-APRTdm	|bool	|is_invariant_string					\
-				|NN const U8 * const s			\
-				|STRLEN len
 ARdp	|I32	|is_lvalue_sub
 : used to check for NULs in pathnames and other names
 ARdip	|bool	|is_safe_syscall|NN const char *pv			\
@@ -1669,9 +1713,6 @@ ATdip	|bool	|is_utf8_fixed_width_buf_loclen_flags			\
 CRp	|bool	|_is_utf8_FOO	|const U8 classnum			\
 				|NN const U8 *p 			\
 				|NN const U8 * const e
-ARTdmo	|bool	|is_utf8_invariant_string				\
-				|NN const U8 * const s			\
-				|STRLEN len
 ARTdip	|bool	|is_utf8_invariant_string_loc				\
 				|NN const U8 * const s			\
 				|STRLEN len				\
@@ -1688,7 +1729,7 @@ ARTdip	|bool	|is_utf8_string_flags					\
 				|NN const U8 *s 			\
 				|STRLEN len				\
 				|const U32 flags
-AMTbdp	|bool	|is_utf8_string_loc					\
+ATdmp	|bool	|is_utf8_string_loc					\
 				|NN const U8 *s 			\
 				|const STRLEN len			\
 				|NN const U8 **ep
@@ -1762,14 +1803,14 @@ ERXp	|HV *	|load_charnames |NN SV *char_name			\
 				|NN const char *context 		\
 				|const STRLEN context_len		\
 				|NN const char **error_msg
-AFdp	|void	|load_module	|U32 flags				\
+AFdpv	|void	|load_module	|U32 flags				\
 				|NN SV *name				\
 				|NULLOK SV *ver 			\
 				|...
-CTopr	|void	|locale_panic	|NN const char *msg			\
-				|NN const char *file_name		\
-				|const line_t line			\
-				|const int errnum
+CTopr	|void	|locale_panic	|NN const char *msg				\
+				|const line_t immediate_caller_line		\
+				|NN const char * const higher_caller_file	\
+				|const line_t higher_caller_line
 : Used in perly.y
 p	|OP *	|localize	|NN OP *o				\
 				|I32 lex
@@ -1853,7 +1894,7 @@ p	|int	|magic_getvec	|NN SV *sv				\
 p	|int	|magic_killbackrefs					\
 				|NN SV *sv				\
 				|NN MAGIC *mg
-Fdop	|SV *	|magic_methcall |NN SV *sv				\
+Fdopv	|SV *	|magic_methcall |NN SV *sv				\
 				|NN const MAGIC *mg			\
 				|NN SV *meth				\
 				|U32 flags				\
@@ -1937,11 +1978,11 @@ p	|int	|magic_wipepack |NN SV *sv				\
 				|NN MAGIC *mg
 
 CTadop	|Malloc_t|malloc	|MEM_SIZE nbytes
-Cp	|I32 *	|markstack_grow
+Cp	|Stack_off_t *|markstack_grow
 EXp	|int	|mbtowc_	|NULLOK const wchar_t *pwc		\
 				|NULLOK const char *s			\
 				|const Size_t len
-Adfp	|SV *	|mess		|NN const char *pat			\
+Adfpv	|SV *	|mess		|NN const char *pat			\
 				|...
 Adp	|SV *	|mess_sv	|NN SV *basemsg 			\
 				|bool consume
@@ -2054,7 +2095,7 @@ Cdp	|PerlIO *|my_popen_list |NN const char *mode			\
 Adp	|void	|my_setenv	|NULLOK const char *nam 		\
 				|NULLOK const char *val
 
-AMTdfp	|int	|my_snprintf	|NN char *buffer			\
+AMTdfpv |int	|my_snprintf	|NN char *buffer			\
 				|const Size_t len			\
 				|NN const char *format			\
 				|...
@@ -2077,18 +2118,6 @@ Adfp	|char * |my_strftime	|NN const char *fmt			\
 				|int wday				\
 				|int yday				\
 				|int isdst
-EXfp	|char * |my_strftime8_temp					\
-				|NN const char *fmt			\
-				|int sec				\
-				|int min				\
-				|int hour				\
-				|int mday				\
-				|int mon				\
-				|int year				\
-				|int wday				\
-				|int yday				\
-				|int isdst				\
-				|NULLOK utf8ness_t *utf8ness
 ARTdp	|NV	|my_strtod	|NN const char * const s		\
 				|NULLOK char **e
 : Used in pp_ctl.c
@@ -2097,13 +2126,13 @@ AMTdp	|int	|my_vsnprintf	|NN char *buffer			\
 				|const Size_t len			\
 				|NN const char *format			\
 				|va_list ap
-Ap	|OP *	|newANONATTRSUB |I32 floor				\
+Adp	|OP *	|newANONATTRSUB |I32 floor				\
 				|NULLOK OP *proto			\
 				|NULLOK OP *attrs			\
 				|NULLOK OP *block
-ARp	|OP *	|newANONHASH	|NULLOK OP *o
-ARp	|OP *	|newANONLIST	|NULLOK OP *o
-Ap	|OP *	|newANONSUB	|I32 floor				\
+ARdp	|OP *	|newANONHASH	|NULLOK OP *o
+ARdp	|OP *	|newANONLIST	|NULLOK OP *o
+Adp	|OP *	|newANONSUB	|I32 floor				\
 				|NULLOK OP *proto			\
 				|NULLOK OP *block
 ARdp	|OP *	|newARGDEFELEMOP|I32 flags				\
@@ -2129,7 +2158,8 @@ ARdm	|AV *	|newAV_alloc_x	|SSize_t size
 ARdm	|AV *	|newAV_alloc_xz |SSize_t size
 ARdp	|AV *	|newAVav	|NULLOK AV *oav
 ARdp	|AV *	|newAVhv	|NULLOK HV *ohv
-ARp	|OP *	|newAVREF	|NN OP *o
+ARdm	|AV *	|newAV_mortal
+ARdp	|OP *	|newAVREF	|NN OP *o
 ARdp	|OP *	|newBINOP	|I32 type				\
 				|I32 flags				\
 				|NULLOK OP *first			\
@@ -2147,7 +2177,7 @@ Adp	|CV *	|newCONSTSUB_flags					\
 				|STRLEN len				\
 				|U32 flags				\
 				|NULLOK SV *sv
-ARp	|OP *	|newCVREF	|I32 flags				\
+ARdp	|OP *	|newCVREF	|I32 flags				\
 				|NULLOK OP *o
 ARdpx	|OP *	|newDEFEROP	|I32 flags				\
 				|NN OP *block
@@ -2171,16 +2201,19 @@ ARdp	|GV *	|newGVgen_flags |NN const char *pack			\
 ARdp	|OP *	|newGVOP	|I32 type				\
 				|I32 flags				\
 				|NN GV *gv
-ARp	|OP *	|newGVREF	|I32 type				\
+ARdp	|OP *	|newGVREF	|I32 type				\
 				|NULLOK OP *o
 AMRbdp	|HV *	|newHV
 ARdp	|HV *	|newHVhv	|NULLOK HV *hv
-ARp	|OP *	|newHVREF	|NN OP *o
+ARdp	|OP *	|newHVREF	|NN OP *o
 AMRbdp	|IO *	|newIO
 ARdp	|OP *	|newLISTOP	|I32 type				\
 				|I32 flags				\
 				|NULLOK OP *first			\
 				|NULLOK OP *last
+AFRdp	|OP *	|newLISTOPn	|I32 type				\
+				|I32 flags				\
+				|...
 ARdp	|OP *	|newLOGOP	|I32 optype				\
 				|I32 flags				\
 				|NN OP *first				\
@@ -2197,7 +2230,7 @@ ARdp	|OP *	|newMETHOP	|I32 type				\
 ARdp	|OP *	|newMETHOP_named|I32 type				\
 				|I32 flags				\
 				|NN SV * const_meth
-Cp	|CV *	|newMYSUB	|I32 floor				\
+Cdp	|CV *	|newMYSUB	|I32 floor				\
 				|NN OP *o				\
 				|NULLOK OP *proto			\
 				|NULLOK OP *attrs			\
@@ -2230,6 +2263,10 @@ ARdp	|OP *	|newSLICEOP	|I32 flags				\
 				|NULLOK OP *listop
 CRp	|PERL_SI *|new_stackinfo|I32 stitems				\
 				|I32 cxitems
+CRp	|PERL_SI *|new_stackinfo_flags					\
+				|I32 stitems				\
+				|I32 cxitems				\
+				|UV flags
 ARdp	|OP *	|newSTATEOP	|I32 flags				\
 				|NULLOK char *label			\
 				|NULLOK OP *o
@@ -2240,6 +2277,10 @@ AMbdp	|CV *	|newSUB 	|I32 floor				\
 				|NULLOK OP *proto			\
 				|NULLOK OP *block
 ARdp	|SV *	|newSV		|const STRLEN len
+: Perl_new_sv is inline, so needs to be visible outside of sv.c
+Ciop	|SV *	|new_sv 	|NN const char *file			\
+				|int line				\
+				|NN const char *func
 Rp	|SV *	|newSVavdefelem |NN AV *av				\
 				|SSize_t ix				\
 				|bool extendible
@@ -2254,9 +2295,9 @@ ARdp	|OP *	|newSVOP	|I32 type				\
 				|NN SV *sv
 ARdp	|SV *	|newSVpv	|NULLOK const char * const s		\
 				|const STRLEN len
-ARdfp	|SV *	|newSVpvf	|NN const char * const pat		\
+ARdfpv	|SV *	|newSVpvf	|NN const char * const pat		\
 				|...
-ARdp	|SV *	|newSVpvn	|NULLOK const char * const buffer	\
+ARdp	|SV *	|newSVpvn	|NULLOK const char * const s		\
 				|const STRLEN len
 ARdp	|SV *	|newSVpvn_flags |NULLOK const char * const s		\
 				|const STRLEN len			\
@@ -2266,7 +2307,8 @@ ARdp	|SV *	|newSVpvn_share |NULLOK const char *s			\
 				|U32 hash
 ARdp	|SV *	|newSVpv_share	|NULLOK const char *s			\
 				|U32 hash
-ARp	|OP *	|newSVREF	|NN OP *o
+ARdp	|SV *	|newSVpvz	|const STRLEN len
+ARdp	|OP *	|newSVREF	|NN OP *o
 Adp	|SV *	|newSVrv	|NN SV * const rv			\
 				|NULLOK const char * const classname
 AMRbdp	|SV *	|newSVsv	|NULLOK SV * const old
@@ -2331,10 +2373,11 @@ AMPTdp	|char * |ninstr 	|NN const char *big			\
 
 p	|void	|no_bareword_filehandle 				\
 				|NN const char *fhname
-Tefpr	|void	|noperl_die	|NN const char *pat			\
+Tefprv	|void	|noperl_die	|NN const char *pat			\
 				|...
+CGTdp	|void	|noshutdownhook
 Adp	|int	|nothreadhook
-p	|void	|notify_parser_that_changed_to_utf8
+p	|void	|notify_parser_that_encoding_changed
 : Used in perly.y
 Rp	|OP *	|oopsAV 	|NN OP *o
 : Used in perly.y
@@ -2356,6 +2399,9 @@ ARdp	|OP *	|op_convert_list|I32 optype				\
 				|I32 flags				\
 				|NULLOK OP *o
 Adp	|void	|op_dump	|NN const OP *o
+Adfp	|void	|opdump_printf	|NN struct Perl_OpDumpContext *ctx	\
+				|NN const char *pat			\
+				|...
 ; Used in op.c and class.c
 Adp	|OP *	|op_force_list	|NULLOK OP *o
 Adp	|void	|op_free	|NULLOK OP *arg
@@ -2374,7 +2420,7 @@ Adp	|OP *	|op_prepend_elem|I32 optype				\
 Cdp	|void	|op_refcnt_lock
 Cdp	|void	|op_refcnt_unlock
 Adpx	|OP *	|op_scope	|NULLOK OP *o
-ATdp	|OP *	|op_sibling_splice					\
+Adp	|OP *	|op_sibling_splice					\
 				|NULLOK OP *parent			\
 				|NULLOK OP *start			\
 				|int del_count				\
@@ -2481,6 +2527,11 @@ ATdo	|void	|perl_free	|NN PerlInterpreter *my_perl
 
 Cop	|const char *|PerlIO_context_layers				\
 				|NULLOK const char *mode
+ATdo	|const char *|Perl_langinfo					\
+				|const nl_item item
+ATdo	|const char *|Perl_langinfo8					\
+				|const nl_item item			\
+				|NN utf8ness_t *utf8ness
 p	|int	|PerlLIO_dup2_cloexec					\
 				|int oldfd				\
 				|int newfd
@@ -2518,11 +2569,12 @@ p	|OP *	|pmruntime	|NN OP *o				\
 				|NULLOK OP *repl			\
 				|UV flags				\
 				|I32 floor
-Xiop	|I32	|POPMARK
+Xiop	|Stack_off_t|POPMARK
 Cdp	|void	|pop_scope
+Cipx	|void	|pop_stackinfo
 
 : Used in perl.c and toke.c
-Fop	|void	|populate_isa	|NN const char *name			\
+Fopv	|void	|populate_isa	|NN const char *name			\
 				|STRLEN len				\
 				|...
 Adhp	|REGEXP *|pregcomp	|NN SV * const pattern			\
@@ -2553,6 +2605,8 @@ Adp	|void	|ptr_table_store|NN PTR_TBL_t * const tbl		\
 				|NULLOK const void * const oldsv	\
 				|NN void * const newsv
 Cdp	|void	|push_scope
+Cipx	|void	|push_stackinfo |I32 type				\
+				|UV flags
 Adp	|char * |pv_display	|NN SV *dsv				\
 				|NN const char *pv			\
 				|STRLEN cur				\
@@ -2591,7 +2645,7 @@ Adp	|REGEXP *|re_compile	|NN SV * const pattern			\
 				|U32 orig_rx_flags
 Cp	|void	|reentrant_free
 Cp	|void	|reentrant_init
-CFTp	|void * |reentrant_retry|NN const char *f			\
+CFTpv	|void * |reentrant_retry|NN const char *f			\
 				|...
 
 Cp	|void	|reentrant_size
@@ -2714,6 +2768,9 @@ Cp	|char * |re_intuit_start|NN REGEXP * const rx			\
 				|NULLOK re_scream_pos_data *data
 Cp	|SV *	|re_intuit_string					\
 				|NN REGEXP  * const r
+
+p	|void	|release_RExC_state					\
+				|NN void *vstate
 Xp	|REGEXP *|re_op_compile |NULLOK SV ** const patternp		\
 				|int pat_count				\
 				|NULLOK OP *expr			\
@@ -2722,10 +2779,9 @@ Xp	|REGEXP *|re_op_compile |NULLOK SV ** const patternp		\
 				|NULLOK bool *is_bare_re		\
 				|const U32 rx_flags			\
 				|const U32 pm_flags
-
 ATdp	|void	|repeatcpy	|NN char *to				\
 				|NN const char *from			\
-				|I32 len				\
+				|SSize_t len				\
 				|IV count
 : Used in doio.c, pp_hot.c, pp_sys.c
 p	|void	|report_evil_fh |NULLOK const GV *gv
@@ -2736,17 +2792,76 @@ p	|void	|report_wrongway_fh					\
 				|NULLOK const GV *gv			\
 				|const char have
 AOdp	|void	|require_pv	|NN const char *pv
-AMp	|void	|resume_compcv	|NN struct suspended_compcv *buffer	\
+Cop	|void	|resume_compcv	|NN struct suspended_compcv *buffer	\
 				|bool save
-dm	|void	|resume_compcv_and_save 				\
+Adm	|void	|resume_compcv_and_save 				\
 				|NN struct suspended_compcv *buffer
-dm	|void	|resume_compcv_final					\
+Adm	|void	|resume_compcv_final					\
 				|NN struct suspended_compcv *buffer
 APTdp	|char * |rninstr	|NN const char *big			\
 				|NN const char *bigend			\
 				|NN const char *little			\
 				|NN const char *lend
 p	|void	|rpeep		|NULLOK OP *o
+Adipx	|void	|rpp_context	|NN SV **mark				\
+				|U8 gimme				\
+				|SSize_t extra
+Adipx	|void	|rpp_extend	|SSize_t n
+Xopx	|void	|rpp_free_2_	|NN SV * const sv1			\
+				|NN SV * const sv2			\
+				|const U32 rc1				\
+				|const U32 rc2
+Adipx	|void	|rpp_invoke_xs	|NN CV *cv
+Adipx	|bool	|rpp_is_lone	|NN SV *sv
+Cpx	|void	|rpp_obliterate_stack_to				\
+				|I32 ix
+Adipx	|void	|rpp_popfree_1
+Adipx	|void	|rpp_popfree_2
+Adipx	|void	|rpp_popfree_1_NN
+Adipx	|void	|rpp_popfree_2_NN
+Adipx	|void	|rpp_popfree_to |NN SV **sp
+Adipx	|void	|rpp_popfree_to_NN					\
+				|NN SV **sp
+Adipx	|SV *	|rpp_pop_1_norc
+Adipx	|void	|rpp_push_1	|NN SV *sv
+Adipx	|void	|rpp_push_2	|NN SV *sv1				\
+				|NN SV *sv2
+Adipx	|void	|rpp_push_IMM	|NN SV *sv
+Adipx	|void	|rpp_push_1_norc|NN SV *sv
+Adipx	|void	|rpp_replace_1_1|NN SV *sv
+Adipx	|void	|rpp_replace_2_1|NN SV *sv
+Adipx	|void	|rpp_replace_at |NN SV **sp				\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_at_NN					\
+				|NN SV **sp				\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_at_norc					\
+				|NN SV **sp				\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_at_norc_NN 				\
+				|NN SV **sp				\
+				|NN SV *sv
+Cipx	|void	|rpp_replace_2_1_COMMON 				\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_1_IMM_NN					\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_2_IMM_NN					\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_1_1_NN					\
+				|NN SV *sv
+Adipx	|void	|rpp_replace_2_1_NN					\
+				|NN SV *sv
+Adipx	|bool	|rpp_stack_is_rc
+Adipx	|bool	|rpp_try_AMAGIC_1					\
+				|int method				\
+				|int flags
+Adipx	|bool	|rpp_try_AMAGIC_2					\
+				|int method				\
+				|int flags
+Adipx	|void	|rpp_xpush_1	|NN SV *sv
+Adipx	|void	|rpp_xpush_2	|NN SV *sv1				\
+				|NN SV *sv2
+Adipx	|void	|rpp_xpush_IMM	|NN SV *sv
 Adp	|Sighandler_t|rsignal	|int i					\
 				|Sighandler_t t
 : Used in pp_sys.c
@@ -2904,12 +3019,6 @@ EXpx	|char * |scan_word	|NN char *s				\
 				|STRLEN destlen 			\
 				|int allow_package			\
 				|NN STRLEN *slp
-EXpx	|char * |scan_word6	|NN char *s				\
-				|NN char *dest				\
-				|STRLEN destlen 			\
-				|int allow_package			\
-				|NN STRLEN *slp 			\
-				|bool warn_tick
 Cp	|U32	|seed
 : Only used by perl.c/miniperl.c, but defined in caretx.c
 ep	|void	|set_caret_X
@@ -2923,8 +3032,12 @@ p	|void	|setfd_cloexec_or_inhexec_by_sysfdness			\
 Tp	|void	|setfd_inhexec	|int fd
 p	|void	|setfd_inhexec_for_sysfd				\
 				|int fd
-Xp	|void	|set_numeric_standard
-Xp	|void	|set_numeric_underlying
+Xp	|void	|set_numeric_standard					\
+				|NN const char *file			\
+				|const line_t caller_line
+Xp	|void	|set_numeric_underlying 				\
+				|NN const char *file			\
+				|const line_t caller_line
 Cp	|HEK *	|share_hek	|NN const char *str			\
 				|SSize_t len				\
 				|U32 hash
@@ -2953,18 +3066,35 @@ dopx	|PerlIO *|start_glob	|NN SV *tmpglob 			\
 				|NN IO *io
 Adp	|I32	|start_subparse |I32 is_format				\
 				|U32 flags
+ATdmp	|bool	|strict_utf8_to_uv					\
+				|NN const U8 * const s			\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p
 CRp	|NV	|str_to_version |NN SV *sv
 : Used in pp_ctl.c
 p	|void	|sub_crush_depth|NN CV *cv
+: Used in perly.y
+p	|void	|subsignature_append_positional 			\
+				|NULLOK OP *varop			\
+				|OPCODE defmode 			\
+				|NULLOK OP *defexpr
+p	|void	|subsignature_append_slurpy				\
+				|I32 sigil				\
+				|NULLOK OP *varop
+p	|OP *	|subsignature_finish
+p	|void	|subsignature_start
 Adp	|void	|suspend_compcv |NN struct suspended_compcv *buffer
 ATdip	|void	|SvAMAGIC_off	|NN SV *sv
 ATdip	|void	|SvAMAGIC_on	|NN SV *sv
 ATdp	|void	|sv_backoff	|NN SV * const sv
 Adp	|SV *	|sv_bless	|NN SV * const sv			\
-				|NN HV * const stash
+				|NN NOCHECK HV * const stash
 CMbdp	|bool	|sv_2bool	|NN SV * const sv
 Cdp	|bool	|sv_2bool_flags |NN SV *sv				\
 				|I32 flags
+Cp	|bool	|sv_can_swipe_pv_buf					\
+				|NN SV *sv
 Adp	|bool	|sv_cat_decode	|NN SV *dsv				\
 				|NN SV *encoding			\
 				|NN SV *ssv				\
@@ -2973,38 +3103,38 @@ Adp	|bool	|sv_cat_decode	|NN SV *dsv				\
 				|int tlen
 Adp	|void	|sv_catpv	|NN SV * const dsv			\
 				|NULLOK const char *sstr
-Adfp	|void	|sv_catpvf	|NN SV * const sv			\
+Adfpv	|void	|sv_catpvf	|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
-Adp	|void	|sv_catpv_flags |NN SV *dsv				\
+Adp	|void	|sv_catpv_flags |NN SV * const dsv			\
 				|NN const char *sstr			\
 				|const I32 flags
-Adfp	|void	|sv_catpvf_mg	|NN SV * const sv			\
+Adfpv	|void	|sv_catpvf_mg	|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
 Adp	|void	|sv_catpv_mg	|NN SV * const dsv			\
 				|NULLOK const char * const sstr
-AMbdp	|void	|sv_catpvn	|NN SV *dsv				\
+AMbdp	|void	|sv_catpvn	|NN SV * const dsv			\
 				|NN const char *sstr			\
 				|STRLEN len
 Adp	|void	|sv_catpvn_flags|NN SV * const dsv			\
 				|NN const char *sstr			\
 				|const STRLEN len			\
 				|const I32 flags
-AMbdp	|void	|sv_catpvn_mg	|NN SV *dsv				\
+AMbdp	|void	|sv_catpvn_mg	|NN SV * const dsv			\
 				|NN const char *sstr			\
 				|STRLEN len
-AMbdp	|void	|sv_catsv	|NN SV *dsv				\
-				|NULLOK SV *sstr
+AMbdp	|void	|sv_catsv	|NN SV * const dsv			\
+				|NULLOK SV * const sstr
 Adp	|void	|sv_catsv_flags |NN SV * const dsv			\
 				|NULLOK SV * const sstr 		\
 				|const I32 flags
-AMbdp	|void	|sv_catsv_mg	|NN SV *dsv				\
-				|NULLOK SV *sstr
+AMbdp	|void	|sv_catsv_mg	|NN SV * const dsv			\
+				|NULLOK SV * const sstr
 Adp	|void	|sv_chop	|NN SV * const sv			\
 				|NULLOK const char * const ptr
 : Used only in perl.c
-dp	|I32	|sv_clean_all
+dp	|SSize_t|sv_clean_all
 : Used only in perl.c
 dp	|void	|sv_clean_objs
 Adp	|void	|sv_clear	|NN SV * const orig_sv
@@ -3087,7 +3217,7 @@ ATdpx	|SV *	|sv_get_backrefs|NN SV * const sv
 Adip	|void	|SvGETMAGIC	|NN SV *sv
 Adp	|char * |sv_gets	|NN SV * const sv			\
 				|NN PerlIO * const fp			\
-				|I32 append
+				|SSize_t append
 Cdp	|char * |sv_grow	|NN SV * const sv			\
 				|STRLEN newlen
 Cdp	|char * |sv_grow_fresh	|NN SV * const sv			\
@@ -3108,7 +3238,7 @@ Adp	|void	|sv_insert_flags|NN SV * const bigstr			\
 Adp	|IO *	|sv_2io 	|NN SV * const sv
 Adp	|int	|sv_isa 	|NULLOK SV *sv				\
 				|NN const char * const name
-ARdpx	|bool	|sv_isa_sv	|NN SV *sv				\
+ARdp	|bool	|sv_isa_sv	|NN SV *sv				\
 				|NN SV *namesv
 Adp	|int	|sv_isobject	|NULLOK SV *sv
 Adip	|IV	|SvIV		|NN SV *sv
@@ -3116,6 +3246,7 @@ CMbp	|IV	|sv_2iv 	|NN SV *sv
 Adp	|IV	|sv_2iv_flags	|NN SV * const sv			\
 				|const I32 flags
 Adip	|IV	|SvIV_nomg	|NN SV *sv
+Adp	|SV *	|sv_langinfo	|const nl_item item
 Adp	|STRLEN |sv_len 	|NULLOK SV * const sv
 Adp	|STRLEN |sv_len_utf8	|NULLOK SV * const sv
 Adp	|STRLEN |sv_len_utf8_nomg					\
@@ -3237,6 +3368,17 @@ AMTdip	|void	|SvREFCNT_inc_void					\
 				|NULLOK SV *sv
 ARdp	|const char *|sv_reftype|NN const SV * const sv 		\
 				|const int ob
+
+Adp	|void	|sv_regex_global_pos_clear				\
+				|NN SV *sv
+ARdp	|bool	|sv_regex_global_pos_get				\
+				|NN SV *sv				\
+				|NN STRLEN *posp			\
+				|U32 flags
+Adp	|void	|sv_regex_global_pos_set				\
+				|NN SV *sv				\
+				|STRLEN pos				\
+				|U32 flags
 Adp	|void	|sv_replace	|NN SV * const sv			\
 				|NN SV * const nsv
 Adp	|void	|sv_report_used
@@ -3266,10 +3408,10 @@ Adp	|char  *|sv_setpv_bufsize					\
 				|NN SV * const sv			\
 				|const STRLEN cur			\
 				|const STRLEN len
-Adfp	|void	|sv_setpvf	|NN SV * const sv			\
+Adfpv	|void	|sv_setpvf	|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
-Adfp	|void	|sv_setpvf_mg	|NN SV * const sv			\
+Adfpv	|void	|sv_setpvf_mg	|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
 Cipx	|char  *|sv_setpv_freshbuf					\
@@ -3329,6 +3471,17 @@ Adm	|bool	|sv_streq	|NULLOK SV *sv1 			\
 Adp	|bool	|sv_streq_flags |NULLOK SV *sv1 			\
 				|NULLOK SV *sv2 			\
 				|const U32 flags
+Adp	|SV *	|sv_strftime_ints					\
+				|NN SV *fmt				\
+				|int sec				\
+				|int min				\
+				|int hour				\
+				|int mday				\
+				|int mon				\
+				|int year				\
+				|int isdst
+Adp	|SV *	|sv_strftime_tm |NN SV *fmt				\
+				|NN const struct tm *mytm
 Adp	|SV *	|sv_string_from_errnum					\
 				|int errnum				\
 				|NULLOK SV *tgtsv
@@ -3427,6 +3580,10 @@ Adp	|void	|sv_vsetpvfn	|NN SV * const sv			\
 				|NULLOK SV ** const svargs		\
 				|const Size_t sv_count			\
 				|NULLOK bool * const maybe_tainted
+Adp	|const char *|sv_vstring_get					\
+				|NN SV * const sv			\
+				|NULLOK STRLEN *lenp
+Cipx	|void	|switch_argstack|NN AV *to
 Adp	|void	|switch_to_global_locale
 Adp	|bool	|sync_locale
 CTop	|void	|sys_init	|NN int *argc				\
@@ -3439,18 +3596,16 @@ CTop	|void	|sys_term
 Cdp	|void	|taint_env
 Cdp	|void	|taint_proper	|NULLOK const char *f			\
 				|NN const char * const s
-Apx	|void	|thread_locale_init
-Apx	|void	|thread_locale_term
 
-Fp	|OP *	|tied_method	|NN SV *methname			\
-				|NN SV **sp				\
+Fpv	|OP *	|tied_method	|NN SV *methname			\
+				|NN SV **mark				\
 				|NN SV * const sv			\
 				|NN const MAGIC * const mg		\
 				|const U32 flags			\
 				|U32 argc				\
 				|...
 Xp	|SSize_t|tmps_grow_p	|SSize_t ix
-Xiop	|I32	|TOPMARK
+Xiop	|Stack_off_t|TOPMARK
 Cm	|UV	|to_uni_fold	|UV c					\
 				|NN U8 *p				\
 				|NN STRLEN *lenp
@@ -3498,6 +3653,11 @@ EXop	|bool	|try_amagic_bin |int method				\
 				|int flags
 EXop	|bool	|try_amagic_un	|int method				\
 				|int flags
+ARTdp	|char * |uiv_2buf	|NN char * const buf			\
+				|const IV iv				\
+				|UV uv					\
+				|const int is_uv			\
+				|NN char ** const peob
 Adp	|SSize_t|unpackstring	|NN const char *pat			\
 				|NN const char *patend			\
 				|NN const char *s			\
@@ -3514,39 +3674,47 @@ ARdip	|IV	|utf8_distance	|NN const U8 *a 			\
 				|NN const U8 *b
 ARTdip	|U8 *	|utf8_hop	|NN const U8 *s 			\
 				|SSize_t off
-ARTdip	|U8 *	|utf8_hop_back	|NN const U8 *s 			\
+ARTdmp	|U8 *	|utf8_hop_back	|NN const U8 *s 			\
 				|SSize_t off				\
-				|NN const U8 *start
-ARTdip	|U8 *	|utf8_hop_forward					\
+				|NN const U8 * const start
+ARTdip	|U8 *	|utf8_hop_back_overshoot				\
 				|NN const U8 *s 			\
 				|SSize_t off				\
-				|NN const U8 *end
-ARTdip	|U8 *	|utf8_hop_safe	|NN const U8 *s 			\
+				|NN const U8 * const start		\
+				|NULLOK SSize_t *remaining
+ARTdmp	|U8 *	|utf8_hop_forward					\
+				|NN const U8 *s 			\
 				|SSize_t off				\
-				|NN const U8 *start			\
-				|NN const U8 *end
+				|NN const U8 * const end
+ARTdip	|U8 *	|utf8_hop_forward_overshoot				\
+				|NN const U8 *s 			\
+				|SSize_t off				\
+				|NN const U8 * const end		\
+				|NULLOK SSize_t *remaining
+ARTdip	|U8 *	|utf8_hop_overshoot					\
+				|NN const U8 *s 			\
+				|SSize_t off				\
+				|NN const U8 * const start		\
+				|NN const U8 * const end		\
+				|NULLOK SSize_t *remaining
+ARTdmp	|U8 *	|utf8_hop_safe	|NN const U8 *s 			\
+				|SSize_t off				\
+				|NN const U8 * const start		\
+				|NN const U8 * const end
 ARdp	|STRLEN |utf8_length	|NN const U8 *s0			\
 				|NN const U8 *e
-
-AMTdp	|UV	|utf8n_to_uvchr |NN const U8 *s 			\
+ATdmp	|UV	|utf8n_to_uvchr |NN const U8 *s 			\
 				|STRLEN curlen				\
 				|NULLOK STRLEN *retlen			\
 				|const U32 flags
-AMTdp	|UV	|utf8n_to_uvchr_error					\
+ATdmp	|UV	|utf8n_to_uvchr_error					\
 				|NN const U8 *s 			\
 				|STRLEN curlen				\
 				|NULLOK STRLEN *retlen			\
 				|const U32 flags			\
 				|NULLOK U32 *errors
 ATdip	|UV	|utf8n_to_uvchr_msgs					\
-				|NN const U8 *s 			\
-				|STRLEN curlen				\
-				|NULLOK STRLEN *retlen			\
-				|const U32 flags			\
-				|NULLOK U32 *errors			\
-				|NULLOK AV **msgs
-CTp	|UV	|_utf8n_to_uvchr_msgs_helper				\
-				|NN const U8 *s 			\
+				|NN const U8 * const s0 		\
 				|STRLEN curlen				\
 				|NULLOK STRLEN *retlen			\
 				|const U32 flags			\
@@ -3557,6 +3725,20 @@ CDbdp	|UV	|utf8n_to_uvuni |NN const U8 *s 			\
 				|NULLOK STRLEN *retlen			\
 				|U32 flags
 Adpx	|U8 *	|utf8_to_bytes	|NN U8 *s				\
+				|NN STRLEN *lenp
+Cp	|bool	|utf8_to_bytes_ |NN U8 **s_ptr				\
+				|NN STRLEN *lenp			\
+				|NN void **free_me			\
+				|Perl_utf8_to_bytes_arg result_as
+Adip	|bool	|utf8_to_bytes_new_pv					\
+				|NN U8 const **s_ptr			\
+				|NN STRLEN *lenp			\
+				|NN void **free_me
+Adip	|bool	|utf8_to_bytes_overwrite				\
+				|NN U8 **s_ptr				\
+				|NN STRLEN *lenp
+Adip	|bool	|utf8_to_bytes_temp_pv					\
+				|NN U8 const **s_ptr			\
 				|NN STRLEN *lenp
 EMXp	|U8 *	|utf16_to_utf8	|NN U8 *p				\
 				|NN U8 *d				\
@@ -3581,16 +3763,48 @@ EMXp	|U8 *	|utf16_to_utf8_reversed 				\
 				|NN U8 *d				\
 				|Size_t bytelen 			\
 				|NN Size_t *newlen
+ATdmp	|bool	|utf8_to_uv	|NN const U8 * const s			\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p
 ADbdp	|UV	|utf8_to_uvchr	|NN const U8 *s 			\
 				|NULLOK STRLEN *retlen
-AMdp	|UV	|utf8_to_uvchr_buf					\
+AMdip	|UV	|utf8_to_uvchr_buf					\
 				|NN const U8 *s 			\
 				|NN const U8 *send			\
 				|NULLOK STRLEN *retlen
-Cip	|UV	|utf8_to_uvchr_buf_helper				\
-				|NN const U8 *s 			\
-				|NN const U8 *send			\
-				|NULLOK STRLEN *retlen
+ATdmp	|bool	|utf8_to_uv_errors					\
+				|NN const U8 * const s			\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p		\
+				|U32 flags				\
+				|NULLOK U32 *errors
+ATdmp	|bool	|utf8_to_uv_flags					\
+				|NN const U8 * const s			\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p		\
+				|U32 flags
+ATdip	|bool	|utf8_to_uv_msgs|NN const U8 * const s0 		\
+				|NN const U8 *e 			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p		\
+				|U32 flags				\
+				|NULLOK U32 *errors			\
+				|NULLOK AV **msgs
+CTp	|bool	|utf8_to_uv_msgs_helper_				\
+				|NN const U8 * const s0 		\
+				|NN const U8 * const e			\
+				|NN UV *cp_p				\
+				|NULLOK Size_t *advance_p		\
+				|U32 flags				\
+				|NULLOK U32 *errors			\
+				|NULLOK AV **msgs
+ATdip	|UV	|utf8_to_uv_or_die					\
+				|NN const U8 * const s			\
+				|NN const U8 *e 			\
+				|NULLOK Size_t *advance_p
 CDbdp	|UV	|utf8_to_uvuni	|NN const U8 *s 			\
 				|NULLOK STRLEN *retlen
 : Used in perly.y
@@ -3620,12 +3834,33 @@ Cp	|U8 *	|uvoffuni_to_utf8_flags_msgs				\
 				|UV input_uv				\
 				|const UV flags 			\
 				|NULLOK HV **msgs
-Cp	|U8 *	|uvuni_to_utf8	|NN U8 *d				\
+
+Adip	|U8 *	|uv_to_utf8	|NN U8 *d				\
+				|UV uv
+Adip	|U8 *	|uv_to_utf8_flags					\
+				|NN U8 *d				\
+				|UV uv					\
+				|UV flags
+Adip	|U8 *	|uv_to_utf8_msgs|NN U8 *d				\
+				|UV uv					\
+				|UV flags				\
+				|NULLOK HV **msgs
+CDbp	|U8 *	|uvuni_to_utf8	|NN U8 *d				\
 				|UV uv
 EXdpx	|bool	|validate_proto |NN SV *name				\
 				|NULLOK SV *proto			\
 				|bool warn				\
 				|bool curstash
+Adp	|bool	|valid_identifier_pve					\
+				|NN const char *s			\
+				|NN const char *end			\
+				|U32 flags
+Adp	|bool	|valid_identifier_pvn					\
+				|NN const char *s			\
+				|STRLEN len				\
+				|U32 flags
+Adp	|bool	|valid_identifier_sv					\
+				|NULLOK SV *sv
 CRTdip	|UV	|valid_utf8_to_uvchr					\
 				|NN const U8 *s 			\
 				|NULLOK STRLEN *retlen
@@ -3634,6 +3869,9 @@ Adp	|int	|vcmp		|NN SV *lhv				\
 Adpr	|void	|vcroak 	|NULLOK const char *pat 		\
 				|NULLOK va_list *args
 Adp	|void	|vdeb		|NN const char *pat			\
+				|NULLOK va_list *args
+Adp	|void	|vfatal_warner	|U32 err				\
+				|NN const char *pat			\
 				|NULLOK va_list *args
 Adp	|char * |vform		|NN const char *pat			\
 				|NULLOK va_list *args
@@ -3663,12 +3901,11 @@ Adp	|void	|vwarner	|U32 err				\
 p	|I32	|wait4pid	|Pid_t pid				\
 				|NN int *statusp			\
 				|int flags
-Adfp	|void	|warn		|NN const char *pat			\
+Adfpv	|void	|warn		|NN const char *pat			\
 				|...
-Adfp	|void	|warner 	|U32 err				\
+Adfpv	|void	|warner 	|U32 err				\
 				|NN const char *pat			\
 				|...
-TXp	|void	|_warn_problematic_locale
 Adp	|void	|warn_sv	|NN SV *baseex
 : Used in cop.h
 RXop	|I32	|was_lvalue_sub
@@ -3690,9 +3927,10 @@ Adp	|void	|wrap_op_checker|Optype opcode				\
 				|NN Perl_check_t *old_checker_p
 : Used in pp_ctl.c
 p	|void	|write_to_stderr|NN SV *msv
-Xp	|void	|xs_boot_epilog |const I32 ax
+Xp	|void	|xs_boot_epilog |const SSize_t ax
 
-FTXop	|I32	|xs_handshake	|const U32 key				\
+FTXopv	|Stack_off_t|xs_handshake					\
+				|const U32 key				\
 				|NN void *v_my_perl			\
 				|NN const char *file			\
 				|...
@@ -3754,7 +3992,7 @@ p	|I32	|do_ipcget	|I32 optype				\
 				|NN SV **mark				\
 				|NN SV **sp
 : Defined in doio.c, used only in pp_sys.c
-p	|I32	|do_msgrcv	|NN SV **mark				\
+p	|SSize_t|do_msgrcv	|NN SV **mark				\
 				|NN SV **sp
 : Defined in doio.c, used only in pp_sys.c
 p	|I32	|do_msgsnd	|NN SV **mark				\
@@ -3767,19 +4005,6 @@ p	|I32	|do_shmio	|I32 optype				\
 				|NN SV **mark				\
 				|NN SV **sp
 #endif /* defined(HAS_MSG) || defined(HAS_SEM) || defined(HAS_SHM) */
-#if defined(HAS_NL_LANGINFO) && defined(PERL_LANGINFO_H)
-ATdo	|const char *|Perl_langinfo					\
-				|const nl_item item
-ATdo	|const char *|Perl_langinfo8					\
-				|const nl_item item			\
-				|NULLOK utf8ness_t *utf8ness
-#else
-ATdo	|const char *|Perl_langinfo					\
-				|const int item
-ATdo	|const char *|Perl_langinfo8					\
-				|const int item 			\
-				|NULLOK utf8ness_t *utf8ness
-#endif
 #if defined(HAS_PIPE)
 Rp	|int	|PerlProc_pipe_cloexec					\
 				|NN int *pipefd
@@ -3843,47 +4068,47 @@ pr	|int	|magic_regdatum_set					\
 				|NN MAGIC *mg
 #endif
 #if defined(MULTIPLICITY)
-ATdfpr	|void	|croak_nocontext|NULLOK const char *pat 		\
+ATdfprv |void	|croak_nocontext|NULLOK const char *pat 		\
 				|...
-ATdfp	|void	|deb_nocontext	|NN const char *pat			\
+ATdfpv	|void	|deb_nocontext	|NN const char *pat			\
 				|...
-ATdfpr	|OP *	|die_nocontext	|NULLOK const char *pat 		\
+ATdfprv |OP *	|die_nocontext	|NULLOK const char *pat 		\
 				|...
-ATdfp	|char * |form_nocontext |NN const char *pat			\
+ATdfpv	|char * |form_nocontext |NN const char *pat			\
 				|...
-AFTdp	|void	|load_module_nocontext					\
+AFTdpv	|void	|load_module_nocontext					\
 				|U32 flags				\
 				|NN SV *name				\
 				|NULLOK SV *ver 			\
 				|...
-ATdfp	|SV *	|mess_nocontext |NN const char *pat			\
+ATdfpv	|SV *	|mess_nocontext |NN const char *pat			\
 				|...
 Cdop	|void * |my_cxt_init	|NN int *indexp 			\
 				|size_t size
-ATdfp	|SV *	|newSVpvf_nocontext					\
+ATdfpv	|SV *	|newSVpvf_nocontext					\
 				|NN const char * const pat		\
 				|...
-ATdfp	|void	|sv_catpvf_mg_nocontext 				\
+ATdfpv	|void	|sv_catpvf_mg_nocontext 				\
 				|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
-ATdfp	|void	|sv_catpvf_nocontext					\
+ATdfpv	|void	|sv_catpvf_nocontext					\
 				|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
-ATdfp	|void	|sv_setpvf_mg_nocontext 				\
+ATdfpv	|void	|sv_setpvf_mg_nocontext 				\
 				|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
-ATdfp	|void	|sv_setpvf_nocontext					\
+ATdfpv	|void	|sv_setpvf_nocontext					\
 				|NN SV * const sv			\
 				|NN const char * const pat		\
 				|...
-ATdfp	|void	|warner_nocontext					\
+ATdfpv	|void	|warner_nocontext					\
 				|U32 err				\
 				|NN const char *pat			\
 				|...
-ATdfp	|void	|warn_nocontext |NN const char *pat			\
+ATdfpv	|void	|warn_nocontext |NN const char *pat			\
 				|...
 #endif /* defined(MULTIPLICITY) */
 #if defined(MYMALLOC)
@@ -3959,28 +4184,28 @@ AMbdp	|GV *	|gv_SVadd	|NULLOK GV *gv
 #endif
 #if defined(PERL_IMPLICIT_SYS)
 CTo	|PerlInterpreter *|perl_alloc_using				\
-				|NN struct IPerlMem *ipM		\
-				|NN struct IPerlMem *ipMS		\
-				|NN struct IPerlMem *ipMP		\
-				|NN struct IPerlEnv *ipE		\
-				|NN struct IPerlStdIO *ipStd		\
-				|NN struct IPerlLIO *ipLIO		\
-				|NN struct IPerlDir *ipD		\
-				|NN struct IPerlSock *ipS		\
-				|NN struct IPerlProc *ipP
+				|NN const struct IPerlMem **ipM 	\
+				|NN const struct IPerlMem **ipMS	\
+				|NN const struct IPerlMem **ipMP	\
+				|NN const struct IPerlEnv **ipE 	\
+				|NN const struct IPerlStdIO **ipStd	\
+				|NN const struct IPerlLIO **ipLIO	\
+				|NN const struct IPerlDir **ipD 	\
+				|NN const struct IPerlSock **ipS	\
+				|NN const struct IPerlProc **ipP
 # if defined(USE_ITHREADS)
 CTo	|PerlInterpreter *|perl_clone_using				\
 				|NN PerlInterpreter *proto_perl 	\
 				|UV flags				\
-				|NN struct IPerlMem *ipM		\
-				|NN struct IPerlMem *ipMS		\
-				|NN struct IPerlMem *ipMP		\
-				|NN struct IPerlEnv *ipE		\
-				|NN struct IPerlStdIO *ipStd		\
-				|NN struct IPerlLIO *ipLIO		\
-				|NN struct IPerlDir *ipD		\
-				|NN struct IPerlSock *ipS		\
-				|NN struct IPerlProc *ipP
+				|NN const struct IPerlMem **ipM 	\
+				|NN const struct IPerlMem **ipMS	\
+				|NN const struct IPerlMem **ipMP	\
+				|NN const struct IPerlEnv **ipE 	\
+				|NN const struct IPerlStdIO **ipStd	\
+				|NN const struct IPerlLIO **ipLIO	\
+				|NN const struct IPerlDir **ipD 	\
+				|NN const struct IPerlSock **ipS	\
+				|NN const struct IPerlProc **ipP
 # endif
 #else
 Adp	|I32	|my_pclose	|NULLOK PerlIO *ptr
@@ -3992,6 +4217,18 @@ i	|bool	|PerlEnv_putenv |NN char *str
 #endif
 #if defined(PERL_IN_AV_C)
 S	|MAGIC *|get_aux_mg	|NN AV *av
+#endif
+#if defined(PERL_IN_BUILTIN_C) || defined(PERL_IN_OP_C)
+p	|void	|finish_export_lexical
+p	|void	|import_builtin_bundle					\
+				|U16 ver
+p	|void	|prepare_export_lexical
+p	|void	|XS_builtin_indexed					\
+				|NN CV *cv
+#endif
+#if defined(PERL_IN_CLASS_C)
+S	|void	|class_cleanup_definition				\
+				|NN HV *stash
 #endif
 #if defined(PERL_IN_CLASS_C) || defined(PERL_IN_OP_C)    || \
     defined(PERL_IN_PAD_C)   || defined(PERL_IN_PERLY_C) || \
@@ -4028,10 +4265,11 @@ Cp	|void	|croak_kw_unless_class					\
           defined(PERL_IN_TOKE_C) */
 #if defined(PERL_IN_DEB_C)
 S	|void	|deb_stack_n	|NN SV **stack_base			\
-				|I32 stack_min				\
-				|I32 stack_max				\
-				|I32 mark_min				\
-				|I32 mark_max
+				|SSize_t stack_min			\
+				|SSize_t stack_max			\
+				|SSize_t mark_min			\
+				|SSize_t mark_max			\
+				|SSize_t nonrc_base
 #endif
 #if defined(PERL_IN_DOIO_C)
 S	|bool	|argvout_final	|NN MAGIC *mg				\
@@ -4040,8 +4278,7 @@ S	|bool	|argvout_final	|NN MAGIC *mg				\
 S	|void	|exec_failed	|NN const char *cmd			\
 				|int fd 				\
 				|int do_report
-RS	|bool	|ingroup	|Gid_t testgid				\
-				|bool effective
+ST	|bool	|is_fork_open	|NN const char *name
 S	|bool	|openn_cleanup	|NN GV *gv				\
 				|NN IO *io				\
 				|NULLOK PerlIO *fp			\
@@ -4061,6 +4298,10 @@ S	|IO *	|openn_setup	|NN GV *gv				\
 				|NN PerlIO **saveofp			\
 				|NN int *savefd 			\
 				|NN char *savetype
+# if !defined(DOSISH)
+RS	|bool	|ingroup	|Gid_t testgid				\
+				|bool effective
+# endif
 #endif
 #if defined(PERL_IN_DOOP_C)
 RS	|Size_t |do_trans_complex					\
@@ -4070,9 +4311,9 @@ RS	|Size_t |do_trans_count |NN SV * const sv			\
 				|NN const OPtrans_map * const tbl
 RS	|Size_t |do_trans_count_invmap					\
 				|NN SV * const sv			\
-				|NN AV * const map
+				|NN AV * const invmap
 RS	|Size_t |do_trans_invmap|NN SV * const sv			\
-				|NN AV * const map
+				|NN AV * const invmap
 RS	|Size_t |do_trans_simple|NN SV * const sv			\
 				|NN const OPtrans_map * const tbl
 #endif
@@ -4306,7 +4547,7 @@ RS	|HE *	|new_he
 : Used in hv.c and mg.c
 opx	|void	|sv_kill_backrefs					\
 				|NN SV * const sv			\
-				|NULLOK AV * const av
+				|NULLOK NOCHECK AV * const av
 #endif
 #if defined(PERL_IN_HV_C) || defined(PERL_IN_SV_C)
 op	|SV *	|hfree_next_entry					\
@@ -4318,74 +4559,133 @@ S	|utf8ness_t|get_locale_string_utf8ness_i			\
 				|NULLOK const char *string		\
 				|const locale_utf8ness_t known_utf8	\
 				|NULLOK const char *locale		\
-				|const unsigned cat_index
+				|const locale_category_index cat_index
+S	|void	|ints_to_tm	|NN struct tm *my_tm			\
+				|NN const char *locale			\
+				|int sec				\
+				|int min				\
+				|int hour				\
+				|int mday				\
+				|int mon				\
+				|int year				\
+				|int isdst
 S	|bool	|is_locale_utf8 |NN const char *locale
-# if defined(HAS_LOCALECONV)
 S	|HV *	|my_localeconv	|const int item
+S	|void	|populate_hash_from_C_localeconv			\
+				|NN HV *hv				\
+				|NN const char *locale			\
+				|const U32 which_mask			\
+				|NN const lconv_offset_t *strings[2]	\
+				|NN const lconv_offset_t *integers[2]
+S	|bool	|strftime8	|NN const char *fmt			\
+				|NN SV *sv				\
+				|NN const char *locale			\
+				|NN const struct tm *mytm		\
+				|const utf8ness_t fmt_utf8ness		\
+				|NN utf8ness_t *result_utf8ness 	\
+				|const bool called_externally
+Sf	|bool	|strftime_tm	|NN const char *fmt			\
+				|NN SV *sv				\
+				|NN const char *locale			\
+				|NN const struct tm *mytm
+S	|SV *	|sv_strftime_common					\
+				|NN SV *fmt				\
+				|NN const char *locale			\
+				|NN const struct tm *mytm
+# if defined(HAS_MISSING_LANGINFO_ITEM_) || !defined(HAS_NL_LANGINFO)
+S	|const char *|emulate_langinfo					\
+				|const PERL_INTMAX_T item		\
+				|NN const char *locale			\
+				|NN SV *sv				\
+				|NULLOK utf8ness_t *utf8ness
+# endif
+# if defined(USE_LOCALE)
+S	|const char *|calculate_LC_ALL_string					\
+				|NULLOK const char **category_locales_list	\
+				|const calc_LC_ALL_format format		\
+				|const calc_LC_ALL_return returning		\
+				|const line_t caller_line
+S	|const char *|external_call_langinfo				\
+				|const nl_item item			\
+				|NN SV *sv				\
+				|NULLOK utf8ness_t *utf8ness
+RS	|locale_category_index|get_category_index_helper		\
+				|const int category			\
+				|NULLOK bool *success			\
+				|const line_t caller_line
+Ri	|const char *|mortalized_pv_copy				\
+				|NULLOK const char * const pv
+S	|const char *|native_querylocale_i				\
+				|const locale_category_index cat_index
+S	|void	|new_LC_ALL	|NN const char *lc_all			\
+				|bool force
+S	|void	|output_check_environment_warning			\
+				|NULLOK const char * const language	\
+				|NULLOK const char * const lc_all	\
+				|NULLOK const char * const lang
+S	|parse_LC_ALL_string_return|parse_LC_ALL_string 		\
+				|NN const char *string			\
+				|NN const char **output 		\
+				|const parse_LC_ALL_STRING_action	\
+				|bool always_use_full_array		\
+				|const bool panic_on_error		\
+				|const line_t caller_line
+So	|void	|restore_toggled_locale_i				\
+				|const locale_category_index cat_index	\
+				|NULLOK const char *original_locale	\
+				|const line_t caller_line
+S	|const char *|save_to_buffer					\
+				|NULLOK const char *string		\
+				|NULLOK char **buf			\
+				|NULLOK Size_t *buf_size
+Sr	|void	|setlocale_failure_panic_via_i				\
+				|const locale_category_index cat_index	\
+				|NULLOK const char *current		\
+				|NN const char *failed			\
+				|const line_t proxy_caller_line 	\
+				|const line_t immediate_caller_line	\
+				|NN const char *higher_caller_file	\
+				|const line_t higher_caller_line
+S	|void	|set_save_buffer_min_size				\
+				|const Size_t min_len			\
+				|NULLOK char **buf			\
+				|NULLOK Size_t *buf_size
+So	|const char *|toggle_locale_i					\
+				|const locale_category_index cat_index	\
+				|NN const char *new_locale		\
+				|const line_t caller_line
+#   if defined(DEBUGGING)
+RS	|char * |my_setlocale_debug_string_i				\
+				|const locale_category_index cat_index	\
+				|NULLOK const char *locale		\
+				|NULLOK const char *retval		\
+				|const line_t line
+#   endif
+#   if   defined(HAS_LOCALECONV) && \
+       ( defined(USE_LOCALE_MONETARY) || defined(USE_LOCALE_NUMERIC) )
 S	|void	|populate_hash_from_localeconv				\
 				|NN HV *hv				\
 				|NN const char *locale			\
 				|const U32 which_mask			\
 				|NN const lconv_offset_t *strings[2]	\
-				|NULLOK const lconv_offset_t *integers
-# endif
-# if defined(USE_LOCALE)
-ST	|unsigned int|get_category_index				\
-				|const int category			\
-				|NULLOK const char *locale
-ST	|int	|get_category_index_nowarn				\
-				|const int category
-Ri	|const char *|mortalized_pv_copy				\
-				|NULLOK const char * const pv
-S	|void	|new_LC_ALL	|NULLOK const char *unused		\
-				|bool force
-So	|void	|restore_toggled_locale_i				\
-				|const unsigned cat_index		\
-				|NULLOK const char *original_locale	\
-				|const line_t caller_line
-ST	|const char *|save_to_buffer					\
-				|NULLOK const char *string		\
-				|NULLOK const char **buf		\
-				|NULLOK Size_t *buf_size
-Sr	|void	|setlocale_failure_panic_i				\
-				|const unsigned int cat_index		\
-				|NULLOK const char *current		\
-				|NN const char *failed			\
-				|const line_t caller_0_line		\
-				|const line_t caller_1_line
-S	|const char *|stdize_locale					\
-				|const int category			\
-				|NULLOK const char *input_locale	\
-				|NULLOK const char **buf		\
-				|NULLOK Size_t *buf_size		\
-				|line_t caller_line
-So	|const char *|toggle_locale_i					\
-				|const unsigned switch_cat_index	\
-				|NN const char *new_locale		\
-				|const line_t caller_line
-#   if defined(DEBUGGING)
-RS	|char * |my_setlocale_debug_string_i				\
-				|const unsigned cat_index		\
-				|NULLOK const char *locale		\
-				|NULLOK const char *retval		\
-				|const line_t line
+				|NN const lconv_offset_t *integers[2]
 #   endif
-#   if defined(HAS_NL_LANGINFO) || defined(HAS_NL_LANGINFO_L)
-S	|const char *|my_langinfo_i					\
+#   if defined(HAS_NL_LANGINFO)
+S	|const char *|langinfo_sv_i					\
 				|const nl_item item			\
-				|const unsigned int cat_index		\
+				|locale_category_index cat_index	\
 				|NN const char *locale			\
-				|NN const char **retbufp		\
-				|NULLOK Size_t *retbuf_sizep		\
+				|NN SV *sv				\
 				|NULLOK utf8ness_t *utf8ness
+#   endif
+#   if defined(LC_ALL)
+S	|void	|give_perl_locale_control				\
+				|NN const char *lc_all_string		\
+				|const line_t caller_line
 #   else
-S	|const char *|my_langinfo_i					\
-				|const int item 			\
-				|const unsigned int cat_index		\
-				|NN const char *locale			\
-				|NN const char **retbufp		\
-				|NULLOK Size_t *retbuf_sizep		\
-				|NULLOK utf8ness_t *utf8ness
+S	|void	|give_perl_locale_control				\
+				|NN const char **curlocales		\
+				|const line_t caller_line
 #   endif
 #   if defined(USE_LOCALE_COLLATE)
 S	|void	|new_collate	|NN const char *newcoll 		\
@@ -4413,51 +4713,30 @@ S	|void	|new_numeric	|NN const char *newnum			\
 S	|const char *|get_LC_ALL_display
 #   endif
 #   if defined(USE_POSIX_2008_LOCALE)
-S	|const char *|emulate_setlocale_i				\
-				|const unsigned int index		\
-				|NULLOK const char *new_locale		\
-				|const recalc_lc_all_t recalc_LC_ALL	\
-				|const line_t line
-S	|const char *|my_querylocale_i					\
-				|const unsigned int index
-S	|const char *|setlocale_from_aggregate_LC_ALL			\
-				|NN const char *locale			\
+S	|bool	|bool_setlocale_2008_i					\
+				|const locale_category_index index	\
+				|NN const char *new_locale		\
+				|const line_t caller_line
+S	|const char *|querylocale_2008_i				\
+				|const locale_category_index index	\
 				|const line_t line
 S	|locale_t|use_curlocale_scratch
-#     if defined(USE_QUERYLOCALE)
-S	|const char *|calculate_LC_ALL					\
-				|const locale_t cur_obj
-#     else
-S	|const char *|update_PL_curlocales_i				\
-				|const unsigned int index		\
+#     if !defined(USE_QUERYLOCALE)
+S	|void	|update_PL_curlocales_i 				\
+				|const locale_category_index index	\
 				|NN const char *new_locale		\
-				|recalc_lc_all_t recalc_LC_ALL
+				|const line_t caller_line
 #     endif
-#   elif  defined(USE_LOCALE_THREADS) &&                  \
-         !defined(USE_THREAD_SAFE_LOCALE) &&              \
-         !defined(USE_THREAD_SAFE_LOCALE_EMULATION) /* &&
-         !defined(USE_POSIX_2008_LOCALE) */
-S	|const char *|less_dicey_setlocale_r				\
-				|const int category			\
-				|NULLOK const char *locale
-: Not currently used
-S	|void	|less_dicey_void_setlocale_i				\
-				|const unsigned cat_index		\
-				|NN const char *locale			\
-				|const line_t line
-#     if 0
+#   elif  defined(USE_LOCALE_THREADS) && !defined(USE_THREAD_SAFE_LOCALE) && \
+         !defined(USE_THREAD_SAFE_LOCALE_EMULATION)
 S	|bool	|less_dicey_bool_setlocale_r				\
 				|const int cat				\
 				|NN const char *locale
-#     endif
+S	|const char *|less_dicey_setlocale_r				\
+				|const int category			\
+				|NULLOK const char *locale
 #   endif
-#   if !(  defined(USE_POSIX_2008_LOCALE) && defined(USE_QUERYLOCALE) ) && \
-        ( !defined(LC_ALL) || defined(USE_POSIX_2008_LOCALE) ||            \
-           defined(WIN32) )
-S	|const char *|calculate_LC_ALL					\
-				|NN const char **individ_locales
-#   endif
-#   if defined(WIN32)
+#   if defined(WIN32) || defined(WIN32_USE_FAKE_OLD_MINGW_LOCALES)
 ST	|wchar_t *|Win_byte_string_to_wstring				\
 				|const UINT code_page			\
 				|NULLOK const char *byte_string
@@ -4471,13 +4750,13 @@ S	|const char *|wrap_wsetlocale					\
 				|const int category			\
 				|NULLOK const char *locale
 #   endif
-#   if   defined(WIN32) || \
+#   if   defined(WIN32) || defined(WIN32_USE_FAKE_OLD_MINGW_LOCALES) || \
        ( defined(USE_POSIX_2008_LOCALE) && !defined(USE_QUERYLOCALE) )
 S	|const char *|find_locale_from_environment			\
-				|const unsigned int index
+				|const locale_category_index index
 #   endif
 # endif /* defined(USE_LOCALE) */
-# if defined(USE_POSIX_2008_LOCALE) || defined(DEBUGGING)
+# if defined(USE_LOCALE) || defined(DEBUGGING)
 S	|const char *|get_displayable_string				\
 				|NN const char * const s		\
 				|NN const char * const e		\
@@ -4582,6 +4861,8 @@ S	|void	|inplace_aassign|NN OP *o
 RST	|bool	|is_handle_constructor					\
 				|NN const OP *o 			\
 				|I32 numargs
+Ti	|bool	|is_standard_filehandle_name				\
+				|NN const char *fhname
 S	|OP *	|listkids	|NULLOK OP *o
 S	|bool	|looks_like_bool|NN const OP *o
 S	|OP *	|modkids	|NULLOK OP *o				\
@@ -4609,6 +4890,9 @@ i	|OP *	|newMETHOP_internal					\
 				|NULLOK SV * const_meth
 RS	|OP *	|no_fh_allowed	|NN OP *o
 i	|OP *	|op_integerize	|NN OP *o
+Ti	|U16	|opslab_slot_offset					\
+				|NN const OPSLAB *slab			\
+				|NN const OPSLOT *slot
 i	|OP *	|op_std_init	|NN OP *o
 S	|OP *	|pmtrans	|NN OP *o				\
 				|NN OP *expr				\
@@ -4628,6 +4912,7 @@ RST	|bool	|scalar_mod_type|NULLOK const OP *o			\
 				|I32 type
 RS	|OP *	|search_const	|NN OP *o
 S	|void	|simplify_sort	|NN OP *o
+Ti	|U16	|size_to_psize	|size_t size
 RS	|OP *	|too_few_arguments_pv					\
 				|NN OP *o				\
 				|NN const char *name			\
@@ -4686,7 +4971,7 @@ Rp	|SV *	|varname	|NULLOK const GV * const gv		\
 Sd	|PADOFFSET|pad_alloc_name					\
 				|NN PADNAME *name			\
 				|U32 flags				\
-				|NULLOK HV *typestash			\
+				|NULLOK NOCHECK HV *typestash		\
 				|NULLOK HV *ourstash
 Sd	|void	|pad_check_dup	|NN PADNAME *name			\
 				|U32 flags				\
@@ -4779,8 +5064,7 @@ RTi	|bool	|lossless_NV_to_IV					\
 : Used in pp_hot.c
 Reop	|GV *	|softref2xv	|NN SV * const sv			\
 				|NN const char * const what		\
-				|const svtype type			\
-				|NN SV ***spp
+				|const svtype type
 #endif
 #if defined(PERL_IN_PP_C)   || defined(PERL_IN_REGCOMP_ANY) || \
     defined(PERL_IN_TOKE_C) || defined(PERL_IN_UNIVERSAL_C)
@@ -4944,6 +5228,8 @@ S	|OP *	|doform 	|NN CV *cv				\
 				|NULLOK OP *retop
 S	|SV *	|space_join_names_mortal				\
 				|NULLOK char * const *array
+S	|void	|warn_not_dirhandle					\
+				|NN GV *gv
 # if !defined(HAS_MKDIR) || !defined(HAS_RMDIR)
 RS	|int	|dooneliner	|NN const char *cmd			\
 				|NN const char *filename
@@ -4970,8 +5256,6 @@ ERTix	|UV	|invlist_highest_range_start				\
 ERTi	|bool	|invlist_is_iterating					\
 				|NN const SV * const invlist
 ERTix	|UV	|invlist_lowest |NN SV * const invlist
-ETp	|bool	|is_ssc_worth_it|NN const RExC_state_t *pRExC_state	\
-				|NN const regnode_ssc *ssc
 Ep	|U32	|join_exact	|NN RExC_state_t *pRExC_state		\
 				|NN regnode *scan			\
 				|NN UV *min_subtract			\
@@ -5002,8 +5286,6 @@ Ep	|void	|set_ANYOF_arg	|NN RExC_state_t * const pRExC_state		\
 				|NULLOK SV * const cp_list			\
 				|NULLOK SV * const runtime_defns		\
 				|NULLOK SV * const only_utf8_locale_list
-Ep	|void	|ssc_finalize	|NN RExC_state_t *pRExC_state		\
-				|NN regnode_ssc *ssc
 Ep	|void	|ssc_init	|NN const RExC_state_t *pRExC_state	\
 				|NN regnode_ssc *ssc
 Ep	|SSize_t|study_chunk	|NN RExC_state_t *pRExC_state		\
@@ -5047,7 +5329,7 @@ ES	|AV *	|add_multi_match|NULLOK AV *multi_char_matches		\
 				|const STRLEN cp_count
 ES	|void	|change_engine_size					\
 				|NN RExC_state_t *pRExC_state		\
-				|const Ptrdiff_t size
+				|const ptrdiff_t size
 ERS	|REGEXP *|compile_wildcard					\
 				|NN const char *subpattern		\
 				|const STRLEN len			\
@@ -5114,6 +5396,8 @@ ES	|SV *	|handle_user_defined_property				\
 				|NN bool *user_defined_ptr		\
 				|NN SV *msg				\
 				|const STRLEN level
+EST	|bool	|is_ssc_worth_it|NN const RExC_state_t *pRExC_state	\
+				|NN const regnode_ssc *ssc
 ES	|void	|nextchar	|NN RExC_state_t *pRExC_state
 ES	|U8	|optimize_regclass						\
 				|NN RExC_state_t *pRExC_state			\
@@ -5142,7 +5426,7 @@ ES	|SV *	|parse_uniprop_string					\
 				|NN bool *user_defined_ptr		\
 				|NN SV *msg				\
 				|const STRLEN level
-Sfr	|void	|re_croak	|bool utf8				\
+Sfrv	|void	|re_croak	|bool utf8				\
 				|NN const char *pat			\
 				|...
 ES	|regnode_offset|reg	|NN RExC_state_t *pRExC_state		\
@@ -5212,6 +5496,8 @@ ES	|void	|skip_to_be_ignored_text				\
 				|NN RExC_state_t *pRExC_state		\
 				|NN char **p				\
 				|const bool force_to_xmod
+ES	|void	|ssc_finalize	|NN RExC_state_t *pRExC_state		\
+				|NN regnode_ssc *ssc
 # if defined(DEBUGGING)
 ES	|regnode_offset|regnode_guts_debug				\
 				|NN RExC_state_t *pRExC_state		\
@@ -5362,20 +5648,22 @@ ERS	|LB_enum|advance_one_LB |NN U8 **curpos 			\
 ERS	|SB_enum|advance_one_SB |NN U8 **curpos 			\
 				|NN const U8 * const strend		\
 				|const bool utf8_target
-ERS	|WB_enum|advance_one_WB |NN U8 **curpos 			\
+ERS	|WB_enum|advance_one_WB_|NN U8 **curpos 			\
 				|NN const U8 * const strend		\
 				|const bool utf8_target 		\
 				|const bool skip_Extend_Format
 ERS	|GCB_enum|backup_one_GCB|NN const U8 * const strbeg		\
 				|NN U8 **curpos 			\
 				|const bool utf8_target
-ERS	|LB_enum|backup_one_LB	|NN const U8 * const strbeg		\
+ERS	|LB_enum|backup_one_LB_ |NN const U8 * const strbeg		\
 				|NN U8 **curpos 			\
-				|const bool utf8_target
+				|const bool utf8_target 		\
+				|bool skip_CM_ZWJ
 ERS	|SB_enum|backup_one_SB	|NN const U8 * const strbeg		\
 				|NN U8 **curpos 			\
 				|const bool utf8_target
-ERS	|WB_enum|backup_one_WB	|NN WB_enum *previous			\
+ERS	|WB_enum|backup_one_WB_but_over_Extend_FO			\
+				|NN WB_enum *previous			\
 				|NN const U8 * const strbeg		\
 				|NN U8 **curpos 			\
 				|const bool utf8_target
@@ -5448,10 +5736,6 @@ ESW	|void	|regcp_restore	|NN regexp *rex 			\
 ERST	|U8 *	|reghop3	|NN U8 *s				\
 				|SSize_t off				\
 				|NN const U8 *lim
-ERST	|U8 *	|reghop4	|NN U8 *s				\
-				|SSize_t off				\
-				|NN const U8 *llim			\
-				|NN const U8 *rlim
 ERST	|U8 *	|reghopmaybe3	|NN U8 *s				\
 				|SSize_t off				\
 				|NN const U8 * const lim
@@ -5491,7 +5775,7 @@ ES	|void	|dump_exec_pos	|NN const char *locinput		\
 				|const bool do_utf8			\
 				|const U32 depth
 
-EFp	|int	|re_exec_indentf|NN const char *fmt			\
+EFpv	|int	|re_exec_indentf|NN const char *fmt			\
 				|U32 depth				\
 				|...
 # endif
@@ -5534,10 +5818,10 @@ Ep	|void	|regprop	|NULLOK const regexp *prog		\
 				|NN const regnode *o			\
 				|NULLOK const regmatch_info *reginfo	\
 				|NULLOK const RExC_state_t *pRExC_state
-EFp	|int	|re_indentf	|NN const char *fmt			\
+EFpv	|int	|re_indentf	|NN const char *fmt			\
 				|U32 depth				\
 				|...
-Efp	|int	|re_printf	|NN const char *fmt			\
+Efpv	|int	|re_printf	|NN const char *fmt			\
 				|...
 # endif
 # if defined(PERL_EXT_RE_BUILD)
@@ -5576,6 +5860,9 @@ S	|void	|assert_uft8_cache_coherent				\
 				|STRLEN from_cache			\
 				|STRLEN real				\
 				|NN SV * const sv
+S	|void	|croak_sv_setsv_flags					\
+				|NN SV * const dsv			\
+				|NN SV * const ssv
 S	|bool	|curse		|NN SV * const sv			\
 				|const bool check_refcnt
 RS	|STRLEN |expect_number	|NN const char ** const pattern
@@ -5637,11 +5924,6 @@ ST	|STRLEN |sv_pos_u2b_midway					\
 				|const STRLEN uend
 i	|void	|sv_unglob	|NN SV * const sv			\
 				|U32 flags
-RTi	|char * |uiv_2buf	|NN char * const buf			\
-				|const IV iv				\
-				|UV uv					\
-				|const int is_uv			\
-				|NN char ** const peob
 S	|void	|utf8_mg_len_cache_update				\
 				|NN SV * const sv			\
 				|NN MAGIC ** const mgp			\
@@ -5652,11 +5934,13 @@ S	|void	|utf8_mg_pos_cache_update				\
 				|const STRLEN byte			\
 				|const STRLEN utf8			\
 				|const STRLEN blen
-S	|I32	|visit		|NN SVFUNC_t f				\
+S	|SSize_t|visit		|NN SVFUNC_t f				\
 				|const U32 flags			\
 				|const U32 mask
 # if defined(DEBUGGING)
 S	|void	|del_sv 	|NN SV *p
+p	|void	|sv_mark_arenas
+p	|void	|sv_sweep_arenas
 # endif
 # if !defined(NV_PRESERVES_UV)
 #   if defined(DEBUGGING)
@@ -5717,10 +6001,11 @@ S	|void	|incline	|NN const char *s			\
 				|NN const char *end
 S	|int	|intuit_method	|NN char *s				\
 				|NULLOK SV *ioname			\
-				|NULLOK CV *cv
+				|NULLOK NOCHECK CV *cv
 S	|int	|intuit_more	|NN char *s				\
 				|NN char *e
-S	|I32	|lop		|I32 f					\
+S	|I32	|lop		|enum yytokentype t			\
+				|I32 f					\
 				|U8 x					\
 				|NN char *s
 Sr	|void	|missingterm	|NULLOK char *s 			\
@@ -5734,15 +6019,12 @@ So	|SV *	|new_constant	|NULLOK const char *s			\
 				|NULLOK const char *type		\
 				|STRLEN typelen 			\
 				|NULLOK const char **error_msg
-S	|void	|no_op		|NN const char * const what		\
-				|NULLOK char *s
 S	|void	|parse_ident	|NN char **s				\
 				|NN char **d				\
 				|NN char * const e			\
 				|int allow_package			\
 				|bool is_utf8				\
-				|bool check_dollar			\
-				|bool tick_warn
+				|bool check_dollar
 S	|int	|pending_ident
 RS	|char * |scan_const	|NN char *start
 RS	|char * |scan_formline	|NN char *s
@@ -5768,6 +6050,12 @@ S	|void	|update_debugger_info					\
 				|NULLOK SV *orig_sv			\
 				|NULLOK const char * const buf		\
 				|STRLEN len
+S	|void	|warn_expect_operator					\
+				|NN const char * const what		\
+				|NULLOK char *s 			\
+				|I32 pop_oldbufptr
+S	|void	|yyerror_non_ascii_message				\
+				|NN const U8 * const s
 S	|int	|yywarn 	|NN const char * const s		\
 				|U32 flags
 # if defined(DEBUGGING)
@@ -5775,12 +6063,6 @@ Sf	|void	|printbuf	|NN const char * const fmt		\
 				|NN const char * const s
 S	|int	|tokereport	|I32 rv 				\
 				|NN const YYSTYPE *lvalp
-# endif
-# if defined(PERL_CR_FILTER)
-S	|I32	|cr_textfilter	|int idx				\
-				|NULLOK SV *sv				\
-				|int maxlen
-S	|void	|strip_return	|NN SV *sv
 # endif
 # if !defined(PERL_NO_UTF16_FILTER)
 S	|U8 *	|add_utf16_textfilter					\
@@ -5813,13 +6095,9 @@ RS	|UV	|check_locale_boundary_crossing 			\
 				|NN STRLEN *lenp
 RTi	|int	|does_utf8_overflow					\
 				|NN const U8 * const s			\
-				|NN const U8 *e 			\
-				|const bool consider_overlongs
+				|NN const U8 *e
 RTi	|int	|isFF_overlong	|NN const U8 * const s			\
 				|const STRLEN len
-Ri	|bool	|is_utf8_common |NN const U8 * const p			\
-				|NN const U8 * const e			\
-				|NULLOK SV * const invlist
 RTi	|int	|is_utf8_overlong					\
 				|NN const U8 * const s			\
 				|const STRLEN len
@@ -5881,8 +6159,8 @@ Ti	|U32	|ptr_hash	|PTRV u
 S	|SV *	|with_queued_errors					\
 				|NN SV *ex
 So	|void	|xs_version_bootcheck					\
-				|U32 items				\
-				|U32 ax 				\
+				|SSize_t items				\
+				|SSize_t ax				\
 				|NN const char *xs_p			\
 				|STRLEN xs_len
 # if defined(PERL_MEM_LOG) && !defined(PERL_MEM_LOG_NOIMPL)
@@ -5972,6 +6250,14 @@ Cipx	|void	|cx_pushwhen	|NN PERL_CONTEXT *cx
 Cipx	|void	|cx_topblock	|NN PERL_CONTEXT *cx
 Cipx	|U8	|gimme_V
 #endif /* !defined(PERL_NO_INLINE_FUNCTIONS) */
+#if defined(PERL_RC_STACK)
+EXopx	|OP *	|pp_wrap	|NN Perl_ppaddr_t real_pp_fn		\
+				|I32 nargs				\
+				|int nlists
+Cpx	|int	|runops_wrap
+EXopx	|void	|xs_wrap	|NN XSUBADDR_t xsub			\
+				|NN CV *cv
+#endif
 #if defined(PERL_USE_3ARG_SIGHANDLER)
 CTp	|Signal_t|csighandler	|int sig				\
 				|NULLOK Siginfo_t *info 		\
@@ -6113,6 +6399,9 @@ Ep	|char * |mem_collxfrm_	|NN const char *input_string		\
 				|bool utf8
 # endif
 #endif /* defined(USE_LOCALE_COLLATE) */
+#if defined(USE_LOCALE_CTYPE)
+TXop	|void	|warn_problematic_locale
+#endif
 #if defined(USE_PERLIO)
 Adhp	|void	|PerlIO_clearerr|NULLOK PerlIO *f
 Adhp	|int	|PerlIO_close	|NULLOK PerlIO *f
@@ -6158,13 +6447,17 @@ Adhp	|SSize_t|PerlIO_write	|NULLOK PerlIO *f			\
 				|Size_t count
 #endif /* defined(USE_PERLIO) */
 #if defined(USE_PERL_SWITCH_LOCALE_CONTEXT)
-CTop	|void	|switch_locale_context
+Cop	|void	|switch_locale_context
 #endif
 #if defined(USE_QUADMATH)
 Tdp	|bool	|quadmath_format_needed 				\
 				|NN const char *format
 Tdp	|bool	|quadmath_format_valid					\
 				|NN const char *format
+#endif
+#if defined(USE_THREADS)
+Apx	|void	|thread_locale_init
+Apx	|void	|thread_locale_term
 #endif
 #if defined(VMS) || defined(WIN32)
 Cp	|int	|do_aspawn	|NULLOK SV *really			\

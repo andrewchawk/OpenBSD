@@ -13,7 +13,7 @@ BEGIN {
 use warnings;
 use strict;
 
-my $tests = 52; # not counting those in the __DATA__ section
+my $tests = 53; # not counting those in the __DATA__ section
 
 use B::Deparse;
 my $deparse = B::Deparse->new();
@@ -62,7 +62,7 @@ while (<DATA>) {
     # parse options if necessary
     my $deparse = $meta{options}
 	? $deparse{$meta{options}} ||=
-	    new B::Deparse split /,/, $meta{options}
+	    B::Deparse->new(split /,/, $meta{options})
 	: $deparse;
 
     my $code = "$meta{context};\n" . <<'EOC' . "sub {$input\n}";
@@ -289,7 +289,7 @@ SKIP: {
 	    # Clear out all hints
 	    %^H = ();
 	    $^H = 0;
-	    new B::Deparse -> ambient_pragmas(strict => 'all');
+	    B::Deparse->new->ambient_pragmas(strict => 'all');
 	}
 	use 5.011;  # should enable strict
 	ok !eval '$do_noT_create_a_variable_with_this_name = 1',
@@ -570,6 +570,19 @@ is runperl(stderr => 1, switches => [ '-MO=-qq,Deparse', $path ],
     prog => 'package Foo; sub f { 1; } BEGIN { *Bar::f = \&f; }'),
     "package Foo;\nsub f {\n    1;\n}\nsub BEGIN {\n    *Bar::f = \\&f;\n}\n",
     "sub glob alias in separate package shouldn't impede emitting original sub";
+
+# method declarations (GH#22777)
+like runperl(stderr => 1, switches => [ '-MO=-qq,Deparse', $path ],
+    prog => <<'EOF',
+        use feature qw( class signatures );
+        class C {
+            field $x;
+            method m () { $x++ }
+        }
+EOF
+    ),
+    qr/ +method m \(\) \{\n +\$x\+\+;\n +\}/,
+    "feature class method deparses as method";
 
 
 done_testing($tests);
@@ -887,7 +900,6 @@ my $f = sub {
 } ;
 ####
 # anonconst
-# CONTEXT no warnings 'experimental::const_attr';
 my $f = sub : const {
     123;
 }
@@ -1813,6 +1825,22 @@ print sort(foo('bar'));
 substr(my $a, 0, 0) = (foo(), bar());
 $a++;
 ####
+# 3-arg substr (non-chop)
+my $str = 'ABCD';
+my $bbb = substr($str, 1, 1);
+####
+# 3-arg substr (chop)
+my $str = 'ABCD';
+my $aaa = substr($str, 0, 1);
+####
+# 4-arg substr (non-chop)
+my $str = 'ABCD';
+my $bbb = substr($str, 1, 1, '');
+####
+# 4-arg substr (chop)
+my $str = 'ABCD';
+my $aaa = substr($str, 0, 1, '');
+####
 # This following line works around an unfixed bug that we are not trying to 
 # test for here:
 # CONTEXT BEGIN { $^H{a} = "b"; delete $^H{a} } # make %^H localised
@@ -1857,7 +1885,7 @@ package foo;
 CORE::do({});
 CORE::do({});
 ####
-# [perl #77096] functions that do not follow the llafr
+# [perl #77096] functions that do not follow the looks-like-a-function rule
 () = (return 1) + time;
 () = (return ($1 + $2) * $3) + time;
 () = (return ($a xor $b)) + time;
@@ -1871,6 +1899,26 @@ CORE::do({});
 () = (last 1) + 3;
 () = (next 1) + 3;
 () = (redo 1) + 3;
+() = (-R $_) + 3;
+() = (-W $_) + 3;
+() = (-X $_) + 3;
+() = (-r $_) + 3;
+() = (-w $_) + 3;
+() = (-x $_) + 3;
+>>>>
+() = (return 1);
+() = (return ($1 + $2) * $3);
+() = (return $a ^^ $b);
+() = (do 'file') + time;
+() = (do ($1 + $2) * $3) + time;
+() = (do ($1 ^^ $2)) + time;
+() = (goto 1);
+() = (require 'foo') + 3;
+() = (require foo) + 3;
+() = (CORE::dump 1);
+() = (last 1);
+() = (next 1);
+() = (redo 1);
 () = (-R $_) + 3;
 () = (-W $_) + 3;
 () = (-X $_) + 3;
@@ -1892,10 +1940,19 @@ require v5.16;
 ####
 # [perl #97476] not() *does* follow the llafr
 $_ = ($a xor not +($1 || 2) ** 2);
+>>>>
+$_ = $a ^^ !($1 || 2) ** 2;
 ####
 # Precedence conundrums with argument-less function calls
 () = (eof) + 1;
 () = (return) + 1;
+() = (return, 1);
+() = warn;
+() = warn() + 1;
+() = setpgrp() + 1;
+>>>>
+() = (eof) + 1;
+() = (return);
 () = (return, 1);
 () = warn;
 () = warn() + 1;
@@ -1907,6 +1964,12 @@ $_ = ($a xor not +($1 || 2) ** 2);
 () = (last a) | 'b';
 () = (next a) | 'b';
 () = (redo a) | 'b';
+>>>>
+() = (CORE::dump a);
+() = (goto a);
+() = (last a);
+() = (next a);
+() = (redo a);
 ####
 # [perl #63558] open local(*FH)
 open local *FH;
@@ -2627,13 +2690,20 @@ foreach \&a (sub { 9; } , sub { 10; } ) {
     die;
 }
 ####
-# CONTEXT no warnings 'experimental::for_list';
 my %hash;
 foreach my ($key, $value) (%hash) {
     study $_;
 }
 ####
-# CONTEXT no warnings 'experimental::for_list';
+my @arr;
+foreach my ($idx, $elem) (builtin::indexed @arr) {
+    die;
+}
+####
+foreach my ($idx, $elem) (builtin::indexed 'x', 'y', 'z') {
+    die;
+}
+####
 my @ducks;
 foreach my ($tick, $trick, $track) (@ducks) {
     study $_;
@@ -3289,7 +3359,7 @@ $a = $b == ($c == $d != $e);
 $a = $b & $c == $d != $e;
 ####
 # try/catch
-# CONTEXT use feature 'try'; no warnings 'experimental::try';
+# CONTEXT use feature 'try';
 try {
     FIRST();
 }
@@ -3297,7 +3367,7 @@ catch($var) {
     SECOND();
 }
 ####
-# CONTEXT use feature 'try'; no warnings 'experimental::try';
+# CONTEXT use feature 'try';
 try {
     FIRST();
 }
@@ -3352,3 +3422,36 @@ my(@x) = (-2.0, -1.0, -0.0, 0.0, 1.0, 2.0);
 # PADSV_STORE optimised state should be handled
 # CONTEXT use feature "state";
 () = (state $s = 1);
+####
+# control transfer in RHS of assignment
+my $x;
+$x = (return 'ok');
+$x //= (return 'ok');
+$x = exit 42;
+$x //= exit 42;
+####
+# preserve __LINE__ etc
+my $x = __LINE__;
+my $y = __FILE__;
+my $z = __PACKAGE__;
+####
+# CONTEXT use feature "state";
+state sub FOO () { 42 }
+print 42, "\n";
+####
+# CONTEXT use feature 'isa';
+# GH #22661 ! vs comparisons
+my $p;
+$_ = (!$p) == 1;
+$_ = (!$p) != 1;
+$_ = (!$p) eq '';
+$_ = (!$p) ne '';
+$_ = (!$p) isa 'Some::Class';
+$_ = (!$p) =~ tr/1//;
+$_ = (!$p) =~ /1/;
+$_ = (!$p) =~ s/1//r;
+####
+# xor operator
+my($x, $y, $z);
+$z = 1 + ($x ^^ $y);
+$z = ($x ^^= $y);

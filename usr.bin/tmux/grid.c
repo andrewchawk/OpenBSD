@@ -1,4 +1,4 @@
-/* $OpenBSD: grid.c,v 1.131 2024/06/24 08:11:46 nicm Exp $ */
+/* $OpenBSD: grid.c,v 1.158 2026/09/01 12:49:49 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -84,13 +84,16 @@ grid_need_extended_cell(const struct grid_cell_entry *gce,
 		return (1);
 	if (gc->attr > 0xff)
 		return (1);
-	if (gc->data.size != 1 || gc->data.width != 1)
+	if (gc->data.size > 1 || gc->data.width > 1)
 		return (1);
-	if ((gc->fg & COLOUR_FLAG_RGB) || (gc->bg & COLOUR_FLAG_RGB))
+	if ((gc->fg & (COLOUR_FLAG_RGB|COLOUR_FLAG_THEME)) ||
+	    (gc->bg & (COLOUR_FLAG_RGB|COLOUR_FLAG_THEME)))
 		return (1);
 	if (gc->us != 8) /* only supports 256 or RGB */
 		return (1);
 	if (gc->link != 0)
+		return (1);
+	if (gc->flags & GRID_FLAG_TAB)
 		return (1);
 	return (0);
 }
@@ -123,8 +126,13 @@ grid_extended_cell(struct grid_line *gl, struct grid_cell_entry *gce,
 	else if (gce->offset >= gl->extdsize)
 		fatalx("offset too big");
 	gl->flags |= GRID_LINE_EXTENDED;
+	if (gc->link != 0)
+		gl->flags |= GRID_LINE_HYPERLINK;
 
-	utf8_from_data(&gc->data, &uc);
+	if (gc->flags & GRID_FLAG_TAB)
+		uc = gc->data.width;
+	else
+		utf8_from_data(&gc->data, &uc);
 
 	gee = &gl->extddata[gce->offset];
 	gee->data = uc;
@@ -186,6 +194,25 @@ grid_get_line(struct grid *gd, u_int line)
 	return (&gd->linedata[line]);
 }
 
+/* Get line time. */
+time_t
+grid_line_time(const struct grid_line *gl)
+{
+	if (gl->time == 0)
+		return (0);
+	return (start_time.tv_sec + gl->time - 1);
+}
+
+/* Set line time. */
+static void
+grid_line_set_time(struct grid_line *gl)
+{
+	if (current_time == 0)
+		gl->time = 0;
+	else
+		gl->time = current_time - start_time.tv_sec + 1;
+}
+
 /* Adjust number of lines. */
 void
 grid_adjust_lines(struct grid *gd, u_int lines)
@@ -195,15 +222,23 @@ grid_adjust_lines(struct grid *gd, u_int lines)
 
 /* Copy default into a cell. */
 static void
-grid_clear_cell(struct grid *gd, u_int px, u_int py, u_int bg)
+grid_clear_cell(struct grid *gd, u_int px, u_int py, u_int bg, int moved)
 {
 	struct grid_line	*gl = &gd->linedata[py];
 	struct grid_cell_entry	*gce = &gl->celldata[px];
 	struct grid_extd_entry	*gee;
+	u_int			 old_offset = gce->offset;
+	int			 had_extd = (gce->flags & GRID_FLAG_EXTENDED);
 
 	memcpy(gce, &grid_cleared_entry, sizeof *gce);
-	if (bg != 8) {
-		if (bg & COLOUR_FLAG_RGB) {
+	if (!moved && had_extd && old_offset < gl->extdsize) {
+		gce->flags |= GRID_FLAG_EXTENDED;
+		gce->offset = old_offset;
+		gee = grid_extended_cell(gl, gce, &grid_cleared_cell);
+		if (bg != 8)
+			gee->bg = bg;
+	} else if (bg != 8) {
+		if (bg & (COLOUR_FLAG_RGB|COLOUR_FLAG_THEME)) {
 			grid_get_extended_cell(gl, gce, gce->flags);
 			gee = grid_extended_cell(gl, gce, &grid_cleared_cell);
 			gee->bg = bg;
@@ -230,9 +265,13 @@ grid_check_y(struct grid *gd, const char *from, u_int py)
 int
 grid_cells_look_equal(const struct grid_cell *gc1, const struct grid_cell *gc2)
 {
+	int flags1 = gc1->flags, flags2 = gc2->flags;
+
 	if (gc1->fg != gc2->fg || gc1->bg != gc2->bg)
 		return (0);
-	if (gc1->attr != gc2->attr || gc1->flags != gc2->flags)
+	if (gc1->attr != gc2->attr)
+		return (0);
+	if ((flags1 & ~GRID_FLAG_CLEARED) != (flags2 & ~GRID_FLAG_CLEARED))
 		return (0);
 	if (gc1->link != gc2->link)
 		return (0);
@@ -252,18 +291,28 @@ grid_cells_equal(const struct grid_cell *gc1, const struct grid_cell *gc2)
 	return (memcmp(gc1->data.data, gc2->data.data, gc1->data.size) == 0);
 }
 
+/* Set grid cell to a tab. */
+void
+grid_set_tab(struct grid_cell *gc, u_int width)
+{
+	memset(gc->data.data, 0, sizeof gc->data.data);
+	gc->flags |= GRID_FLAG_TAB;
+	gc->flags &= ~GRID_FLAG_PADDING;
+	gc->data.width = gc->data.size = gc->data.have = width;
+	memset(gc->data.data, ' ', gc->data.size);
+}
+
 /* Free one line. */
 static void
 grid_free_line(struct grid *gd, u_int py)
 {
 	free(gd->linedata[py].celldata);
-	gd->linedata[py].celldata = NULL;
 	free(gd->linedata[py].extddata);
-	gd->linedata[py].extddata = NULL;
+	memset(&gd->linedata[py], 0, sizeof gd->linedata[py]);
 }
 
 /* Free several lines. */
-static void
+void
 grid_free_lines(struct grid *gd, u_int py, u_int ny)
 {
 	u_int	yy;
@@ -278,23 +327,16 @@ grid_create(u_int sx, u_int sy, u_int hlimit)
 {
 	struct grid	*gd;
 
-	gd = xmalloc(sizeof *gd);
+	gd = xcalloc(1, sizeof *gd);
 	gd->sx = sx;
 	gd->sy = sy;
 
 	if (hlimit != 0)
 		gd->flags = GRID_HISTORY;
-	else
-		gd->flags = 0;
-
-	gd->hscrolled = 0;
-	gd->hsize = 0;
 	gd->hlimit = hlimit;
 
 	if (gd->sy != 0)
 		gd->linedata = xcalloc(gd->sy, sizeof *gd->linedata);
-	else
-		gd->linedata = NULL;
 
 	return (gd);
 }
@@ -304,9 +346,7 @@ void
 grid_destroy(struct grid *gd)
 {
 	grid_free_lines(gd, 0, gd->hsize + gd->sy);
-
 	free(gd->linedata);
-
 	free(gd);
 }
 
@@ -341,9 +381,13 @@ grid_compare(struct grid *ga, struct grid *gb)
 static void
 grid_trim_history(struct grid *gd, u_int ny)
 {
+	u_int	remaining;
+
 	grid_free_lines(gd, 0, ny);
+	remaining = gd->hsize + gd->sy - ny;
 	memmove(&gd->linedata[0], &gd->linedata[ny],
-	    (gd->hsize + gd->sy - ny) * (sizeof *gd->linedata));
+	    remaining * (sizeof *gd->linedata));
+	memset(&gd->linedata[remaining], 0, ny * (sizeof *gd->linedata));
 }
 
 /*
@@ -351,14 +395,17 @@ grid_trim_history(struct grid *gd, u_int ny)
  * and shift up.
  */
 void
-grid_collect_history(struct grid *gd)
+grid_collect_history(struct grid *gd, int all)
 {
 	u_int	ny;
 
 	if (gd->hsize == 0 || gd->hsize < gd->hlimit)
 		return;
 
-	ny = gd->hlimit / 10;
+	if (all)
+		ny = gd->hsize - gd->hlimit;
+	else
+		ny = gd->hlimit / 10;
 	if (ny < 1)
 		ny = 1;
 	if (ny > gd->hsize)
@@ -371,6 +418,7 @@ grid_collect_history(struct grid *gd)
 	grid_trim_history(gd, ny);
 
 	gd->hsize -= ny;
+	gd->scroll_collected += ny;
 	if (gd->hscrolled > gd->hsize)
 		gd->hscrolled = gd->hsize;
 }
@@ -379,12 +427,14 @@ grid_collect_history(struct grid *gd)
 void
 grid_remove_history(struct grid *gd, u_int ny)
 {
-	u_int	yy;
+	u_int	yy, start;
 
 	if (ny > gd->hsize)
 		return;
+	start = gd->hsize + gd->sy - ny;
 	for (yy = 0; yy < ny; yy++)
-		grid_free_line(gd, gd->hsize + gd->sy - 1 - yy);
+		grid_free_line(gd, start + yy);
+	memset(&gd->linedata[start], 0, ny * sizeof *gd->linedata);
 	gd->hsize -= ny;
 }
 
@@ -404,8 +454,9 @@ grid_scroll_history(struct grid *gd, u_int bg)
 
 	gd->hscrolled++;
 	grid_compact_line(&gd->linedata[gd->hsize]);
-	gd->linedata[gd->hsize].time = current_time;
+	grid_line_set_time(&gd->linedata[gd->hsize]);
 	gd->hsize++;
+	gd->scroll_added++;
 }
 
 /* Clear the history. */
@@ -416,6 +467,7 @@ grid_clear_history(struct grid *gd)
 
 	gd->hscrolled = 0;
 	gd->hsize = 0;
+	gd->scroll_generation++;
 
 	gd->linedata = xreallocarray(gd->linedata, gd->sy,
 	    sizeof *gd->linedata);
@@ -444,7 +496,7 @@ grid_scroll_history_region(struct grid *gd, u_int upper, u_int lower, u_int bg)
 
 	/* Move the line into the history. */
 	memcpy(gl_history, gl_upper, sizeof *gl_history);
-	gl_history->time = current_time;
+	grid_line_set_time(gl_history);
 
 	/* Then move the region up and clear the bottom line. */
 	memmove(gl_upper, gl_upper + 1, (lower - upper) * sizeof *gl_upper);
@@ -453,6 +505,7 @@ grid_scroll_history_region(struct grid *gd, u_int upper, u_int lower, u_int bg)
 	/* Move the history offset down over the line. */
 	gd->hscrolled++;
 	gd->hsize++;
+	gd->scroll_added++;
 }
 
 /* Expand line to fit to cell. */
@@ -473,9 +526,14 @@ grid_expand_line(struct grid *gd, u_int py, u_int sx, u_int bg)
 	else if (gd->sx > sx)
 		sx = gd->sx;
 
-	gl->celldata = xreallocarray(gl->celldata, sx, sizeof *gl->celldata);
+	gl->celldata = xreallocarray(gl->celldata, sx,
+	    sizeof *gl->celldata);
+	if (gl->cellsize < sx) {
+		memset(gl->celldata + gl->cellsize, 0,
+		    (sx - gl->cellsize) * sizeof *gl->celldata);
+	}
 	for (xx = gl->cellsize; xx < sx; xx++)
-		grid_clear_cell(gd, xx, py, bg);
+		grid_clear_cell(gd, xx, py, bg, 0);
 	gl->cellsize = sx;
 }
 
@@ -515,7 +573,11 @@ grid_get_cell1(struct grid_line *gl, u_int px, struct grid_cell *gc)
 			gc->bg = gee->bg;
 			gc->us = gee->us;
 			gc->link = gee->link;
-			utf8_to_data(gee->data, &gc->data);
+
+			if (gc->flags & GRID_FLAG_TAB)
+				grid_set_tab(gc, gee->data);
+			else
+				utf8_to_data(gee->data, &gc->data);
 		}
 		return;
 	}
@@ -569,9 +631,13 @@ grid_set_cell(struct grid *gd, u_int px, u_int py, const struct grid_cell *gc)
 
 /* Set padding at position. */
 void
-grid_set_padding(struct grid *gd, u_int px, u_int py)
+grid_set_padding(struct grid *gd, u_int px, u_int py, int bg)
 {
-	grid_set_cell(gd, px, py, &grid_padding_cell);
+	struct grid_cell	gc;
+
+	memcpy(&gc, &grid_padding_cell, sizeof gc);
+	gc.bg = bg;
+	grid_set_cell(gd, px, py, &gc);
 }
 
 /* Set cells at position. */
@@ -639,7 +705,7 @@ grid_clear(struct grid *gd, u_int px, u_int py, u_int nx, u_int ny, u_int bg)
 
 		grid_expand_line(gd, yy, px + ox, 8); /* default bg first */
 		for (xx = px; xx < px + ox; xx++)
-			grid_clear_cell(gd, xx, yy, bg);
+			grid_clear_cell(gd, xx, yy, bg, 0);
 	}
 }
 
@@ -733,7 +799,7 @@ grid_move_cells(struct grid *gd, u_int dx, u_int px, u_int py, u_int nx,
 	for (xx = px; xx < px + nx; xx++) {
 		if (xx >= dx && xx < dx + nx)
 			continue;
-		grid_clear_cell(gd, xx, py, bg);
+		grid_clear_cell(gd, xx, py, bg, 1);
 	}
 }
 
@@ -743,9 +809,16 @@ grid_string_cells_fg(const struct grid_cell *gc, int *values)
 {
 	size_t	n;
 	u_char	r, g, b;
+	int	c;
 
 	n = 0;
-	if (gc->fg & COLOUR_FLAG_256) {
+	if (gc->fg & COLOUR_FLAG_THEME) {
+		c = colour_theme_terminal_colour(gc->fg & 0xff);
+		if (c == 8)
+			values[n++] = 39;
+		else
+			values[n++] = c + 30;
+	} else if (gc->fg & COLOUR_FLAG_256) {
 		values[n++] = 38;
 		values[n++] = 5;
 		values[n++] = gc->fg & 0xff;
@@ -792,9 +865,16 @@ grid_string_cells_bg(const struct grid_cell *gc, int *values)
 {
 	size_t	n;
 	u_char	r, g, b;
+	int	c;
 
 	n = 0;
-	if (gc->bg & COLOUR_FLAG_256) {
+	if (gc->bg & COLOUR_FLAG_THEME) {
+		c = colour_theme_terminal_colour(gc->bg & 0xff);
+		if (c == 8)
+			values[n++] = 49;
+		else
+			values[n++] = c + 40;
+	} else if (gc->bg & COLOUR_FLAG_256) {
 		values[n++] = 48;
 		values[n++] = 5;
 		values[n++] = gc->bg & 0xff;
@@ -841,9 +921,19 @@ grid_string_cells_us(const struct grid_cell *gc, int *values)
 {
 	size_t	n;
 	u_char	r, g, b;
+	int	c;
 
 	n = 0;
-	if (gc->us & COLOUR_FLAG_256) {
+	if (gc->us & COLOUR_FLAG_THEME) {
+		c = colour_theme_terminal_colour(gc->us & 0xff);
+		if (c == 8)
+			values[n++] = 59;
+		else {
+			values[n++] = 58;
+			values[n++] = 5;
+			values[n++] = c;
+		}
+	} else if (gc->us & COLOUR_FLAG_256) {
 		values[n++] = 58;
 		values[n++] = 5;
 		values[n++] = gc->us & 0xff;
@@ -1058,18 +1148,22 @@ grid_string_cells(struct grid *gd, u_int px, u_int py, u_int nx,
 	off = 0;
 
 	gl = grid_peek_line(gd, py);
+	if (gl == NULL) {
+		buf[0] = '\0';
+		return (buf);
+	}
 	if (flags & GRID_STRING_EMPTY_CELLS)
 		end = gl->cellsize;
 	else
 		end = gl->cellused;
 	for (xx = px; xx < px + nx; xx++) {
-		if (gl == NULL || xx >= end)
+		if (xx >= end)
 			break;
 		grid_get_cell(gd, xx, py, &gc);
 		if (gc.flags & GRID_FLAG_PADDING)
 			continue;
 
-		if (flags & GRID_STRING_WITH_SEQUENCES) {
+		if (lastgc != NULL && (flags & GRID_STRING_WITH_SEQUENCES)) {
 			grid_string_cells_code(*lastgc, &gc, code, sizeof code,
 			    flags, s, &has_link);
 			codelen = strlen(code);
@@ -1077,13 +1171,18 @@ grid_string_cells(struct grid *gd, u_int px, u_int py, u_int nx,
 		} else
 			codelen = 0;
 
-		data = gc.data.data;
-		size = gc.data.size;
-		if ((flags & GRID_STRING_ESCAPE_SEQUENCES) &&
-		    size == 1 &&
-		    *data == '\\') {
-			data = "\\\\";
-			size = 2;
+		if (gc.flags & GRID_FLAG_TAB) {
+			data = "\t";
+			size = 1;
+		} else {
+			data = gc.data.data;
+			size = gc.data.size;
+			if ((flags & GRID_STRING_ESCAPE_SEQUENCES) &&
+			    size == 1 &&
+			    *data == '\\') {
+				data = "\\\\";
+				size = 2;
+			}
 		}
 
 		while (len < off + size + codelen + 1) {
@@ -1275,7 +1374,7 @@ grid_reflow_join(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 		if (!wrapped || want != from->cellused || width == sx)
 			break;
 	}
-	if (lines == 0)
+	if (lines == 0 || from == NULL)
 		return;
 
 	/*
@@ -1456,6 +1555,7 @@ grid_reflow(struct grid *gd, u_int sx)
 	free(gd->linedata);
 	gd->linedata = target->linedata;
 	free(target);
+	gd->scroll_generation++;
 }
 
 /* Convert to position based on wrapped lines. */
@@ -1484,7 +1584,7 @@ grid_wrap_position(struct grid *gd, u_int px, u_int py, u_int *wx, u_int *wy)
 void
 grid_unwrap_position(struct grid *gd, u_int *px, u_int *py, u_int wx, u_int wy)
 {
-	u_int	yy, ay = 0;
+	u_int	yy, ay = 0, ey = gd->hsize + gd->sy - 1;
 
 	for (yy = 0; yy < gd->hsize + gd->sy - 1; yy++) {
 		if (ay == wy)
@@ -1498,7 +1598,7 @@ grid_unwrap_position(struct grid *gd, u_int *px, u_int *py, u_int wx, u_int wy)
 	 * until we find the end or the line now containing wx.
 	 */
 	if (wx == UINT_MAX) {
-		while (gd->linedata[yy].flags & GRID_LINE_WRAPPED)
+		while (yy < ey && gd->linedata[yy].flags & GRID_LINE_WRAPPED)
 			yy++;
 		wx = gd->linedata[yy].cellused;
 	} else {
@@ -1532,4 +1632,157 @@ grid_line_length(struct grid *gd, u_int py)
 		px--;
 	}
 	return (px);
+}
+
+/* Get last position on line, not including padding. */
+u_int
+grid_line_limit(struct grid *gd, u_int py)
+{
+	struct grid_cell	gc;
+	u_int			px;
+
+	px = grid_line_length(gd, py);
+	if (px == 0)
+		return (0);
+	px--;
+	while (px > 0) {
+		grid_get_cell(gd, px, py, &gc);
+		if (~gc.flags & GRID_FLAG_PADDING)
+			break;
+		px--;
+	}
+	return (px);
+}
+
+/* Check if character is in set. */
+int
+grid_in_set(struct grid *gd, u_int px, u_int py, const char *set)
+{
+	struct grid_cell	gc, tmp_gc;
+	u_int			pxx;
+	int			has_tab, has_space;
+
+	has_tab = (strchr(set, '\t') != NULL);
+	has_space = (strchr(set, ' ') != NULL);
+
+	grid_get_cell(gd, px, py, &gc);
+	if (gc.flags & GRID_FLAG_PADDING) {
+		if (!has_tab && !has_space)
+			return (0);
+		pxx = px;
+		do
+			grid_get_cell(gd, --pxx, py, &tmp_gc);
+		while (pxx > 0 && tmp_gc.flags & GRID_FLAG_PADDING);
+		if (((has_tab || has_space) &&
+		    (tmp_gc.flags & GRID_FLAG_TAB)) ||
+		    (has_space && utf8_has_whitespace(&tmp_gc.data)))
+			return (tmp_gc.data.width - (px - pxx));
+		return (0);
+	}
+	if ((has_tab || has_space) && (gc.flags & GRID_FLAG_TAB))
+		return (gc.data.width);
+	if (has_space && utf8_has_whitespace(&gc.data))
+		return (gc.data.width == 0 ? 1 : gc.data.width);
+	return (utf8_cstrhas(set, &gc.data));
+}
+
+/* Line flags to string. */
+const char *
+grid_line_flags_string(int flags)
+{
+	static char	s[128];
+
+	*s = '\0';
+	if (flags & GRID_LINE_WRAPPED)
+		strlcat(s, "WRAPPED,", sizeof s);
+	if (flags & GRID_LINE_EXTENDED)
+		strlcat(s, "EXTENDED,", sizeof s);
+	if (flags & GRID_LINE_DEAD)
+		strlcat(s, "DEAD,", sizeof s);
+	if (flags & GRID_LINE_START_PROMPT)
+		strlcat(s, "START_PROMPT,", sizeof s);
+	if (flags & GRID_LINE_SECOND_PROMPT)
+		strlcat(s, "SECOND_PROMPT,", sizeof s);
+	if (flags & GRID_LINE_START_COMMAND)
+		strlcat(s, "START_COMMAND,", sizeof s);
+	if (flags & GRID_LINE_START_OUTPUT)
+		strlcat(s, "START_OUTPUT,", sizeof s);
+	if (flags & GRID_LINE_END_OUTPUT)
+		strlcat(s, "END_OUTPUT,", sizeof s);
+	if (flags & GRID_LINE_HYPERLINK)
+		strlcat(s, "HYPERLINK,", sizeof s);
+	if (*s == '\0')
+		return ("NONE");
+	s[strlen(s) - 1] = '\0';
+	return (s);
+}
+
+/* Cell flags to string. */
+const char *
+grid_cell_flags_string(int flags)
+{
+	static char	s[128];
+
+	*s = '\0';
+	if (flags & GRID_FLAG_FG256)
+		strlcat(s, "FG256,", sizeof s);
+	if (flags & GRID_FLAG_BG256)
+		strlcat(s, "BG256,", sizeof s);
+	if (flags & GRID_FLAG_PADDING)
+		strlcat(s, "PADDING,", sizeof s);
+	if (flags & GRID_FLAG_EXTENDED)
+		strlcat(s, "EXTENDED,", sizeof s);
+	if (flags & GRID_FLAG_SELECTED)
+		strlcat(s, "SELECTED,", sizeof s);
+	if (flags & GRID_FLAG_CLEARED)
+		strlcat(s, "CLEARED,", sizeof s);
+	if (flags & GRID_FLAG_TAB)
+		strlcat(s, "TAB,", sizeof s);
+	if (flags & GRID_FLAG_NOPALETTE)
+		strlcat(s, "NOPALETTE,", sizeof s);
+	if (*s == '\0')
+		return ("NONE");
+	s[strlen(s) - 1] = '\0';
+	return (s);
+}
+
+/* Cell attributes to string. */
+const char *
+grid_cell_attr_string(int attr)
+{
+	static char	s[256];
+
+	*s = '\0';
+	if (attr & GRID_ATTR_CHARSET)
+		strlcat(s, "CHARSET,", sizeof s);
+	if (attr & GRID_ATTR_BRIGHT)
+		strlcat(s, "BRIGHT,", sizeof s);
+	if (attr & GRID_ATTR_DIM)
+		strlcat(s, "DIM,", sizeof s);
+	if (attr & GRID_ATTR_UNDERSCORE)
+		strlcat(s, "UNDERSCORE,", sizeof s);
+	if (attr & GRID_ATTR_BLINK)
+		strlcat(s, "BLINK,", sizeof s);
+	if (attr & GRID_ATTR_REVERSE)
+		strlcat(s, "REVERSE,", sizeof s);
+	if (attr & GRID_ATTR_HIDDEN)
+		strlcat(s, "HIDDEN,", sizeof s);
+	if (attr & GRID_ATTR_ITALICS)
+		strlcat(s, "ITALICS,", sizeof s);
+	if (attr & GRID_ATTR_STRIKETHROUGH)
+		strlcat(s, "STRIKETHROUGH,", sizeof s);
+	if (attr & GRID_ATTR_UNDERSCORE_2)
+		strlcat(s, "UNDERSCORE_2,", sizeof s);
+	if (attr & GRID_ATTR_UNDERSCORE_3)
+		strlcat(s, "UNDERSCORE_3,", sizeof s);
+	if (attr & GRID_ATTR_UNDERSCORE_4)
+		strlcat(s, "UNDERSCORE_4,", sizeof s);
+	if (attr & GRID_ATTR_UNDERSCORE_5)
+		strlcat(s, "UNDERSCORE_5,", sizeof s);
+	if (attr & GRID_ATTR_OVERLINE)
+		strlcat(s, "OVERLINE,", sizeof s);
+	if (*s == '\0')
+		return ("NONE");
+	s[strlen(s) - 1] = '\0';
+	return (s);
 }

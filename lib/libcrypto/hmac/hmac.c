@@ -1,4 +1,4 @@
-/* $OpenBSD: hmac.c,v 1.35 2024/06/01 07:36:16 tb Exp $ */
+/* $OpenBSD: hmac.c,v 1.37 2025/05/10 05:54:38 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -60,9 +60,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <openssl/err.h>
 #include <openssl/hmac.h>
 
+#include "err_local.h"
 #include "evp_local.h"
 #include "hmac_local.h"
 
@@ -135,15 +135,6 @@ err:
 	return 0;
 }
 LCRYPTO_ALIAS(HMAC_Init_ex);
-
-int
-HMAC_Init(HMAC_CTX *ctx, const void *key, int len, const EVP_MD *md)
-{
-	if (key && md)
-		HMAC_CTX_init(ctx);
-	return HMAC_Init_ex(ctx, key, len, md, NULL);
-}
-LCRYPTO_ALIAS(HMAC_Init);
 
 int
 HMAC_Update(HMAC_CTX *ctx, const unsigned char *data, size_t len)

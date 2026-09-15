@@ -1,4 +1,4 @@
-/*	$OpenBSD: stireg.h,v 1.14 2015/04/05 23:25:57 miod Exp $	*/
+/*	$OpenBSD: stireg.h,v 1.17 2026/05/10 15:57:38 miod Exp $	*/
 
 /*
  * Copyright (c) 2000 Michael Shalayeff
@@ -28,8 +28,6 @@
 
 #ifndef _IC_STIREG_H_
 #define _IC_STIREG_H_
-
-/* #define	STIDEBUG */
 
 #define	STI_REGION_MAX	8
 #define	STI_MONITOR_MAX	256
@@ -134,6 +132,7 @@ struct	sti_dd {
 #define	STI_DD_SUMMIT		0x2FC1066B	/* Visualize FX2, FX4, FX6 */
 #define	STI_DD_PINNACLE		0x35ACDA16	/* Visualize FXe */
 #define	STI_DD_LEGO		0x35ACDA30	/* Visualize FX5, FX10 */
+#define	STI_DD_FIREGL		0x3BA8F544	/* FireGL-UX */
 	u_int32_t	dd_fntaddr;	/* 0x10 font start address */
 	u_int32_t	dd_maxst;	/* 0x14 max state storage */
 	u_int32_t	dd_romend;	/* 0x18 rom last address */
@@ -150,13 +149,14 @@ struct	sti_dd {
 #define	STI_BUSSUPPORT_GSC15X	0x02	/*	supports GSC 1.5X */
 #define	STI_BUSSUPPORT_GSC2X	0x04	/*	supports GSC 2.X */
 #define	STI_BUSSUPPORT_PCIIOEIM	0x08	/*	will use directed int */
-#define	STI_BUSSUPPORT_PCISTD	0x10	/*	will use std PCI int */
-#define	STI_BUSSUPPORT_ILOCK	0x20	/*	supports implicit locking */
+#define	STI_BUSSUPPORT_ILOCK	0x10	/*	supports implicit locking */
+#define	STI_BUSSUPPORT_2DECODE	0x20	/*	single address decoder */
 #define	STI_BUSSUPPORT_ROMMAP	0x40	/*	rom is only in pci erom space */
-#define	STI_BUSSUPPORT_2DECODE	0x80	/*	single address decoder */
+#define	STI_BUSSUPPORT_PCISTD	0x80	/*	will use std PCI int */
 	u_int8_t	dd_ebussup;	/* 0x37 extended bus support */
 #define	STI_EBUSSUPPORT_DMA	0x01	/*	supports dma */
 #define	STI_EBUSSUPPORT_PIOLOCK	0x02	/*	no implicit locking for dma */
+#define	STI_EBUSSUPPORT_GVID	0x04	/*	requires gvid callback */
 	u_int8_t	dd_altcodet;	/* 0x38 alternate code type */
 #define	STI_ALTCODE_UNKNOWN	0x00
 #define	STI_ALTCODE_PA64	0x01	/*	alt code is in pa64 */
@@ -228,7 +228,15 @@ typedef struct sti_ecfg {
 	u_int16_t	power;		/* power dissipation Watts */
 	u_int32_t	freq_ref;
 	u_int32_t	*addr;		/* memory block of size dd_stimemreq */
-	void		*future;
+	union {
+		struct {
+			int32_t		(*gvid_cmd)(void *, ...);
+			void		*gvid_cmd_arg;
+			u_int32_t	pci_id;
+			void		*future;
+		} g;
+		void *future;
+	} future;
 } __packed *sti_ecfg_t;
 
 typedef struct sti_cfg {
@@ -319,7 +327,7 @@ typedef struct sti_unpmvflags {
 } __packed *sti_unpmvflags_t;
 
 typedef struct sti_unpmvin {
-	u_int32_t	*font_addr;	/* font */
+	const u_int32_t	*font_addr;	/* font */
 	u_int16_t	index;		/* character index in the font */
 	u_int8_t	fg_colour;
 	u_int8_t	bg_colour;

@@ -1,25 +1,22 @@
-# $OpenBSD: Makefile.inc,v 1.17 2024/03/29 11:00:57 jsing Exp $
+# $OpenBSD: Makefile.inc,v 1.21 2026/01/17 16:18:32 jsing Exp $
 
 # mips64-specific libcrypto build rules
 
 # aes
-CFLAGS+= -DAES_ASM
+CFLAGS+= -DLIBRESSL_USE_AES_ASSEMBLY
 SSLASM+= aes aes-mips aes-mips
-CFLAGS+= -DHAVE_AES_SET_ENCRYPT_KEY_INTERNAL
-CFLAGS+= -DHAVE_AES_SET_DECRYPT_KEY_INTERNAL
-CFLAGS+= -DHAVE_AES_ENCRYPT_INTERNAL
-CFLAGS+= -DHAVE_AES_DECRYPT_INTERNAL
+
 # bn
+CFLAGS+= -DLIBRESSL_USE_BN_ASSEMBLY
 SSLASM+= bn mips bn-mips
 SSLASM+= bn mips-mont mips-mont
 CFLAGS+= -DOPENSSL_BN_ASM_MONT
+
 # sha
+CFLAGS+= -DLIBRESSL_USE_SHA_ASSEMBLY
 SSLASM+= sha sha1-mips sha1-mips
-CFLAGS+= -DSHA1_ASM
 SSLASM+= sha sha512-mips sha256-mips
-CFLAGS+= -DSHA256_ASM
 SSLASM+= sha sha512-mips sha512-mips
-CFLAGS+= -DSHA512_ASM
 
 .for dir src dst in ${SSLASM}
 SRCS+=	${dst}.S

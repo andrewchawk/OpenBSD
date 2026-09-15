@@ -1,4 +1,4 @@
-/*	$OpenBSD: evptest.c,v 1.15 2024/03/30 09:49:59 tb Exp $	*/
+/*	$OpenBSD: evptest.c,v 1.17 2026/09/14 23:36:58 kenjiro Exp $	*/
 /* Written by Ben Laurie, 2001 */
 /*
  * Copyright (c) 2001 The OpenSSL Project.  All rights reserved.
@@ -339,9 +339,6 @@ main(int argc, char **argv)
 	}
 
 	/* Load up the software EVP_CIPHER and EVP_MD definitions */
-	OpenSSL_add_all_ciphers();
-	OpenSSL_add_all_digests();
-
 	for (;;) {
 		char line[8 * 1024];
 		char *p;
@@ -431,10 +428,8 @@ main(int argc, char **argv)
 	}
 	fclose(f);
 
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
 	ERR_remove_thread_state(NULL);
-	ERR_free_strings();
+	OPENSSL_cleanup();
 
 	return 0;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.191 2023/06/25 08:07:38 op Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.209 2026/09/07 19:34:30 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <agentx.h>
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
@@ -47,6 +48,7 @@
 #include <tls.h>
 
 #include "relayd.h"
+#include "log.h"
 
 #define MAXIMUM(a, b)	(((a) > (b)) ? (a) : (b))
 
@@ -60,13 +62,15 @@ void		 parent_shutdown(struct relayd *);
 int		 parent_dispatch_pfe(int, struct privsep_proc *, struct imsg *);
 int		 parent_dispatch_hce(int, struct privsep_proc *, struct imsg *);
 int		 parent_dispatch_relay(int, struct privsep_proc *,
-		    struct imsg *);
+    struct imsg *);
 int		 parent_dispatch_ca(int, struct privsep_proc *,
-		    struct imsg *);
+    struct imsg *);
 int		 bindany(struct ctl_bindany *);
 void		 parent_tls_ticket_rekey(int, short, void *);
 
 struct relayd			*relayd_env;
+
+static int			 cli_verbose;
 
 static struct privsep_proc procs[] = {
 	{ "pfe",	PROC_PFE, parent_dispatch_pfe, pfe },
@@ -119,11 +123,12 @@ int
 main(int argc, char *argv[])
 {
 	int			 c;
-	int			 debug = 0, verbose = 0;
+	int			 debug = 0;
 	u_int32_t		 opts = 0;
 	struct relayd		*env;
 	struct privsep		*ps;
 	const char		*conffile = CONF_FILE;
+	char			 execpath[PATH_MAX];
 	enum privsep_procid	 proc_id = PROC_PARENT;
 	int			 proc_instance = 0;
 	const char		*errp, *title = NULL;
@@ -147,7 +152,7 @@ main(int argc, char *argv[])
 			conffile = optarg;
 			break;
 		case 'v':
-			verbose++;
+			cli_verbose = 1;
 			opts |= RELAYD_OPT_VERBOSE;
 			break;
 		case 'P':
@@ -181,7 +186,6 @@ main(int argc, char *argv[])
 	relayd_env = env;
 	env->sc_ps = ps;
 	ps->ps_env = env;
-	TAILQ_INIT(&ps->ps_rcsocks);
 	env->sc_conffile = conffile;
 	env->sc_conf.opts = opts;
 	TAILQ_INIT(&env->sc_hosts);
@@ -196,14 +200,18 @@ main(int argc, char *argv[])
 	if (debug)
 		env->sc_conf.opts |= RELAYD_OPT_LOGUPDATE;
 
+	/* CLI always wins over log level form config. */
+	if (cli_verbose)
+		env->sc_conf.opts |= RELAYD_OPT_VERBOSE;
+
 	if (geteuid())
 		errx(1, "need root privileges");
 
-	if ((ps->ps_pw =  getpwnam(RELAYD_USER)) == NULL)
+	if ((ps->ps_pw = getpwnam(RELAYD_USER)) == NULL)
 		errx(1, "unknown user %s", RELAYD_USER);
 
 	log_init(debug, LOG_DAEMON);
-	log_setverbose(verbose);
+	log_setverbose(env->sc_conf.opts & RELAYD_OPT_VERBOSE ? 2 : 0);
 
 	if (env->sc_conf.opts & RELAYD_OPT_NOACTION)
 		ps->ps_noaction = 1;
@@ -214,8 +222,11 @@ main(int argc, char *argv[])
 	if (title != NULL)
 		ps->ps_title[proc_id] = title;
 
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
+
 	/* only the parent returns */
-	proc_init(ps, procs, nitems(procs), debug, argc0, argv, proc_id);
+	proc_init(ps, procs, nitems(procs), debug, execpath, argc0, argv, proc_id);
 
 	log_procinit("parent");
 
@@ -224,6 +235,13 @@ main(int argc, char *argv[])
 
 	if (unveil("/", "rx") == -1)
 		err(1, "unveil /");
+	if (env->sc_conf.flags & F_AGENTX) {
+		if (unveil(env->sc_conf.agentx_path, "w") == -1)
+			err(1, "unveil %s", env->sc_conf.agentx_path);
+	} else {
+		if (unveil(AGENTX_MASTER_PATH, "w") == -1)
+			err(1, "unveil %s", env->sc_conf.agentx_path);
+	}
 	if (unveil(NULL, NULL) == -1)
 		err(1, "unveil");
 
@@ -303,11 +321,16 @@ parent_configure(struct relayd *env)
 	/* HCE, PFE, CA and the relays need to reload their config. */
 	env->sc_reload = 2 + (2 * env->sc_conf.prefork_relay);
 
+	/* CLI always wins over log level form config. */
+	if (cli_verbose)
+		env->sc_conf.opts |= RELAYD_OPT_VERBOSE;
+
 	for (id = 0; id < PROC_MAX; id++) {
 		if (id == privsep_process)
 			continue;
-		proc_compose_imsg(env->sc_ps, id, -1, IMSG_CFG_DONE, -1,
-		    -1, &env->sc_conf, sizeof(env->sc_conf));
+		if (proc_compose_imsg(env->sc_ps, id, -1, IMSG_CFG_DONE, -1,
+		    -1, &env->sc_conf, sizeof(env->sc_conf)) == -1)
+			fatal("%s: proc_compose_imsg", __func__);
 	}
 
 	ret = 0;
@@ -335,14 +358,14 @@ parent_reload(struct relayd *env, u_int reset, const char *filename)
 
 	if (reset == CONFIG_RELOAD) {
 		if (load_config(filename, env) == -1) {
-			log_debug("%s: failed to load config file %s",
+			log_warn("%s: failed to load config file %s",
 			    __func__, filename);
 		}
 
 		config_setreset(env, CONFIG_ALL);
 
 		if (parent_configure(env) == -1) {
-			log_debug("%s: failed to commit config from %s",
+			log_warn("%s: failed to commit config from %s",
 			    __func__, filename);
 		}
 	} else
@@ -365,7 +388,9 @@ parent_configure_done(struct relayd *env)
 			if (id == privsep_process)
 				continue;
 
-			proc_compose(env->sc_ps, id, IMSG_CTL_START, NULL, 0);
+			if (proc_compose(env->sc_ps, id, IMSG_CTL_START, NULL,
+			    0) == -1)
+				fatal("%s: proc_compose", __func__);
 		}
 	}
 }
@@ -390,32 +415,51 @@ parent_shutdown(struct relayd *env)
 int
 parent_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
+	struct ibuf		 ibuf;
 	struct privsep		*ps = p->p_ps;
 	struct relayd		*env = ps->ps_env;
 	struct ctl_demote	 demote;
 	struct ctl_netroute	 crt;
 	u_int			 v;
 	char			*str = NULL;
+	size_t			 s;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_DEMOTE:
-		IMSG_SIZE_CHECK(imsg, &demote);
-		memcpy(&demote, imsg->data, sizeof(demote));
-		carp_demote_set(demote.group, demote.level);
+		if (imsg_get_data(imsg, &demote, sizeof(demote)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
+			return (-1);
+		}
+		demote.group[sizeof(demote.group) - 1] = '\0';
+		if (carp_demote_set(demote.group, demote.level) != 0)
+			return (-1);
 		break;
 	case IMSG_RTMSG:
-		IMSG_SIZE_CHECK(imsg, &crt);
-		memcpy(&crt, imsg->data, sizeof(crt));
-		pfe_route(env, &crt);
+		if (imsg_get_data(imsg, &crt, sizeof(crt)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
+			return (-1);
+		}
+		crt.host.name[sizeof(crt.host.name) - 1] = '\0';
+		crt.rt.name[sizeof(crt.rt.name) - 1] = '\0';
+		crt.rt.label[sizeof(crt.rt.label) - 1] = '\0';
+		if (pfe_route(env, &crt) != 0)
+			return (-1);
 		break;
 	case IMSG_CTL_RESET:
-		IMSG_SIZE_CHECK(imsg, &v);
-		memcpy(&v, imsg->data, sizeof(v));
+		if (imsg_get_data(imsg, &v, sizeof(v)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
+			return (-1);
+		}
 		parent_reload(env, v, NULL);
 		break;
 	case IMSG_CTL_RELOAD:
-		if (IMSG_DATA_SIZE(imsg) > 0)
-			str = get_string(imsg->data, IMSG_DATA_SIZE(imsg));
+		if (imsg_get_ibuf(imsg, &ibuf) != -1 &&
+		    (s = ibuf_size(&ibuf)) > 0) {
+			if ((str = ibuf_get_string(&ibuf, s)) == NULL) {
+				log_warn("%s: ibuf_get_string", __func__);
+				return (-1);
+			}
+		}
 		parent_reload(env, CONFIG_RELOAD, str);
 		free(str);
 		break;
@@ -442,12 +486,18 @@ parent_dispatch_hce(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct relayd		*env = ps->ps_env;
 	struct ctl_script	 scr;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_SCRIPT:
-		IMSG_SIZE_CHECK(imsg, &scr);
-		bcopy(imsg->data, &scr, sizeof(scr));
+		if (imsg_get_data(imsg, &scr, sizeof(scr)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
+			return (-1);
+		}
+		scr.name[sizeof(scr.name) - 1] = '\0';
+		scr.path[sizeof(scr.path) - 1] = '\0';
 		scr.retval = script_exec(env, &scr);
-		proc_compose(ps, PROC_HCE, IMSG_SCRIPT, &scr, sizeof(scr));
+		if (proc_compose(ps, PROC_HCE, IMSG_SCRIPT, &scr,
+		    sizeof(scr)) == -1)
+			log_warn("%s: proc_compose", __func__);
 		break;
 	case IMSG_CFG_DONE:
 		parent_configure_done(env);
@@ -467,11 +517,15 @@ parent_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct ctl_bindany	 bnd;
 	int			 s;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_BINDANY:
-		IMSG_SIZE_CHECK(imsg, &bnd);
-		bcopy(imsg->data, &bnd, sizeof(bnd));
-		if (bnd.bnd_proc > env->sc_conf.prefork_relay)
+		if (imsg_get_data(imsg, &bnd, sizeof(bnd)) == -1) {
+			log_warn("%s: imsg_get_data", __func__);
+			return (-1);
+		}
+
+		if (bnd.bnd_proc < 0 ||
+		    bnd.bnd_proc > env->sc_conf.prefork_relay)
 			fatalx("%s: invalid relay proc", __func__);
 		switch (bnd.bnd_proto) {
 		case IPPROTO_TCP:
@@ -483,8 +537,9 @@ parent_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 			/* NOTREACHED */
 		}
 		s = bindany(&bnd);
-		proc_compose_imsg(ps, PROC_RELAY, bnd.bnd_proc,
-		    IMSG_BINDANY, -1, s, &bnd.bnd_id, sizeof(bnd.bnd_id));
+		if (proc_compose_imsg(ps, PROC_RELAY, bnd.bnd_proc,
+		    IMSG_BINDANY, -1, s, &bnd.bnd_id, sizeof(bnd.bnd_id)) == -1)
+			log_warn("%s: proc_compose_imsg", __func__);
 		break;
 	case IMSG_CFG_DONE:
 		parent_configure_done(env);
@@ -502,7 +557,7 @@ parent_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct privsep		*ps = p->p_ps;
 	struct relayd		*env = ps->ps_env;
 
-	switch (imsg->hdr.type) {
+	switch (imsg_get_type(imsg)) {
 	case IMSG_CFG_DONE:
 		parent_configure_done(env);
 		break;
@@ -650,7 +705,7 @@ kv_add(struct kvtree *keys, char *key, char *value, int unique)
 int
 kv_set(struct kv *kv, char *fmt, ...)
 {
-	va_list		  ap;
+	va_list		 ap;
 	char		*value = NULL;
 	struct kv	*ckv;
 	int		 ret;
@@ -658,7 +713,7 @@ kv_set(struct kv *kv, char *fmt, ...)
 	va_start(ap, fmt);
 	ret = vasprintf(&value, fmt, ap);
 	va_end(ap);
- 	if (ret == -1)
+	if (ret == -1)
 		return (-1);
 
 	/* Remove all children */
@@ -678,7 +733,7 @@ kv_set(struct kv *kv, char *fmt, ...)
 int
 kv_setkey(struct kv *kv, char *fmt, ...)
 {
-	va_list  ap;
+	va_list	 ap;
 	char	*key = NULL;
 	int	 ret;
 
@@ -710,25 +765,6 @@ kv_delete(struct kvtree *keys, struct kv *kv)
 
 	kv_free(kv);
 	free(kv);
-}
-
-struct kv *
-kv_extend(struct kvtree *keys, struct kv *kv, char *value)
-{
-	char		*newvalue;
-
-	if (kv == NULL) {
-		return (NULL);
-	} else if (kv->kv_value != NULL) {
-		if (asprintf(&newvalue, "%s%s", kv->kv_value, value) == -1)
-			return (NULL);
-
-		free(kv->kv_value);
-		kv->kv_value = newvalue;
-	} else if ((kv->kv_value = strdup(value)) == NULL)
-		return (NULL);
-
-	return (kv);
 }
 
 void
@@ -862,10 +898,8 @@ kv_find_value(struct kvtree *keys, char *key, const char *value,
 	/* not matched */
 	match = NULL;
  done:
-#ifdef DEBUG
 	if (match != NULL)
-		DPRINTF("%s: matched %s: %s", __func__, key, value);
-#endif
+		log_debug("%s: matched %s: %s", __func__, key, value);
 	free(val);
 	return (match);
 }
@@ -1164,12 +1198,12 @@ table_findbyconf(struct relayd *env, struct table *tb)
 
 	bcopy(&tb->conf, &a, sizeof(a));
 	a.id = a.rdrid = 0;
-	a.flags &= ~(F_USED|F_BACKUP);
+	a.flags &= ~F_USED;
 
 	TAILQ_FOREACH(table, env->sc_tables, entry) {
 		bcopy(&table->conf, &b, sizeof(b));
 		b.id = b.rdrid = 0;
-		b.flags &= ~(F_USED|F_BACKUP);
+		b.flags &= ~F_USED;
 
 		/*
 		 * Compare two tables and return the existing table if
@@ -1177,8 +1211,8 @@ table_findbyconf(struct relayd *env, struct table *tb)
 		 */
 		if (bcmp(&a, &b, sizeof(b)) == 0 &&
 		    ((tb->sendbuf == NULL && table->sendbuf == NULL) ||
-		    (tb->sendbuf != NULL && table->sendbuf != NULL &&
-		    strcmp(tb->sendbuf, table->sendbuf) == 0)))
+		     (tb->sendbuf != NULL && table->sendbuf != NULL &&
+		      strcmp(tb->sendbuf, table->sendbuf) == 0)))
 			return (table);
 	}
 	return (NULL);
@@ -1219,7 +1253,7 @@ relay_findbyaddr(struct relayd *env, struct relay_config *rc)
 }
 
 EVP_PKEY *
-pkey_find(struct relayd *env, char * hash)
+pkey_find(struct relayd *env, char *hash)
 {
 	struct ca_pkey	*pkey;
 
@@ -1296,7 +1330,6 @@ relay_load_fd(int fd, off_t *len)
 	char		*buf = NULL;
 	struct stat	 st;
 	off_t		 size;
-	ssize_t		 rv;
 	int		 err;
 
 	if (fstat(fd, &st) != 0)
@@ -1304,7 +1337,7 @@ relay_load_fd(int fd, off_t *len)
 	size = st.st_size;
 	if ((buf = calloc(1, size + 1)) == NULL)
 		goto fail;
-	if ((rv = pread(fd, buf, size, 0)) != size)
+	if (pread(fd, buf, size, 0) != size)
 		goto fail;
 
 	close(fd);
@@ -1321,14 +1354,16 @@ relay_load_fd(int fd, off_t *len)
 }
 
 int
-relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
+relay_load_certfiles(struct relayd *env, struct relay *rlay,
+    const struct keyname *name)
 {
-	char	 certfile[PATH_MAX];
-	char	 hbuf[PATH_MAX];
-	struct protocol *proto = rlay->rl_proto;
-	struct relay_cert *cert;
-	int	 useport = htons(rlay->rl_conf.port);
-	int	 cert_fd = -1, key_fd = -1, ocsp_fd = -1;
+	char			 certfile[PATH_MAX];
+	char			 hbuf[PATH_MAX];
+	struct protocol		*proto = rlay->rl_proto;
+	struct relay_cert	*cert;
+	int			 useport = htons(rlay->rl_conf.port);
+	int			 cert_fd = -1, key_fd = -1, ocsp_fd = -1,
+				 ret = 0;
 
 	if (rlay->rl_conf.flags & F_TLSCLIENT) {
 		if (strlen(proto->tlsca) && rlay->rl_tls_ca_fd == -1) {
@@ -1359,19 +1394,39 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 	if ((rlay->rl_conf.flags & F_TLS) == 0)
 		return (0);
 
+	if (strlen(proto->tlsclientca) && rlay->rl_tls_client_ca_fd == -1) {
+		if ((rlay->rl_tls_client_ca_fd =
+		    open(proto->tlsclientca, O_RDONLY)) == -1)
+			return (-1);
+		log_debug("%s: using client ca %s", __func__,
+		    proto->tlsclientca);
+	}
+
 	if (name == NULL &&
 	    print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)
 		goto fail;
 	else if (name != NULL &&
-	    strlcpy(hbuf, name, sizeof(hbuf)) >= sizeof(hbuf))
+	    strlcpy(hbuf, name->name, sizeof(hbuf)) >= sizeof(hbuf))
 		goto fail;
 
-	if (snprintf(certfile, sizeof(certfile),
-	    "/etc/ssl/%s:%u.crt", hbuf, useport) == -1)
-		goto fail;
+	if (name != NULL && strcmp(name->certificate, "") != 0) {
+		if (strlcpy(certfile, name->certificate, sizeof(certfile)) >=
+		    sizeof(certfile)) {
+			log_warnx("certificate truncated");
+			goto fail;
+		}
+	} else {
+		ret = snprintf(certfile, sizeof(certfile),
+		    "/etc/ssl/%s:%u.crt", hbuf, useport);
+
+		if (ret < 0 || (size_t)ret >= sizeof(certfile))
+			goto fail;
+	}
 	if ((cert_fd = open(certfile, O_RDONLY)) == -1) {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/%s.crt", hbuf) == -1)
+		ret = snprintf(certfile, sizeof(certfile),
+		    "/etc/ssl/%s.crt", hbuf);
+
+		if (ret < 0 || (size_t)ret >= sizeof(certfile))
 			goto fail;
 		if ((cert_fd = open(certfile, O_RDONLY)) == -1)
 			goto fail;
@@ -1379,27 +1434,53 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 	}
 	log_debug("%s: using certificate %s", __func__, certfile);
 
-	if (useport) {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s:%u.key", hbuf, useport) == -1)
+	if (name != NULL && strcmp(name->key, "") != 0) {
+		if (strlcpy(certfile, name->key, sizeof(certfile)) >=
+		    sizeof(certfile)) {
+			log_warnx("certificate key truncated");
 			goto fail;
+		}
 	} else {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s.key", hbuf) == -1)
-			goto fail;
+		if (useport) {
+			ret = snprintf(certfile, sizeof(certfile),
+			    "/etc/ssl/private/%s:%u.key",
+			    hbuf, useport);
+
+			if (ret < 0 || (size_t)ret >= sizeof(certfile))
+				goto fail;
+		} else {
+			ret = snprintf(certfile, sizeof(certfile),
+			    "/etc/ssl/private/%s.key", hbuf);
+
+			if (ret < 0 || (size_t)ret >= sizeof(certfile))
+				goto fail;
+		}
 	}
 	if ((key_fd = open(certfile, O_RDONLY)) == -1)
 		goto fail;
 	log_debug("%s: using private key %s", __func__, certfile);
 
-	if (useport) {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/%s:%u.ocsp", hbuf, useport) == -1)
+	if (name != NULL && strcmp(name->ocsp, "") != 0) {
+		if (strlcpy(certfile, name->ocsp, sizeof(certfile)) >=
+		    sizeof(certfile)) {
+			log_warnx("certificate ocsp truncated");
 			goto fail;
+		}
 	} else {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/%s.ocsp", hbuf) == -1)
-			goto fail;
+		if (useport) {
+			ret = snprintf(certfile, sizeof(certfile),
+			    "/etc/ssl/%s:%u.ocsp",
+			    hbuf, useport);
+
+			if (ret < 0 || (size_t)ret >= sizeof(certfile))
+				goto fail;
+		} else {
+			ret = snprintf(certfile, sizeof(certfile),
+			    "/etc/ssl/%s.ocsp", hbuf);
+
+			if (ret < 0 || (size_t)ret >= sizeof(certfile))
+				goto fail;
+		}
 	}
 	if ((ocsp_fd = open(certfile, O_RDONLY)) != -1)
 		log_debug("%s: using OCSP staple file %s", __func__, certfile);
@@ -1453,15 +1534,14 @@ expand_string(char *label, size_t len, const char *srch, const char *repl)
 	char *p, *q;
 
 	if ((tmp = calloc(1, len)) == NULL) {
-		log_debug("%s: calloc", __func__);
 		return (-1);
 	}
-	p = q = label;
+	p = label;
 	while ((q = strstr(p, srch)) != NULL) {
 		*q = '\0';
 		if ((strlcat(tmp, p, len) >= len) ||
 		    (strlcat(tmp, repl, len) >= len)) {
-			log_debug("%s: string too long", __func__);
+			log_warn("%s: string too long", __func__);
 			free(tmp);
 			return (-1);
 		}
@@ -1469,7 +1549,7 @@ expand_string(char *label, size_t len, const char *srch, const char *repl)
 		p = q;
 	}
 	if (strlcat(tmp, p, len) >= len) {
-		log_debug("%s: string too long", __func__);
+		log_warn("%s: string too long", __func__);
 		free(tmp);
 		return (-1);
 	}
@@ -1606,7 +1686,7 @@ parse_url(const char *url, char **protoptr, char **hostptr, char **pathptr)
 	/* strip path after host */
 	host[strcspn(host, "/")] = '\0';
 
-	DPRINTF("%s: %s proto %s, host %s, path %s", __func__,
+	log_debug("%s: %s proto %s, host %s, path %s", __func__,
 	    url, proto, host, path);
 
 	*protoptr = proto;
@@ -1723,28 +1803,21 @@ socket_rlimit(int maxfd)
 		fatal("%s: failed to set resource limit", __func__);
 }
 
-char *
-get_string(u_int8_t *ptr, size_t len)
-{
-	size_t	 i;
-
-	for (i = 0; i < len; i++)
-		if (!(isprint((unsigned char)ptr[i]) ||
-		    isspace((unsigned char)ptr[i])))
-			break;
-
-	return strndup(ptr, i);
-}
-
 void *
-get_data(u_int8_t *ptr, size_t len)
+get_data(struct ibuf *ibuf, size_t len)
 {
 	u_int8_t	*data;
 
+	if (len == 0)
+		return (NULL);
+
 	if ((data = malloc(len)) == NULL)
 		return (NULL);
-	memcpy(data, ptr, len);
 
+	if (ibuf_get(ibuf, data, len) == -1) {
+		free(data);
+		return (NULL);
+	}
 	return (data);
 }
 
@@ -1826,7 +1899,7 @@ prefixlen2mask(u_int8_t prefixlen)
 struct in6_addr *
 prefixlen2mask6(u_int8_t prefixlen, u_int32_t *mask)
 {
-	static struct in6_addr  s6;
+	static struct in6_addr	s6;
 	int			i;
 
 	if (prefixlen > 128)
@@ -1857,7 +1930,8 @@ accept_reserve(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
 
 	if ((ret = accept4(sockfd, addr, addrlen, SOCK_NONBLOCK)) > -1) {
 		(*counter)++;
-		DPRINTF("%s: inflight incremented, now %d",__func__, *counter);
+		log_debug("%s: inflight incremented, now %d", __func__,
+		    *counter);
 	}
 	return (ret);
 }
@@ -1870,13 +1944,14 @@ parent_tls_ticket_rekey(int fd, short events, void *arg)
 	struct timeval		 tv;
 	struct relay_ticket_key	 key;
 
-	log_debug("%s: rekeying tickets", __func__);
+	DPRINTF("%s: rekeying tickets", __func__);
 
 	key.tt_keyrev = arc4random();
 	arc4random_buf(key.tt_key, sizeof(key.tt_key));
 
-	proc_compose_imsg(env->sc_ps, PROC_RELAY, -1, IMSG_TLSTICKET_REKEY,
-	    -1, -1, &key, sizeof(key));
+	if (proc_compose_imsg(env->sc_ps, PROC_RELAY, -1, IMSG_TLSTICKET_REKEY,
+	    -1, -1, &key, sizeof(key)) == -1)
+		log_warn("%s: proc_compose_imsg", __func__);
 
 	evtimer_set(&rekeyev, parent_tls_ticket_rekey, env);
 	timerclear(&tv);

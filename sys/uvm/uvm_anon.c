@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_anon.c,v 1.58 2024/04/06 10:59:52 mpi Exp $	*/
+/*	$OpenBSD: uvm_anon.c,v 1.67 2026/02/11 22:34:40 deraadt Exp $	*/
 /*	$NetBSD: uvm_anon.c,v 1.10 2000/11/25 06:27:59 chs Exp $	*/
 
 /*
@@ -47,7 +47,15 @@ uvm_anon_init(void)
 {
 	pool_init(&uvm_anon_pool, sizeof(struct vm_anon), 0, IPL_MPFLOOR,
 	    PR_WAITOK, "anonpl", NULL);
-	pool_sethiwat(&uvm_anon_pool, uvmexp.free / 16);
+	pool_sethiwat(&uvm_anon_pool, atomic_load_sint(&uvmexp.free) / 16);
+}
+
+void
+uvm_anon_init_percpu(void)
+{
+#ifdef MULTIPROCESSOR
+	pool_cache_init(&uvm_anon_pool);
+#endif
 }
 
 /*
@@ -71,14 +79,13 @@ uvm_analloc(void)
 }
 
 /*
- * uvm_anfree_list: free a single anon structure
+ * uvm_anfree: free a single anon structure
  *
  * => anon must be removed from the amap (if anon was in an amap).
  * => amap must be locked, if anon was owned by amap.
- * => we may lock the pageq's.
  */
 void
-uvm_anfree_list(struct vm_anon *anon, struct pglist *pgl)
+uvm_anfree(struct vm_anon *anon)
 {
 	struct vm_page *pg = anon->an_page;
 
@@ -101,24 +108,11 @@ uvm_anfree_list(struct vm_anon *anon, struct pglist *pgl)
 			return;
 		}
 		pmap_page_protect(pg, PROT_NONE);
-		if (pgl != NULL) {
-			/*
-			 * clean page, and put it on pglist
-			 * for later freeing.
-			 */
-			uvm_lock_pageq();
-			uvm_pageclean(pg);
-			uvm_unlock_pageq();
-			TAILQ_INSERT_HEAD(pgl, pg, pageq);
-		} else {
-			uvm_lock_pageq();	/* lock out pagedaemon */
-			uvm_pagefree(pg);	/* bye bye */
-			uvm_unlock_pageq();	/* free the daemon */
-		}
+		uvm_pagefree(pg);
 	} else {
 		if (anon->an_swslot != 0 && anon->an_swslot != SWSLOT_BAD) {
 			/* This page is no longer only in swap. */
-			KASSERT(uvmexp.swpgonly > 0);
+			KASSERT(atomic_load_sint(&uvmexp.swpgonly) > 0);
 			atomic_dec_int(&uvmexp.swpgonly);
 		}
 	}
@@ -170,20 +164,19 @@ uvm_anon_pagein(struct vm_amap *amap, struct vm_anon *anon)
 	rv = uvmfault_anonget(NULL, amap, anon);
 
 	switch (rv) {
-	case VM_PAGER_OK:
+	case 0:
+		/* Success - we have the page. */
 		KASSERT(rw_write_held(anon->an_lock));
 		break;
-
-	case VM_PAGER_ERROR:
-	case VM_PAGER_REFAULT:
-
+	case EACCES:
+	case ERESTART:
 		/*
-		 * Nothing more to do on errors.
-		 * VM_PAGER_REFAULT  means that the anon was freed.
+		 * Nothing more to do on errors.  ERESTART means that the
+		 * anon was freed.
 		 */
-
 		return FALSE;
-
+	case ENOLCK:
+		/* Should not be possible. */
 	default:
 #ifdef DIAGNOSTIC
 		panic("anon_pagein: uvmfault_anonget -> %d", rv);
@@ -205,11 +198,7 @@ uvm_anon_pagein(struct vm_amap *amap, struct vm_anon *anon)
 	/*
 	 * Deactivate the page (to put it on a page queue).
 	 */
-	pmap_clear_reference(pg);
-	pmap_page_protect(pg, PROT_NONE);
-	uvm_lock_pageq();
 	uvm_pagedeactivate(pg);
-	uvm_unlock_pageq();
 	rw_exit(anon->an_lock);
 
 	return FALSE;
@@ -254,10 +243,8 @@ uvm_anon_release(struct vm_anon *anon)
 	KASSERT(pg->uanon == anon);
 	KASSERT(anon->an_ref == 0);
 
-	uvm_lock_pageq();
 	pmap_page_protect(pg, PROT_NONE);
 	uvm_pagefree(pg);
-	uvm_unlock_pageq();
 	KASSERT(anon->an_page == NULL);
 	lock = anon->an_lock;
 	uvm_anon_dropswap(anon);

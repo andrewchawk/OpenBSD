@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.h,v 1.12 2005/05/26 04:34:52 kettenis Exp $	*/
+/*	$OpenBSD: trap.h,v 1.15 2025/07/16 07:15:42 jsg Exp $	*/
 
 /*
  * Copyright (c) 1999-2004 Michael Shalayeff
@@ -55,7 +55,7 @@
 #define	T_TLB_DIRTY	20	/* TLB dirty bit */
 #define	T_PAGEREF	21	/* page reference */
 #define	T_EMULATION	22	/* assist emulation */
-#define	T_HIGHERPL	23	/* higher-privelege transfer */
+#define	T_HIGHERPL	23	/* higher-privilege transfer */
 #define	T_LOWERPL	24	/* lower-privilege transfer */
 #define	T_TAKENBR	25	/* taken branch */
 #define	T_DATACC	26	/* data access rights >=7100 */
@@ -75,19 +75,12 @@
  * Various trap frame flags.
  */
 #define	TFF_LAST_POS	0
-#define	TFF_ITLB_POS	1
-#define	TFF_SYS_POS	2
-#define	TFF_INTR_POS	3
+#define	TFF_SYS_POS	1
+#define	TFF_INTR_POS	2
 
 #define	TFF_LAST	(1 << (31 - TFF_LAST_POS))
-#define	TFF_ITLB	(1 << (31 - TFF_ITLB_POS))
 #define	TFF_SYS		(1 << (31 - TFF_SYS_POS))
 #define	TFF_INTR	(1 << (31 - TFF_INTR_POS))
-
-/*
- * Define this for pretty printings of trapflags.
- */
-#define	T_BITS	"\020\07user\036intr\037itlb\040last"
 
 /*
  * These are break instruction entry points.

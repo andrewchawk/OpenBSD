@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_cmd.c,v 1.12 2018/07/13 20:06:10 bentley Exp $	*/
+/*	$OpenBSD: ex_cmd.c,v 1.13 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1992, 1993, 1994
@@ -98,7 +98,7 @@ EXCMDLIST const cmds[] = {
 	    "[line] a[ppend][!]",
 	    "append input to a line"},
 /* C_ABBR */
-	{"abbreviate", 	ex_abbr,	0,
+	{"abbreviate",	ex_abbr,	0,
 	    "W",
 	    "ab[brev] [word replace]",
 	    "specify an input abbreviation"},
@@ -253,7 +253,7 @@ EXCMDLIST const cmds[] = {
 	    "prev[ious][!]",
 	    "edit the previous file in the file argument list"},
 /* C_PUT */
-	{"put",		ex_put,	
+	{"put",		ex_put,
 	    E_ADDR1|E_AUTOPRINT|E_ADDR_ZERO|E_ADDR_ZERODEF,
 	    "b",
 	    "[line] pu[t] [buffer]",

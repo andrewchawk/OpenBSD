@@ -1,4 +1,4 @@
-/*	$OpenBSD: vs_msg.c,v 1.20 2017/04/18 01:45:35 deraadt Exp $	*/
+/*	$OpenBSD: vs_msg.c,v 1.21 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -140,7 +140,7 @@ vs_busy(SCR *sp, const char *msg, busy_t btype)
 	(void)gp->scr_refresh(sp, 0);
 }
 
-/* 
+/*
  * vs_home --
  *	Home the cursor to the bottom row, left-most column.
  *

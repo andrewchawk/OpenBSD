@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.52 2023/07/04 02:56:11 dlg Exp $ */
+/*	$OpenBSD: parse.y,v 1.54 2026/07/22 16:37:46 bket Exp $ */
 
 /*
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
@@ -211,7 +211,7 @@ varset		: STRING '=' string		{
 		;
 
 conf_main	: ROUTERID STRING {
-			if (!inet_aton($2, &conf->rtr_id)) {
+			if (inet_pton(AF_INET, $2, &conf->rtr_id) != 1) {
 				yyerror("error parsing router-id");
 				free($2);
 				YYERROR;
@@ -489,7 +489,7 @@ areaid		: NUMBER {
 			$$.s_addr = htonl($1);
 		}
 		| STRING {
-			if (inet_aton($1, &$$) == 0) {
+			if (inet_pton(AF_INET, $1, &$$) != 1) {
 				yyerror("error parsing area");
 				free($1);
 				YYERROR;
@@ -554,8 +554,10 @@ interface	: INTERFACE STRING	{
 			iface->metric = defs->metric;
 			iface->priority = defs->priority;
 			iface->cflags |= F_IFACE_CONFIGURED;
-			if (defs->p2p == 1)
+			if (defs->p2p == 1) {
 				iface->type = IF_TYPE_POINTOPOINT;
+				iface->cflags |= F_IFACE_TYPE;
+			}
 			iface = NULL;
 			/* interface is always part of an area */
 			defs = &areadefs;

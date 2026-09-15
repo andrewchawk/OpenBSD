@@ -34,6 +34,7 @@ BEGIN {
     }
 }
 
+use warnings;
 use strict;
 use Test::More;
 
@@ -83,8 +84,7 @@ sub testit {
             package lexsubtest;
             no warnings 'experimental::lexical_subs';
             use feature 'lexical_subs';
-            no strict 'vars';
-            $code = "sub { state sub $keyword; ${vars}() = $expr }";
+            $code = "no warnings 'syntax'; no strict 'vars'; sub { state sub $keyword; ${vars}() = $expr }";
             $code = "use feature 'isa';\n$code" if $keyword eq "isa";
             $code = "use feature 'switch';\n$code" if $keyword eq "break";
             $code_ref = eval $code or die "$@ in $expr";
@@ -92,8 +92,9 @@ sub testit {
         else {
             package test;
             use subs ();
-            import subs $keyword;
-            $code = "no strict 'vars'; sub { ${vars}() = $expr }";
+            no warnings qw( experimental::keyword_any experimental::keyword_all );
+            subs->import($keyword);
+            $code = "no warnings 'syntax'; no strict 'vars'; sub { ${vars}() = $expr }";
             $code = "use feature 'isa';\n$code" if $keyword eq "isa";
             $code = "use feature 'switch';\n$code" if $keyword eq "break";
             $code_ref = eval $code or die "$@ in $expr";
@@ -123,7 +124,7 @@ sub testit {
 
 
 # Deparse can't distinguish 'and' from '&&' etc
-my %infix_map = qw(and && or ||);
+my %infix_map = (and => '&&', or => '||', xor => '^^');
 
 # Test a keyword that is a binary infix operator, like 'cmp'.
 # $parens - "$a op $b" is deparsed as "($a op $b)"
@@ -132,9 +133,7 @@ my %infix_map = qw(and && or ||);
 sub do_infix_keyword {
     my ($keyword, $parens, $strong) = @_;
     $SEEN_STRENGTH{$keyword} = $strong;
-    my $expr = "(\$a $keyword \$b)";
     my $nkey = $infix_map{$keyword} // $keyword;
-    my $expr = "(\$a $keyword \$b)";
     my $exp = "\$a $nkey \$b";
     $exp = "($exp)" if $parens;
     $exp .= ";";
@@ -235,6 +234,9 @@ while (<DATA>) {
 
 
 # Special cases
+
+testit any      => 'CORE::any { $a } $b, $c',    'CORE::any({$a;} $b, $c);';
+testit all      => 'CORE::all { $a } $b, $c',    'CORE::all({$a;} $b, $c);';
 
 testit dbmopen  => 'CORE::dbmopen(%foo, $bar, $baz);';
 testit dbmclose => 'CORE::dbmclose %foo;';
@@ -354,6 +356,7 @@ my %not_tested = map { $_ => 1} qw(
     __FILE__
     __LINE__
     __PACKAGE__
+    __CLASS__
     ADJUST
     AUTOLOAD
     BEGIN
@@ -607,7 +610,7 @@ recv             4     p
 ref              01    $
 rename           2     p
 # XXX This code prints 'Undefined subroutine &main::require called':
-#   use subs (); import subs 'require';
+#   use subs (); subs->import('require');
 #   eval q[no strict 'vars'; sub { () = require; }]; print $@;
 # so disable for now
 #require          01    $+
@@ -687,4 +690,4 @@ wantarray        0     -
 warn             @     p1
 write            01    -
 x                B     -
-xor              B     p
+xor              B     -

@@ -10,7 +10,7 @@
    Copyright (c) 2003      Greg Stein <gstein@users.sourceforge.net>
    Copyright (c) 2005-2007 Steven Solie <steven@solie.ca>
    Copyright (c) 2005-2012 Karl Waclawek <karl@waclawek.net>
-   Copyright (c) 2016-2024 Sebastian Pipping <sebastian@pipping.org>
+   Copyright (c) 2016-2026 Sebastian Pipping <sebastian@pipping.org>
    Copyright (c) 2017-2022 Rhodri James <rhodri@wildebeest.org.uk>
    Copyright (c) 2017      Joe Orton <jorton@redhat.com>
    Copyright (c) 2017      José Gutiérrez de la Concha <jose@zeroc.com>
@@ -39,13 +39,15 @@
    DAMAGES OR  OTHER LIABILITY, WHETHER  IN AN  ACTION OF CONTRACT,  TORT OR
    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+   SPDX-License-Identifier: MIT
 */
+
+#include "expat_config.h"
 
 #include <math.h> /* NAN, INFINITY */
 #include <stdio.h>
 #include <string.h>
-
-#include "expat_config.h"
 
 #include "expat.h"
 #include "internal.h"
@@ -360,13 +362,16 @@ END_TEST
 START_TEST(test_helper_unsigned_char_to_printable) {
   // Smoke test
   unsigned char uc = 0;
-  for (; uc < (unsigned char)-1; uc++) {
+  for (;; uc++) {
     set_subtest("char %u", (unsigned)uc);
     const char *const printable = unsignedCharToPrintable(uc);
     if (printable == NULL)
       fail("unsignedCharToPrintable returned NULL");
     else if (strlen(printable) < (size_t)1)
       fail("unsignedCharToPrintable returned empty string");
+    if (uc == (unsigned char)-1) {
+      break;
+    }
   }
 
   // Two concrete samples

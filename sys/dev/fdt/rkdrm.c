@@ -1,4 +1,4 @@
-/* $OpenBSD: rkdrm.c,v 1.22 2024/05/13 01:15:50 jsg Exp $ */
+/* $OpenBSD: rkdrm.c,v 1.25 2026/08/10 06:11:43 jsg Exp $ */
 /* $NetBSD: rk_drm.c,v 1.3 2019/12/15 01:00:58 mrg Exp $ */
 /*-
  * Copyright (c) 2019 Jared D. McNeill <jmcneill@invisible.ca>
@@ -52,6 +52,8 @@ void	rkdrm_attach(struct device *, struct device *, void *);
 void	rkdrm_attachhook(struct device *);
 
 int	rkdrm_unload(struct drm_device *);
+int	rkdrm_fb_probe(struct drm_fb_helper *,
+	    struct drm_fb_helper_surface_size *);
 
 struct drm_driver rkdrm_driver = {
 	.driver_features = DRIVER_ATOMIC | DRIVER_MODESET | DRIVER_GEM,
@@ -60,10 +62,10 @@ struct drm_driver rkdrm_driver = {
 	.dumb_map_offset = drm_gem_dumb_map_offset,
 
 	.gem_fault = drm_gem_dma_fault,
+	.fbdev_probe = rkdrm_fb_probe,
 
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
-	.date = DRIVER_DATE,
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
@@ -139,7 +141,7 @@ struct drm_framebuffer_funcs rkdrm_framebuffer_funcs = {
 
 struct drm_framebuffer *
 rkdrm_fb_create(struct drm_device *ddev, struct drm_file *file,
-    const struct drm_mode_fb_cmd2 *cmd)
+    const struct drm_format_info *info, const struct drm_mode_fb_cmd2 *cmd)
 {
 	struct rkdrm_framebuffer *fb;
 	struct drm_gem_object *gem_obj;
@@ -153,7 +155,7 @@ rkdrm_fb_create(struct drm_device *ddev, struct drm_file *file,
 		return NULL;
 
 	fb = malloc(sizeof(*fb), M_DRM, M_ZERO | M_WAITOK);
-	drm_helper_mode_fill_fb_struct(ddev, &fb->base, cmd);
+	drm_helper_mode_fill_fb_struct(ddev, &fb->base, info, cmd);
 	fb->base.format = drm_format_info(DRM_FORMAT_ARGB8888);
 	fb->base.obj[0] = gem_obj;
 	fb->obj = to_drm_gem_dma_obj(gem_obj);
@@ -183,10 +185,7 @@ struct drm_mode_config_funcs rkdrm_mode_config_funcs = {
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
-int rkdrm_fb_probe(struct drm_fb_helper *, struct drm_fb_helper_surface_size *);
-
 struct drm_fb_helper_funcs rkdrm_fb_helper_funcs = {
-	.fb_probe = rkdrm_fb_probe,
 };
 
 int
@@ -245,7 +244,6 @@ int
 rkdrm_wsioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 {
 	struct rasops_info *ri = v;
-	struct rkdrm_softc *sc = ri->ri_hw;
 	struct wsdisplay_param *dp = (struct wsdisplay_param *)data;
 	struct wsdisplay_fbinfo *wdf;
 
@@ -368,7 +366,6 @@ rkdrm_attachhook(struct device *dev)
 	struct drm_fb_helper *helper = &sc->helper;
 	struct rasops_info *ri = &sc->ro;
 	struct rkdrm_framebuffer *sfb;
-	struct drm_device *ddev;
 	uint32_t *ports;
 	int i, portslen, nports;
 	int console = 0;
@@ -478,16 +475,13 @@ rkdrm_attachhook(struct device *dev)
 int
 rkdrm_fb_probe(struct drm_fb_helper *helper, struct drm_fb_helper_surface_size *sizes)
 {
-	struct rkdrm_softc *sc = rkdrm_private(helper->dev);
 	struct drm_device *ddev = helper->dev;
 	struct rkdrm_framebuffer *sfb = to_rkdrm_framebuffer(helper->fb);
 	struct drm_mode_fb_cmd2 mode_cmd = { 0 };
 	struct drm_framebuffer *fb = helper->fb;
-	struct wsemuldisplaydev_attach_args aa;
-	struct rasops_info *ri = &sc->ro;
-	struct rkdrmfb_attach_args sfa;
+	struct fb_info *info = helper->info;
+	const struct drm_format_info *format_info;
 	unsigned int bytes_per_pixel;
-	struct fb_info *info;
 	size_t size;
 	int error;
 
@@ -509,19 +503,13 @@ rkdrm_fb_probe(struct drm_fb_helper *helper, struct drm_fb_helper_surface_size *
 		return -ENOMEM;
 	}
 
-	drm_helper_mode_fill_fb_struct(ddev, fb, &mode_cmd);
-	fb->format = drm_format_info(DRM_FORMAT_ARGB8888);
+	format_info = drm_format_info(DRM_FORMAT_ARGB8888);
+	drm_helper_mode_fill_fb_struct(ddev, fb, format_info, &mode_cmd);
 	fb->obj[0] = &sfb->obj->base;
 	error = drm_framebuffer_init(ddev, fb, &rkdrm_framebuffer_funcs);
 	if (error != 0) {
 		DRM_ERROR("failed to initialize framebuffer\n");
 		return error;
-	}
-
-	info = drm_fb_helper_alloc_info(helper);
-	if (IS_ERR(info)) {
-		DRM_ERROR("Failed to allocate fb_info\n");
-		return PTR_ERR(info);
 	}
 	info->par = helper;
 	return 0;

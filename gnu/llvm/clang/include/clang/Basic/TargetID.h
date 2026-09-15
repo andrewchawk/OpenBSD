@@ -11,7 +11,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
 #include <optional>
 #include <set>
 
@@ -56,6 +56,11 @@ getConflictTargetIDCombination(const std::set<llvm::StringRef> &TargetIDs);
 /// Check whether the provided target ID is compatible with the requested
 /// target ID.
 bool isCompatibleTargetID(llvm::StringRef Provided, llvm::StringRef Requested);
+
+/// Sanitize a target ID string for use in a file name.
+/// Replaces invalid characters (like ':') with safe characters (like '@').
+/// Currently only replaces ':' with '@' on Windows.
+std::string sanitizeTargetIDInFileName(llvm::StringRef TargetID);
 } // namespace clang
 
 #endif

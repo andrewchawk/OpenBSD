@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_amap.c,v 1.95 2024/05/20 17:03:36 dv Exp $	*/
+/*	$OpenBSD: uvm_amap.c,v 1.101 2026/08/12 14:49:25 gnezdo Exp $	*/
 /*	$NetBSD: uvm_amap.c,v 1.27 2000/11/25 06:27:59 chs Exp $	*/
 
 /*
@@ -72,13 +72,6 @@ static inline void amap_list_remove(struct vm_amap *);
 struct vm_amap_chunk *amap_chunk_get(struct vm_amap *, int, int, int);
 void amap_chunk_free(struct vm_amap *, struct vm_amap_chunk *);
 
-/*
- * if we enable PPREF, then we have a couple of extra functions that
- * we need to prototype here...
- */
-
-#ifdef UVM_AMAP_PPREF
-
 #define PPREF_NONE ((int *) -1)	/* not using ppref */
 
 void	amap_pp_adjref(struct vm_amap *, int, vsize_t, int);
@@ -86,8 +79,6 @@ void	amap_pp_establish(struct vm_amap *);
 void	amap_wiperange_chunk(struct vm_amap *, struct vm_amap_chunk *, int,
 	    int);
 void	amap_wiperange(struct vm_amap *, int, int);
-
-#endif	/* UVM_AMAP_PPREF */
 
 static inline void
 amap_list_insert(struct vm_amap *amap)
@@ -114,13 +105,15 @@ amap_list_remove(struct vm_amap *amap)
 struct vm_amap_chunk *
 amap_chunk_get(struct vm_amap *amap, int slot, int create, int waitf)
 {
-	int bucket = UVM_AMAP_BUCKET(amap, slot);
-	int baseslot = AMAP_BASE_SLOT(slot);
+	int bucket, baseslot;
 	int n;
 	struct vm_amap_chunk *chunk, *newchunk, *pchunk = NULL;
 
 	if (UVM_AMAP_SMALL(amap))
 		return &amap->am_small;
+
+	bucket = UVM_AMAP_BUCKET(amap, slot);
+	baseslot = AMAP_BASE_SLOT(slot);
 
 	for (chunk = amap->am_buckets[bucket]; chunk != NULL;
 	    chunk = TAILQ_NEXT(chunk, ac_list)) {
@@ -159,12 +152,13 @@ amap_chunk_get(struct vm_amap *amap, int slot, int create, int waitf)
 void
 amap_chunk_free(struct vm_amap *amap, struct vm_amap_chunk *chunk)
 {
-	int bucket = UVM_AMAP_BUCKET(amap, chunk->ac_baseslot);
+	int bucket;
 	struct vm_amap_chunk *nchunk;
 
 	if (UVM_AMAP_SMALL(amap))
 		return;
 
+	bucket = UVM_AMAP_BUCKET(amap, chunk->ac_baseslot);
 	nchunk = TAILQ_NEXT(chunk, ac_list);
 	TAILQ_REMOVE(&amap->am_chunks, chunk, ac_list);
 	if (amap->am_buckets[bucket] == chunk) {
@@ -179,13 +173,11 @@ amap_chunk_free(struct vm_amap *amap, struct vm_amap_chunk *chunk)
 	amap->am_ncused--;
 }
 
-#ifdef UVM_AMAP_PPREF
 /*
  * what is ppref?   ppref is an _optional_ amap feature which is used
- * to keep track of reference counts on a per-page basis.  it is enabled
- * when UVM_AMAP_PPREF is defined.
+ * to keep track of reference counts on a per-page basis.
  *
- * when enabled, an array of ints is allocated for the pprefs.  this
+ * an array of ints is allocated for the pprefs.  this
  * array is allocated only when a partial reference is added to the
  * map (either by unmapping part of the amap, or gaining a reference
  * to only a part of an amap).  if the allocation of the array fails
@@ -246,7 +238,6 @@ pp_setreflen(int *ppref, int offset, int ref, int len)
 		ppref[offset+1] = len;
 	}
 }
-#endif /* UVM_AMAP_PPREF */
 
 /*
  * amap_init: called at boot time to init global amap data structures
@@ -347,9 +338,7 @@ amap_alloc1(int slots, int waitf, int lazyalloc)
 	amap->am_lock = NULL;
 	amap->am_ref = 1;
 	amap->am_flags = 0;
-#ifdef UVM_AMAP_PPREF
 	amap->am_ppref = NULL;
-#endif
 	amap->am_nslot = slots;
 	amap->am_nused = 0;
 
@@ -454,10 +443,8 @@ amap_free(struct vm_amap *amap)
 		rw_obj_free(amap->am_lock);
 	}
 
-#ifdef UVM_AMAP_PPREF
 	if (amap->am_ppref && amap->am_ppref != PPREF_NONE)
 		free(amap->am_ppref, M_UVMAMAP, amap->am_nslot * sizeof(int));
-#endif
 
 	if (UVM_AMAP_SMALL(amap))
 		pool_put(&uvm_small_amap_pool[amap->am_nslot - 1], amap);
@@ -493,8 +480,6 @@ amap_wipeout(struct vm_amap *amap)
 		amap_unlock(amap);
 		return;
 	}
-
-	amap_list_remove(amap);
 
 	AMAP_CHUNK_FOREACH(chunk, amap) {
 		int i, refs, map = chunk->ac_usedmap;
@@ -621,7 +606,7 @@ amap_copy(struct vm_map *map, struct vm_map_entry *entry, int waitf,
 	amap->am_lock = srcamap->am_lock;
 	rw_obj_hold(amap->am_lock);
 
-	amap_lock(srcamap);
+	amap_lock(srcamap, RW_WRITE);
 
 	/*
 	 * Re-check the reference count with the lock held.  If it has
@@ -658,10 +643,9 @@ amap_copy(struct vm_map *map, struct vm_map_entry *entry, int waitf,
 
 		chunk = amap_chunk_get(amap, lcv, 1, PR_NOWAIT);
 		if (chunk == NULL) {
-			amap_unlock(srcamap);
-			/* Destroy the new amap. */
+			/* amap_wipeout() releases the shared lock. */
 			amap->am_ref--;
-			amap_free(amap);
+			amap_wipeout(amap);
 			return;
 		}
 
@@ -688,12 +672,10 @@ amap_copy(struct vm_map *map, struct vm_map_entry *entry, int waitf,
 
 	if (srcamap->am_ref == 1 && (srcamap->am_flags & AMAP_SHARED) != 0)
 		srcamap->am_flags &= ~AMAP_SHARED;   /* clear shared flag */
-#ifdef UVM_AMAP_PPREF
 	if (srcamap->am_ppref && srcamap->am_ppref != PPREF_NONE) {
 		amap_pp_adjref(srcamap, entry->aref.ar_pageoff, 
 		    (entry->end - entry->start) >> PAGE_SHIFT, -1);
 	}
-#endif
 
 	/*
 	 * If we referenced any anons, then share the source amap's lock.
@@ -749,7 +731,7 @@ amap_cow_now(struct vm_map *map, struct vm_map_entry *entry)
 	 * am_anon[] array on us while the lock is dropped.
 	 */
 ReStart:
-	amap_lock(amap);
+	amap_lock(amap, RW_WRITE);
 	AMAP_CHUNK_FOREACH(chunk, amap) {
 		int i, map = chunk->ac_usedmap;
 
@@ -823,9 +805,7 @@ ReStart:
 			 */
 			atomic_clearbits_int(&npg->pg_flags, PG_BUSY|PG_FAKE);
 			UVM_PAGE_OWN(npg, NULL);
-			uvm_lock_pageq();
 			uvm_pageactivate(npg);
-			uvm_unlock_pageq();
 		}
 	}
 	amap_unlock(amap);
@@ -849,16 +829,14 @@ amap_splitref(struct vm_aref *origref, struct vm_aref *splitref, vaddr_t offset)
 	if (leftslots == 0)
 		panic("amap_splitref: split at zero offset");
 
-	amap_lock(amap);
+	amap_lock(amap, RW_WRITE);
 
 	if (amap->am_nslot - origref->ar_pageoff - leftslots <= 0)
 		panic("amap_splitref: map size check failed");
 
-#ifdef UVM_AMAP_PPREF
 	/* Establish ppref before we add a duplicate reference to the amap. */
 	if (amap->am_ppref == NULL)
 		amap_pp_establish(amap);
-#endif
 
 	/* Note: not a share reference. */
 	amap->am_ref++;
@@ -866,8 +844,6 @@ amap_splitref(struct vm_aref *origref, struct vm_aref *splitref, vaddr_t offset)
 	splitref->ar_pageoff = origref->ar_pageoff + leftslots;
 	amap_unlock(amap);
 }
-
-#ifdef UVM_AMAP_PPREF
 
 /*
  * amap_pp_establish: add a ppref array to an amap, if possible.
@@ -1065,8 +1041,6 @@ amap_wiperange(struct vm_amap *amap, int slotoff, int slots)
 	}
 }
 
-#endif
-
 /*
  * amap_swap_off: pagein anonymous pages in amaps and drop swap slots.
  *
@@ -1088,8 +1062,8 @@ amap_swap_off(int startslot, int endslot)
 		int i, map;
 		struct vm_amap_chunk *chunk;
 
-		amap_lock(am);
-		if (am->am_nused == 0) {
+		amap_lock(am, RW_WRITE);
+		if (am->am_ref == 0 || am->am_nused == 0) {
 			amap_unlock(am);
 			am_next = LIST_NEXT(am, am_list);
 			continue;
@@ -1118,10 +1092,13 @@ again:
 				am->am_flags |= AMAP_SWAPOFF;
 
 				rv = uvm_anon_pagein(am, anon);
-				amap_lock(am);
+				amap_lock(am, RW_WRITE);
 
 				am->am_flags &= ~AMAP_SWAPOFF;
 				if (amap_refs(am) == 0) {
+					amap_unlock(am);
+					amap_list_remove(am);
+					amap_lock(am, RW_WRITE);
 					amap_wipeout(am);
 					am = NULL;
 					goto nextamap;
@@ -1303,7 +1280,6 @@ static void
 amap_adjref_anons(struct vm_amap *amap, vaddr_t offset, vsize_t len,
     int refv, boolean_t all)
 {
-#ifdef UVM_AMAP_PPREF
 	KASSERT(rw_write_held(amap->am_lock));
 
 	/*
@@ -1313,11 +1289,8 @@ amap_adjref_anons(struct vm_amap *amap, vaddr_t offset, vsize_t len,
 	if (amap->am_ppref == NULL && !all && len != amap->am_nslot) {
 		amap_pp_establish(amap);
 	}
-#endif
-
 	amap->am_ref += refv;
 
-#ifdef UVM_AMAP_PPREF
 	if (amap->am_ppref && amap->am_ppref != PPREF_NONE) {
 		if (all) {
 			amap_pp_adjref(amap, 0, amap->am_nslot, refv);
@@ -1325,7 +1298,6 @@ amap_adjref_anons(struct vm_amap *amap, vaddr_t offset, vsize_t len,
 			amap_pp_adjref(amap, offset, len, refv);
 		}
 	}
-#endif
 	amap_unlock(amap);
 }
 
@@ -1339,7 +1311,7 @@ amap_adjref_anons(struct vm_amap *amap, vaddr_t offset, vsize_t len,
 void
 amap_ref(struct vm_amap *amap, vaddr_t offset, vsize_t len, int flags)
 {
-	amap_lock(amap);
+	amap_lock(amap, RW_WRITE);
 	if (flags & AMAP_SHARED)
 		amap->am_flags |= AMAP_SHARED;
 	amap_adjref_anons(amap, offset, len, 1, (flags & AMAP_REFALL) != 0);
@@ -1355,7 +1327,7 @@ amap_ref(struct vm_amap *amap, vaddr_t offset, vsize_t len, int flags)
 void
 amap_unref(struct vm_amap *amap, vaddr_t offset, vsize_t len, boolean_t all)
 {
-	amap_lock(amap);
+	amap_lock(amap, RW_WRITE);
 
 	KASSERT(amap->am_ref > 0);
 
@@ -1364,6 +1336,13 @@ amap_unref(struct vm_amap *amap, vaddr_t offset, vsize_t len, boolean_t all)
 		 * If the last reference - wipeout and destroy the amap.
 		 */
 		amap->am_ref--;
+		if ((amap->am_flags & AMAP_SWAPOFF) != 0) {
+			amap_wipeout(amap);
+			return;
+		}
+		amap_unlock(amap);
+		amap_list_remove(amap);
+		amap_lock(amap, RW_WRITE);
 		amap_wipeout(amap);
 		return;
 	}

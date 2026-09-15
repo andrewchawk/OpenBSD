@@ -1,4 +1,4 @@
-/*	$OpenBSD: inet.c,v 1.182 2024/04/17 20:48:51 bluhm Exp $	*/
+/*	$OpenBSD: inet.c,v 1.187 2026/02/05 03:26:00 dlg Exp $	*/
 /*	$NetBSD: inet.c,v 1.14 1995/10/03 21:42:37 thorpej Exp $	*/
 
 /*
@@ -408,10 +408,13 @@ tcp_stats(char *name)
 	p(tcps_sndwinup, "\t\t%u window update packet%s\n");
 	p(tcps_sndctrl, "\t\t%u control packet%s\n");
 	p(tcps_outswcsum, "\t\t%u packet%s software-checksummed\n");
-	p(tcps_outswtso, "\t\t%u output TSO packet%s software chopped\n");
-	p(tcps_outhwtso, "\t\t%u output TSO packet%s hardware processed\n");
-	p(tcps_outpkttso, "\t\t%u output TSO packet%s generated\n");
-	p(tcps_outbadtso, "\t\t%u output TSO packet%s dropped\n");
+	p(tcps_outswtso,
+	    "\t\t%u output TSO large packet%s chopped in software\n");
+	p(tcps_outhwtso,
+	    "\t\t%u output TSO large packet%s to device\n");
+	p(tcps_outpkttso,
+	    "\t\t%u output TSO generated packet%s sent to network\n");
+	p(tcps_outbadtso, "\t\t%u bad TSO packet%s dropped\n");
 	p(tcps_rcvtotal, "\t%u packet%s received\n");
 	p2(tcps_rcvackpack, tcps_rcvackbyte, "\t\t%u ack%s (for %llu byte%s)\n");
 	p(tcps_rcvdupack, "\t\t%u duplicate ack%s\n");
@@ -440,11 +443,12 @@ tcp_stats(char *name)
 	p(tcps_rcvbadsig, "\t\t%u bad/missing md5 checksum%s\n");
 	p(tcps_rcvgoodsig, "\t\t%llu good md5 checksum%s\n");
 	p(tcps_inswlro,
-	    "\t\t%u input LRO packet%s passed through pseudo device\n");
-	p(tcps_inhwlro, "\t\t%u input LRO generated packet%s from hardware\n");
+	    "\t\t%u input LRO generated packet%s glued in software\n");
+	p(tcps_inhwlro,
+	    "\t\t%u input LRO generated packet%s from device\n");
 	p(tcps_inpktlro,
-	    "\t\t%u input LRO coalesced packet%s by network device\n");
-	p(tcps_inbadlro, "\t\t%u input bad LRO packet%s dropped\n");
+	    "\t\t%u input LRO small packet%s received from network\n");
+	p(tcps_inbadlro, "\t\t%u bad LRO packet%s dropped\n");
 	p(tcps_connattempt, "\t%u connection request%s\n");
 	p(tcps_accepts, "\t%u connection accept%s\n");
 	p(tcps_connects, "\t%u connection%s established (including accepts)\n");
@@ -464,6 +468,7 @@ tcp_stats(char *name)
 	p(tcps_preddat, "\t%u correct data packet header prediction%s\n");
 	pes(tcps_pcbhashmiss, "\t%u PCB cache miss%s\n");
 	p1(tcps_noport, "\t%u dropped due to no socket\n");
+	p1(tcps_closing, "\t%u dropped as socket is closing\n");
 
 	p(tcps_ecn_accepts, "\t%u ECN connection%s accepted\n");
 	p(tcps_ecn_rcvece, "\t\t%u ECE packet%s received\n");
@@ -813,7 +818,6 @@ static char *
 getrpcportnam(in_port_t port, int proto)
 {
 	struct sockaddr_in server_addr;
-	struct hostent *hp;
 	static struct pmaplist *head;
 	int socket = RPC_ANYSOCK;
 	struct timeval minutetimeout;
@@ -828,11 +832,7 @@ getrpcportnam(in_port_t port, int proto)
 		first = 1;
 		memset(&server_addr, 0, sizeof server_addr);
 		server_addr.sin_family = AF_INET;
-		if ((hp = gethostbyname("localhost")) != NULL)
-			memmove((caddr_t)&server_addr.sin_addr, hp->h_addr,
-			    hp->h_length);
-		else
-			(void) inet_aton("0.0.0.0", &server_addr.sin_addr);
+		(void) inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
 
 		minutetimeout.tv_sec = 60;
 		minutetimeout.tv_usec = 0;

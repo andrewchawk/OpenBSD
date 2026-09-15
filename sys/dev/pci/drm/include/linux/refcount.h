@@ -15,6 +15,12 @@ refcount_dec_and_test(uint32_t *p)
 }
 
 static inline bool
+refcount_inc(uint32_t *p)
+{
+	return atomic_inc(p);
+}
+
+static inline bool
 refcount_inc_not_zero(uint32_t *p)
 {
 	return atomic_inc_not_zero(p);
@@ -38,6 +44,12 @@ refcount_dec_and_lock_irqsave(volatile int *v, struct mutex *lock,
 		return true;
 	mtx_leave(lock);
 	return false;
+}
+
+static inline uint32_t
+refcount_read(uint32_t *p)
+{
+	return atomic_read(p);
 }
 
 #endif

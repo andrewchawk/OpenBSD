@@ -1,4 +1,4 @@
-/*	$Id: test-mft.c,v 1.29 2024/04/22 05:54:01 claudio Exp $ */
+/*	$Id: test-mft.c,v 1.34 2026/09/03 17:18:03 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -28,7 +28,6 @@
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
 #include <openssl/x509v3.h>
 
 #include "extern.h"
@@ -41,24 +40,16 @@ int experimental;
 int
 main(int argc, char *argv[])
 {
-	int		 c, i, ppem = 0, verb = 0;
+	int		 c, i, verb = 0;
 	struct mft	*p;
-	X509		*xp = NULL;
+	struct cert	*cert = NULL;
 	unsigned char	*buf;
 	size_t		 len;
 
-	ERR_load_crypto_strings();
-	OpenSSL_add_all_ciphers();
-	OpenSSL_add_all_digests();
 	x509_init_oid();
 
 	while (-1 != (c = getopt(argc, argv, "pv")))
 		switch (c) {
-		case 'p':
-			if (ppem)
-				break;
-			ppem = 1;
-			break;
 		case 'v':
 			verb++;
 			break;
@@ -74,24 +65,18 @@ main(int argc, char *argv[])
 
 	for (i = 0; i < argc; i++) {
 		buf = load_file(argv[i], &len);
-		if ((p = mft_parse(&xp, argv[i], -1, buf, len)) == NULL) {
+		if ((p = signed_object_parse(&cert, argv[i], RTYPE_MFT, -1,
+		    buf, len)) == NULL) {
 			free(buf);
 			break;
 		}
 		if (verb)
-			mft_print(xp, p);
-		if (ppem) {
-			if (!PEM_write_X509(stdout, xp))
-				errx(1, "PEM_write_X509: unable to write cert");
-		}
+			mft_print(cert, p);
 		free(buf);
 		mft_free(p);
-		X509_free(xp);
+		cert_free(cert);
+		cert = NULL;
 	}
-
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
-	ERR_free_strings();
 
 	if (i < argc)
 		errx(1, "test failed for %s", argv[i]);

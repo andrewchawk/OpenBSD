@@ -17,20 +17,15 @@ use warnings;
 BEGIN {
     eval { require POSIX; POSIX->import("locale_h") };
     if ($@) {
-	skip_all("could not load the POSIX module"); # running minitest?
+        skip_all("could not load the POSIX module"); # running minitest?
     }
 }
 use Config;
 
-if ($^O eq "aix" && ($Config{osvers} =~ /^(\d+)/)[0] < 7) {
-    # https://www.ibm.com/support/pages/apar/IV22174
-    skip_all("old AIX setlocale is broken in some cases");
-}
-
 use I18N::Langinfo qw(langinfo RADIXCHAR);
 my $have_strtod = $Config{d_strtod} eq 'define';
 my $have_localeconv = defined $Config{d_locconv} && $Config{d_locconv} eq 'define';
-my @locales = find_locales( [ 'LC_ALL', 'LC_CTYPE', 'LC_NUMERIC' ]);
+my @locales = find_locales('LC_NUMERIC');
 skip_all("no locales available") unless @locales;
 note("locales available: @locales");
 
@@ -52,7 +47,10 @@ delete local @ENV{'LANGUAGE', 'LANG', (grep /^LC_[A-Z]+$/, keys %ENV)};
 # 'debug'
 delete local $ENV{'PERL_DEBUG_LOCALE_INIT'} unless $debug;
 
-{
+my $has_ctype = grep { $_ eq "LC_CTYPE" } platform_locale_categories();
+
+SKIP: {
+    skip("LC_CTYPE not available on the system", 1 ) unless $has_ctype;
     fresh_perl_is(<<"EOF",
             use locale;
             use POSIX;
@@ -63,7 +61,8 @@ EOF
         1, { stderr => 'devnull' }, "/il matching of [bracketed] doesn't skip POSIX class if fails individ char");
 }
 
-{
+SKIP: {
+    skip("LC_CTYPE not available on the system", 1 ) unless $has_ctype;
     fresh_perl_is(<<"EOF",
             use locale;
             use POSIX;
@@ -354,6 +353,7 @@ EOF
 
         {
             open my $saved_stderr, ">&STDERR" or die "Can't dup STDERR: $!";
+            # Comment out the following line to get error output when running the test
             close STDERR;
 
             {
@@ -376,7 +376,7 @@ EOF
 EOF
                 "LANG is used if LC_ALL, LC_NUMERIC are invalid"))
             {
-                note "To see details change this .t, do not close STDERR";
+                note "To see details change '" . __FILE__ . "', to not close STDERR";
             }
             }
 
@@ -404,7 +404,7 @@ EOF
 EOF
                     'C locale is used if LC_ALL, LC_NUMERIC, LANG are invalid'))
                     {
-                        note "To see details change this .t, do not close STDERR";
+                        note "To see details change '" . __FILE__ . "', to not close STDERR";
                     }
                 }
             }
@@ -495,19 +495,28 @@ EOF
                 "1.5", { stderr => 'devnull' }, "POSIX::strtod() uses underlying locale");
             }
           }
+
+          { # GH #21746
+                local $ENV{LANG} = $comma;
+                fresh_perl_is(<<"EOF",
+                    use POSIX;
+                    POSIX::setlocale(POSIX::LC_ALL(),'');
+                    eval q{ use constant X => \$] };
+                    print \$@;
+EOF
+                "", {},
+                "Properly toggles to radix dot locale");
+          }
         }
     }
 
 SKIP: {
-        # Note: the setlocale Configure probe could be enhanced to give us the
-        # syntax to use, but khw doesn't think it's worth it at this time, as
-        # the current outliers seem to be skipped by the test just below
-        # anyway.  If the POSIX 2008 locale functions are being used, the
-        # syntax becomes mostly irrelevant, so do the test anyway if they are.
-        # It's a lot of trouble to figure out in a perl script.
         if ($Config{d_setlocale_accepts_any_locale_name})
         {
             skip("Can't distinguish between valid and invalid locale names on this system", 2);
+        }
+        if (! $Config{d_perl_lc_all_uses_name_value_pairs}) {
+            skip("Test only valid when LC_ALL syntax is name=value pairs", 2);
         }
 
         my @valid_categories = valid_locale_categories();
@@ -551,7 +560,7 @@ EOF
 SKIP:
 {
     use locale;
-    # look for an english locale (so a < B, hopefully)
+    # look for an English locale (so 'a' < 'B', hopefully)
     my ($en) = grep { /^en_/ } find_locales( [ 'LC_COLLATE' ]);
     defined $en
         or skip "didn't find a suitable locale", 1;
@@ -575,11 +584,82 @@ else {
 EOF
 }
 
-SKIP: {   # GH #20085
-    my @utf8_locales = find_utf8_ctype_locales();
-    skip "didn't find a UTF-8 locale", 1 unless @utf8_locales;
+@locales = find_locales( [ qw(LC_CTYPE LC_COLLATE) ] );
+my ($utf8_ref, $non_utf8_ref) = classify_locales_wrt_utf8ness(\@locales);
+my @non_utf8_locales = grep { $_ !~ / \b C \b | POSIX /x } $non_utf8_ref->@*;
 
-    local $ENV{LC_CTYPE} = $utf8_locales[0];
+SKIP:
+{
+    skip "didn't find a suitable non-UTF-8 locale", 1 unless
+                                                            @non_utf8_locales;
+    my $locale = $non_utf8_locales[0];
+
+    fresh_perl_is(<<"EOF", "ok\n", {}, "cmp() handles above Latin1 and NUL in non-UTF8 locale");
+use locale;
+use POSIX qw(setlocale LC_COLLATE);
+if (setlocale(LC_COLLATE, '$locale')) {
+     my \$x = "A\\xB5\\x00B";
+     utf8::upgrade(\$x);
+     my \$y = "\\x{100}";
+     my \$cmp = \$x cmp \$y;
+     print \$cmp <= 0 ? "ok\n" : "not ok\n";
+}
+else {
+     print "ok\n";
+}
+EOF
+}
+
+SKIP:
+{
+    skip "didn't find a suitable UTF-8 locale", 1
+                                            unless $utf8_ref && $utf8_ref->@*;
+    my $locale = $utf8_ref->[0];
+
+    fresh_perl_is(<<"EOF", "ok\n", {}, "Handles above Unicode in a UTF8 locale");
+use locale;
+use POSIX qw(setlocale LC_COLLATE);
+if (setlocale(LC_COLLATE, '$locale')) {
+     my \$x = "a\\x{10FFFF}\\x{110000}a\\x{10FFFF}a\\x{110000}";
+     my \$y = "a\\x{10FFFF}\\x{10FFFF}a\\x{10FFFF}a\\x{10FFFF}";
+     my \$cmp = \$x cmp \$y;
+     print \$cmp >= 0 ? "ok\n" : "not ok\n";
+}
+else {
+     print "ok\n";
+}
+EOF
+}
+
+SKIP:
+{
+    skip "didn't find a suitable UTF-8 locale", 1
+                                            unless $utf8_ref && $utf8_ref->@*;
+    my $is64bit = length sprintf("%x", ~0) > 8;
+    skip "32-bit ASCII platforms can't physically have extended UTF-8", 1
+                                                   if $::IS_ASCII  && ! $is64bit;
+    my $locale = $utf8_ref->[0];
+
+    fresh_perl_is(<<"EOF", "ok\n", {}, "cmp() handles Perl extended UTF-8");
+use locale;
+use POSIX qw(setlocale LC_COLLATE);
+if (setlocale(LC_COLLATE, '$locale')) {
+     no warnings qw(non_unicode portable);
+     my \$x = "\\x{10FFFF}";
+     my \$y = "\\x{100000000}";
+     my \$cmp = \$x cmp \$y;
+     print \$cmp <= 0 ? "ok\n" : "not ok\n";
+}
+else {
+     print "ok\n";
+}
+EOF
+}
+
+SKIP: {   # GH #20085
+    skip "didn't find a suitable UTF-8 locale", 1
+                                            unless $utf8_ref && $utf8_ref->@*;
+    local $ENV{LC_CTYPE} = $utf8_ref->[0];
     local $ENV{LC_ALL} = undef;
     fresh_perl_is(<<~'EOF', "ok\n", {}, "check that setlocale overrides startup");
         use POSIX;
@@ -605,18 +685,19 @@ SKIP: {   # GH #20054
     skip "Even illegal locale names are accepted", 1
                     if $Config{d_setlocale_accepts_any_locale_name}
                     && $Config{d_setlocale_accepts_any_locale_name} eq 'define';
-	
+
     my @lc_all_locales = find_locales('LC_ALL');
     my $locale = $lc_all_locales[0];
     skip "LC_ALL not enabled on this platform", 1 unless $locale;
-
-    local $ENV{LC_ALL} = "This is not a legal locale name";
-    local $ENV{LANG} = "Nor this neither";
-
     my $fallback = ($^O eq "MSWin32")
                     ? "system default"
                     : "standard";
-    fresh_perl_like("", qr/Falling back to the $fallback locale/,
+    fresh_perl_like(<<~EOT,
+                        local \$ENV{LC_ALL} = "This is not a legal locale name";
+                        local \$ENV{LANG} = "Nor this neither";
+                        system "\$^X -e1";
+                    EOT
+                    qr/Falling back to the $fallback locale/,
                     {}, "check that illegal startup environment falls back");
 }
 

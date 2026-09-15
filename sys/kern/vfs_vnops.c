@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_vnops.c,v 1.122 2023/07/10 22:54:40 deraadt Exp $	*/
+/*	$OpenBSD: vfs_vnops.c,v 1.128 2026/06/12 12:20:25 kirill Exp $	*/
 /*	$NetBSD: vfs_vnops.c,v 1.20 1996/02/04 02:18:41 christos Exp $	*/
 
 /*
@@ -99,6 +99,8 @@ vn_open(struct nameidata *ndp, int fmode, int cmode)
 		return (EINVAL);
 	if ((fmode & (O_TRUNC | FWRITE)) == O_TRUNC)
 		return (EINVAL);
+	if ((fmode & (O_CREAT | O_DIRECTORY)) == (O_CREAT | O_DIRECTORY))
+		return (EINVAL);
 	if (fmode & O_CREAT) {
 		ndp->ni_cnd.cn_nameiop = CREATE;
 		ndp->ni_cnd.cn_flags |= LOCKPARENT | LOCKLEAF;
@@ -108,7 +110,7 @@ vn_open(struct nameidata *ndp, int fmode, int cmode)
 			return (error);
 
 		if (ndp->ni_vp == NULL) {
-			VATTR_NULL(&va);
+			vattr_null(&va);
 			va.va_type = VREG;
 			va.va_mode = cmode;
 			if (fmode & O_EXCL)
@@ -130,6 +132,10 @@ vn_open(struct nameidata *ndp, int fmode, int cmode)
 			vp = ndp->ni_vp;
 			if (fmode & O_EXCL) {
 				error = EEXIST;
+				goto bad;
+			}
+			if (vp->v_type == VDIR) {
+				error = EISDIR;
 				goto bad;
 			}
 			fmode &= ~O_CREAT;
@@ -169,7 +175,7 @@ vn_open(struct nameidata *ndp, int fmode, int cmode)
 		}
 	}
 	if ((fmode & O_TRUNC) && vp->v_type == VREG) {
-		VATTR_NULL(&va);
+		vattr_null(&va);
 		va.va_size = 0;
 		if ((error = VOP_SETATTR(vp, &va, cred, p)) != 0)
 			goto bad;
@@ -427,7 +433,13 @@ int
 vn_statfile(struct file *fp, struct stat *sb, struct proc *p)
 {
 	struct vnode *vp = fp->f_data;
-	return vn_stat(vp, sb, p);
+	int error;
+
+	KERNEL_LOCK();
+	error = vn_stat(vp, sb, p);
+	KERNEL_UNLOCK();
+
+	return (error);
 }
 
 /*
@@ -515,7 +527,7 @@ vn_ioctl(struct file *fp, u_long com, caddr_t data, struct proc *p)
 				break;
 			*(int *)data = vattr.va_size - foffset(fp);
 
-		} else if (com == FIONBIO || com == FIOASYNC)	/* XXX */
+		} else if (com == FIOASYNC)			/* XXX */
 			error = 0;				/* XXX */
 		break;
 
@@ -580,9 +592,9 @@ vn_lock(struct vnode *vp, int flags)
 				 */
 				error = ENOENT;
 				VOP_UNLOCK(vp);
-				if (do_wakeup)
-					wakeup_one(&vp->v_lockcount);
 			}
+			if (do_wakeup && xlocked)
+				wakeup_one(&vp->v_lockcount);
 		}
 	} while (flags & LK_RETRY);
 	return (error);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: init.c,v 1.24 2024/07/22 22:06:27 kettenis Exp $ */
+/*	$OpenBSD: init.c,v 1.28 2026/09/10 03:52:16 deraadt Exp $ */
 /*
  * Copyright (c) 2014,2015 Philip Guenther <guenther@openbsd.org>
  *
@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <sys/timetc.h>		/* timekeep */
+#include <sys/auxv.h>		/* _hwcap */
 
 #ifndef PIC
 #include <sys/mman.h>
@@ -51,6 +52,7 @@ int	_pagesize = 0;
 struct timekeep	*_timekeep;
 unsigned long	_hwcap, _hwcap2;
 int	_hwcap_avail, _hwcap2_avail;
+char	*_execpath;
 
 /*
  * In dynamically linked binaries environ and __progname are overridden by
@@ -130,19 +132,14 @@ _libc_preinit(int argc, char **argv, char **envp, dl_cb_cb *cb)
 			if (issetugid() == 0 && getenv("LIBC_NOUSERTC"))
 				_timekeep = NULL;
 			break;
+		case AUX_execpath:	/* XXX delete before 2027 */
+		case AUX_openbsd_execpath:
+			_execpath = (void *)aux->au_v;
+			break;
 		}
 	}
 
 #ifndef PIC
-	if (cb == NULL && phdr == NULL && __executable_start != NULL) {
-		/*
-		 * Static non-PIE processes don't get an AUX vector,
-		 * so find the phdrs through the ELF header
-		 */
-		phdr = (void *)((char *)__executable_start +
-		    __executable_start->e_phoff);
-		phnum = __executable_start->e_phnum;
-	}
 	_static_phdr_info.dlpi_phdr = phdr;
 	_static_phdr_info.dlpi_phnum = phnum;
 

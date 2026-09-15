@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.89 2023/10/23 08:38:58 espie Exp $
+# $OpenBSD: Makefile,v 1.92 2026/07/26 09:41:33 tb Exp $
 
 REGRESS_TARGETS=pkgnames pkgpaths signatures depends-check longnames pkgcfl \
 	collision-check1 collision-check2 collision-check3 \
@@ -13,7 +13,7 @@ REGRESS_TARGETS=pkgnames pkgpaths signatures depends-check longnames pkgcfl \
 	tying-1 tying-2 tag-delete setsprint temp-error1 \
 	temp-error2 temp-error2-as-root temp-error3 temp-error4 \
 	cksum-error system-version XXX-warning symlink no-symlink \
-	oldlib2
+	oldlib2 lib-error gcc15
 
 REGRESS_ROOT_TARGETS = temp-error2-as-root
 
@@ -52,7 +52,7 @@ D$i ?= ${.OBJDIR}/dest$i
 DEST$i ?= ${D$i}/usr/local
 .endfor
 
-# current maxes (used): D49, SRC30, plist27, rep7
+# current maxes (used): D49, SRC30, plist28, rep9
 pkgnames:
 	${PERLSCRIPT}/check-name
 
@@ -338,7 +338,8 @@ rep0/gb-0.tgz rep1/gb-0p0.tgz rep0/gd-0.tgz rep0/ge-0.tgz \
 rep0/gf-1.tgz rep1/gf-0.tgz \
 rep1/missc-0.tgz rep0/q5-0.tgz rep1/q5-1.tgz \
 rep0/ma-0.tgz rep1/ma-1.tgz rep0/mc-0.tgz rep1/me-1.tgz \
-rep0/tcl-8.5.7.tgz:
+rep0/tcl-8.5.7.tgz rep8/gcc-libs-15.tgz rep9/gcc-libs-15.tgz \
+rep9/gcc-libs-16.tgz:
 	@${CREATE_PKG} ${EMPTY} $@
 
 rep0/md-0.tgz:
@@ -783,6 +784,8 @@ rep7/avahi-glib-1.tgz: plist26
 rep7/cups-1.tgz:
 	@${CREATE_PKG} ${WAVE_PLIST} -P't/avahi-libs:avahi-libs-*:avahi-libs-0' -P't/avahi-glib:avahi-glib-*:avahi-glib-1' -W avahi.0.0 ${EMPTY} $@
 
+rep8/cfitsio-0.tgz rep9/cfitsio-0.tgz:
+	@${CREATE_PKG} -P't/gcc-libs-15:gcc-libs->=15,<16:gcc-libs-15' ${EMPTY} $@
 
 rep0/sym-0.tgz: plist19
 	@mkdir -p ${SRC30}
@@ -829,6 +832,21 @@ oldlib2: rep0/p4-0.tgz rep0/boost-0.tgz rep0/Imath-0.tgz \
 	@ROOT=${D49} ${ADD_PKG} rep0/Imath-0.tgz
 	@ROOT=${D49} PKG_PATH=${.OBJDIR}/rep1 ${ADD_PKG} -u
 	@if fgrep -q .libs ${D49}/pkgdb/Imath-0/+REQUIRING; then exit 1; fi
+
+plist28:
+	@${MKPLIST} '@lib lib/subdir/libbad.so.$${LIBbaad_VERSION}' >$@
+
+lib-error: plist28
+	@rm -f lib-error.out
+	@if ${CREATE_PKG} -B src30 -f plist28 bad-package-0 2>lib-error.out; then exit 1; fi
+	@diff -u lib-error.out ${.CURDIR}/lib-error.ref
+
+gcc15: rep8/cfitsio-0.tgz rep8/gcc-libs-15.tgz \
+	rep9/cfitsio-0.tgz rep9/gcc-libs-15.tgz rep9/gcc-libs-16.tgz
+	@-rm -rf ${D50}
+	@ROOT=${D50} ${ADD_PKG} rep8/cfitsio-0.tgz
+	@ROOT=${D50} PKG_PATH=${.OBJDIR}/rep9 ${ADD_PKG} -u 2>&1|head -100 |tee error-loop.out
+	@if [ `wc -l <error-loop.out` -eq 100 ]; then exit 1; fi
 
 clean:
 	-rm -rf rep* dest* plist* src* signatures.out *.ref *.out

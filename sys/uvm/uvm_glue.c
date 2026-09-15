@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_glue.c,v 1.84 2022/09/10 20:35:29 miod Exp $	*/
+/*	$OpenBSD: uvm_glue.c,v 1.95 2026/02/11 22:34:40 deraadt Exp $	*/
 /*	$NetBSD: uvm_glue.c,v 1.44 2001/02/06 19:54:44 eeh Exp $	*/
 
 /* 
@@ -71,11 +71,9 @@
 #include <sys/proc.h>
 #include <sys/resourcevar.h>
 #include <sys/buf.h>
-#include <sys/user.h>
 #ifdef SYSVSHM
 #include <sys/shm.h>
 #endif
-#include <sys/sched.h>
 
 #include <uvm/uvm.h>
 
@@ -116,7 +114,7 @@ uvm_vslock(struct proc *p, caddr_t addr, size_t len, vm_prot_t access_type)
 	if (end <= start)
 		return (EINVAL);
 
-	return uvm_fault_wire(map, start, end, access_type);
+	return uvm_map_pageable(map, start, end, FALSE, 0);
 }
 
 /*
@@ -127,13 +125,14 @@ uvm_vslock(struct proc *p, caddr_t addr, size_t len, vm_prot_t access_type)
 void
 uvm_vsunlock(struct proc *p, caddr_t addr, size_t len)
 {
+	struct vm_map *map = &p->p_vmspace->vm_map;
 	vaddr_t start, end;
 
 	start = trunc_page((vaddr_t)addr);
 	end = round_page((vaddr_t)addr + len);
 	KASSERT(end > start);
 
-	uvm_fault_unwire(&p->p_vmspace->vm_map, start, end);
+	uvm_map_pageable(map, start, end, TRUE, 0);
 }
 
 /*
@@ -256,8 +255,13 @@ uvm_vsunlock_device(struct proc *p, void *addr, size_t len, void *map)
 	uvm_km_pgremove_intrsafe(kva, kva + sz);
 	pmap_kremove(kva, sz);
 	pmap_update(pmap_kernel());
-	uvm_km_free(kernel_map, kva, sz);
+	km_free((void *)kva, sz, &kv_any, &kp_none);
 }
+
+const struct kmem_va_mode kv_uarea = {
+	.kv_map = &kernel_map,
+	.kv_align = USPACE_ALIGN
+};
 
 /*
  * uvm_uarea_alloc: allocate the u-area for a new thread
@@ -265,14 +269,26 @@ uvm_vsunlock_device(struct proc *p, void *addr, size_t len, void *map)
 vaddr_t
 uvm_uarea_alloc(void)
 {
-	vaddr_t uaddr;
+	vaddr_t va;
 
-	uaddr = uvm_km_kmemalloc_pla(kernel_map, uvm.kernel_object, USPACE,
-	    USPACE_ALIGN, UVM_KMF_ZERO,
-	    no_constraint.ucr_low, no_constraint.ucr_high,
-	    0, 0, USPACE/PAGE_SIZE);
+	va = (vaddr_t)km_alloc(USPACE, &kv_uarea, &kp_zero, &kd_waitok);
 
-	return (uaddr);
+#ifdef __HAVE_USPACE_GUARD
+	/* Carve out a guard page between the PCB and the stack. */
+	if (va) {
+		struct vm_page *pg = NULL;
+		paddr_t pa;
+
+		if (pmap_extract(pmap_kernel(), va + PAGE_SIZE, &pa))
+			pg = PHYS_TO_VM_PAGE(pa);
+		pmap_kremove(va + PAGE_SIZE, PAGE_SIZE);
+		pmap_update(pmap_kernel());
+		if (pg)
+			uvm_pagefree(pg);
+	}
+#endif
+
+	return va;
 }
 
 /*
@@ -284,8 +300,27 @@ uvm_uarea_alloc(void)
 void
 uvm_uarea_free(struct proc *p)
 {
-	uvm_km_free(kernel_map, (vaddr_t)p->p_addr, USPACE);
+	km_free(p->p_addr, USPACE, &kv_uarea, &kp_zero);
 	p->p_addr = NULL;
+}
+
+/*
+ * uvm_purge: teardown a virtual address space.
+ *
+ * If multi-threaded, must be called by the last thread of a process.
+ */
+void
+uvm_purge(void)
+{
+	struct proc *p = curproc;
+	struct vmspace *vm = p->p_vmspace;
+
+	KERNEL_ASSERT_UNLOCKED();
+
+#ifdef __HAVE_PMAP_PURGE
+	pmap_purge(p);
+#endif
+	uvmspace_purge(vm);
 }
 
 /*
@@ -318,105 +353,8 @@ uvm_init_limits(struct plimit *limit0)
 	limit0->pl_rlimit[RLIMIT_STACK].rlim_max = MAXSSIZ;
 	limit0->pl_rlimit[RLIMIT_DATA].rlim_cur = DFLDSIZ;
 	limit0->pl_rlimit[RLIMIT_DATA].rlim_max = MAXDSIZ;
-	limit0->pl_rlimit[RLIMIT_RSS].rlim_cur = ptoa(uvmexp.free);
+	limit0->pl_rlimit[RLIMIT_RSS].rlim_cur = ptoa(atomic_load_sint(&uvmexp.free));
 }
-
-#ifdef __HAVE_PMAP_COLLECT
-
-#ifdef DEBUG
-int	enableswap = 1;
-int	swapdebug = 0;
-#define	SDB_FOLLOW	1
-#define SDB_SWAPIN	2
-#define SDB_SWAPOUT	4
-#endif
-
-
-/*
- * swapout_threads: find threads that can be swapped
- *
- * - called by the pagedaemon
- * - try and swap at least one process
- * - processes that are sleeping or stopped for maxslp or more seconds
- *   are swapped... otherwise the longest-sleeping or stopped process
- *   is swapped, otherwise the longest resident process...
- */
-void
-uvm_swapout_threads(void)
-{
-	struct process *pr;
-	struct proc *p, *slpp;
-	struct process *outpr;
-	int outpri;
-	int didswap = 0;
-	extern int maxslp; 
-	/* XXXCDC: should move off to uvmexp. or uvm., also in uvm_meter */
-
-#ifdef DEBUG
-	if (!enableswap)
-		return;
-#endif
-
-	/*
-	 * outpr/outpri  : stop/sleep process whose most active thread has
-	 *	the largest sleeptime < maxslp
-	 */
-	outpr = NULL;
-	outpri = 0;
-	LIST_FOREACH(pr, &allprocess, ps_list) {
-		if (pr->ps_flags & (PS_SYSTEM | PS_EXITING))
-			continue;
-
-		/*
-		 * slpp: the sleeping or stopped thread in pr with
-		 * the smallest p_slptime
-		 */
-		slpp = NULL;
-		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
-			switch (p->p_stat) {
-			case SRUN:
-			case SONPROC:
-				goto next_process;
-
-			case SSLEEP:
-			case SSTOP:
-				if (slpp == NULL ||
-				    slpp->p_slptime < p->p_slptime)
-					slpp = p;
-				continue;
-			}
-		}
-
-		if (slpp != NULL) {
-			if (slpp->p_slptime >= maxslp) {
-				pmap_collect(pr->ps_vmspace->vm_map.pmap);
-				didswap++;
-			} else if (slpp->p_slptime > outpri) {
-				outpr = pr;
-				outpri = slpp->p_slptime;
-			}
-		}
-next_process:	;
-	}
-
-	/*
-	 * If we didn't get rid of any real duds, toss out the next most
-	 * likely sleeping/stopped or running candidate.  We only do this
-	 * if we are real low on memory since we don't gain much by doing
-	 * it.
-	 */
-	if (didswap == 0 && uvmexp.free <= atop(round_page(USPACE)) &&
-	    outpr != NULL) {
-#ifdef DEBUG
-		if (swapdebug & SDB_SWAPOUT)
-			printf("swapout_threads: no duds, try procpr %p\n",
-			    outpr);
-#endif
-		pmap_collect(outpr->ps_vmspace->vm_map.pmap);
-	}
-}
-
-#endif	/* __HAVE_PMAP_COLLECT */
 
 /*
  * uvm_atopg: convert KVAs back to their page structures.
@@ -433,18 +371,6 @@ uvm_atopg(vaddr_t kva)
 	pg = PHYS_TO_VM_PAGE(pa);
 	KASSERT(pg != NULL);
 	return (pg);
-}
-
-void
-uvm_pause(void)
-{
-	static unsigned int toggle;
-	if (toggle++ > 128) {
-		toggle = 0;
-		KERNEL_UNLOCK();
-		KERNEL_LOCK();
-	}
-	sched_pause(preempt);
 }
 
 #ifndef SMALL_KERNEL

@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.21 2024/04/23 13:34:51 jsg Exp $ */
+/*	$OpenBSD: control.c,v 1.30 2026/08/04 19:05:21 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -39,19 +39,19 @@
 int
 control_check(char *path)
 {
-	struct sockaddr_un	 sun;
+	struct sockaddr_un	 sa;
 	int			 fd;
 
-	bzero(&sun, sizeof(sun));
-	sun.sun_family = AF_UNIX;
-	strlcpy(sun.sun_path, path, sizeof(sun.sun_path));
+	bzero(&sa, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
 
 	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
 		log_debug("control_check: socket check");
 		return (-1);
 	}
 
-	if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) == 0) {
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
 		log_debug("control_check: socket in use");
 		close(fd);
 		return (-1);
@@ -149,7 +149,12 @@ control_accept(int listenfd)
 		return (0);
 	}
 
-	imsg_init(&ctl_conn->ibuf, connfd);
+	if (imsgbuf_init(&ctl_conn->ibuf, connfd) == -1) {
+		log_warn("control_accept");
+		close(connfd);
+		free(ctl_conn);
+		return (0);
+	}
 
 	TAILQ_INSERT_TAIL(&ctl_conns, ctl_conn, entry);
 
@@ -179,7 +184,7 @@ control_close(int fd)
 		return (0);
 	}
 
-	msgbuf_clear(&c->ibuf.w);
+	imsgbuf_clear(&c->ibuf);
 	TAILQ_REMOVE(&ctl_conns, c, entry);
 
 	close(c->ibuf.fd);
@@ -198,8 +203,7 @@ control_dispatch_msg(struct pollfd *pfd, u_int *ctl_cnt)
 	struct ctl_show_status	 c_status;
 	struct ctl_show_peer	 c_peer;
 	struct ctl_show_sensor	 c_sensor;
-	int			 cnt;
-	ssize_t			 n;
+	int			 n, cnt;
 
 	if ((c = control_connbyfd(pfd->fd)) == NULL) {
 		log_warn("control_dispatch_msg: fd %d: not found", pfd->fd);
@@ -207,7 +211,7 @@ control_dispatch_msg(struct pollfd *pfd, u_int *ctl_cnt)
 	}
 
 	if (pfd->revents & POLLOUT)
-		if (msgbuf_write(&c->ibuf.w) <= 0 && errno != EAGAIN) {
+		if (imsgbuf_write(&c->ibuf) == -1) {
 			*ctl_cnt -= control_close(pfd->fd);
 			return (1);
 		}
@@ -215,13 +219,13 @@ control_dispatch_msg(struct pollfd *pfd, u_int *ctl_cnt)
 	if (!(pfd->revents & POLLIN))
 		return (0);
 
-	if (((n = imsg_read(&c->ibuf)) == -1 && errno != EAGAIN) || n == 0) {
+	if (imsgbuf_read(&c->ibuf) != 1) {
 		*ctl_cnt -= control_close(pfd->fd);
 		return (1);
 	}
 
 	for (;;) {
-		if ((n = imsg_get(&c->ibuf, &imsg)) == -1) {
+		if ((n = imsgbuf_get(&c->ibuf, &imsg)) == -1) {
 			*ctl_cnt -= control_close(pfd->fd);
 			return (1);
 		}

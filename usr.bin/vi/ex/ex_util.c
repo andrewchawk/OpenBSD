@@ -1,4 +1,4 @@
-/*	$OpenBSD: ex_util.c,v 1.9 2016/01/06 22:28:52 millert Exp $	*/
+/*	$OpenBSD: ex_util.c,v 1.10 2026/04/20 10:30:02 tb Exp $	*/
 
 /*-
  * Copyright (c) 1993, 1994
@@ -171,7 +171,7 @@ ex_emsg(SCR *sp, char *p, exm_t which)
 		msgq(sp, M_ERR, "Buffer %s is empty", p);
 		break;
 	case EXM_FILECOUNT:
-		 msgq_str(sp, M_ERR, p, 
+		 msgq_str(sp, M_ERR, p,
 		     "%s: expanded into too many file names");
 		break;
 	case EXM_NOCANON:

@@ -1,4 +1,4 @@
-/*	$OpenBSD: dhcpd.h,v 1.69 2024/05/21 05:00:48 jsg Exp $ */
+/*	$OpenBSD: dhcpd.h,v 1.74 2026/06/29 20:48:05 millert Exp $ */
 
 /*
  * Copyright (c) 1995, 1996, 1997, 1998, 1999
@@ -49,6 +49,8 @@
 #define SERVER_PORT	67
 #define CLIENT_PORT	68
 
+#define	OPTIONS_LEN	256
+
 struct iaddr {
 	int len;
 	unsigned char iabuf[16];
@@ -86,7 +88,7 @@ struct packet {
 	struct hardware *haddr;		/* Physical link address
 					   of local sender (maybe gateway). */
 	struct shared_network *shared_network;
-	struct option_data options[256];
+	struct option_data options[OPTIONS_LEN];
 	int got_requested_address;	/* True if client sent the
 					   dhcp-requested-address option. */
 };
@@ -134,13 +136,11 @@ struct lease {
 };
 
 struct lease_state {
-	struct lease_state *next;
-
 	struct interface_info *ip;
 
 	time_t offered_expiry;
 
-	struct tree_cache *options[256];
+	struct tree_cache *options[OPTIONS_LEN];
 	u_int32_t expiry, renewal, rebind;
 	char filename[DHCP_FILE_LEN];
 	char *server_name;
@@ -201,7 +201,7 @@ struct group {
 	int always_reply_rfc1048;
 	int echo_client_id;
 
-	struct tree_cache *options[256];
+	struct tree_cache *options[OPTIONS_LEN];
 };
 
 /* A dhcp host declaration structure. */
@@ -289,6 +289,7 @@ struct protocol {
 	int fd;
 	void (*handler)(struct protocol *);
 	void *local;
+	int pfd; /* slot used in the pollfd array */
 };
 
 #define _PATH_DHCPD_CONF	"/etc/dhcpd.conf"
@@ -444,7 +445,7 @@ ssize_t receive_packet(struct interface_info *, unsigned char *, size_t,
 extern struct interface_info *interfaces;
 extern struct protocol *protocols;
 extern struct dhcpd_timeout *timeouts;
-void discover_interfaces(int *);
+void discover_interfaces(void);
 void dispatch(void);
 int locate_network(struct packet *);
 void got_one(struct protocol *);
@@ -460,8 +461,8 @@ void delete_hash_entry(struct hash_table *, unsigned char *, int);
 unsigned char *hash_lookup(struct hash_table *, unsigned char *, int);
 
 /* tables.c */
-extern struct option dhcp_options[256];
-extern unsigned char dhcp_option_default_priority_list[256];
+extern struct option dhcp_options[OPTIONS_LEN];
+extern unsigned char dhcp_option_default_priority_list[OPTIONS_LEN];
 extern char *hardware_types[256];
 extern struct hash_table universe_hash;
 extern struct universe dhcp_universe;
@@ -494,7 +495,8 @@ void assemble_hw_header(struct interface_info *, unsigned char *,
 void assemble_udp_ip_header(struct interface_info *, unsigned char *,
     int *, u_int32_t, u_int32_t, unsigned int, unsigned char *, int);
 ssize_t decode_hw_header(unsigned char *, u_int32_t, struct hardware *);
-ssize_t decode_udp_ip_header(unsigned char *, u_int32_t, struct sockaddr_in *);
+ssize_t decode_udp_ip_header(unsigned char *, u_int32_t, struct sockaddr_in *,
+    u_int16_t);
 u_int32_t	checksum(unsigned char *, u_int32_t, u_int32_t);
 u_int32_t	wrapsum(u_int32_t);
 

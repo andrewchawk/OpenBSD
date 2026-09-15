@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl.h,v 1.64 2024/07/14 19:51:08 sashan Exp $ */
+/*	$OpenBSD: pfctl.h,v 1.66 2026/02/03 10:25:28 sashan Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -76,12 +76,15 @@ extern struct pfr_ktablehead pfr_ktables;
 
 SLIST_HEAD(pfr_anchors, pfr_anchoritem);
 
+struct pfctl;
+
 int	 pfr_clr_tables(struct pfr_table *, int *, int);
 int	 pfr_add_tables(struct pfr_table *, int, int *, int);
 int	 pfr_del_tables(struct pfr_table *, int, int *, int);
 int	 pfr_get_tables(struct pfr_table *, struct pfr_table *, int *, int);
 int	 pfr_get_tstats(struct pfr_table *, struct pfr_tstats *, int *, int);
 int	 pfr_clr_tstats(struct pfr_table *, int, int *, int);
+int	 pfr_clr_astats(struct pfr_table *, struct pfr_addr *, int, int *, int);
 int	 pfr_clr_addrs(struct pfr_table *, int *, int);
 int	 pfr_add_addrs(struct pfr_table *, struct pfr_addr *, int, int *, int);
 int	 pfr_del_addrs(struct pfr_table *, struct pfr_addr *, int, int *, int);
@@ -125,5 +128,10 @@ int	 pfctl_show_queues(int, const char *, int, int);
 
 void	 pfctl_err(int, int, const char *, ...);
 void	 pfctl_errx(int, int, const char *, ...);
+
+const char
+	*pfctl_statelim_id2name(struct pfctl *, u_int8_t);
+const char
+	*pfctl_sourcelim_id2name(struct pfctl *, u_int8_t);
 
 #endif /* _PFCTL_H_ */

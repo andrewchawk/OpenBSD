@@ -29,6 +29,8 @@
  * GSAR 97-03-27
  */
 
+MSVC_DIAG_IGNORE(4324)
+
 struct jmpenv {
     struct jmpenv *	je_prev;
     Sigjmp_buf		je_buf;		/* uninit if je_prev is NULL */
@@ -38,9 +40,11 @@ struct jmpenv {
     SSize_t             je_old_stack_hwm;
 };
 
+MSVC_DIAG_RESTORE
+
 typedef struct jmpenv JMPENV;
 
-#if defined DEBUGGING && !defined DEBUGGING_RE_ONLY
+#if defined PERL_USE_HWM
 #  define JE_OLD_STACK_HWM_zero      PL_start_env.je_old_stack_hwm = 0
 #  define JE_OLD_STACK_HWM_save(je)  \
         (je).je_old_stack_hwm = PL_curstackinfo->si_stack_hwm
@@ -430,6 +434,15 @@ the octets.
 
 #include "mydtrace.h"
 
+/* keep in sync with feature.h (which will complain if this is out of sync)
+ */
+#define COP_FEATURE_SIZE 1
+
+/* make this a struct so we can copy the feature bits with assignment */
+struct cop_feature_t {
+  U32 bits[COP_FEATURE_SIZE];
+};
+
 struct cop {
     BASEOP
     /* On LP64 putting this here takes advantage of the fact that BASEOP isn't
@@ -456,12 +469,11 @@ struct cop {
     /* compile time state of %^H.  See the comment in op.c for how this is
        used to recreate a hash to return from caller.  */
     COPHH *	cop_hints_hash;
-    /* for now just a bitmask stored here.
-       If we get sufficient features this may become a pointer.
+    /*
        How these flags are stored is subject to change without
        notice.  Use the macros to test for features.
     */
-    U32		cop_features;
+    struct cop_feature_t	cop_features;
 };
 
 /*
@@ -484,11 +496,12 @@ doesn't already exist.
 =for apidoc Am|SV *|CopFILESV|const COP * c
 Returns the SV associated with the C<COP> C<c>
 
-=for apidoc Am|void|CopFILE_set|COP * c|const char * pv
-Makes C<pv> the name of the file associated with the C<COP> C<c>
-
-=for apidoc Am|void|CopFILE_setn|COP * c|const char * pv|STRLEN len
-Makes C<pv> the name of the file associated with the C<COP> C<c>
+=for apidoc   Am|void|CopFILE_set|COP * c|const char * pv
+=for apidoc_item|void|CopFILE_setn|COP * c|const char * pv|STRLEN len
+These each make C<pv> the name of the file associated with the C<COP> C<c>.
+In the plain C<CopFILE_set> form, C<pv> is a C language NUL-terminated string.
+In C<CopFILE_setn>, C<len> is the length of C<pv>, which hence may contain
+embedded NUL characters.
 
 =for apidoc Am|void|CopFILE_copy|COP * dst|COP * src
 Efficiently copies the cop file name from one COP to another. Wraps
@@ -885,12 +898,14 @@ struct block_format {
     } STMT_END
 
 /* junk in @_ spells trouble when cloning CVs and in pp_caller(), so don't
- * leave any (a fast av_clear(ary), basically) */
+ * leave any (a fast av_clear(ary), basically).
+ * New code should probably be using Perl_clear_defarray_simple()
+ * and/or Perl_clear_defarray()
+ */
 #define CLEAR_ARGARRAY(ary) \
     STMT_START {							\
-        AvMAX(ary) += AvARRAY(ary) - AvALLOC(ary);			\
-        AvARRAY(ary) = AvALLOC(ary);					\
         AvFILLp(ary) = -1;						\
+        av_remove_offset(ary);                                          \
     } STMT_END
 
 
@@ -930,7 +945,7 @@ struct block_loop {
             IV  ix;   /* index relative to base of array */
         } ary;
         struct { /* CXt_LOOP_LIST, C<for (list)> */
-            I32 basesp; /* first element of list on stack */
+            SSize_t basesp; /* first element of list on stack */
             IV  ix;      /* index relative to basesp */
         } stack;
         struct { /* CXt_LOOP_LAZYIV, C<for (1..9)> */
@@ -989,12 +1004,12 @@ struct block {
     U16		blku_u16;	/* used by block_sub and block_eval (so far) */
     I32		blku_oldsaveix; /* saved PL_savestack_ix */
     /* all the fields above must be aligned with same-sized fields as sbu */
-    I32		blku_oldsp;	/* current sp floor: where nextstate pops to */
-    I32		blku_oldmarksp;	/* mark stack index */
+    SSize_t	blku_oldsp;	/* current sp floor: where nextstate pops to */
     COP *	blku_oldcop;	/* old curcop pointer */
     PMOP *	blku_oldpm;	/* values of pattern match vars */
     SSize_t     blku_old_tmpsfloor;     /* saved PL_tmps_floor */
     I32		blku_oldscopesp;	/* scope stack index */
+    I32		blku_oldmarksp;	/* mark stack index */
 
     union {
         struct block_sub	blku_sub;
@@ -1213,6 +1228,7 @@ struct context {
 #define G_RE_REPARSING  0x800   /* compiling a run-time /(?{..})/ */
 #define G_METHOD_NAMED 0x1000	/* calling named method, eg without :: or ' */
 #define G_RETHROW      0x2000	/* eval_sv(): re-throw any error */
+#define G_USEHINTS     0x4000   /* eval_sv(): use current hints/features */
 
 /* flag bits for PL_in_eval */
 #define EVAL_NULL	0	/* not in an eval */
@@ -1242,6 +1258,8 @@ struct context {
 #define PERLSI_REQUIRE		9
 #define PERLSI_MULTICALL       10
 #define PERLSI_REGCOMP         11
+#define PERLSI_SMARTMATCH      12
+#define PERLSI_CONSTRUCTOR     13
 
 struct stackinfo {
     AV *		si_stack;	/* stack for current runlevel */
@@ -1255,7 +1273,16 @@ struct stackinfo {
     I32			si_markoff;	/* offset where markstack begins for us.
                                          * currently used only with DEBUGGING,
                                          * but not #ifdef-ed for bincompat */
-#if defined DEBUGGING && !defined DEBUGGING_RE_ONLY
+
+#ifdef PERL_RC_STACK
+                                        /* index of first entry in the argument
+                                           stack which is not ref-counted. If
+                                           set to 0 (default), all stack
+                                           elements are ref-counted */
+    I32                 si_stack_nonrc_base;
+#endif
+
+#ifdef PERL_USE_HWM
 /* high water mark: for checking if the stack was correctly extended /
  * tested for extension by each pp function */
     SSize_t             si_stack_hwm;
@@ -1277,65 +1304,48 @@ typedef struct stackinfo PERL_SI;
 
 #ifdef DEBUGGING
 #  define SET_MARK_OFFSET \
-    PL_curstackinfo->si_markoff = PL_markstack_ptr - PL_markstack
+    STMT_START {                                                                \
+        /* ensure .si_markoff is an I32 and can hold the pointer difference */  \
+        STATIC_ASSERT_STMT(sizeof PL_curstackinfo->si_markoff == sizeof (I32)); \
+        assert(PL_markstack_ptr >= PL_markstack);                               \
+        assert(PL_markstack_ptr - PL_markstack <= (ptrdiff_t)I32_MAX);          \
+        PL_curstackinfo->si_markoff = (I32)(PL_markstack_ptr - PL_markstack);   \
+    } STMT_END
 #else
 #  define SET_MARK_OFFSET NOOP
 #endif
 
-#if defined DEBUGGING && !defined DEBUGGING_RE_ONLY
+#ifdef PERL_USE_HWM
 #  define PUSHSTACK_INIT_HWM(si) ((si)->si_stack_hwm = 0)
 #else
 #  define PUSHSTACK_INIT_HWM(si) NOOP
 #endif
 
+/* for backcompat; use push_stackinfo() instead */
+
 #define PUSHSTACKi(type) \
-    STMT_START {							\
-        PERL_SI *next = PL_curstackinfo->si_next;			\
-        DEBUG_l({							\
-            int i = 0; PERL_SI *p = PL_curstackinfo;			\
-            while (p) { i++; p = p->si_prev; }				\
-            Perl_deb(aTHX_ "push STACKINFO %d in %s at %s:%d\n",        \
-                         i, SAFE_FUNCTION__, __FILE__, __LINE__);})        \
-        if (!next) {							\
-            next = new_stackinfo(32, 2048/sizeof(PERL_CONTEXT) - 1);	\
-            next->si_prev = PL_curstackinfo;				\
-            PL_curstackinfo->si_next = next;				\
-        }								\
-        next->si_type = type;						\
-        next->si_cxix = -1;						\
-        next->si_cxsubix = -1;						\
-        PUSHSTACK_INIT_HWM(next);                                       \
-        AvFILLp(next->si_stack) = 0;					\
-        SWITCHSTACK(PL_curstack,next->si_stack);			\
-        PL_curstackinfo = next;						\
-        SET_MARK_OFFSET;						\
+    STMT_START {		\
+        PL_stack_sp = sp;       \
+        push_stackinfo(type, 0);\
+        sp = PL_stack_sp ;      \
     } STMT_END
 
 #define PUSHSTACK PUSHSTACKi(PERLSI_UNKNOWN)
 
-/* POPSTACK works with PL_stack_sp, so it may need to be bracketed by
+
+/* for backcompat; use pop_stackinfo() instead.
+ *
+ * POPSTACK works with PL_stack_sp, so it may need to be bracketed by
  * PUTBACK/SPAGAIN to flush/refresh any local SP that may be active */
-#define POPSTACK \
-    STMT_START {							\
-        dSP;								\
-        PERL_SI * const prev = PL_curstackinfo->si_prev;		\
-        DEBUG_l({							\
-            int i = -1; PERL_SI *p = PL_curstackinfo;			\
-            while (p) { i++; p = p->si_prev; }				\
-            Perl_deb(aTHX_ "pop  STACKINFO %d in %s at %s:%d\n",        \
-                         i, SAFE_FUNCTION__, __FILE__, __LINE__);})        \
-        if (!prev) {							\
-            Perl_croak_popstack();					\
-        }								\
-        SWITCHSTACK(PL_curstack,prev->si_stack);			\
-        /* don't free prev here, free them all at the END{} */		\
-        PL_curstackinfo = prev;						\
-    } STMT_END
+
+#define POPSTACK pop_stackinfo()
+
 
 #define POPSTACK_TO(s) \
     STMT_START {							\
         while (PL_curstack != s) {					\
             dounwind(-1);						\
+            rpp_obliterate_stack_to(0);					\
             POPSTACK;							\
         }								\
     } STMT_END

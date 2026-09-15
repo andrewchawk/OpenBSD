@@ -1,4 +1,4 @@
-/*	$Id: json.c,v 1.21 2020/09/14 16:00:17 florian Exp $ */
+/*	$Id: json.c,v 1.25 2026/05/22 01:53:10 jmatthew Exp $ */
 /*
  * Copyright (c) 2016 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -412,7 +412,8 @@ json_parse_challenge(struct jsmnn *n, struct chng *p)
 static enum orderstatus
 json_parse_order_status(struct jsmnn *n)
 {
-	char	*status;
+	char			*status;
+	enum orderstatus	 rc;
 
 	if (n == NULL)
 		return ORDER_INVALID;
@@ -421,17 +422,20 @@ json_parse_order_status(struct jsmnn *n)
 		return ORDER_INVALID;
 
 	if (strcmp(status, "pending") == 0)
-		return ORDER_PENDING;
+		rc = ORDER_PENDING;
 	else if (strcmp(status, "ready") == 0)
-		return ORDER_READY;
+		rc = ORDER_READY;
 	else if (strcmp(status, "processing") == 0)
-		return ORDER_PROCESSING;
+		rc = ORDER_PROCESSING;
 	else if (strcmp(status, "valid") == 0)
-		return ORDER_VALID;
+		rc = ORDER_VALID;
 	else if (strcmp(status, "invalid") == 0)
-		return ORDER_INVALID;
+		rc = ORDER_INVALID;
 	else
-		return ORDER_INVALID;
+		rc = ORDER_INVALID;
+
+	free(status);
+	return rc;
 }
 
 /*
@@ -443,20 +447,17 @@ json_parse_order(struct jsmnn *n, struct order *order)
 {
 	struct jsmnn	*array;
 	size_t		 i;
-	char		*finalize, *str;
+	char		*str;
 
 	order->status = json_parse_order_status(n);
 
 	if (n == NULL)
 		return 0;
 
-	if ((finalize = json_getstr(n, "finalize")) == NULL) {
+	if ((order->finalize = json_getstr(n, "finalize")) == NULL) {
 		warnx("no finalize field in order response");
 		return 0;
 	}
-
-	if ((order->finalize = strdup(finalize)) == NULL)
-		goto err;
 
 	if ((array = json_getarray(n, "authorizations")) == NULL)
 		goto err;
@@ -488,12 +489,9 @@ err:
 int
 json_parse_upd_order(struct jsmnn *n, struct order *order)
 {
-	char	*certificate;
 	order->status = json_parse_order_status(n);
-	if ((certificate = json_getstr(n, "certificate")) != NULL) {
-		if ((order->certificate = strdup(certificate)) == NULL)
-			return 0;
-	}
+	order->certificate = json_getstr(n, "certificate");
+
 	return 1;
 }
 
@@ -508,7 +506,6 @@ json_free_order(struct order *order)
 		free(order->auths[i]);
 	free(order->auths);
 
-	order->finalize = NULL;
 	order->auths = NULL;
 	order->authsz = 0;
 }
@@ -618,7 +615,7 @@ json_fmt_chkacc(void)
  * Format the "newAccount" resource request.
  */
 char *
-json_fmt_newacc(const char *contact)
+json_fmt_newacc(const char *contact, const char *eab)
 {
 	int	 c;
 	char	*p, *cnt = NULL;
@@ -629,6 +626,18 @@ json_fmt_newacc(const char *contact)
 			warn("asprintf");
 			return NULL;
 		}
+	}
+	if (eab != NULL) {
+		char *ecnt = NULL;
+		c = asprintf(&ecnt, "%s\"externalAccountBinding\": %s, ",
+		    cnt == NULL ? "" : cnt, eab);
+		if (c == -1) {
+			warn("asprintf");
+			return NULL;
+		}
+
+		free(cnt);
+		cnt = ecnt;
 	}
 
 	c = asprintf(&p, "{"
@@ -647,20 +656,31 @@ json_fmt_newacc(const char *contact)
  * Format the "newOrder" resource request
  */
 char *
-json_fmt_neworder(const char *const *alts, size_t altsz)
+json_fmt_neworder(struct domain_c *domain)
 {
-	size_t	 i;
-	int	 c;
-	char	*p, *t;
+	int			 c, first;
+	char			*p, *t;
+	struct altname_c	*ac;
 
 	if ((p = strdup("{ \"identifiers\": [")) == NULL)
 		goto err;
 
 	t = p;
-	for (i = 0; i < altsz; i++) {
-		c = asprintf(&p,
-		    "%s { \"type\": \"dns\", \"value\": \"%s\" }%s",
-		    t, alts[i], i + 1 == altsz ? "" : ",");
+	first = 1;
+	TAILQ_FOREACH(ac, &domain->altname_list, entry) {
+		switch (ac->idtype) {
+		case ID_DNS:
+			c = asprintf(&p, "%s%s { \"type\": \"dns\", "
+			    "\"value\": \"%s\" }", t, first ? "" : ",",
+			    ac->domain);
+			break;
+		case ID_IP:
+			c = asprintf(&p, "%s%s { \"type\": \"ip\", "
+			    "\"value\": \"%s\" }", t, first ? "" : ",",
+			    ac->domain);
+			break;
+		}
+		first = 0;
 		free(t);
 		if (c == -1) {
 			warn("asprintf");
@@ -669,7 +689,11 @@ json_fmt_neworder(const char *const *alts, size_t altsz)
 		}
 		t = p;
 	}
-	c = asprintf(&p, "%s ] }", t);
+	if (domain->profile == NULL)
+		c = asprintf(&p, "%s ] }", t);
+	else
+		c = asprintf(&p, "%s ], \"profile\": \"%s\" }", t,
+		    domain->profile);
 	free(t);
 	if (c == -1) {
 		warn("asprintf");
@@ -722,23 +746,35 @@ json_fmt_newcert(const char *cert)
 }
 
 /*
- * Protected component of json_fmt_signed().
+ * Format an RSA public key in JWK format.
  */
 char *
-json_fmt_protected_rsa(const char *exp, const char *mod, const char *nce,
-    const char *url)
+json_fmt_jwk_rsa(const char *exp, const char *mod)
 {
 	int	 c;
 	char	*p;
 
-	c = asprintf(&p, "{"
-	    "\"alg\": \"RS256\", "
-	    "\"jwk\": "
-	    "{\"e\": \"%s\", \"kty\": \"RSA\", \"n\": \"%s\"}, "
-	    "\"nonce\": \"%s\", "
-	    "\"url\": \"%s\""
-	    "}",
-	    exp, mod, nce, url);
+	c = asprintf(&p, "{\"e\": \"%s\", \"kty\": \"RSA\", \"n\": \"%s\"}",
+	    exp, mod);
+	if (c == -1) {
+		warn("asprintf");
+		p = NULL;
+	}
+	return p;
+}
+
+/*
+ * Format an EC public key in JWK format.
+ */
+char *
+json_fmt_jwk_ec(const char *x, const char *y)
+{
+	int	 c;
+	char	*p;
+
+	c = asprintf(&p, "{\"crv\": \"P-384\", \"kty\": \"EC\","
+	    " \"x\": \"%s\", \"y\": \"%s\"}",
+	    x, y);
 	if (c == -1) {
 		warn("asprintf");
 		p = NULL;
@@ -750,19 +786,19 @@ json_fmt_protected_rsa(const char *exp, const char *mod, const char *nce,
  * Protected component of json_fmt_signed().
  */
 char *
-json_fmt_protected_ec(const char *x, const char *y, const char *nce,
+json_fmt_protected_jwk(const char *alg, const char *jwk, const char *nce,
     const char *url)
 {
 	int	 c;
 	char	*p;
 
 	c = asprintf(&p, "{"
-	    "\"alg\": \"ES384\", "
-	    "\"jwk\": "
-	    "{\"crv\": \"P-384\", \"kty\": \"EC\", \"x\": \"%s\", "
-	    "\"y\": \"%s\"}, \"nonce\": \"%s\", \"url\": \"%s\""
+	    "\"alg\": \"%s\", "
+	    "\"jwk\": %s, "
+	    "\"nonce\": \"%s\", "
+	    "\"url\": \"%s\""
 	    "}",
-	    x, y, nce, url);
+	    alg, jwk, nce, url);
 	if (c == -1) {
 		warn("asprintf");
 		p = NULL;
@@ -856,6 +892,28 @@ json_fmt_thumb_ec(const char *x, const char *y)
 	c = asprintf(&p, "{\"crv\":\"P-384\",\"kty\":\"EC\",\"x\":\"%s\","
 	    "\"y\":\"%s\"}",
 	    x, y);
+	if (c == -1) {
+		warn("asprintf");
+		p = NULL;
+	}
+	return p;
+}
+
+/*
+ * Protected component of external account binding.
+ */
+char *
+json_fmt_protected_eab(const char *keyid, const char *url)
+{
+	int	 c;
+	char	*p;
+
+	c = asprintf(&p, "{"
+	    "\"alg\": \"HS256\", "
+	    "\"kid\": \"%s\", "
+	    "\"url\": \"%s\""
+	    "}",
+	    keyid, url);
 	if (c == -1) {
 		warn("asprintf");
 		p = NULL;

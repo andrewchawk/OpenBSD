@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_ktrace.c,v 1.114 2023/12/15 15:12:08 deraadt Exp $	*/
+/*	$OpenBSD: kern_ktrace.c,v 1.116 2026/05/13 14:18:20 deraadt Exp $	*/
 /*	$NetBSD: kern_ktrace.c,v 1.23 1996/02/09 18:59:36 christos Exp $	*/
 
 /*
@@ -179,7 +179,9 @@ ktrsyscall(struct proc *p, register_t code, size_t argsize, register_t args[])
 		*argp++ = args[i];
 	if (nargs && copyin((void *)args[0], argp, nargs * sizeof(int)))
 		memset(argp, 0, nargs * sizeof(int));
+	KERNEL_LOCK();
 	ktrwrite(p, &kth, ktp, len);
+	KERNEL_UNLOCK();
 	free(ktp, M_TEMP, len);
 	atomic_clearbits_int(&p->p_flag, P_INKTR);
 }
@@ -203,7 +205,9 @@ ktrsysret(struct proc *p, register_t code, int error,
 		len = sizeof(long long);
 	else
 		len = sizeof(register_t);
+	KERNEL_LOCK();
 	ktrwrite2(p, &kth, &ktp, sizeof(ktp), retval, len);
+	KERNEL_UNLOCK();
 	atomic_clearbits_int(&p->p_flag, P_INKTR);
 }
 
@@ -214,7 +218,9 @@ ktrnamei(struct proc *p, char *path)
 
 	atomic_setbits_int(&p->p_flag, P_INKTR);
 	ktrinitheader(&kth, p, KTR_NAMEI);
+	KERNEL_LOCK();
 	ktrwrite(p, &kth, path, strlen(path));
+	KERNEL_UNLOCK();
 	atomic_clearbits_int(&p->p_flag, P_INKTR);
 }
 
@@ -282,6 +288,7 @@ ktrpsig(struct proc *p, int sig, sig_t action, int mask, int code,
 
 	atomic_setbits_int(&p->p_flag, P_INKTR);
 	ktrinitheader(&kth, p, KTR_PSIG);
+	memset(&kp, 0, sizeof(kp));
 	kp.signo = (char)sig;
 	kp.action = action;
 	kp.mask = mask;
@@ -351,7 +358,7 @@ void
 ktrexec(struct proc *p, int type, const char *data, ssize_t len)
 {
 	struct ktr_header kth;
-	int count;
+	int count, error;
 	int buflen;
 
 	assert(type == KTR_EXECARGS || type == KTR_EXECENV);
@@ -373,7 +380,10 @@ ktrexec(struct proc *p, int type, const char *data, ssize_t len)
 		sched_pause(preempt);
 
 		count = lmin(len, buflen);
-		if (ktrwrite(p, &kth, data, count) != 0)
+		KERNEL_LOCK();
+		error = ktrwrite(p, &kth, data, count);
+		KERNEL_UNLOCK();
+		if (error != 0)
 			break;
 
 		len -= count;

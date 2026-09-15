@@ -43,7 +43,7 @@ void TestSelectionRangesInFile::dump(raw_ostream &OS) const {
 bool TestSelectionRangesInFile::foreachRange(
     const SourceManager &SM,
     llvm::function_ref<void(SourceRange)> Callback) const {
-  auto FE = SM.getFileManager().getFile(Filename);
+  auto FE = SM.getFileManager().getOptionalFileRef(Filename);
   FileID FID = FE ? SM.translateFile(*FE) : FileID();
   if (!FE || FID.isInvalid()) {
     llvm::errs() << "error: -selection=test:" << Filename
@@ -176,11 +176,11 @@ std::pair<unsigned, unsigned> getLineColumn(StringRef Filename,
 
 bool TestRefactoringResultConsumer::handleAllResults() {
   bool Failed = false;
-  for (auto &Group : llvm::enumerate(Results)) {
+  for (const auto &Group : llvm::enumerate(Results)) {
     // All ranges in the group must produce the same result.
     std::optional<tooling::AtomicChanges> CanonicalResult;
     std::optional<std::string> CanonicalErrorMessage;
-    for (auto &I : llvm::enumerate(Group.value())) {
+    for (const auto &I : llvm::enumerate(Group.value())) {
       Expected<tooling::AtomicChanges> &Result = I.value();
       std::string ErrorMessage;
       bool HasResult = !!Result;
@@ -373,10 +373,7 @@ findTestSelectionRanges(StringRef Filename) {
       EndOffset = Offset;
     }
     TestSelectionRange Range = {Offset, EndOffset};
-    auto It = GroupedRanges.insert(std::make_pair(
-        Matches[1].str(), SmallVector<TestSelectionRange, 8>{Range}));
-    if (!It.second)
-      It.first->second.push_back(Range);
+    GroupedRanges[Matches[1].str()].push_back(Range);
   }
   if (GroupedRanges.empty()) {
     llvm::errs() << "error: -selection=test:" << Filename

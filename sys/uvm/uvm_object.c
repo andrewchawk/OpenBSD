@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_object.c,v 1.25 2022/02/21 16:08:36 kn Exp $	*/
+/*	$OpenBSD: uvm_object.c,v 1.29 2026/07/22 20:58:23 kirill Exp $	*/
 
 /*
  * Copyright (c) 2006, 2010, 2019 The NetBSD Foundation, Inc.
@@ -156,18 +156,16 @@ uvm_obj_wire(struct uvm_object *uobj, voff_t start, voff_t end,
 			if (pgs[i]->pg_flags & PQ_AOBJ) {
 				atomic_clearbits_int(&pgs[i]->pg_flags,
 				    PG_CLEAN);
-				uao_dropswap(uobj, i);
+				uao_dropswap(uobj, pgs[i]->offset >> PAGE_SHIFT);
 			}
 		}
 
 		/* Wire the pages */
-		uvm_lock_pageq();
 		for (i = 0; i < npages; i++) {
 			uvm_pagewire(pgs[i]);
 			if (pageq != NULL)
 				TAILQ_INSERT_TAIL(pageq, pgs[i], pageq);
 		}
-		uvm_unlock_pageq();
 
 		/* Unbusy the pages */
 		uvm_page_unbusy(pgs, npages);
@@ -198,7 +196,6 @@ uvm_obj_unwire(struct uvm_object *uobj, voff_t start, voff_t end)
 	off_t offset;
 
 	rw_enter(uobj->vmobjlock, RW_WRITE | RW_DUPOK);
-	uvm_lock_pageq();
 	for (offset = start; offset < end; offset += PAGE_SIZE) {
 		pg = uvm_pagelookup(uobj, offset);
 
@@ -207,7 +204,6 @@ uvm_obj_unwire(struct uvm_object *uobj, voff_t start, voff_t end)
 
 		uvm_pageunwire(pg);
 	}
-	uvm_unlock_pageq();
 	rw_exit(uobj->vmobjlock);
 }
 #endif /* !SMALL_KERNEL */
@@ -233,13 +229,12 @@ uvm_obj_free(struct uvm_object *uobj)
  	 */
 	RBT_FOREACH(pg, uvm_objtree, &uobj->memt) {
 		/*
-		 * clear PG_TABLED so we don't do work to remove
-		 * this pg from the uobj we are throwing away
+		 * clear PG_TABLED and `uobject' so we don't do work to
+		 * remove this pg from the uobj we are throwing away.
 		 */
 		atomic_clearbits_int(&pg->pg_flags, PG_TABLED);
-		uvm_lock_pageq();
+		pg->uobject = NULL;
 		uvm_pageclean(pg);
-		uvm_unlock_pageq();
 		TAILQ_INSERT_TAIL(&pgl, pg, pageq);
  	}
 	uvm_pglistfree(&pgl);

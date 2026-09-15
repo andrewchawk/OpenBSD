@@ -885,6 +885,7 @@ expand_domacro(struct expstate *es, struct place *p)
 			complain(p, "Too many arguments for defined()");
 			complain_fail();
 			expand_send(es, p, "0", 1);
+			expstate_destroyargs(es);
 			return;
 		}
 		name = stringarray_get(&es->args, 0);

@@ -25,9 +25,11 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/DataTypes.h"
 #include <cassert>
 #include <cstdio>
+#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -35,7 +37,7 @@ namespace llvm {
 
 /// This is a helper class used for handling formatted output.  It is the
 /// abstract base class of a templated derived class.
-class format_object_base {
+class LLVM_ABI format_object_base {
 protected:
   const char *Fmt;
   ~format_object_base() = default; // Disallow polymorphic deletion.
@@ -76,19 +78,20 @@ public:
 /// printed, this synthesizes the string into a temporary buffer provided and
 /// returns whether or not it is big enough.
 
-// Helper to validate that format() parameters are scalars or pointers.
-template <typename... Args> struct validate_format_parameters;
-template <typename Arg, typename... Args>
-struct validate_format_parameters<Arg, Args...> {
-  static_assert(std::is_scalar_v<Arg>,
-                "format can't be used with non fundamental / non pointer type");
-  validate_format_parameters() { validate_format_parameters<Args...>(); }
+namespace detail {
+template <typename T> struct decay_if_c_char_array {
+  using type = T;
 };
-template <> struct validate_format_parameters<> {};
+template <std::size_t N> struct decay_if_c_char_array<char[N]> {
+  using type = const char *;
+};
+template <typename T>
+using decay_if_c_char_array_t = typename decay_if_c_char_array<T>::type;
+} // namespace detail
 
 template <typename... Ts>
 class format_object final : public format_object_base {
-  std::tuple<Ts...> Vals;
+  std::tuple<detail::decay_if_c_char_array_t<Ts>...> Vals;
 
   template <std::size_t... Is>
   int snprint_tuple(char *Buffer, unsigned BufferSize,
@@ -103,7 +106,9 @@ class format_object final : public format_object_base {
 public:
   format_object(const char *fmt, const Ts &... vals)
       : format_object_base(fmt), Vals(vals...) {
-    validate_format_parameters<Ts...>();
+    static_assert(
+        (std::is_scalar_v<detail::decay_if_c_char_array_t<Ts>> && ...),
+        "format can't be used with non fundamental / non pointer type");
   }
 
   int snprint(char *Buffer, unsigned BufferSize) const override {
@@ -215,7 +220,8 @@ inline FormattedNumber format_decimal(int64_t N, unsigned Width) {
 class FormattedBytes {
   ArrayRef<uint8_t> Bytes;
 
-  // If not None, display offsets for each line relative to starting value.
+  // If not std::nullopt, display offsets for each line relative to starting
+  // value.
   std::optional<uint64_t> FirstByteOffset;
   uint32_t IndentLevel;  // Number of characters to indent each line.
   uint32_t NumPerLine;   // Number of bytes to show per line.

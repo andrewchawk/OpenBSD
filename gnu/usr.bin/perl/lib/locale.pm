@@ -3,7 +3,7 @@ package locale;
 use strict;
 use warnings;
 
-our $VERSION = '1.10';
+our $VERSION = '1.13';
 use Config;
 
 $Carp::Internal{ (__PACKAGE__) } = 1;
@@ -12,40 +12,43 @@ $Carp::Internal{ (__PACKAGE__) } = 1;
 
 locale - Perl pragma to use or avoid POSIX locales for built-in operations
 
-=head1 WARNING
-
-DO NOT USE this pragma in scripts that have multiple
-L<threads|threads> active.  The locale is not local to a single thread.
-Another thread may change the locale at any time, which could cause at a
-minimum that a given thread is operating in a locale it isn't expecting
-to be in.  On some platforms, segfaults can also occur.  The locale
-change need not be explicit; some operations cause perl to change the
-locale itself.  You are vulnerable simply by having done a C<"use
-locale">.
-
 =head1 SYNOPSIS
 
-    @x = sort @y;      # Native-platform/Unicode code point sort order
-    {
-        use locale;
-        @x = sort @y;  # Locale-defined sort order
-    }
-    @x = sort @y;      # Native-platform/Unicode code point sort order
-                       # again
+ my @x1 = sort @y;      # Native-platform/Unicode code point sort order
+ {
+     use locale;
+     my @x2 = sort @y;  # Locale-defined sort order
+ }
+ my @x3 = sort @y;      # Native-platform/Unicode code point sort order
+                        # again
+
+ # Parameters to the pragma are to work around deficiencies in locale
+ # handling that have since been fixed, and hence these are likely no
+ # longer useful
+ use locale qw(:ctype :collate);    # Only use the locale for character
+                                    # classification (\w, \d, etc.), and
+                                    # for string comparison operations
+                                    # like '$a le $b' and sorting.
+ use locale ':not_characters';      # Use the locale for everything but
+                                    # character classification and string
+                                    # comparison operations
+
+ use locale ':!numeric';            # Use the locale for everything but
+                                    # numeric-related operations
+ use locale ':not_numeric';         # Same
+
+ no locale;             # Turn off locale handling for the remainder of
+                        # the scope.
 
 =head1 DESCRIPTION
 
 This pragma tells the compiler to enable (or disable) the use of POSIX
-locales for built-in operations (for example, LC_CTYPE for regular
-expressions, LC_COLLATE for string comparison, and LC_NUMERIC for number
-formatting).  Each "use locale" or "no locale"
+locales for built-in operations (for example, C<LC_CTYPE> for regular
+expressions, C<LC_COLLATE> for string comparison, and C<LC_NUMERIC> for number
+formatting).  Each C<use locale> or C<no locale>
 affects statements to the end of the enclosing BLOCK.
 
-See L<perllocale> for more detailed information on how Perl supports
-locales.
-
-On systems that don't have locales, this pragma will cause your operations
-to behave as if in the "C" locale; attempts to change the locale will fail.
+The pragma is documented as part of L<perllocale>.
 
 =cut
 
@@ -54,7 +57,6 @@ to behave as if in the "C" locale; attempts to change the locale will fail.
 # argument.
 
 $locale::hint_bits = 0x4;
-$locale::partial_hint_bits = 0x10;  # If pragma has an argument
 
 # The pseudo-category :characters consists of 2 real ones; but it also is
 # given its own number, -1, because in the complement form it also has the
@@ -64,9 +66,9 @@ sub import {
     shift;  # should be 'locale'; not checked
 
     $^H{locale} = 0 unless defined $^H{locale};
+    $^H |= $locale::hint_bits;
     if (! @_) { # If no parameter, use the plain form that changes all categories
-        $^H |= $locale::hint_bits;
-
+        $^H{locale} = 0;
     }
     else {
         my @categories = ( qw(:ctype :collate :messages
@@ -103,22 +105,15 @@ sub import {
                 next;
             }
 
-            $^H |= $locale::partial_hint_bits;
-
-            # This form of the pragma overrides the other
-            $^H &= ~$locale::hint_bits;
-
             $arg =~ s/^://;
 
-            eval { require POSIX; import POSIX 'locale_h'; };
+            eval { require POSIX; POSIX->import('locale_h'); };
 
             # Map our names to the ones defined by POSIX
             my $LC = "LC_" . uc($arg);
 
             my $bit = eval "&POSIX::$LC";
-            if (defined $bit) { # XXX Should we warn that this category isn't
-                                # supported on this platform, or make it
-                                # always be the C locale?
+            if (defined $bit) {
 
                 # Verify our assumption.
                 if (! ($bit >= 0 && $bit < 31)) {
@@ -139,7 +134,7 @@ sub import {
 }
 
 sub unimport {
-    $^H &= ~($locale::hint_bits|$locale::partial_hint_bits);
+    $^H &= ~($locale::hint_bits);
     $^H{locale} = 0;
 }
 

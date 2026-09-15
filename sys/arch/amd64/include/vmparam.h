@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmparam.h,v 1.24 2023/04/28 18:33:22 robert Exp $	*/
+/*	$OpenBSD: vmparam.h,v 1.26 2026/06/22 00:27:33 jsg Exp $	*/
 /*	$NetBSD: vmparam.h,v 1.1 2003/04/26 18:39:49 fvdl Exp $	*/
 
 /*-
@@ -98,9 +98,7 @@
 #define VM_MIN_STACK_ADDRESS	0x0000600000000000
 #endif
 #define VM_MIN_KERNEL_ADDRESS	0xffff800000000000
-#define VM_MAX_KERNEL_ADDRESS	0xffff800100000000
-
-#define VM_MAXUSER_ADDRESS32	0xffffc000
+#define VM_MAX_KERNEL_ADDRESS	0xffff808000000000
 
 /* map PIE into approximately the first quarter of user va space */
 #define VM_PIE_MIN_ADDR		VM_MIN_ADDRESS

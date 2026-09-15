@@ -1,4 +1,4 @@
-/*	$OpenBSD: tty.h,v 1.43 2024/05/12 08:21:56 jsg Exp $	*/
+/*	$OpenBSD: tty.h,v 1.46 2026/08/06 20:38:02 claudio Exp $	*/
 /*	$NetBSD: tty.h,v 1.30.4.1 1996/06/02 09:08:13 mrg Exp $	*/
 
 /*-
@@ -146,7 +146,7 @@ struct itty {
 	short t_lowat;
 	short t_column;
 	int t_state;
-	struct session *t_session;
+	pid_t t_session_id;
 	pid_t t_pgrp_pg_id;
 	u_char t_line;
 };
@@ -164,7 +164,6 @@ struct itty {
 #define	TTIPRI	25			/* Sleep priority for tty reads. */
 #define	TTOPRI	26			/* Sleep priority for tty writes. */
 
-#define	TTMASK	15
 #define	OBUFSIZ	512
 #define	TTYHOG(tp)	(tp)->t_qlen
 
@@ -291,6 +290,7 @@ void	 ttypend(struct tty *tp);
 int	 ttyretype(struct tty *tp);
 int	 ttyrub(int c, struct tty *tp);
 int	 ttysleep(struct tty *tp, void *chan, int pri, char *wmesg);
+int	 ttysleep_nsec(struct tty *, void *, int, char *, uint64_t);
 int	 ttywait(struct tty *tp);
 int	 ttywflush(struct tty *tp);
 void	 ttytstamp(struct tty *tp, int octs, int ncts, int odcd, int ndcd);

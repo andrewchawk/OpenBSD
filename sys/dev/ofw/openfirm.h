@@ -1,4 +1,4 @@
-/*	$OpenBSD: openfirm.h,v 1.19 2024/05/13 01:15:51 jsg Exp $	*/
+/*	$OpenBSD: openfirm.h,v 1.23 2026/06/22 21:12:12 kettenis Exp $	*/
 /*	$NetBSD: openfirm.h,v 1.1 1996/09/30 16:35:10 ws Exp $	*/
 
 /*
@@ -50,6 +50,8 @@ int OF_parent(int phandle);
 int OF_instance_to_package(int ihandle);
 int OF_getproplen(int handle, char *prop);
 int OF_getprop(int handle, char *prop, void *buf, int buflen);
+int OF_getpropstr(int, char *, char **, int *);
+void OF_freepropstr(char *, int);
 int OF_getpropbool(int handle, char *);
 uint32_t OF_getpropint(int handle, char *, uint32_t);
 int OF_getpropintarray(int, char *, uint32_t *, int);
@@ -59,8 +61,7 @@ int OF_setprop(int, char *, const void *, int);
 int OF_nextprop(int, char *, void *);
 int OF_finddevice(char *name);
 int OF_is_compatible(int, const char *);
-int OF_instance_to_path(int ihandle, char *buf, int buflen);
-int OF_package_to_path(int phandle, char *buf, int buflen);
+int OF_is_enabled(int);
 int OF_call_method_1(char *method, int ihandle, int nargs, ...);
 int OF_call_method(char *method, int ihandle, int nargs, int nreturns, ...);
 int OF_open(char *dname);
@@ -78,6 +79,7 @@ void (*OF_set_callback(void (*newfunc)(void *))) ();
 int OF_getnodebyname(int, const char *);
 int OF_getnodebyphandle(uint32_t);
 int OF_getindex(int, const char *, const char *);
+int OF_translate(int, char *, uint64_t *, uint64_t *);
 
 /*
  * Generic OpenFirmware probe argument.

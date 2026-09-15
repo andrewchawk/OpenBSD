@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_aspa.c,v 1.5 2023/08/16 08:26:35 claudio Exp $ */
+/*	$OpenBSD: rde_aspa.c,v 1.9 2026/09/14 08:51:47 claudio Exp $ */
 
 /*
  * Copyright (c) 2022 Claudio Jeker <claudio@openbsd.org>
@@ -39,7 +39,7 @@ struct rde_aspa_set {
 /*
  * Power of 2 hash table
  * The nodes are stored in the sets array.
- * Additonal data for the rde_aspa_set are stored in data.
+ * Additional data for the rde_aspa_set are stored in data.
  * For lookups only table and mask need to be accessed.
  */
 struct rde_aspa {
@@ -51,7 +51,7 @@ struct rde_aspa {
 	size_t			  maxdata;
 	size_t			  curdata;
 	uint32_t		  curset;
-	time_t			  lastchange;
+	monotime_t		  lastchange;
 };
 
 struct aspa_state {
@@ -107,7 +107,7 @@ aspa_lookup(struct rde_aspa *ra, uint32_t asnum)
  * Lookup if there is a customer - provider relation between cas and pas.
  * Returns UNKNOWN if cas is not in the ra table or the aid is out of range.
  * Returns PROVIDER if pas is registered for cas for the specified aid.
- * Retruns NOT_PROVIDER otherwise.
+ * Returns NOT_PROVIDER otherwise.
  * This function is called very frequently and needs to be fast.
  */
 static enum cp_state
@@ -228,7 +228,7 @@ aspa_check_aspath(struct rde_aspa *ra, struct aspath *a, struct aspa_state *s)
 			 * unknown and not-provider node and the
 			 * left-most provider node for which all nodes
 			 * after are valid.
-			 * We recorde the nhops value of prevas,
+			 * We record the nhops value of prevas,
 			 * that's why the use of nhops - 1.
 			 */
 			switch (aspa_cp_lookup(ra, as, prevas)) {
@@ -307,7 +307,7 @@ aspa_validation(struct rde_aspa *ra, struct aspath *a,
 {
 	struct aspa_state state = { 0 };
 
-	/* no aspa table, evrything is unknown */
+	/* no aspa table, everything is unknown */
 	if (ra == NULL) {
 		memset(vstate, ASPA_UNKNOWN, sizeof(*vstate));
 		return;
@@ -363,12 +363,15 @@ aspa_table_prep(uint32_t entries, size_t datasize)
 	ra->maxdata = datasize / sizeof(ra->data[0]);
 	ra->lastchange = getmonotime();
 
+	rdemem.aspa_cnt += ra->maxset;
+	rdemem.aspa_size += ra->maxset * sizeof(ra->sets[0]) +
+	    ra->maxdata * sizeof(ra->data[0]);
 	return ra;
 }
 
 /*
  * Insert an aspa customer/provider set into the hash table.
- * For hash conflict resulution insertion must happen in reverse order (biggest
+ * For hash conflict resolution insertion must happen in reverse order (biggest
  * customer asnum first). On conflict objects in the sets array are moved
  * around so that conflicting elements are direct neighbors.
  * The per AID information is (if required) stored as 2bits per provider.
@@ -421,6 +424,9 @@ aspa_table_free(struct rde_aspa *ra)
 {
 	if (ra == NULL)
 		return;
+	rdemem.aspa_cnt -= ra->maxset;
+	rdemem.aspa_size -= ra->maxset * sizeof(ra->sets[0]) +
+	    ra->maxdata * sizeof(ra->data[0]);
 	free(ra->table);
 	free(ra->sets);
 	free(ra->data);
@@ -453,9 +459,12 @@ aspa_table_equal(const struct rde_aspa *ra, const struct rde_aspa *rb)
 	if (ra->maxset != rb->maxset ||
 	    ra->maxdata != rb->maxdata)
 		return 0;
-	for (i = 0; i < ra->maxset; i++)
+	for (i = 0; i < ra->maxset; i++) {
 		if (ra->sets[i].as != rb->sets[i].as)
 			return 0;
+		if (ra->sets[i].num != rb->sets[i].num)
+			return 0;
+	}
 	if (memcmp(ra->data, rb->data, ra->maxdata * sizeof(ra->data[0])) != 0)
 		return 0;
 

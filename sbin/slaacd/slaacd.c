@@ -1,4 +1,4 @@
-/*	$OpenBSD: slaacd.c,v 1.69 2024/04/21 17:33:05 florian Exp $	*/
+/*	$OpenBSD: slaacd.c,v 1.85 2026/09/06 18:45:29 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -34,6 +34,7 @@
 #include <netinet6/in6_var.h>
 #include <netinet/icmp6.h>
 
+#include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -76,7 +77,9 @@ void	configure_gateway(struct imsg_configure_dfr *, uint8_t);
 void	add_gateway(struct imsg_configure_dfr *);
 void	delete_gateway(struct imsg_configure_dfr *);
 void	send_rdns_proposal(struct imsg_propose_rdns *);
-int	get_soiikey(uint8_t *);
+void	read_soiikey(void);
+int	parse_hex_char(char);
+ssize_t	parse_hex_string(unsigned char *, size_t, const char *);
 
 static int	main_imsg_send_ipc_sockets(struct imsgbuf *, struct imsgbuf *);
 int		main_imsg_compose_frontend(int, int, void *, uint16_t);
@@ -89,6 +92,7 @@ pid_t			 frontend_pid;
 pid_t			 engine_pid;
 
 int			 routesock, ioctl_sock, rtm_seq = 0;
+uint8_t			 soiikey[SLAACD_SOIIKEY_LEN];
 
 void
 main_sig_handler(int sig, short event, void *arg)
@@ -124,7 +128,7 @@ main(int argc, char *argv[])
 	int			 ch;
 	int			 debug = 0, engine_flag = 0, frontend_flag = 0;
 	int			 verbose = 0;
-	char			*saved_argv0;
+	char			 execpath[PATH_MAX];
 	int			 pipe_main2frontend[2];
 	int			 pipe_main2engine[2];
 	int			 frontend_routesock, rtfilter, lockfd;
@@ -138,9 +142,8 @@ main(int argc, char *argv[])
 	log_init(1, LOG_DAEMON);	/* Log to stderr until daemonized. */
 	log_setverbose(1);
 
-	saved_argv0 = argv[0];
-	if (saved_argv0 == NULL)
-		saved_argv0 = "slaacd";
+	if (getexecpath(execpath, sizeof execpath) != 0)
+		errx(1, "getexecpath");
 
 	while ((ch = getopt(argc, argv, "dEFs:v")) != -1) {
 		switch (ch) {
@@ -203,9 +206,9 @@ main(int argc, char *argv[])
 		fatal("main2engine socketpair");
 
 	/* Start children. */
-	engine_pid = start_child(PROC_ENGINE, saved_argv0, pipe_main2engine[1],
+	engine_pid = start_child(PROC_ENGINE, execpath, pipe_main2engine[1],
 	    debug, verbose);
-	frontend_pid = start_child(PROC_FRONTEND, saved_argv0,
+	frontend_pid = start_child(PROC_FRONTEND, execpath,
 	    pipe_main2frontend[1], debug, verbose);
 
 	log_procinit("main");
@@ -230,9 +233,13 @@ main(int argc, char *argv[])
 	if ((iev_frontend = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_engine = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_frontend->ibuf, pipe_main2frontend[0]);
+	if (imsgbuf_init(&iev_frontend->ibuf, pipe_main2frontend[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_frontend->ibuf);
 	iev_frontend->handler = main_dispatch_frontend;
-	imsg_init(&iev_engine->ibuf, pipe_main2engine[0]);
+	if (imsgbuf_init(&iev_engine->ibuf, pipe_main2engine[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_engine->ibuf);
 	iev_engine->handler = main_dispatch_engine;
 
 	/* Setup event handlers for pipes to engine & frontend. */
@@ -270,6 +277,8 @@ main(int argc, char *argv[])
 #ifndef SMALL
 	if ((control_fd = control_init(csock)) == -1)
 		warnx("control socket setup failed");
+
+	read_soiikey();
 #endif /* SMALL */
 
 	if (pledge("stdio inet sendfd wroute", NULL) == -1)
@@ -303,9 +312,9 @@ main_shutdown(void)
 	int	 status;
 
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_engine->ibuf.w);
+	imsgbuf_clear(&iev_engine->ibuf);
 	close(iev_engine->ibuf.fd);
 
 	log_debug("waiting for children to terminate");
@@ -328,7 +337,7 @@ main_shutdown(void)
 }
 
 static pid_t
-start_child(enum slaacd_process p, char *argv0, int fd, int debug, int verbose)
+start_child(enum slaacd_process p, char *execpath, int fd, int debug, int verbose)
 {
 	char	*argv[7];
 	int	 argc = 0;
@@ -350,7 +359,7 @@ start_child(enum slaacd_process p, char *argv0, int fd, int debug, int verbose)
 	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
-	argv[argc++] = argv0;
+	argv[argc++] = execpath;
 	switch (p) {
 	case PROC_MAIN:
 		fatalx("Can not start main process");
@@ -369,8 +378,8 @@ start_child(enum slaacd_process p, char *argv0, int fd, int debug, int verbose)
 		argv[argc++] = "-v";
 	argv[argc++] = NULL;
 
-	execvp(argv0, argv);
-	fatal("execvp");
+	execv(execpath, argv);
+	fatal("execv");
 }
 
 void
@@ -380,8 +389,8 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	struct imsgbuf		*ibuf;
 	struct imsg		 imsg;
 	struct imsg_ifinfo	 imsg_ifinfo;
-	ssize_t			 n;
-	int			 shut = 0;
+	uint32_t		 type;
+	int			 n, shut = 0;
 	int			 rdomain;
 #ifndef	SMALL
 	int			 verbose;
@@ -390,56 +399,57 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+
+		switch (type) {
 		case IMSG_OPEN_ICMP6SOCK:
-			log_debug("IMSG_OPEN_ICMP6SOCK");
-			if (IMSG_DATA_SIZE(imsg) != sizeof(rdomain))
-				fatalx("%s: IMSG_OPEN_ICMP6SOCK wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&rdomain, imsg.data, sizeof(rdomain));
+			if (imsg_get_data(&imsg, &rdomain,
+			    sizeof(rdomain)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			open_icmp6sock(rdomain);
 			break;
 #ifndef	SMALL
 		case IMSG_CTL_LOG_VERBOSE:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(verbose))
-				fatalx("%s: IMSG_CTL_LOG_VERBOSE wrong length: "
-				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&verbose, imsg.data, sizeof(verbose));
+			if (imsg_get_data(&imsg, &verbose,
+			    sizeof(verbose)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			log_setverbose(verbose);
 			break;
 #endif	/* SMALL */
 		case IMSG_UPDATE_IF:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_ifinfo))
-				fatalx("%s: IMSG_UPDATE_IF wrong length: %lu",
-				    __func__, IMSG_DATA_SIZE(imsg));
-			memcpy(&imsg_ifinfo, imsg.data, sizeof(imsg_ifinfo));
-			if (get_soiikey(imsg_ifinfo.soiikey) == -1)
-				log_warn("get_soiikey");
-			else
-				main_imsg_compose_engine(IMSG_UPDATE_IF, 0,
-				    &imsg_ifinfo, sizeof(imsg_ifinfo));
+			if (imsg_get_data(&imsg, &imsg_ifinfo,
+			    sizeof(imsg_ifinfo)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
+			memcpy(imsg_ifinfo.soiikey, soiikey,
+			    SLAACD_SOIIKEY_LEN);
+			main_imsg_compose_engine(IMSG_UPDATE_IF, 0,
+			    &imsg_ifinfo, sizeof(imsg_ifinfo));
 			break;
 		default:
-			log_debug("%s: error handling imsg %d", __func__,
-			    imsg.hdr.type);
+			log_debug("%s: error handling imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -462,78 +472,76 @@ main_dispatch_engine(int fd, short event, void *bula)
 	struct imsg_configure_address	 address;
 	struct imsg_configure_dfr	 dfr;
 	struct imsg_propose_rdns	 rdns;
-	ssize_t				 n;
-	int				 shut = 0;
+	uint32_t			 type;
+	int				 n, shut = 0;
 
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
-		if ((n = imsg_get(ibuf, &imsg)) == -1)
-			fatal("imsg_get");
+		if ((n = imsgbuf_get(ibuf, &imsg)) == -1)
+			fatal("imsgbuf_get");
 		if (n == 0)	/* No more messages. */
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+
+		switch (type) {
 		case IMSG_CONFIGURE_ADDRESS:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(address))
-				fatalx("%s: IMSG_CONFIGURE_ADDRESS wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&address, imsg.data, sizeof(address));
+			if (imsg_get_data(&imsg, &address,
+			    sizeof(address)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			configure_interface(&address);
 			break;
 		case IMSG_WITHDRAW_ADDRESS:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(address))
-				fatalx("%s: IMSG_WITHDRAW_ADDRESS wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&address, imsg.data, sizeof(address));
+			if (imsg_get_data(&imsg, &address,
+			    sizeof(address)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			delete_address(&address);
 			break;
 		case IMSG_CONFIGURE_DFR:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(dfr))
-				fatalx("%s: IMSG_CONFIGURE_DFR wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&dfr, imsg.data, sizeof(dfr));
+			if (imsg_get_data(&imsg, &dfr, sizeof(dfr)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			add_gateway(&dfr);
 			break;
 		case IMSG_WITHDRAW_DFR:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(dfr))
-				fatalx("%s: IMSG_WITHDRAW_DFR wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&dfr, imsg.data, sizeof(dfr));
+			if (imsg_get_data(&imsg, &dfr, sizeof(dfr)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
+
 			delete_gateway(&dfr);
 			break;
 		case IMSG_PROPOSE_RDNS:
-			if (IMSG_DATA_SIZE(imsg) != sizeof(rdns))
-				fatalx("%s: IMSG_PROPOSE_RDNS wrong "
-				    "length: %lu", __func__,
-				    IMSG_DATA_SIZE(imsg));
-			memcpy(&rdns, imsg.data, sizeof(rdns));
+			if (imsg_get_data(&imsg, &rdns, sizeof(rdns)) == -1)
+				fatalx("%s: invalid %s", __func__, i2s(type));
 			if ((2 + rdns.rdns_count * sizeof(struct in6_addr)) >
 			    sizeof(struct sockaddr_rtdns))
 				fatalx("%s: rdns_count too big: %d", __func__,
 				    rdns.rdns_count);
+			if (rdns.rdns_count > MAX_RDNS_COUNT)
+				fatalx("%s: rdns_count too big: %d", __func__,
+				    rdns.rdns_count);
+
 			send_rdns_proposal(&rdns);
 			break;
 		default:
-			log_debug("%s: error handling imsg %d", __func__,
-			    imsg.hdr.type);
+			log_debug("%s: error handling imsg %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -571,7 +579,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -592,6 +600,16 @@ imsg_compose_event(struct imsgev *iev, uint16_t type, uint32_t peerid,
 	return (ret);
 }
 
+int
+imsg_forward_event(struct imsgev *iev, struct imsg *imsg)
+{
+	int	ret;
+
+	if ((ret = imsg_forward(&iev->ibuf, imsg)) != -1)
+		imsg_event_add(iev);
+
+	return (ret);
+}
 static int
 main_imsg_send_ipc_sockets(struct imsgbuf *frontend_buf,
     struct imsgbuf *engine_buf)
@@ -605,11 +623,11 @@ main_imsg_send_ipc_sockets(struct imsgbuf *frontend_buf,
 	if (imsg_compose(frontend_buf, IMSG_SOCKET_IPC, 0, 0,
 	    pipe_frontend2engine[0], NULL, 0) == -1)
 		return (-1);
-	imsg_flush(frontend_buf);
+	imsgbuf_flush(frontend_buf);
 	if (imsg_compose(engine_buf, IMSG_SOCKET_IPC, 0, 0,
 	    pipe_frontend2engine[1], NULL, 0) == -1)
 		return (-1);
-	imsg_flush(engine_buf);
+	imsgbuf_flush(engine_buf);
 	return (0);
 }
 
@@ -784,8 +802,10 @@ configure_gateway(struct imsg_configure_dfr *dfr, uint8_t rtm_type)
 		rtm.rtm_msglen += padlen;
 	}
 
-	if (writev(routesock, iov, iovcnt) == -1)
-		log_warn("failed to send route message");
+	if (writev(routesock, iov, iovcnt) == -1) {
+		if (errno != EEXIST)
+			log_warn("failed to send route message");
+	}
 }
 
 void
@@ -858,16 +878,78 @@ sin6_to_str(struct sockaddr_in6 *sin6)
 	}
 	return hbuf;
 }
-#endif	/* SMALL */
 
 int
-get_soiikey(uint8_t *key)
+parse_hex_char(char ch)
 {
-	int	 mib[4] = {CTL_NET, PF_INET6, IPPROTO_IPV6, IPV6CTL_SOIIKEY};
-	size_t	 size = SLAACD_SOIIKEY_LEN;
+	if (ch >= '0' && ch <= '9')
+		return (ch - '0');
 
-	return sysctl(mib, sizeof(mib) / sizeof(mib[0]), key, &size, NULL, 0);
+	ch = tolower((unsigned char)ch);
+	if (ch >= 'a' && ch <= 'f')
+		return (ch - 'a' + 10);
+
+	return (-1);
 }
+
+ssize_t
+parse_hex_string(unsigned char *dst, size_t dstlen, const char *src)
+{
+	size_t len = 0;
+	int digit;
+
+	memset(dst, 0, dstlen);
+	while (len < dstlen) {
+		if (*src == '\0')
+			return (len);
+
+		digit = parse_hex_char(*src++);
+		if (digit == -1)
+			return (-1);
+		dst[len] = digit << 4;
+
+		digit = parse_hex_char(*src++);
+		if (digit == -1)
+			return (-1);
+
+		dst[len] |= digit;
+		len++;
+	}
+
+	while (*src != '\0') {
+		if (parse_hex_char(*src++) == -1 ||
+		    parse_hex_char(*src++) == -1)
+			return (-1);
+
+		len++;
+	}
+
+	return (len);
+}
+
+void
+read_soiikey(void)
+{
+	int	 fd = -1;
+	char	 buf[33];
+
+	if ((fd = open("/etc/soii.key", O_RDONLY)) == -1)
+		goto err;
+	memset(buf, 0, sizeof(buf));
+	if (read(fd, buf, sizeof(buf) - 1) == -1)
+		goto err;
+	close(fd);
+	fd = -1;
+	if (parse_hex_string(soiikey, sizeof(soiikey), buf) == -1)
+		goto err;
+	return;
+ err:
+	memset(soiikey, 0, sizeof(soiikey));
+	if (fd != -1)
+		close(fd);
+}
+
+#endif	/* SMALL */
 
 void
 open_icmp6sock(int rdomain)
@@ -899,3 +981,54 @@ open_icmp6sock(int rdomain)
 	main_imsg_compose_frontend(IMSG_ICMP6SOCK, icmp6sock, &rdomain,
 	    sizeof(rdomain));
 }
+
+#ifndef	SMALL
+
+#define	I2S(x) case x: return #x
+
+const char*
+i2s(uint32_t type)
+{
+	static char	unknown[sizeof("IMSG_4294967295")];
+
+	switch (type) {
+	I2S(IMSG_NONE);
+	I2S(IMSG_CTL_LOG_VERBOSE);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_RA);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_RA_PREFIX);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_RA_RDNS);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_ADDR_PROPOSALS);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_ADDR_PROPOSAL);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_DFR_PROPOSALS);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_DFR_PROPOSAL);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_RDNS_PROPOSALS);
+	I2S(IMSG_CTL_SHOW_INTERFACE_INFO_RDNS_PROPOSAL);
+	I2S(IMSG_CTL_END);
+	I2S(IMSG_PROPOSE_RDNS);
+	I2S(IMSG_REPROPOSE_RDNS);
+	I2S(IMSG_CTL_SEND_SOLICITATION);
+	I2S(IMSG_SOCKET_IPC);
+	I2S(IMSG_OPEN_ICMP6SOCK);
+	I2S(IMSG_ICMP6SOCK);
+	I2S(IMSG_ROUTESOCK);
+	I2S(IMSG_CONTROLFD);
+	I2S(IMSG_STARTUP);
+	I2S(IMSG_UPDATE_IF);
+	I2S(IMSG_REMOVE_IF);
+	I2S(IMSG_RA);
+	I2S(IMSG_CONFIGURE_ADDRESS);
+	I2S(IMSG_WITHDRAW_ADDRESS);
+	I2S(IMSG_DEL_ADDRESS);
+	I2S(IMSG_DEL_ROUTE);
+	I2S(IMSG_CONFIGURE_DFR);
+	I2S(IMSG_WITHDRAW_DFR);
+	I2S(IMSG_DUP_ADDRESS);
+	default:
+		snprintf(unknown, sizeof(unknown), "IMSG_%u", type);
+		return unknown;
+	}
+}
+#undef	I2S
+
+#endif	/* SMALL */
